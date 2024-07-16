@@ -1,18 +1,12 @@
 ## My Project
 
-TODO: Fill this README out!
+This package provides a model hub for running inference on Neuronx Distributed (NxD). 
 
-Be sure to:
+## Contributing
 
-* Change the title in this README
-* Edit your repository description on GitHub
-* Write in your license below and create a LICENSE file
+### Formatting code
 
-## Security
-
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
-
-## License
-
-This library is licensed under the LICENSE NAME HERE License.
-
+To format the code, use the following command:
+```
+pre-commit run --all-files
+```
