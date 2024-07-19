@@ -2,7 +2,7 @@ from setuptools import PEP420PackageFinder, setup
 
 exec(open("src/neuronx_distributed_inference/_version.py").read())
 setup(
-    name="neuronx-distributed-interface",
+    name="neuronx-distributed-inference",
     version=__version__, #noqa F821
     classifiers=[
         "Development Status :: 3 - Alpha",
