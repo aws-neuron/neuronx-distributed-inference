@@ -6,7 +6,7 @@ package.NeuronxDistributedInference = {
         network-access = internal;
     };
 
-    build-system = container-build;
+    build-system = enhanced-container-build;
     build-tools = {
         1.0 = {
             ContainerBuild = 1.2;
@@ -15,7 +15,41 @@ package.NeuronxDistributedInference = {
             Python3PBuildTool = 2.0;
             Python-setuptools = default;
             NeuronLicense = 1.0;
+            BrazilPython = 3.0;
         };
     };
 
+    test-dependencies = {
+        1.0 = {
+            # Run tests with py.test in BrazilPython.
+            BrazilPython-Pytest = 6.x;
+            Pytest = 6.x;
+    
+            # Coverage for Python tests.
+            Python-Pytest-cov = 4.x;
+            Coverage = 7.x;
+    
+            # Enable the "guard" command to watch tests and automatically re-run them
+            BrazilPython-Pytest-Guard = any;
+    
+            # Publish test results to Brazil's test and coverage detection
+            BrazilPythonTestSupport = 3.0;
+    
+            # Dependencies for formatting checks. Controlled in `setup.cfg` and
+            # `pyproject.toml`
+            BrazilPython-formatters = 1.0;
+            Python-black = no1;
+            Python-isort = 5.x;
+    
+            # Dependencies for type checking. Controlled in `setup.cfg` and
+            # `pyproject.toml`
+            BrazilPython-mypy = any;
+            Python-mypy = 1.x;
+    
+            # Dependencies for build-time linting. Controlled in `setup.cfg`
+            BrazilPython-Flake8 = any;
+            Python-flake8 = 7.x;
+            Python-pep8-naming = 0.x;
+        }
+    };
 };

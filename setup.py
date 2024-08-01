@@ -3,7 +3,7 @@ from setuptools import PEP420PackageFinder, setup
 exec(open("src/neuronx_distributed_inference/_version.py").read())
 setup(
     name="neuronx-distributed-inference",
-    version=__version__, #noqa F821
+    version=__version__,  # noqa F821
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
@@ -21,11 +21,7 @@ setup(
     keywords="aws neuron",
     packages=PEP420PackageFinder.find(where="src"),
     package_data={"": []},
-    install_requires=[
-        "neuronx_distributed",
-        "transformers==4.40.0",
-        "sentencepiece"
-    ],
+    install_requires=["neuronx_distributed", "transformers==4.40.0", "sentencepiece"],
     python_requires=">=3.7",
     package_dir={"": "src"},
 )

@@ -21,4 +21,6 @@ cp setup.py ${WHL_BUILD_PATH}/
 cp -r src/ ${WHL_BUILD_PATH}/
 cp ${LICENSE_TXT_PATH} ${WHL_BUILD_PATH}/src/neuronx_distributed_inference/LICENSE.txt
 
+rm -rf $BUILD_PATH/lib
+
 bash ./build.sh

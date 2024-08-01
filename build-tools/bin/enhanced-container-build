@@ -1,0 +1,49 @@
+set -e
+
+BUILD_LIB=build/lib
+
+# `bb clean`
+if [ "$1" == "clean" ]; then
+    container-build "$@"
+    exit
+fi
+
+# `bb test`
+if [ "$1" == "test" ]; then
+    if [ ! -d "$BUILD_LIB" ]; then
+        echo "Must build package first to run brazil-build test" 1>&2;
+        exit 1
+    fi
+    
+    # Set PYTHONPATH so unit tests can find the package.
+    export PYTHONPATH=$BUILD_LIB
+    $BRAZIL_BUILD_HOME/bin/brazil-test-exec pytest "${@:2}"
+    exit
+fi
+
+# `bb format`
+if [ "$1" == "format" ]; then
+    brazilpython format
+    exit
+fi
+
+# `bb flake8`
+if [ "$1" == "flake8" ]; then
+    brazilpython flake8
+    exit
+fi
+
+# `bb`
+echo "Formatting code..."
+brazilpython format
+
+echo "Checking style with flake8..."
+brazilpython flake8
+
+echo "Building in container..."
+container-build "$@"
+
+# Set PYTHONPATH so unit tests can find the package.
+export PYTHONPATH=$BUILD_LIB
+echo "Running unit tests..."
+$BRAZIL_BUILD_HOME/bin/brazil-test-exec pytest
