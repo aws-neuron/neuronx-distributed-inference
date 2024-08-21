@@ -6,7 +6,10 @@ from typing import Union
 
 from transformers import AutoConfig, PretrainedConfig
 
+from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
+
 CONFIG_FILE = "neuron_config.json"
+LORA_CONFIG_FILE = "lora_config.json"
 
 
 class NeuronConfig:
@@ -17,7 +20,9 @@ class NeuronConfig:
     optimization/features in NxD.
     """
 
-    def __init__(self, hf_config: PretrainedConfig = None, **kwargs) -> None:
+    def __init__(
+        self, hf_config: PretrainedConfig = None, lora_config: LoraServingConfig = None, **kwargs
+    ) -> None:
         self.hf_config: PretrainedConfig = hf_config
 
         # Basic config for inference in NxD
@@ -81,6 +86,9 @@ class NeuronConfig:
         self.num_medusa_heads = kwargs.pop("num_medusa_heads", 0)
         self.medusa_tree = kwargs.pop("medusa_tree", 0)
 
+        # Lora
+        self.lora_config = lora_config
+
     def save(self, model_directory: Union[str, os.PathLike]):
         """
         Saves the config to a JSON file in the given model directory.
@@ -90,6 +98,11 @@ class NeuronConfig:
         if self.hf_config is not None:
             logging.debug(f"Saving HF config: {self.hf_config.to_json_string()}")
             self.hf_config.save_pretrained(model_directory)
+
+        lora_config_file = os.path.join(model_directory, LORA_CONFIG_FILE)
+        if self.lora_config is not None:
+            logging.debug(f"Saving lora config: {self.lora_config.to_json_string()}")
+            self.lora_config.to_json_file(lora_config_file)
 
     def to_json_file(self, json_file: Union[str, os.PathLike]):
         with open(json_file, "w", encoding="utf-8") as writer:
@@ -101,6 +114,7 @@ class NeuronConfig:
         # HF config is serialized separately, so we exclude it.
         config_dict = copy.deepcopy(self.__dict__)
         del config_dict["hf_config"]
+        del config_dict["lora_config"]
         return json.dumps(config_dict, indent=2, sort_keys=True)
 
     @classmethod
@@ -121,6 +135,10 @@ class NeuronConfig:
         if not skip_hf_config:
             neuron_config.hf_config = AutoConfig.from_pretrained(model_directory)
             logging.info(f"Loaded HF config: {neuron_config.hf_config.to_json_string()}")
+
+        lora_config_file = os.path.join(model_directory, LORA_CONFIG_FILE)
+        neuron_config.lora_config = LoraServingConfig.from_json_file(lora_config_file)
+
         return neuron_config
 
     @classmethod
