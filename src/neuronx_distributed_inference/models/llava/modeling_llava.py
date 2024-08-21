@@ -24,14 +24,14 @@ import torch
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
 from torch import nn
-from transformers import LlavaPreTrainedModel, PretrainedConfig
+from transformers import LlavaConfig, LlavaPreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.models.llava.modeling_llava import (
     LlavaCausalLMOutputWithPast,
     LlavaForConditionalGeneration,
 )
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import NeuronConfig, PretrainedConfigAdapter
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaModel
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 
@@ -39,22 +39,25 @@ from .model_wrapper_llava import ModelWrapperLlava
 from .modeling_clip import NeuronCLIPVisionModel
 
 
-class NeuronLlavaConfig(NeuronConfig):
-    def __init__(self, hf_config: PretrainedConfig = None, **kwargs) -> None:
-        super().__init__(hf_config, **kwargs)
+class LlavaConfigAdapter(PretrainedConfigAdapter, LlavaConfig):
+    def __init__(self, neuron_config: NeuronConfig = None, **kwargs):
+        super().__init__(neuron_config, **kwargs)
+        self.text_config.attn_cls = "NeuronLlamaAttention"
+        self.text_config._attn_implementation = "eager"
 
-        self.hf_config.text_config.attn_cls = "NeuronLlamaAttention"
-        self.hf_config.text_config._attn_implementation = "eager"
+        # Move self.text_config.* to  self.*
+        # We will directly use self as the configuration for llama model
+        for key, value in self.text_config.__dict__.items():
+            if not hasattr(self, key):
+                setattr(self, key, value)
+        self.pad_token_id = self.text_config.pad_token_id
+        self.bos_token_id = self.text_config.bos_token_id
+        self.eos_token_id = self.text_config.eos_token_id
+        self._attn_implementation = self.text_config._attn_implementation
 
-        # Move self.hf_config.text_config.* to  self.hf_config.*
-        # We will directly use self.hf_config as the configuration for llama model
-        for key, value in self.hf_config.text_config.__dict__.items():
-            if not hasattr(self.hf_config, key):
-                setattr(self.hf_config, key, value)
-        self.hf_config.pad_token_id = self.hf_config.text_config.pad_token_id
-        self.hf_config.bos_token_id = self.hf_config.text_config.bos_token_id
-        self.hf_config.eos_token_id = self.hf_config.text_config.eos_token_id
-        self.hf_config._attn_implementation = self.hf_config.text_config._attn_implementation
+    @classmethod
+    def get_config_cls(cls):
+        return NeuronConfig
 
 
 class NeuronLlavaMultiModalProjector(nn.Module):
@@ -62,7 +65,7 @@ class NeuronLlavaMultiModalProjector(nn.Module):
     The linear layers are replaced with ColumnParallelLinear
     """
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: LlavaConfigAdapter):
         super().__init__()
 
         self.act = ACT2FN[config.projector_hidden_act]
@@ -101,21 +104,21 @@ class NeuronLlavaMultiModalProjector(nn.Module):
 
 
 class NeuronLlavaModel(NeuronBaseModel, LlavaPreTrainedModel):
-    def __init__(self, neuron_config: NeuronLlavaConfig):
-        super().__init__(neuron_config, optimize_inference=False)
+    def __init__(self, config: LlavaConfigAdapter):
+        super().__init__(config, optimize_inference=False)
 
-    def setup_attr_for_model(self, neuron_config: NeuronLlavaConfig):
-        self.on_device_sampling = neuron_config.on_device_sampling
-        self.tp_degree = neuron_config.tp_degree
-        self.neuron_config = neuron_config
+    def setup_attr_for_model(self, config: LlavaConfigAdapter):
+        self.on_device_sampling = config.neuron_config.on_device_sampling
+        self.tp_degree = config.neuron_config.tp_degree
+        self.neuron_config = config.neuron_config
 
-    def init_model(self, neuron_config: NeuronLlavaConfig):
-        neuron_config.hf_config.vision_config.tp_degree = neuron_config.tp_degree
-        neuron_config.hf_config.vision_config.torch_dtype = neuron_config.hf_config.torch_dtype
-        self.vision_tower = NeuronCLIPVisionModel(neuron_config.hf_config.vision_config)
-        self.multi_modal_projector = NeuronLlavaMultiModalProjector(neuron_config.hf_config)
-        self.language_model = NeuronLlamaModel(neuron_config)
-        self.past_key_values = self.language_model.past_key_values
+    def init_model(self, config: LlavaConfigAdapter):
+        config.vision_config.tp_degree = config.neuron_config.tp_degree
+        config.vision_config.torch_dtype = config.torch_dtype
+        self.vision_tower = NeuronCLIPVisionModel(config.vision_config)
+        self.multi_modal_projector = NeuronLlavaMultiModalProjector(config)
+        self.language_model = NeuronLlamaModel(config)
+        self.past_key_values = self.language_model.kv_mgr.past_key_values
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
@@ -145,8 +148,8 @@ class NeuronLlavaModel(NeuronBaseModel, LlavaPreTrainedModel):
             new_num_tokens, pad_to_multiple_of
         )
         # update vocab size
-        self.neuron_config.text_config.vocab_size = model_embeds.num_embeddings
-        self.neuron_config.vocab_size = model_embeds.num_embeddings
+        self.config.text_config.vocab_size = model_embeds.num_embeddings
+        self.config.vocab_size = model_embeds.num_embeddings
         self.vocab_size = model_embeds.num_embeddings
         return model_embeds
 
@@ -201,12 +204,12 @@ class NeuronLlavaModel(NeuronBaseModel, LlavaPreTrainedModel):
         vision_feature_layer = (
             vision_feature_layer
             if vision_feature_layer is not None
-            else self.neuron_config.hf_config.vision_feature_layer
+            else self.config.vision_feature_layer
         )
         vision_feature_select_strategy = (
             vision_feature_select_strategy
             if vision_feature_select_strategy is not None
-            else self.neuron_config.hf_config.vision_feature_select_strategy
+            else self.config.vision_feature_select_strategy
         )
 
         if inputs_embeds is None:
@@ -225,7 +228,7 @@ class NeuronLlavaModel(NeuronBaseModel, LlavaPreTrainedModel):
                     selected_image_feature = selected_image_feature
                 else:
                     raise ValueError(
-                        f"Unexpected select feature strategy: {self.neuron_config.vision_feature_select_strategy}"
+                        f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
                     )
 
                 image_features = self.multi_modal_projector(selected_image_feature)
@@ -256,12 +259,12 @@ class NeuronLlavaForConditionalGeneration(NeuronBaseForCausalLM, LlavaPreTrained
     _NEW_STATE_DICT_MODEL_PREFIX = "language_model."
     _model_cls = NeuronLlavaModel
 
-    def __init__(self, model_path: str, neuron_config: NeuronLlavaConfig):
-        super().__init__(model_path, neuron_config)
-        self.torch_dtype = neuron_config.hf_config.torch_dtype
-        self.image_size = neuron_config.hf_config.vision_config.image_size
-        self.patch_size = neuron_config.hf_config.vision_config.patch_size
-        self.image_token_index = neuron_config.hf_config.image_token_index
+    def __init__(self, model_path: str, config: LlavaConfigAdapter):
+        super().__init__(model_path, config)
+        self.torch_dtype = config.torch_dtype
+        self.image_size = config.vision_config.image_size
+        self.patch_size = config.vision_config.patch_size
+        self.image_token_index = config.image_token_index
 
     @staticmethod
     def load_hf_model(model_path):

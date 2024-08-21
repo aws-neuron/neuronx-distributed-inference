@@ -17,17 +17,18 @@ from transformers.generation.stopping_criteria import (
 )
 from transformers.modeling_outputs import ModelOutput
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 
 class HuggingFaceGenerationAdapter(GenerationMixin):
-    def __init__(self, neuron_config: NeuronConfig):
-        super().__init__(neuron_config.hf_config)
-        self.neuron_config = neuron_config
-        self.padding_side = neuron_config.padding_side
+    def __init__(self, config: PretrainedConfigAdapter):
+        super().__init__(config)
+        self.config = config
+        self.neuron_config = config.neuron_config
+        self.padding_side = config.neuron_config.padding_side
         self.kv_cache_populated = False
         self.prev_kv_cache_populated = False
 
@@ -101,8 +102,8 @@ class HuggingFaceGenerationAdapter(GenerationMixin):
 
             if not self.neuron_config.on_device_sampling:
                 if self.sampler is None:
-                    self.neuron_config.hf_config.do_sample = True
-                    self.sampler = Sampler(self.neuron_config)
+                    self.config.do_sample = True
+                    self.sampler = Sampler(self.config)
                 next_tokens = self.sampler.sample(outputs.logits[:, -1, :])
             else:
                 next_tokens = outputs.tokens
@@ -123,7 +124,7 @@ class HuggingFaceGenerationAdapter(GenerationMixin):
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
-                is_encoder_decoder=self.neuron_config.hf_config.is_encoder_decoder,
+                is_encoder_decoder=self.config.is_encoder_decoder,
             )
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, None)

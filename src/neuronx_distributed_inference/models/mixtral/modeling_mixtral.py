@@ -17,11 +17,11 @@ import warnings
 from typing import Optional, Tuple, Union
 
 import torch
-from neuronx_distributed.utils.sampling import Sampler
 
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.modules.attention.gqa import GQA
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 # Try except for the compatibility with older compiler version
 try:
@@ -36,11 +36,11 @@ from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
 from torch import nn
 from torch_neuronx.xla_impl.ops import nki_jit
-from transformers import MixtralForCausalLM, MixtralPreTrainedModel
+from transformers import MixtralConfig, MixtralForCausalLM, MixtralPreTrainedModel
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.models.mixtral.modeling_mixtral import MixtralRMSNorm
 
-from neuronx_distributed_inference.models.config import MoENeuronConfig
+from neuronx_distributed_inference.models.config import MoENeuronConfig, PretrainedConfigAdapter
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 
@@ -51,13 +51,13 @@ SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
 
-def convert_mixtral_to_neuron_state_dict(neuron_state_dict, neuron_config):
+def convert_mixtral_to_neuron_state_dict(neuron_state_dict, config):
     """
     Helper function which returns the model weights from the mixtral model in a state dictionary compatible with the stucture of the neuron MoE model.
     """
-    assert neuron_config.glu_mlp is True, "Only GLU MLP is supported for Mixtral Top-K model"
+    assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported for Mixtral Top-K model"
 
-    for l in range(neuron_config.hf_config.num_hidden_layers):  # noqa: E741
+    for l in range(config.num_hidden_layers):  # noqa: E741
         # Copy router weights
         neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
             neuron_state_dict[f"layers.{l}.block_sparse_moe.gate.weight"].detach().clone()
@@ -72,13 +72,13 @@ def convert_mixtral_to_neuron_state_dict(neuron_state_dict, neuron_config):
 
         # copy the MLP parameters
         gate_up_proj = torch.empty(
-            neuron_config.hf_config.num_local_experts,
+            config.num_local_experts,
             hidden_size,
             2 * intermediate_size,
             dtype=dtype,
             device=device,
         )
-        for e in range(neuron_config.hf_config.num_local_experts):
+        for e in range(config.num_local_experts):
             # Copy gate_proj and up_proj after concatenation
             gate_proj_weights = (
                 neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w1.weight"]
@@ -104,13 +104,13 @@ def convert_mixtral_to_neuron_state_dict(neuron_state_dict, neuron_config):
         neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
 
         down_proj = torch.empty(
-            neuron_config.hf_config.num_local_experts,
+            config.num_local_experts,
             intermediate_size,
             hidden_size,
             dtype=dtype,
             device=device,
         )
-        for e in range(neuron_config.hf_config.num_local_experts):
+        for e in range(config.num_local_experts):
             # Copy down_proj
             down_proj_weights = (
                 neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w2.weight"]
@@ -127,25 +127,32 @@ def convert_mixtral_to_neuron_state_dict(neuron_state_dict, neuron_config):
     return neuron_state_dict
 
 
-def get_rmsnorm_cls(neuron_config):
+def get_rmsnorm_cls(config):
     # Initialize to the appropriate implementation of RMSNorm
     # If infer on NXD -> CustomRMSNorm
     # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
-    return MixtralRMSNorm if neuron_config.on_cpu else CustomRMSNorm
+    return MixtralRMSNorm if config.neuron_config.on_cpu else CustomRMSNorm
+
+
+class MixtralConfigAdapter(PretrainedConfigAdapter, MixtralConfig):
+    @classmethod
+    def get_config_cls(cls):
+        return MoENeuronConfig
 
 
 class NeuronMixtralAttention(NeuronAttentionBase):
-    def __init__(self, neuron_config: MoENeuronConfig):
+    def __init__(self, config: MixtralConfigAdapter):
         super().__init__()
-        self.neuron_config = neuron_config
-        self.hidden_size = neuron_config.hf_config.hidden_size
-        self.num_attention_heads = neuron_config.hf_config.num_attention_heads
-        self.num_key_value_heads = neuron_config.hf_config.num_key_value_heads
+        self.config = config
+        self.neuron_config = config.neuron_config
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = self.hidden_size // self.num_attention_heads
-        self.max_position_embeddings = neuron_config.hf_config.max_position_embeddings
-        self.rope_theta = neuron_config.hf_config.rope_theta
-        self.padding_side = neuron_config.padding_side
-        self.torch_dtype = neuron_config.hf_config.torch_dtype
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.padding_side = config.neuron_config.padding_side
+        self.torch_dtype = config.torch_dtype
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
@@ -170,24 +177,24 @@ class NeuronMixtralDecoderLayer(nn.Module):
     Just replace the attention with the NXD version, and MLP with the NXD version
     """
 
-    def __init__(self, neuron_config: MoENeuronConfig, layer_idx: int):
+    def __init__(self, config: MixtralConfigAdapter, layer_idx: int):
         super().__init__()
-        self.hidden_size = neuron_config.hf_config.hidden_size
-        self.self_attn = NeuronMixtralAttention(neuron_config=neuron_config)
+        self.hidden_size = config.hidden_size
+        self.self_attn = NeuronMixtralAttention(config=config)
 
         router = RouterTopK(
-            num_experts=neuron_config.hf_config.num_local_experts,
-            top_k=neuron_config.hf_config.num_experts_per_tok,
-            hidden_size=neuron_config.hf_config.hidden_size,
+            num_experts=config.num_local_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
         )
         expert_mlps = ExpertMLPs(
-            num_experts=neuron_config.hf_config.num_local_experts,
-            top_k=neuron_config.hf_config.num_experts_per_tok,
-            hidden_size=neuron_config.hf_config.hidden_size,
-            intermediate_size=neuron_config.hf_config.intermediate_size,
-            hidden_act=neuron_config.hf_config.hidden_act,
-            glu_mlp=neuron_config.glu_mlp,
-            capacity_factor=neuron_config.capacity_factor,
+            num_experts=config.num_local_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            glu_mlp=config.neuron_config.glu_mlp,
+            capacity_factor=config.neuron_config.capacity_factor,
             normalize_top_k_affinities=True,
         )
         self.mlp = MoE(
@@ -196,13 +203,13 @@ class NeuronMixtralDecoderLayer(nn.Module):
         )
         self.mlp.eval()  # Set MoE module in eval mode
 
-        self.input_layernorm = get_rmsnorm_cls(neuron_config)(
-            neuron_config.hf_config.hidden_size,
-            eps=neuron_config.hf_config.rms_norm_eps,
+        self.input_layernorm = get_rmsnorm_cls(config)(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm = get_rmsnorm_cls(neuron_config)(
-            neuron_config.hf_config.hidden_size,
-            eps=neuron_config.hf_config.rms_norm_eps,
+        self.post_attention_layernorm = get_rmsnorm_cls(config)(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
         )
 
     def forward(
@@ -261,38 +268,34 @@ class NeuronMixtralModel(NeuronBaseModel, MixtralPreTrainedModel):
 
     _model_cls = MixtralPreTrainedModel
 
-    def setup_attr_for_model(self, neuron_config: MoENeuronConfig):
-        self.on_device_sampling = neuron_config.on_device_sampling
-        self.tp_degree = neuron_config.tp_degree
-        self.hidden_size = neuron_config.hf_config.hidden_size
-        self.num_attention_heads = neuron_config.hf_config.num_attention_heads
-        self.num_key_value_heads = neuron_config.hf_config.num_key_value_heads
-        self.max_batch_size = neuron_config.max_batch_size
-        self.buckets = neuron_config.buckets
+    def setup_attr_for_model(self, config: MixtralConfigAdapter):
+        self.on_device_sampling = config.neuron_config.on_device_sampling
+        self.tp_degree = config.neuron_config.tp_degree
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.max_batch_size = config.neuron_config.max_batch_size
+        self.buckets = config.neuron_config.buckets
 
-    def init_model(self, neuron_config: MoENeuronConfig):
-        self.padding_idx = neuron_config.hf_config.pad_token_id
-        self.vocab_size = neuron_config.hf_config.vocab_size
+    def init_model(self, config: MixtralConfigAdapter):
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
 
         self.embed_tokens = ParallelEmbedding(
-            neuron_config.hf_config.vocab_size,
-            neuron_config.hf_config.hidden_size,
+            config.vocab_size,
+            config.hidden_size,
             self.padding_idx,
-            dtype=neuron_config.hf_config.torch_dtype,
+            dtype=config.torch_dtype,
             shard_across_embedding=True,
         )
         self.layers = nn.ModuleList(
             [
-                NeuronMixtralDecoderLayer(neuron_config, layer_idx)
-                for layer_idx in range(neuron_config.hf_config.num_hidden_layers)
+                NeuronMixtralDecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = get_rmsnorm_cls(neuron_config)(
-            self.hidden_size, eps=neuron_config.hf_config.rms_norm_eps
-        )
-        self.lm_head = ColumnParallelLinear(
-            neuron_config.hf_config.hidden_size, self.vocab_size, bias=False
-        )
+        self.norm = get_rmsnorm_cls(config)(self.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = ColumnParallelLinear(config.hidden_size, self.vocab_size, bias=False)
 
 
 class NeuronMixtralForCausalLM(NeuronBaseForCausalLM, MixtralPreTrainedModel):
@@ -302,17 +305,17 @@ class NeuronMixtralForCausalLM(NeuronBaseForCausalLM, MixtralPreTrainedModel):
 
     _model_cls = NeuronMixtralModel
 
-    def __init__(self, model_path: str, neuron_config: MoENeuronConfig):
-        super().__init__(model_path, neuron_config)
-        self.sampler = Sampler(neuron_config)
+    def __init__(self, model_path: str, config: MixtralConfigAdapter):
+        super().__init__(model_path, config)
+        self.sampler = Sampler(config)
 
     @staticmethod
     def load_hf_model(model_path):
         return MixtralForCausalLM.from_pretrained(model_path)
 
     @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, neuron_config: MoENeuronConfig) -> dict:
-        return convert_mixtral_to_neuron_state_dict(state_dict, neuron_config)
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: MixtralConfigAdapter) -> dict:
+        return convert_mixtral_to_neuron_state_dict(state_dict, config)
 
     def get_compiler_args(self):
         compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
@@ -321,6 +324,6 @@ class NeuronMixtralForCausalLM(NeuronBaseForCausalLM, MixtralPreTrainedModel):
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
         # Prevent auto-down casting when running with fp32
-        if self.neuron_config.hf_config.torch_dtype == torch.float32:
+        if self.config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
         return compiler_args

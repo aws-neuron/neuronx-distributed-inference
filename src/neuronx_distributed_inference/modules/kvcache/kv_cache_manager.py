@@ -4,7 +4,7 @@ import torch
 from neuronx_distributed.parallel_layers import parallel_state, utils
 from torch import Tensor, nn
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
 from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402; noqa: E402; noqa: E402
     determine_sharding_strategy,
     get_shardable_head_counts,
@@ -37,17 +37,17 @@ class KVCacheManager(nn.Module):
     and vends out read and write operations.
     """
 
-    def __init__(self, neuron_config: NeuronConfig, **kwargs):
+    def __init__(self, config: PretrainedConfigAdapter, **kwargs):
         super().__init__()
-        self.is_medusa = neuron_config.is_medusa
-        self.num_medusa_heads = neuron_config.num_medusa_heads
-        self.padding_side = neuron_config.padding_side
-        self.is_continuous_batching = neuron_config.is_continuous_batching
+        self.is_medusa = config.neuron_config.is_medusa
+        self.num_medusa_heads = config.neuron_config.num_medusa_heads
+        self.padding_side = config.neuron_config.padding_side
+        self.is_continuous_batching = config.neuron_config.is_continuous_batching
         self.num_kv_head = kwargs["num_kv_head"]
-        self._init_kv_shape(neuron_config)
+        self._init_kv_shape(config)
 
-        num_layer = neuron_config.hf_config.num_hidden_layers
-        dtype = neuron_config.hf_config.torch_dtype
+        num_layer = config.num_hidden_layers
+        dtype = config.torch_dtype
         self.past_key_values = nn.ParameterList(
             [
                 nn.Parameter(torch.zeros(self.kv_shape, dtype=dtype), requires_grad=False)
@@ -55,13 +55,13 @@ class KVCacheManager(nn.Module):
             ]
         )
 
-    def _init_kv_shape(self, neuron_config):
-        max_batch_size = neuron_config.max_batch_size
-        max_len = neuron_config.max_length
-        tp_degree = neuron_config.tp_degree
+    def _init_kv_shape(self, config: PretrainedConfigAdapter):
+        max_batch_size = config.neuron_config.max_batch_size
+        max_len = config.neuron_config.max_length
+        tp_degree = config.neuron_config.tp_degree
         num_kv_head = self.num_kv_head
-        num_atten_head = neuron_config.hf_config.num_attention_heads
-        hidden_size = neuron_config.hf_config.hidden_size
+        num_atten_head = config.num_attention_heads
+        hidden_size = config.hidden_size
 
         gqa_sharding_strategy = determine_sharding_strategy(tp_degree, num_kv_head)
         _, num_key_value_heads = get_shardable_head_counts(

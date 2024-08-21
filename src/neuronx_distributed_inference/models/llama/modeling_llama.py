@@ -28,8 +28,7 @@ from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E4
     RowParallelLinear,
 )
 from torch import nn
-from transformers import LlamaForCausalLM  # noqa: E402
-from transformers import LlamaPreTrainedModel
+from transformers import LlamaConfig, LlamaForCausalLM, LlamaPreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.models.llama.modeling_llama import (
     LlamaDynamicNTKScalingRotaryEmbedding,
@@ -38,7 +37,10 @@ from transformers.models.llama.modeling_llama import (
     LlamaRotaryEmbedding,
 )
 
-from neuronx_distributed_inference.models.config import NeuronConfig  # noqa: E402
+from neuronx_distributed_inference.models.config import (  # noqa: E402
+    NeuronConfig,
+    PretrainedConfigAdapter,
+)
 from neuronx_distributed_inference.models.model_base import (  # noqa: E402
     NeuronBaseForCausalLM,
     NeuronBaseModel,
@@ -91,18 +93,25 @@ def register_module(key: str):
     return inner
 
 
+class LlamaConfigAdapter(PretrainedConfigAdapter, LlamaConfig):
+    @classmethod
+    def get_config_cls(cls):
+        return NeuronConfig
+
+
 class NeuronLlamaMLP(nn.Module):
     """
     This class just replace the linear layers (gate_proj, up_proj and down_proj) with column and row parallel layers
     """
 
-    def __init__(self, neuron_config: NeuronConfig):
+    def __init__(self, config: PretrainedConfigAdapter):
         super().__init__()
-        self.neuron_config = neuron_config
-        self.tp_degree = neuron_config.tp_degree
-        self.hidden_size = neuron_config.hf_config.hidden_size
-        self.intermediate_size = neuron_config.hf_config.intermediate_size
-        self.act_fn = ACT2FN[neuron_config.hf_config.hidden_act]
+        self.config = config
+        self.neuron_config = config.neuron_config
+        self.tp_degree = config.neuron_config.tp_degree
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.act_fn = ACT2FN[config.hidden_act]
 
         if parallel_state.model_parallel_is_initialized():
             self.gate_proj = ColumnParallelLinear(
@@ -110,7 +119,7 @@ class NeuronLlamaMLP(nn.Module):
                 self.intermediate_size,
                 bias=False,
                 gather_output=False,
-                dtype=neuron_config.hf_config.torch_dtype,
+                dtype=config.torch_dtype,
                 pad=True,
             )
             self.up_proj = ColumnParallelLinear(
@@ -118,7 +127,7 @@ class NeuronLlamaMLP(nn.Module):
                 self.intermediate_size,
                 bias=False,
                 gather_output=False,
-                dtype=neuron_config.hf_config.torch_dtype,
+                dtype=config.torch_dtype,
                 pad=True,
             )
             self.down_proj = RowParallelLinear(
@@ -126,7 +135,7 @@ class NeuronLlamaMLP(nn.Module):
                 self.hidden_size,
                 bias=False,
                 input_is_parallel=True,
-                dtype=neuron_config.hf_config.torch_dtype,
+                dtype=config.torch_dtype,
                 pad=True,
             )
         else:
@@ -149,19 +158,20 @@ class NeuronLlamaAttention(NeuronAttentionBase):
     5. update forward() method to adjust to changes from self.num_head
     """
 
-    def __init__(self, neuron_config: NeuronConfig):
+    def __init__(self, config: PretrainedConfigAdapter):
         super().__init__()
 
-        self.neuron_config = neuron_config
-        self.hidden_size = neuron_config.hf_config.hidden_size
-        self.num_attention_heads = neuron_config.hf_config.num_attention_heads
-        self.num_key_value_heads = neuron_config.hf_config.num_key_value_heads
+        self.config = config
+        self.neuron_config = config.neuron_config
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = self.hidden_size // self.num_attention_heads
-        self.max_position_embeddings = neuron_config.hf_config.max_position_embeddings
-        self.rope_theta = neuron_config.hf_config.rope_theta
-        self.padding_side = neuron_config.padding_side
-        self.torch_dtype = neuron_config.hf_config.torch_dtype
-        self.is_medusa = neuron_config.is_medusa
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.padding_side = config.neuron_config.padding_side
+        self.torch_dtype = config.torch_dtype
+        self.is_medusa = config.neuron_config.is_medusa
 
         if parallel_state.model_parallel_is_initialized():
             self.tp_degree = parallel_state.get_tensor_model_parallel_size()
@@ -175,10 +185,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.init_rope()
 
     def init_rope(self):
-        if (
-            not hasattr(self.neuron_config.hf_config, "rope_scaling")
-            or self.neuron_config.hf_config.rope_scaling is None
-        ):
+        if not hasattr(self.config, "rope_scaling") or self.config.rope_scaling is None:
             # TODO(yihsian): Check if we can just use our own implementation
             if self.is_medusa:
                 self.rotary_emb = LlamaRotaryEmbedding(
@@ -193,8 +200,8 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                     base=self.rope_theta,
                 )
         else:
-            scaling_type = self.neuron_config.hf_config.rope_scaling["type"]
-            scaling_factor = self.neuron_config.hf_config.rope_scaling["factor"]
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
@@ -218,18 +225,18 @@ class NeuronLlamaDecoderLayer(nn.Module):
     Just replace the attention with the NXD version, and MLP with the NXD version
     """
 
-    def __init__(self, neuron_config: NeuronConfig):
+    def __init__(self, config: PretrainedConfigAdapter):
         super().__init__()
-        self.hidden_size = neuron_config.hf_config.hidden_size
-        self.self_attn = _LLAMA_MODULE_MAP[neuron_config.attn_cls](neuron_config=neuron_config)
-        self.mlp = NeuronLlamaMLP(neuron_config)
+        self.hidden_size = config.hidden_size
+        self.self_attn = _LLAMA_MODULE_MAP[config.neuron_config.attn_cls](config=config)
+        self.mlp = NeuronLlamaMLP(config)
         self.input_layernorm = get_rmsnorm_cls()(
-            neuron_config.hf_config.hidden_size,
-            eps=neuron_config.hf_config.rms_norm_eps,
+            config.hidden_size,
+            eps=config.rms_norm_eps,
         )
         self.post_attention_layernorm = get_rmsnorm_cls()(
-            neuron_config.hf_config.hidden_size,
-            eps=neuron_config.hf_config.rms_norm_eps,
+            config.hidden_size,
+            eps=config.rms_norm_eps,
         )
 
     def forward(
@@ -301,26 +308,26 @@ class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
     The neuron version of the LlamaModel
     """
 
-    def setup_attr_for_model(self, neuron_config: NeuronConfig):
+    def setup_attr_for_model(self, config: PretrainedConfigAdapter):
         # Needed for init_inference_optimization()
-        self.on_device_sampling = neuron_config.on_device_sampling
-        self.tp_degree = neuron_config.tp_degree
-        self.hidden_size = neuron_config.hf_config.hidden_size
-        self.num_attention_heads = neuron_config.hf_config.num_attention_heads
-        self.num_key_value_heads = neuron_config.hf_config.num_key_value_heads
-        self.max_batch_size = neuron_config.max_batch_size
-        self.buckets = neuron_config.buckets
+        self.on_device_sampling = config.neuron_config.on_device_sampling
+        self.tp_degree = config.neuron_config.tp_degree
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.max_batch_size = config.neuron_config.max_batch_size
+        self.buckets = config.neuron_config.buckets
 
-    def init_model(self, neuron_config: NeuronConfig):
-        self.padding_idx = neuron_config.hf_config.pad_token_id
-        self.vocab_size = neuron_config.hf_config.vocab_size
+    def init_model(self, config: PretrainedConfigAdapter):
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
 
         if parallel_state.model_parallel_is_initialized():
             self.embed_tokens = ParallelEmbedding(
-                neuron_config.hf_config.vocab_size,
-                neuron_config.hf_config.hidden_size,
+                config.vocab_size,
+                config.hidden_size,
                 self.padding_idx,
-                dtype=neuron_config.hf_config.torch_dtype,
+                dtype=config.torch_dtype,
                 shard_across_embedding=True,
                 # We choose to shard across embedding dimension because this stops XLA from introducing
                 # rank specific constant parameters into the HLO. We could shard across vocab, but that
@@ -328,36 +335,31 @@ class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
                 pad=True,
             )
             self.lm_head = ColumnParallelLinear(
-                neuron_config.hf_config.hidden_size,
-                neuron_config.hf_config.vocab_size,
+                config.hidden_size,
+                config.vocab_size,
                 bias=False,
                 pad=True,
             )
         else:
             self.embed_tokens = nn.Embedding(
-                neuron_config.hf_config.vocab_size,
-                neuron_config.hf_config.hidden_size,
+                config.vocab_size,
+                config.hidden_size,
                 self.padding_idx,
             )
             self.lm_head = nn.Linear(
-                neuron_config.hf_config.hidden_size,
-                neuron_config.hf_config.vocab_size,
+                config.hidden_size,
+                config.vocab_size,
                 bias=False,
             )
 
         self.layers = nn.ModuleList(
-            [
-                NeuronLlamaDecoderLayer(neuron_config)
-                for _ in range(neuron_config.hf_config.num_hidden_layers)
-            ]
+            [NeuronLlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = get_rmsnorm_cls()(
-            neuron_config.hf_config.hidden_size, eps=neuron_config.hf_config.rms_norm_eps
-        )
+        self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.is_medusa = neuron_config.is_medusa
-        self.num_medusa_heads = neuron_config.num_medusa_heads
-        self.medusa_speculation_length = neuron_config.medusa_speculation_length
+        self.is_medusa = config.neuron_config.is_medusa
+        self.num_medusa_heads = config.neuron_config.num_medusa_heads
+        self.medusa_speculation_length = config.neuron_config.medusa_speculation_length
 
         if self.is_medusa:
             if parallel_state.model_parallel_is_initialized():
@@ -366,10 +368,10 @@ class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
                 medusa_head_cls = nn.Linear
             for i in range(self.num_medusa_heads):
                 medusa_head = nn.Sequential(
-                    *([ResBlock(neuron_config.hf_config.hidden_size)] * 1),
+                    *([ResBlock(config.hidden_size)] * 1),
                     medusa_head_cls(
-                        neuron_config.hf_config.hidden_size,
-                        neuron_config.hf_config.vocab_size,
+                        config.hidden_size,
+                        config.vocab_size,
                         bias=False,
                     ),
                 )

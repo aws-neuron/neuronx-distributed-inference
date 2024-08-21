@@ -22,6 +22,7 @@ from torch import nn
 
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.modules.attention.gqa import GQA
+from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 try:
     from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
@@ -33,12 +34,11 @@ from neuronx_distributed.modules.moe.model import MoE
 from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
-from neuronx_distributed.utils.sampling import Sampler
 from torch_neuronx.xla_impl.ops import nki_jit
-from transformers import DbrxForCausalLM, DbrxPreTrainedModel, PretrainedConfig
+from transformers import DbrxConfig, DbrxForCausalLM, DbrxPreTrainedModel
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 
-from neuronx_distributed_inference.models.config import MoENeuronConfig
+from neuronx_distributed_inference.models.config import MoENeuronConfig, PretrainedConfigAdapter
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 
@@ -51,27 +51,27 @@ GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 logger = logging.getLogger(__name__)
 
 
-def convert_dbrx_to_neuron_state_dict(dbrx_state_dict, neuron_config):
+def convert_dbrx_to_neuron_state_dict(dbrx_state_dict, config):
     """
     Helper function which returns the model weights from the dbrx model in a state dictionary compatible with the stucture of the neuron MoE model.
     """
 
-    assert neuron_config.glu_mlp is True, "Only GLU MLP is supported for Dbrx Top-K model"
+    assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported for Dbrx Top-K model"
     neuron_state_dict = {}
     neuron_state_dict["embed_tokens.weight"] = dbrx_state_dict["wte.weight"].clone().detach()
     neuron_state_dict["norm.weight"] = dbrx_state_dict["norm_f.weight"].clone().detach()
     neuron_state_dict["lm_head.weight"] = dbrx_state_dict["lm_head.weight"].clone().detach()
 
-    for l in range(neuron_config.hf_config.n_layers):  # noqa: E741
+    for l in range(config.n_layers):  # noqa: E741
         # Copy router weights
         neuron_state_dict[f"layers.{l}.ffn.router.linear_router.weight"] = (
             dbrx_state_dict[f"blocks.{l}.ffn.router.layer.weight"].clone().detach()
         )
 
-        num_experts = neuron_config.hf_config.ffn_config.moe_num_experts
+        num_experts = config.ffn_config.moe_num_experts
         intermediate_size, hidden_size = (
-            neuron_config.hf_config.ffn_config.ffn_hidden_size,
-            neuron_config.hf_config.d_model,
+            config.ffn_config.ffn_hidden_size,
+            config.d_model,
         )
 
         # Copy gate_proj and up_proj after concatenation
@@ -112,23 +112,30 @@ def convert_dbrx_to_neuron_state_dict(dbrx_state_dict, neuron_config):
 
 
 class NeuronDbrxConfig(MoENeuronConfig):
-    def __init__(self, hf_config: PretrainedConfig = None, **kwargs):
-        super().__init__(hf_config, **kwargs)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.fused_qkv = True
 
 
+class DbrxConfigAdapter(PretrainedConfigAdapter, DbrxConfig):
+    @classmethod
+    def get_config_cls(cls):
+        return NeuronDbrxConfig
+
+
 class NeuronDbrxAttention(NeuronAttentionBase):
-    def __init__(self, neuron_config: NeuronDbrxConfig):
+    def __init__(self, config: DbrxConfigAdapter):
         super().__init__()
-        self.neuron_config = neuron_config
-        self.hidden_size = neuron_config.hf_config.d_model
-        self.num_attention_heads = neuron_config.hf_config.n_heads
+        self.config = config
+        self.neuron_config = config.neuron_config
+        self.hidden_size = config.d_model
+        self.num_attention_heads = config.n_heads
         self.head_dim = self.hidden_size // self.num_attention_heads
-        self.max_position_embeddings = neuron_config.hf_config.max_seq_len
-        self.torch_dtype = neuron_config.hf_config.torch_dtype
-        self.padding_side = neuron_config.padding_side
-        self.num_key_value_heads = neuron_config.hf_config.attn_config.kv_n_heads
-        self.rope_theta = neuron_config.hf_config.attn_config.rope_theta
+        self.max_position_embeddings = config.max_seq_len
+        self.torch_dtype = config.torch_dtype
+        self.padding_side = config.neuron_config.padding_side
+        self.num_key_value_heads = config.attn_config.kv_n_heads
+        self.rope_theta = config.attn_config.rope_theta
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
@@ -136,8 +143,8 @@ class NeuronDbrxAttention(NeuronAttentionBase):
                 " module to initialize a distributed env."
             )
         self.tp_degree = parallel_state.get_tensor_model_parallel_size()
-        self.fused_qkv = neuron_config.fused_qkv
-        self.clip_qkv = neuron_config.hf_config.attn_config.clip_qkv
+        self.fused_qkv = config.neuron_config.fused_qkv
+        self.clip_qkv = config.attn_config.clip_qkv
 
         self.init_gqa_properties()
 
@@ -153,27 +160,27 @@ class NeuronDbrxBlock(nn.Module):
     Just replace the attention with the NXD version, and MLP with the NXD version
     """
 
-    def __init__(self, neuron_config: NeuronDbrxConfig, block_idx: int):
+    def __init__(self, config: DbrxConfigAdapter, block_idx: int):
         super().__init__()
-        self.hidden_size = neuron_config.hf_config.d_model
-        self.resid_pdrop = neuron_config.hf_config.resid_pdrop
+        self.hidden_size = config.d_model
+        self.resid_pdrop = config.resid_pdrop
         self.block_idx = block_idx
-        self.self_attn = NeuronDbrxAttention(neuron_config=neuron_config)
+        self.self_attn = NeuronDbrxAttention(config=config)
 
-        ffn_config = neuron_config.hf_config.ffn_config
+        ffn_config = config.ffn_config
         router = RouterTopK(
             num_experts=ffn_config.moe_num_experts,
             top_k=ffn_config.moe_top_k,
-            hidden_size=neuron_config.hf_config.d_model,
+            hidden_size=config.d_model,
         )
         expert_mlps = ExpertMLPs(
             num_experts=ffn_config.moe_num_experts,
             top_k=ffn_config.moe_top_k,
-            hidden_size=neuron_config.hf_config.d_model,
+            hidden_size=config.d_model,
             intermediate_size=ffn_config.ffn_hidden_size,
             hidden_act=ffn_config.ffn_act_fn["name"],
-            capacity_factor=neuron_config.capacity_factor,
-            glu_mlp=neuron_config.glu_mlp,
+            capacity_factor=config.neuron_config.capacity_factor,
+            glu_mlp=config.neuron_config.glu_mlp,
             normalize_top_k_affinities=True,
         )
         self.ffn = MoE(
@@ -182,8 +189,8 @@ class NeuronDbrxBlock(nn.Module):
         )
         self.ffn.eval()  # Set MoE module in eval mode
 
-        self.input_layernorm = nn.LayerNorm(neuron_config.hf_config.d_model, bias=False)
-        self.post_attention_layernorm = nn.LayerNorm(neuron_config.hf_config.d_model, bias=False)
+        self.input_layernorm = nn.LayerNorm(config.d_model, bias=False)
+        self.post_attention_layernorm = nn.LayerNorm(config.d_model, bias=False)
 
     def forward(
         self,
@@ -243,39 +250,34 @@ class NeuronDbrxModel(NeuronBaseModel, DbrxPreTrainedModel):
 
     _model_cls = DbrxPreTrainedModel
 
-    def setup_attr_for_model(self, neuron_config: NeuronDbrxConfig):
-        self.emb_pdrop = neuron_config.hf_config.emb_pdrop
+    def setup_attr_for_model(self, config: DbrxConfigAdapter):
+        self.emb_pdrop = config.emb_pdrop
 
         # Needed for init_inference_optimization()
-        self.on_device_sampling = neuron_config.on_device_sampling
-        self.tp_degree = neuron_config.tp_degree
-        self.hidden_size = neuron_config.hf_config.d_model
-        self.num_attention_heads = neuron_config.hf_config.n_heads
-        self.num_key_value_heads = neuron_config.hf_config.attn_config.kv_n_heads
-        self.max_batch_size = neuron_config.max_batch_size
-        self.buckets = neuron_config.buckets
+        self.on_device_sampling = config.neuron_config.on_device_sampling
+        self.tp_degree = config.neuron_config.tp_degree
+        self.hidden_size = config.d_model
+        self.num_attention_heads = config.n_heads
+        self.num_key_value_heads = config.attn_config.kv_n_heads
+        self.max_batch_size = config.neuron_config.max_batch_size
+        self.buckets = config.neuron_config.buckets
 
-    def init_model(self, neuron_config: NeuronDbrxConfig):
-        self.padding_idx = neuron_config.hf_config.pad_token_id
-        self.vocab_size = neuron_config.hf_config.vocab_size
+    def init_model(self, config: DbrxConfigAdapter):
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
 
         self.embed_tokens = ParallelEmbedding(
-            neuron_config.hf_config.vocab_size,
-            neuron_config.hf_config.d_model,
+            config.vocab_size,
+            config.d_model,
             self.padding_idx,
-            dtype=neuron_config.hf_config.torch_dtype,
+            dtype=config.torch_dtype,
             shard_across_embedding=True,
         )
         self.layers = nn.ModuleList(
-            [
-                NeuronDbrxBlock(neuron_config, block_idx)
-                for block_idx in range(neuron_config.hf_config.n_layers)
-            ]
+            [NeuronDbrxBlock(config, block_idx) for block_idx in range(config.n_layers)]
         )
-        self.norm = nn.LayerNorm(neuron_config.hf_config.d_model, bias=False)
-        self.lm_head = ColumnParallelLinear(
-            neuron_config.hf_config.d_model, neuron_config.hf_config.vocab_size, bias=False
-        )
+        self.norm = nn.LayerNorm(config.d_model, bias=False)
+        self.lm_head = ColumnParallelLinear(config.d_model, config.vocab_size, bias=False)
 
 
 class NeuronDbrxForCausalLM(NeuronBaseForCausalLM, DbrxPreTrainedModel):
@@ -287,17 +289,17 @@ class NeuronDbrxForCausalLM(NeuronBaseForCausalLM, DbrxPreTrainedModel):
 
     _model_cls = NeuronDbrxModel
 
-    def __init__(self, model_path: str, neuron_config: NeuronDbrxConfig):
-        super().__init__(model_path, neuron_config)
-        self.sampler = Sampler(neuron_config)
+    def __init__(self, model_path: str, config: DbrxConfigAdapter):
+        super().__init__(model_path, config)
+        self.sampler = Sampler(config)
 
     @staticmethod
     def load_hf_model(model_path, hf_config):
         return DbrxForCausalLM.from_pretrained(model_path, torch_dtype=hf_config.torch_dtype)
 
     @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, neuron_config: NeuronDbrxConfig) -> dict:
-        return convert_dbrx_to_neuron_state_dict(state_dict, neuron_config)
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: DbrxConfigAdapter) -> dict:
+        return convert_dbrx_to_neuron_state_dict(state_dict, config)
 
     def get_compiler_args(self):
         compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
@@ -306,7 +308,7 @@ class NeuronDbrxForCausalLM(NeuronBaseForCausalLM, DbrxPreTrainedModel):
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
         # Prevent auto-downcasting when running with fp32
-        if self.neuron_config.hf_config.torch_dtype == torch.float32:
+        if self.config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
         # TODO: Remove this flag after compiler fix is merged (NCC-2677)
         compiler_args += " --internal-hlo2tensorizer-options=--expand-batch-norm-training"

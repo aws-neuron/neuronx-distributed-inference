@@ -17,7 +17,7 @@ from safetensors.torch import load_file
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
 from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     CONTEXT_ENCODING_MODEL_TAG,
     MEDUSA_MODEL_TAG,
@@ -39,26 +39,26 @@ class NeuronBaseModel(PreTrainedModel):
     The forward() function will be traced and compiled by NxD.
     """
 
-    def __init__(self, neuron_config: NeuronConfig, optimize_inference=True):
-        super().__init__(neuron_config.hf_config)
+    def __init__(self, config: PretrainedConfigAdapter, optimize_inference=True):
+        super().__init__(config)
 
         self.sampler = None
         self.kv_mgr = None
-        self.neuron_config = neuron_config
-        self.batch_size = neuron_config.batch_size
-        self.n_positions = neuron_config.n_positions
-        self.vocab_size = neuron_config.hf_config.vocab_size
-        self.speculation_length = neuron_config.speculation_length
-        self.padding_side = neuron_config.padding_side
-        self.max_length = neuron_config.max_length
+        self.neuron_config = config.neuron_config
+        self.batch_size = config.neuron_config.batch_size
+        self.n_positions = config.neuron_config.n_positions
+        self.vocab_size = config.vocab_size
+        self.speculation_length = config.neuron_config.speculation_length
+        self.padding_side = config.neuron_config.padding_side
+        self.max_length = config.neuron_config.max_length
 
-        self.setup_attr_for_model(neuron_config)
-        self.init_model(neuron_config)
+        self.setup_attr_for_model(config)
+        self.init_model(config)
         if optimize_inference:
-            self.init_inference_optimization(neuron_config)
+            self.init_inference_optimization(config)
         self.post_init()
 
-    def setup_attr_for_model(self, neuron_config: NeuronConfig):
+    def setup_attr_for_model(self, config: PretrainedConfigAdapter):
         """
         Please provide model-specific definition for the following attributes
             self.on_device_sampling
@@ -71,7 +71,7 @@ class NeuronBaseModel(PreTrainedModel):
         """
         raise NotImplementedError("setup_attr_for_model() is not implemented")
 
-    def init_model(self, neuron_config: NeuronConfig):
+    def init_model(self, config: PretrainedConfigAdapter):
         """
         Please provide definition for the following components:
             self.embed_tokens
@@ -81,10 +81,10 @@ class NeuronBaseModel(PreTrainedModel):
         """
         raise NotImplementedError("init_model() is not implemented")
 
-    def init_inference_optimization(self, neuron_config: NeuronConfig):
+    def init_inference_optimization(self, config: PretrainedConfigAdapter):
         if self.on_device_sampling:
-            self.sampler = Sampler(neuron_config)
-        self.kv_mgr = KVCacheManager(neuron_config, num_kv_head=self.num_key_value_heads)
+            self.sampler = Sampler(config)
+        self.kv_mgr = KVCacheManager(config, num_kv_head=self.num_key_value_heads)
 
     def _create_context_attn_mask(self, attention_mask):
         mask = torch.full(
@@ -399,12 +399,13 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
 
     _model_cls = None
 
-    def __init__(self, model_path: str, neuron_config: NeuronConfig):
-        super().__init__(neuron_config)
+    def __init__(self, model_path: str, config: PretrainedConfigAdapter):
+        super().__init__(config)
 
-        self.neuron_config = neuron_config
-        self.vocab_size = neuron_config.hf_config.vocab_size
-        self.padding_side = neuron_config.padding_side
+        self.config = config
+        self.neuron_config = config.neuron_config
+        self.vocab_size = config.vocab_size
+        self.padding_side = config.neuron_config.padding_side
         self.kv_cache_populated = False
 
         self.sampler = None
@@ -412,11 +413,11 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
 
         self.models = []
         self.enable_context_encoding()
-        if neuron_config.trace_tokengen_model:
+        if config.neuron_config.trace_tokengen_model:
             self.enable_token_generation()
-        if neuron_config.speculation_length > 0:
+        if config.neuron_config.speculation_length > 0:
             self.enable_speculation()
-        if neuron_config.medusa_speculation_length > 0:
+        if config.neuron_config.medusa_speculation_length > 0:
             self.enable_medusa_speculation()
         self.model_path = model_path
 
@@ -431,20 +432,23 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         return ModelWrapper
 
     def enable_context_encoding(self):
-        new_neuron_config = copy.deepcopy(self.neuron_config)
-        new_neuron_config.batch_size = self.neuron_config.ctx_batch_size
-        new_neuron_config.n_active_tokens = self.neuron_config.max_context_length
-        new_neuron_config.bucket_n_active_tokens = True
+        new_config = copy.deepcopy(self.config)
+        new_config.neuron_config.batch_size = self.neuron_config.ctx_batch_size
+        new_config.neuron_config.n_active_tokens = self.neuron_config.max_context_length
+        new_config.neuron_config.bucket_n_active_tokens = True
 
-        if not new_neuron_config.enable_bucketing:
-            new_neuron_config.buckets = generate_buckets(
-                new_neuron_config.max_context_length, new_neuron_config.max_context_length
+        if not new_config.neuron_config.enable_bucketing:
+            new_config.neuron_config.buckets = generate_buckets(
+                new_config.neuron_config.max_context_length,
+                new_config.neuron_config.max_context_length,
             )
         else:
-            new_neuron_config.buckets = generate_buckets(128, new_neuron_config.max_context_length)
+            new_config.neuron_config.buckets = generate_buckets(
+                128, new_config.neuron_config.max_context_length
+            )
 
         self.context_encoding_model = self.model_wrapper(
-            neuron_config=new_neuron_config,
+            config=new_config,
             model_cls=self._model_cls,
             tag=CONTEXT_ENCODING_MODEL_TAG,
             compiler_args=self.get_compiler_args(),
@@ -452,20 +456,20 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         self.models.append(self.context_encoding_model)
 
     def enable_token_generation(self):
-        new_neuron_config = copy.deepcopy(self.neuron_config)
-        new_neuron_config.batch_size = self.neuron_config.tkg_batch_size
-        new_neuron_config.n_active_tokens = 1
-        new_neuron_config.bucket_n_active_tokens = False
+        new_config = copy.deepcopy(self.config)
+        new_config.neuron_config.batch_size = self.neuron_config.tkg_batch_size
+        new_config.neuron_config.n_active_tokens = 1
+        new_config.neuron_config.bucket_n_active_tokens = False
 
-        if not new_neuron_config.enable_bucketing:
-            new_neuron_config.buckets = generate_buckets(
+        if not new_config.neuron_config.enable_bucketing:
+            new_config.neuron_config.buckets = generate_buckets(
                 self.neuron_config.max_length, self.neuron_config.max_length
             )
         else:
-            new_neuron_config.buckets = generate_buckets(128, self.neuron_config.max_length)
+            new_config.neuron_config.buckets = generate_buckets(128, self.neuron_config.max_length)
 
         self.token_generation_model = self.model_wrapper(
-            neuron_config=new_neuron_config,
+            config=new_config,
             model_cls=self._model_cls,
             tag=TOKEN_GENERATION_MODEL_TAG,
             compiler_args=self.get_compiler_args(),
@@ -473,11 +477,11 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         self.models.append(self.token_generation_model)
 
     def enable_speculation(self):
-        new_neuron_config = copy.deepcopy(self.neuron_config)
-        new_neuron_config.batch_size = self.neuron_config.spec_batch_size
-        new_neuron_config.n_active_tokens = self.neuron_config.speculation_length
+        new_config = copy.deepcopy(self.config)
+        new_config.neuron_config.batch_size = self.neuron_config.spec_batch_size
+        new_config.neuron_config.n_active_tokens = self.neuron_config.speculation_length
         self.speculation_model = self.model_wrapper(
-            neuron_config=new_neuron_config,
+            config=new_config,
             model_cls=self._model_cls,
             tag=SPECULATION_MODEL_TAG,
         )
@@ -485,17 +489,17 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         self.models.append(self.speculation_model)
 
     def enable_medusa_speculation(self):
-        new_neuron_config = copy.deepcopy(self.neuron_config)
-        new_neuron_config.batch_size = self.neuron_config.spec_batch_size
-        new_neuron_config.n_active_tokens = self.neuron_config.medusa_speculation_length
+        new_config = copy.deepcopy(self.config)
+        new_config.neuron_config.batch_size = self.neuron_config.spec_batch_size
+        new_config.neuron_config.n_active_tokens = self.neuron_config.medusa_speculation_length
         self.medusa_speculation_model = self.model_wrapper(
-            neuron_config=new_neuron_config, model_cls=self._model_cls, tag=MEDUSA_MODEL_TAG
+            config=new_config, model_cls=self._model_cls, tag=MEDUSA_MODEL_TAG
         )
 
         self.models.append(self.medusa_speculation_model)
 
     @classmethod
-    def get_state_dict(cls, model_path: str, neuron_config: NeuronConfig) -> dict:
+    def get_state_dict(cls, model_path: str, config: PretrainedConfigAdapter) -> dict:
         model_sd = load_state_dict(model_path)
         param_name_list = list(model_sd.keys())
         for param_name in param_name_list:
@@ -508,16 +512,16 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         if os.path.exists(model_path + "/medusa_heads.pt"):
             medusa_head = torch.load(model_path + "/medusa_heads.pt", map_location="cpu")
             model_sd.update(medusa_head)
-        model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, neuron_config)
+        model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
         return model_sd
 
     @classmethod
-    def get_quantized_state_dict(cls, neuron_config: NeuronConfig, mmap: bool = False) -> dict:
+    def get_quantized_state_dict(cls, config: PretrainedConfigAdapter, mmap: bool = False) -> dict:
         """
         This function loads the checkpointed float model state dictionary and weights from the quantized hf model
         This will be removed once we move to safe tensors in NxD
         """
-        existing_checkpoint_path = neuron_config.quantized_checkpoints_path
+        existing_checkpoint_path = config.neuron_config.quantized_checkpoints_path
         if not os.path.exists(existing_checkpoint_path):
             raise FileNotFoundError(
                 f"Quantized checkpoint file not found: {existing_checkpoint_path}"
@@ -525,10 +529,10 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
 
         print(f"Using existing checkpoint: {existing_checkpoint_path}")
         model_quant_sd = torch.load(existing_checkpoint_path)
-        model_quant_sd = cls.convert_hf_to_neuron_state_dict(model_quant_sd, neuron_config)
+        model_quant_sd = cls.convert_hf_to_neuron_state_dict(model_quant_sd, config)
 
         # Make sure that the non quantized weights are in bfloat16 and not float32
-        if neuron_config.hf_config.torch_dtype == torch.bfloat16:
+        if config.torch_dtype == torch.bfloat16:
             for name, param in model_quant_sd.items():
                 # TODO: Reduce and clean-up these warnings
                 if param is not None and param.dtype == torch.float32:
@@ -545,14 +549,16 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         return model_quant_sd
 
     @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, neuron_config: NeuronConfig) -> dict:
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: PretrainedConfigAdapter) -> dict:
         """This function should be over-ridden in child classes as needed"""
         return state_dict
 
     @classmethod
-    def generate_quantized_state_dict(cls, model_path: str, neuron_config: NeuronConfig) -> dict:
+    def generate_quantized_state_dict(
+        cls, model_path: str, config: PretrainedConfigAdapter
+    ) -> dict:
         hf_model = cls.load_hf_model(model_path)
-        quantization_type = QuantizationType(neuron_config.quantization_type)
+        quantization_type = QuantizationType(config.neuron_config.quantization_type)
         if quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
             hf_model_quant = quantize_pytorch_model_per_tensor_symmetric(
                 float_model=hf_model, inplace=True
@@ -562,7 +568,7 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
                 float_model=hf_model, inplace=True
             )
         else:
-            raise RuntimeError(f"{neuron_config.quantization_type} not supported")
+            raise RuntimeError(f"{config.neuron_config.quantization_type} not supported")
 
         model_quant_sd = hf_model_quant.model.state_dict()
         lm_head_quant_sd = hf_model_quant.lm_head.state_dict()
@@ -575,17 +581,17 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         return model_quant_sd
 
     @classmethod
-    def from_pretrained(cls, model_path: str, neuron_config: NeuronConfig):
-        return cls(model_path, neuron_config)
+    def from_pretrained(cls, model_path: str, config: PretrainedConfigAdapter):
+        return cls(model_path, config)
 
     def checkpoint_loader_fn(self, mmap: bool = False):
         """This function loads the model's state dictionary and weights from the hf model"""
 
         if self.neuron_config.quantized:
-            return self.get_quantized_state_dict(self.neuron_config)
+            return self.get_quantized_state_dict(self.config)
         else:
-            model_sd = self.get_state_dict(self.model_path, self.neuron_config)
-            if self.neuron_config.hf_config.torch_dtype == torch.bfloat16:
+            model_sd = self.get_state_dict(self.model_path, self.config)
+            if self.config.torch_dtype == torch.bfloat16:
                 for name, param in model_sd.items():
                     model_sd[name] = param.bfloat16()
             return model_sd
@@ -713,18 +719,14 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
 
     def _setup_func_config(self, output_attentions, output_hidden_states, return_dict):
         output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.neuron_config.hf_config.output_attentions
+            output_attentions if output_attentions is not None else self.config.output_attentions
         )
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else self.neuron_config.hf_config.output_hidden_states
+            else self.config.output_hidden_states
         )
-        return_dict = (
-            return_dict if return_dict is not None else self.neuron_config.hf_config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         return output_attentions, output_hidden_states, return_dict
 
     def _infer_attention_mask(self, position_ids):

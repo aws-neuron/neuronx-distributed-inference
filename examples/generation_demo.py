@@ -1,10 +1,10 @@
 import os
 import torch
 
-from transformers import AutoConfig, AutoTokenizer, GenerationConfig
+from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
+from neuronx_distributed_inference.models.llama.modeling_llama import LlamaConfigAdapter, NeuronLlamaForCausalLM
 
 model_path = "/home/ubuntu/model_hf/Llama-2-7b/"
 traced_model_path = "/home/ubuntu/traced_model/Llama-2-7b/"
@@ -23,9 +23,8 @@ def run_llama_generate():
     generation_config.update(**generation_config_kwargs)
 
     # TODO: Separate GenerationConfig from PretrainedConfig
-    hf_config = AutoConfig.from_pretrained(model_path, **generation_config_kwargs)
-    neuron_config = NeuronConfig(
-        hf_config,
+    config = LlamaConfigAdapter.from_pretrained(model_path, **generation_config_kwargs)
+    config.neuron_config = NeuronConfig(
         tp_degree=32,
         batch_size=2,
         max_context_length=32,
@@ -42,17 +41,17 @@ def run_llama_generate():
         
     # Compile and save model.
     print("\nCompiling and saving model...")
-    model = NeuronLlamaForCausalLM.from_pretrained(model_path, neuron_config)
+    model = NeuronLlamaForCausalLM.from_pretrained(model_path, config)
     model.compile(traced_model_path)
-    neuron_config.save(traced_model_path)
+    config.save_pretrained(traced_model_path)
     tokenizer.save_pretrained(traced_model_path)
 
     # Load from compiled checkpoint.
     print("\nLoading model from compiled checkpoint...")
-    neuron_config = NeuronConfig.load(traced_model_path)
-    model = NeuronLlamaForCausalLM.from_pretrained("", neuron_config)
+    config = LlamaConfigAdapter.from_pretrained(traced_model_path)
+    model = NeuronLlamaForCausalLM.from_pretrained("", config)
     model.load(traced_model_path)
-    if neuron_config.hf_config.torch_dtype == torch.bfloat16:
+    if config.torch_dtype == torch.bfloat16:
         model.bfloat16()
     tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
 
@@ -65,7 +64,7 @@ def run_llama_generate():
         inputs.input_ids,
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,
-        max_length=neuron_config.max_length,
+        max_length=config.neuron_config.max_length,
     )
     output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     print("Generated outputs:")

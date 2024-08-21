@@ -1,7 +1,7 @@
 from torch import argmax, count_nonzero, cumsum, gather, nn, rand, subtract, topk
 from torch_neuronx.xla_impl.ops import Argmax, Softmax, TopK
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
 
 
 class Sampler:
@@ -10,14 +10,14 @@ class Sampler:
 
     """
 
-    def __init__(self, neuron_config: NeuronConfig):
-        self.on_device_sampling = neuron_config.on_device_sampling
-        if hasattr(neuron_config, "is_medusa"):
-            self.is_medusa = neuron_config.is_medusa
+    def __init__(self, config: PretrainedConfigAdapter):
+        self.on_device_sampling = config.neuron_config.on_device_sampling
+        if hasattr(config.neuron_config, "is_medusa"):
+            self.is_medusa = config.neuron_config.is_medusa
         else:
             self.is_medusa = False
-        if neuron_config.hf_config.do_sample and neuron_config.hf_config.num_beams == 1:
-            self.top_k = neuron_config.hf_config.top_k
+        if config.do_sample and config.num_beams == 1:
+            self.top_k = config.top_k
             self.sampling_method = self.multinomial
         else:
             raise Exception("Selected sampling method is not supported.")

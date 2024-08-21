@@ -14,7 +14,7 @@ from neuronx_distributed.trace import parallel_model_load, parallel_model_trace
 from neuronx_distributed.trace.model_builder import BaseModelInstance
 from torch_neuronx import BucketModelConfig
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
 from neuronx_distributed_inference.modules.autobucketing import (
     get_context_encoder_bk,
     get_token_generation_bk,
@@ -26,12 +26,12 @@ SPECULATION_MODEL_TAG = "speculation_model"
 MEDUSA_MODEL_TAG = "medusa_speculation_model"
 
 
-def get_bucket_model_config_from_tag(tag, neuron_config: NeuronConfig):
-    bucket_degree = len(neuron_config.buckets)
+def get_bucket_model_config_from_tag(tag, config: PretrainedConfigAdapter):
+    bucket_degree = len(config.neuron_config.buckets)
     if bucket_degree == 1:
         return None
 
-    pad_token = neuron_config.hf_config.pad_token_id
+    pad_token = config.pad_token_id
 
     # NOTE: KV Cache preprocessing is done within the model and not the
     # shared buffer preprocessor due to lack of support of non-contiguous
@@ -40,8 +40,8 @@ def get_bucket_model_config_from_tag(tag, neuron_config: NeuronConfig):
         return BucketModelConfig(
             bucket_kernel=get_context_encoder_bk,
             bucket_kernel_constant_args=(
-                torch.tensor(neuron_config.buckets),
-                neuron_config.padding_side,
+                torch.tensor(config.neuron_config.buckets),
+                config.neuron_config.padding_side,
                 pad_token,
             ),
             shared_state_buffer=None,
@@ -51,8 +51,8 @@ def get_bucket_model_config_from_tag(tag, neuron_config: NeuronConfig):
         return BucketModelConfig(
             bucket_kernel=get_token_generation_bk,
             bucket_kernel_constant_args=(
-                torch.tensor(neuron_config.buckets),
-                neuron_config.padding_side,
+                torch.tensor(config.neuron_config.buckets),
+                config.neuron_config.padding_side,
             ),
             shared_state_buffer=None,
             func_kwargs=[{"bucket_rank": i} for i in range(bucket_degree)],
@@ -66,34 +66,35 @@ def get_bucket_model_config_from_tag(tag, neuron_config: NeuronConfig):
 class ModelWrapper(torch.nn.Module):
     def __init__(
         self,
-        neuron_config: NeuronConfig,
+        config: PretrainedConfigAdapter,
         model_cls,
         tag="",
         compiler_args: str = None,
         priority_model_idx: int = None,
     ) -> None:
         super().__init__()
-        self.neuron_config = neuron_config
+        self.config = config
+        self.neuron_config = config.neuron_config
 
-        if not self.neuron_config.hf_config.torch_dtype:
-            self.neuron_config.hf_config.torch_dtype = torch.float32
+        if not config.torch_dtype:
+            config.torch_dtype = torch.float32
 
-        if self.neuron_config.hf_config.pad_token_id is None:
-            self.neuron_config.hf_config.pad_token_id = 0
+        if config.pad_token_id is None:
+            config.pad_token_id = 0
 
         self.model_cls = model_cls
         self.model = None
         self.is_compiled = False
         self.serialize_base_path = None
         self.tag = tag
-        self.is_medusa = neuron_config.is_medusa
+        self.is_medusa = config.neuron_config.is_medusa
         if compiler_args is None:
             self.compiler_args = "--enable-saturate-infinity --auto-cast=none --model-type=transformer --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2' -O1 "
 
         else:
             self.compiler_args = compiler_args
 
-        self.bucket_config = get_bucket_model_config_from_tag(tag, self.neuron_config)
+        self.bucket_config = get_bucket_model_config_from_tag(tag, self.config)
         self.priority_model_idx = priority_model_idx
 
     def is_neuron(self):
@@ -124,7 +125,7 @@ class ModelWrapper(torch.nn.Module):
         self.model = parallel_model_load(os.path.join(serialize_base_path, self.tag))
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        self.model = self.model_cls(self.neuron_config)
+        self.model = self.model_cls(self.config)
         self.model.load_state_dict(state_dict, strict=strict, assign=assign)
 
     def input_generator(
@@ -186,7 +187,7 @@ class ModelWrapper(torch.nn.Module):
         return inputs
 
     def get_model_instance(self):
-        return DecoderModelInstance(model_cls=self.model_cls, neuron_config=self.neuron_config)
+        return DecoderModelInstance(model_cls=self.model_cls, config=self.config)
 
     def _forward_with_pad(self, *args):
         seq_ids = args[3]
@@ -276,7 +277,7 @@ class ModelWrapper(torch.nn.Module):
         if self.tag == CONTEXT_ENCODING_MODEL_TAG:
             to_pad = args[:3]
             pad_lengths = [self.neuron_config.max_context_length - arg.shape[1] for arg in to_pad]
-            tensor_pad_vals = [self.neuron_config.hf_config.pad_token_id, 0, 1]
+            tensor_pad_vals = [self.config.pad_token_id, 0, 1]
             padded_args = [
                 F.pad(arg, (0, pad_len), "constant", pad_val)
                 for arg, pad_val, pad_len in zip(to_pad, tensor_pad_vals, pad_lengths)
@@ -346,17 +347,18 @@ class ModelWrapper(torch.nn.Module):
 
 
 class DecoderModelInstance(BaseModelInstance):
-    def __init__(self, model_cls, neuron_config: NeuronConfig):
+    def __init__(self, model_cls, config: PretrainedConfigAdapter):
         self.model_cls = model_cls
         self.module = None
         self.input_output_aliases = None
-        self.neuron_config = neuron_config
+        self.config = config
+        self.neuron_config = config.neuron_config
 
     def load_module(self):
-        float_model = self.model_cls(self.neuron_config)
+        float_model = self.model_cls(self.config)
         float_model.eval()
 
-        if self.neuron_config.hf_config.torch_dtype == torch.bfloat16:
+        if self.config.torch_dtype == torch.bfloat16:
             float_model.bfloat16()
 
         if self.neuron_config.quantized is True:
@@ -380,29 +382,33 @@ class DecoderModelInstance(BaseModelInstance):
         # generating HLO
         self.input_output_aliases = {}
         num_output_from_trace = 1
-        for i in range(len(self.module.kv_mgr.past_key_values)):
-            self.input_output_aliases[self.module.kv_mgr.past_key_values[i]] = (
-                num_output_from_trace + i
-            )
+        # TODO: This else block is a short-term fix for Llava/ViT models to use DecoderModelInstance.
+        #       Long-term, these models should use a different implementation of BaseModelInstance.
+        if self.module.kv_mgr is not None:
+            past_key_values = self.module.kv_mgr.past_key_values
+        else:
+            past_key_values = self.module.past_key_values
+        for i in range(len(past_key_values)):
+            self.input_output_aliases[past_key_values[i]] = num_output_from_trace + i
         return self.module, self.input_output_aliases
 
 
-def get_trace_callable(model_cls, neuron_config: NeuronConfig, bucket_rank=None):
+def get_trace_callable(model_cls, config: PretrainedConfigAdapter, bucket_rank=None):
     if bucket_rank is not None:
-        neuron_config.n_positions = neuron_config.buckets[bucket_rank]
-    float_model = model_cls(neuron_config)
+        config.neuron_config.n_positions = config.neuron_config.buckets[bucket_rank]
+    float_model = model_cls(config)
     float_model.eval()
-    if neuron_config.hf_config.torch_dtype == torch.bfloat16:
+    if config.torch_dtype == torch.bfloat16:
         float_model.bfloat16()
 
-    if neuron_config.quantized is True:
-        quantization_type = QuantizationType(neuron_config.quantization_type)
+    if config.neuron_config.quantized is True:
+        quantization_type = QuantizationType(config.neuron_config.quantization_type)
         if quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
             q_config = get_default_per_channel_custom_qconfig_dict()
         elif quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
             q_config = get_default_custom_qconfig_dict()
         else:
-            raise RuntimeError(f"{neuron_config.quantization_type} is not supported")
+            raise RuntimeError(f"{config.neuron_config.quantization_type} is not supported")
         model = convert(float_model, q_config=q_config, inplace=False, mapping=None)
     else:
         model = float_model

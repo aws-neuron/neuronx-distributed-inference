@@ -124,16 +124,16 @@ class NeuronAttentionBase(nn.Module):
             Q = (
                 Q.permute(0, 1, 3, 2)
                 .reshape((bsz * self.num_heads, self.head_dim, q_len))
-                .to(self.neuron_config.hf_config.torch_dtype)
+                .to(self.torch_dtype)
             )
             Q = Q / math.sqrt(self.head_dim)
             K_active = (
                 K_active.permute(0, 1, 3, 2)
                 .reshape((bsz * self.num_heads, self.head_dim, q_len))
-                .to(self.neuron_config.hf_config.torch_dtype)
+                .to(self.torch_dtype)
             )
             V_active = V_active.reshape((bsz * self.num_heads, q_len, self.head_dim)).to(
-                self.neuron_config.hf_config.torch_dtype
+                self.torch_dtype
             )
             attn_output = torch.zeros(
                 bsz * self.num_heads, q_len, self.head_dim, dtype=Q.dtype, device=Q.device
