@@ -1,22 +1,13 @@
 import copy
 import logging
-import os
-import tempfile
-import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
-from neuronx_distributed.quantization.quantization_config import QuantizationType
-from neuronx_distributed.quantization.quantization_utils import (
-    convert_qint8_to_int8_state_dict,
-    quantize_pytorch_model_per_channel_symmetric,
-    quantize_pytorch_model_per_tensor_symmetric,
-)
-from neuronx_distributed.trace.model_builder import ModelBuilder
-from safetensors.torch import load_file
+from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
 from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     CONTEXT_ENCODING_MODEL_TAG,
@@ -26,8 +17,6 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; 
     ModelWrapper,
 )
 from neuronx_distributed_inference.modules.autobucketing import generate_buckets
-from neuronx_distributed_inference.modules.checkpoint import load_state_dict
-from neuronx_distributed_inference.modules.generation.hf_adapter import HuggingFaceGenerationAdapter
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
 
@@ -393,17 +382,12 @@ class NeuronBaseModel(PreTrainedModel):
         return (hidden_states, next_decoder_cache)
 
 
-class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
-    _STATE_DICT_MODEL_PREFIX = "model."
-    _NEW_STATE_DICT_MODEL_PREFIX = ""
-
+class NeuronBaseForCausalLM(NeuronApplicationBase):
     _model_cls = None
 
     def __init__(self, model_path: str, config: PretrainedConfigAdapter):
-        super().__init__(config)
+        super().__init__(model_path=model_path, config=config)
 
-        self.config = config
-        self.neuron_config = config.neuron_config
         self.vocab_size = config.vocab_size
         self.padding_side = config.neuron_config.padding_side
         self.kv_cache_populated = False
@@ -411,7 +395,6 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         self.sampler = None
         self.model_wrapper = self.get_model_wrapper_cls()
 
-        self.models = []
         self.enable_context_encoding()
         if config.neuron_config.trace_tokengen_model:
             self.enable_token_generation()
@@ -419,14 +402,6 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
             self.enable_speculation()
         if config.neuron_config.medusa_speculation_length > 0:
             self.enable_medusa_speculation()
-        self.model_path = model_path
-
-    @staticmethod
-    def load_hf_model(model_path):
-        raise NotImplementedError("load_hf_model is not implemented")
-
-    def get_compiler_args(self):
-        return None
 
     def get_model_wrapper_cls(self):
         return ModelWrapper
@@ -499,77 +474,7 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         self.models.append(self.medusa_speculation_model)
 
     @classmethod
-    def get_state_dict(cls, model_path: str, config: PretrainedConfigAdapter) -> dict:
-        model_sd = load_state_dict(model_path)
-        param_name_list = list(model_sd.keys())
-        for param_name in param_name_list:
-            if param_name.startswith(cls._STATE_DICT_MODEL_PREFIX):
-                updated_param_name = param_name.replace(
-                    cls._STATE_DICT_MODEL_PREFIX, cls._NEW_STATE_DICT_MODEL_PREFIX, 1
-                )
-                model_sd[updated_param_name] = model_sd[param_name]
-                del model_sd[param_name]
-        if os.path.exists(model_path + "/medusa_heads.pt"):
-            medusa_head = torch.load(model_path + "/medusa_heads.pt", map_location="cpu")
-            model_sd.update(medusa_head)
-        model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
-        return model_sd
-
-    @classmethod
-    def get_quantized_state_dict(cls, config: PretrainedConfigAdapter, mmap: bool = False) -> dict:
-        """
-        This function loads the checkpointed float model state dictionary and weights from the quantized hf model
-        This will be removed once we move to safe tensors in NxD
-        """
-        existing_checkpoint_path = config.neuron_config.quantized_checkpoints_path
-        if not os.path.exists(existing_checkpoint_path):
-            raise FileNotFoundError(
-                f"Quantized checkpoint file not found: {existing_checkpoint_path}"
-            )
-
-        print(f"Using existing checkpoint: {existing_checkpoint_path}")
-        model_quant_sd = torch.load(existing_checkpoint_path)
-        model_quant_sd = cls.convert_hf_to_neuron_state_dict(model_quant_sd, config)
-
-        # Make sure that the non quantized weights are in bfloat16 and not float32
-        if config.torch_dtype == torch.bfloat16:
-            for name, param in model_quant_sd.items():
-                # TODO: Reduce and clean-up these warnings
-                if param is not None and param.dtype == torch.float32:
-                    if name.endswith(".scale"):
-                        warnings.warn(
-                            f"Found float32 weights in quantized checkpoint: {name}. Will skip converting to bfloat16 as its scale"
-                        )
-                    else:
-                        warnings.warn(
-                            f"Found float32 weights in quantized checkpoint: {name}. Will convert to bfloat16"
-                        )
-                        model_quant_sd[name] = param.bfloat16()
-
-        return model_quant_sd
-
-    @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, config: PretrainedConfigAdapter) -> dict:
-        """This function should be over-ridden in child classes as needed"""
-        return state_dict
-
-    @classmethod
-    def generate_quantized_state_dict(
-        cls, model_path: str, config: PretrainedConfigAdapter
-    ) -> dict:
-        hf_model = cls.load_hf_model(model_path)
-        quantization_type = QuantizationType(config.neuron_config.quantization_type)
-        if quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
-            hf_model_quant = quantize_pytorch_model_per_tensor_symmetric(
-                float_model=hf_model, inplace=True
-            )
-        elif quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
-            hf_model_quant = quantize_pytorch_model_per_channel_symmetric(
-                float_model=hf_model, inplace=True
-            )
-        else:
-            raise RuntimeError(f"{config.neuron_config.quantization_type} not supported")
-
+    def prepare_quantized_state_dict(cls, hf_model_quant):
         model_quant_sd = hf_model_quant.model.state_dict()
         lm_head_quant_sd = hf_model_quant.lm_head.state_dict()
         convert_qint8_to_int8_state_dict(model_quant_sd)
@@ -579,84 +484,6 @@ class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
         model_quant_sd["lm_head.scale"] = lm_head_quant_sd["scale"]
 
         return model_quant_sd
-
-    @classmethod
-    def from_pretrained(cls, model_path: str, config: PretrainedConfigAdapter):
-        return cls(model_path, config)
-
-    def checkpoint_loader_fn(self, mmap: bool = False):
-        """This function loads the model's state dictionary and weights from the hf model"""
-
-        if self.neuron_config.quantized:
-            return self.get_quantized_state_dict(self.config)
-        else:
-            model_sd = self.get_state_dict(self.model_path, self.config)
-            if self.config.torch_dtype == torch.bfloat16:
-                for name, param in model_sd.items():
-                    model_sd[name] = param.bfloat16()
-            return model_sd
-
-    def compile(self, serialize_base_path=None):
-        base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
-
-        builder = ModelBuilder(
-            router=None,
-            tp_degree=self.neuron_config.tp_degree,
-            checkpoint_loader=self.checkpoint_loader_fn,
-            compiler_workdir=base_compile_work_dir,
-        )
-
-        for model in self.models:
-            builder.add(
-                key=model.tag,
-                model_instance=model.get_model_instance(),
-                example_inputs=model.input_generator(),
-                compiler_args=model.compiler_args,
-                bucket_config=model.bucket_config,
-                priority_model_idx=model.priority_model_idx,
-            )
-
-        traced_model = builder.trace(initialize_model_weights=False)
-        torch.jit.save(traced_model, serialize_base_path + "model.pt")
-        del traced_model
-
-        builder.shard_checkpoint(serialize_path=os.path.join(serialize_base_path, "weights/"))
-        self.is_loaded_to_neuron = True
-
-    def load(self, serialize_base_path):
-        traced_model = torch.jit.load(serialize_base_path + "model.pt")
-
-        weights = []
-        for rank in range(self.neuron_config.tp_degree):
-            ckpt = load_file(
-                os.path.join(
-                    serialize_base_path, f"weights/tp{rank}_sharded_checkpoint.safetensors"
-                )
-            )
-            weights.append(ckpt)
-
-        traced_model.nxd_model.initialize(weights)
-
-        for model_wrapper in self.models:
-            model_wrapper.model = traced_model
-
-    def to_neuron(self, serialize_base_path=None):
-        if serialize_base_path is None:
-            with tempfile.TemporaryDirectory(suffix="nxd-temp-serial-path") as tmpdirname:
-                self.compile(tmpdirname)
-                self.load(tmpdirname)
-        else:
-            self.compile(serialize_base_path)
-            self.load(serialize_base_path)
-
-    @property
-    def device(self) -> torch.device:
-        """
-        `torch.device`: The device on which the module is (assuming that all the module parameters are on the same
-        device).
-        """
-        # We dont want HF to move parameters to device
-        return torch.device("cpu")
 
     def forward(
         self,

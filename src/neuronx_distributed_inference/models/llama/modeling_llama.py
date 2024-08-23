@@ -51,6 +51,7 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.generation.hf_adapter import HuggingFaceGenerationAdapter
 
 _LLAMA_MODULE_MAP = {}
 
@@ -378,7 +379,9 @@ class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
                 setattr(self, f"medusa_head_{i}", medusa_head)
 
 
-class NeuronLlamaForCausalLM(NeuronBaseForCausalLM, LlamaPreTrainedModel):
+class NeuronLlamaForCausalLM(
+    NeuronBaseForCausalLM, HuggingFaceGenerationAdapter, LlamaPreTrainedModel
+):
     """
     This class extends LlamaForCausalLM create traceable
     blocks for Neuron.
@@ -389,6 +392,13 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM, LlamaPreTrainedModel):
 
     _model_cls = NeuronLlamaModel
 
+    def __init__(self, model_path: str, config: PretrainedConfigAdapter):
+        super().__init__(model_path, config)
+
     @staticmethod
     def load_hf_model(model_path):
         return LlamaForCausalLM.from_pretrained(model_path)
+
+    @classmethod
+    def get_config_cls(cls):
+        return LlamaConfigAdapter

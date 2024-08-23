@@ -21,6 +21,7 @@ import torch
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.modules.attention.gqa import GQA
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.generation.hf_adapter import HuggingFaceGenerationAdapter
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 # Try except for the compatibility with older compiler version
@@ -298,7 +299,9 @@ class NeuronMixtralModel(NeuronBaseModel, MixtralPreTrainedModel):
         self.lm_head = ColumnParallelLinear(config.hidden_size, self.vocab_size, bias=False)
 
 
-class NeuronMixtralForCausalLM(NeuronBaseForCausalLM, MixtralPreTrainedModel):
+class NeuronMixtralForCausalLM(
+    NeuronBaseForCausalLM, HuggingFaceGenerationAdapter, MixtralPreTrainedModel
+):
     """
     This class can be used as MixtralForCausalLM
     """
@@ -312,6 +315,10 @@ class NeuronMixtralForCausalLM(NeuronBaseForCausalLM, MixtralPreTrainedModel):
     @staticmethod
     def load_hf_model(model_path):
         return MixtralForCausalLM.from_pretrained(model_path)
+
+    @classmethod
+    def get_config_cls(cls):
+        return MixtralConfigAdapter
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: MixtralConfigAdapter) -> dict:

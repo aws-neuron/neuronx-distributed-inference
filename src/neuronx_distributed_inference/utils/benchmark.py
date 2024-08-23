@@ -5,7 +5,6 @@ from functools import partial
 
 import numpy as np
 import torch
-
 from transformers import PreTrainedModel
 
 from neuronx_distributed_inference.models.config import NeuronConfig
@@ -31,7 +30,9 @@ def benchmark_sampling(
     # Benchmark E2E model
     if target in ["all", "e2e"]:
         # FIXME: fix pixel values generation
-        input_ids, attention_mask, pixel_values = get_sample_inputs(END_TO_END_MODEL, neuron_config, image=image)
+        input_ids, attention_mask, pixel_values = get_sample_inputs(
+            END_TO_END_MODEL, neuron_config, image=image
+        )
         input_param = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -132,13 +133,11 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, image=None):
     if model_type == END_TO_END_MODEL:
         input_ids = torch.randint(0, 100, (batch_size, max_context_length))
         attention_mask = torch.zeros((batch_size, max_context_length), dtype=torch.int64)
-        assert image is None, "image is not supported currently for benchmarking for END_TO_END_MODEL"
+        assert (
+            image is None
+        ), "image is not supported currently for benchmarking for END_TO_END_MODEL"
 
-        sample_inputs = (
-            input_ids,
-            attention_mask,
-            None
-        )
+        sample_inputs = (input_ids, attention_mask, None)
 
     elif model_type == CONTEXT_ENCODING_MODEL:
         input_ids = torch.zeros((batch_size, max_context_length), dtype=torch.int64)

@@ -34,6 +34,7 @@ from transformers.models.llava.modeling_llava import (
 from neuronx_distributed_inference.models.config import NeuronConfig, PretrainedConfigAdapter
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaModel
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
+from neuronx_distributed_inference.modules.generation.hf_adapter import HuggingFaceGenerationAdapter
 
 from .model_wrapper_llava import ModelWrapperLlava
 from .modeling_clip import NeuronCLIPVisionModel
@@ -254,7 +255,9 @@ class NeuronLlavaModel(NeuronBaseModel, LlavaPreTrainedModel):
         return outputs
 
 
-class NeuronLlavaForConditionalGeneration(NeuronBaseForCausalLM, LlavaPreTrainedModel):
+class NeuronLlavaForConditionalGeneration(
+    NeuronBaseForCausalLM, HuggingFaceGenerationAdapter, LlavaPreTrainedModel
+):
     _STATE_DICT_MODEL_PREFIX = "language_model.model."
     _NEW_STATE_DICT_MODEL_PREFIX = "language_model."
     _model_cls = NeuronLlavaModel
@@ -269,6 +272,10 @@ class NeuronLlavaForConditionalGeneration(NeuronBaseForCausalLM, LlavaPreTrained
     @staticmethod
     def load_hf_model(model_path):
         return LlavaForConditionalGeneration.from_pretrained(model_path)
+
+    @classmethod
+    def get_config_cls(cls):
+        return LlavaConfigAdapter
 
     def get_model_wrapper_cls(self):
         return ModelWrapperLlava

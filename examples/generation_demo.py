@@ -1,4 +1,3 @@
-import os
 import torch
 
 from transformers import AutoTokenizer, GenerationConfig
@@ -23,7 +22,7 @@ def run_llama_generate():
     generation_config.update(**generation_config_kwargs)
 
     # TODO: Separate GenerationConfig from PretrainedConfig
-    config = LlamaConfigAdapter.from_pretrained(model_path, **generation_config_kwargs)
+    config = LlamaConfigAdapter.from_pretrained(model_path, torch_dtype = torch.bfloat16, **generation_config_kwargs)
     config.neuron_config = NeuronConfig(
         tp_degree=32,
         batch_size=2,
@@ -35,24 +34,18 @@ def run_llama_generate():
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
     tokenizer.pad_token = tokenizer.eos_token
-
-    if not os.path.exists(traced_model_path):
-        os.makedirs(traced_model_path)
         
     # Compile and save model.
     print("\nCompiling and saving model...")
-    model = NeuronLlamaForCausalLM.from_pretrained(model_path, config)
+    model = NeuronLlamaForCausalLM(model_path, config)
     model.compile(traced_model_path)
-    config.save_pretrained(traced_model_path)
     tokenizer.save_pretrained(traced_model_path)
 
     # Load from compiled checkpoint.
     print("\nLoading model from compiled checkpoint...")
-    config = LlamaConfigAdapter.from_pretrained(traced_model_path)
-    model = NeuronLlamaForCausalLM.from_pretrained("", config)
+    config = NeuronLlamaForCausalLM.get_config_cls().from_pretrained(traced_model_path)
+    model = NeuronLlamaForCausalLM(traced_model_path, config)
     model.load(traced_model_path)
-    if config.torch_dtype == torch.bfloat16:
-        model.bfloat16()
     tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
 
     # Generate outputs.
@@ -64,7 +57,7 @@ def run_llama_generate():
         inputs.input_ids,
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,
-        max_length=config.neuron_config.max_length,
+        max_length=model.config.neuron_config.max_length,
     )
     output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     print("Generated outputs:")

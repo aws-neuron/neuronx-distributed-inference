@@ -155,3 +155,19 @@ def save_state_dict_safetensors(
     for filename, shard in sharded_state_dict.items():
         file_path = os.path.join(state_dict_dir, filename)
         save_file(shard, file_path)
+
+
+def prune_state_dict(state_dict):
+    """
+    A helper function that deletes None values in the state_dict before saving
+    as torch.save does not like None values in the state dict.
+    """
+    keys_to_delete = []
+    for key in state_dict:
+        if state_dict[key] is None:
+            keys_to_delete.append(key)
+
+    print(f"Will be deleting following keys as its Value is None: {keys_to_delete}")
+
+    pruned_state_dict = {k: v for k, v in state_dict.items() if v is not None}
+    return pruned_state_dict

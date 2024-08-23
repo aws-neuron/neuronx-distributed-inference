@@ -22,6 +22,7 @@ from torch import nn
 
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.modules.attention.gqa import GQA
+from neuronx_distributed_inference.modules.generation.hf_adapter import HuggingFaceGenerationAdapter
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 try:
@@ -280,7 +281,9 @@ class NeuronDbrxModel(NeuronBaseModel, DbrxPreTrainedModel):
         self.lm_head = ColumnParallelLinear(config.d_model, config.vocab_size, bias=False)
 
 
-class NeuronDbrxForCausalLM(NeuronBaseForCausalLM, DbrxPreTrainedModel):
+class NeuronDbrxForCausalLM(
+    NeuronBaseForCausalLM, HuggingFaceGenerationAdapter, DbrxPreTrainedModel
+):
     """
     This class can be used as DbrxForCausalLM
     """
@@ -296,6 +299,10 @@ class NeuronDbrxForCausalLM(NeuronBaseForCausalLM, DbrxPreTrainedModel):
     @staticmethod
     def load_hf_model(model_path, hf_config):
         return DbrxForCausalLM.from_pretrained(model_path, torch_dtype=hf_config.torch_dtype)
+
+    @classmethod
+    def get_config_cls(cls):
+        return DbrxConfigAdapter
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: DbrxConfigAdapter) -> dict:
