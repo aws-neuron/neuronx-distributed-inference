@@ -10,7 +10,7 @@ from transformers import PreTrainedModel
 from neuronx_distributed_inference.models.config import NeuronConfig
 from neuronx_distributed_inference.utils.constants import *
 
-TEST_PROMPT = "I believe the meaning of life is"
+
 
 BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
