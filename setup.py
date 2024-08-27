@@ -24,4 +24,9 @@ setup(
     install_requires=["neuronx_distributed", "transformers==4.40.0", "sentencepiece"],
     python_requires=">=3.7",
     package_dir={"": "src"},
+    entry_points={
+        "console_scripts": [
+            "inference_demo=neuronx_distributed_inference.inference_demo:main",
+        ],
+    },
 )

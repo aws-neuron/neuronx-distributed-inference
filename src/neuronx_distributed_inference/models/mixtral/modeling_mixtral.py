@@ -137,7 +137,7 @@ def get_rmsnorm_cls(config):
 
 class MixtralConfigAdapter(PretrainedConfigAdapter, MixtralConfig):
     @classmethod
-    def get_config_cls(cls):
+    def get_neuron_config_cls(cls):
         return MoENeuronConfig
 
 

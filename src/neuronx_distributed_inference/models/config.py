@@ -116,11 +116,11 @@ class PretrainedConfigAdapter(PretrainedConfig):
         if config.neuron_config is not None:
             merged_kwargs = config.neuron_config
             merged_kwargs.update(kwargs)
-            config.neuron_config = cls.get_config_cls()(**merged_kwargs)
+            config.neuron_config = cls.get_neuron_config_cls()(**merged_kwargs)
         return config
 
     @classmethod
-    def get_config_cls(cls) -> NeuronConfig:
+    def get_neuron_config_cls(cls) -> NeuronConfig:
         raise NeuronConfig
 
 

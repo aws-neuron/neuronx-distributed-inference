@@ -96,7 +96,7 @@ def register_module(key: str):
 
 class LlamaConfigAdapter(PretrainedConfigAdapter, LlamaConfig):
     @classmethod
-    def get_config_cls(cls):
+    def get_neuron_config_cls(cls):
         return NeuronConfig
 
 

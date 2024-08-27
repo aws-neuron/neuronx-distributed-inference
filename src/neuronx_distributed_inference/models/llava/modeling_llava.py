@@ -57,7 +57,7 @@ class LlavaConfigAdapter(PretrainedConfigAdapter, LlavaConfig):
         self._attn_implementation = self.text_config._attn_implementation
 
     @classmethod
-    def get_config_cls(cls):
+    def get_neuron_config_cls(cls):
         return NeuronConfig
 
 
