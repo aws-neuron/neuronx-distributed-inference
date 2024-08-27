@@ -297,8 +297,8 @@ class NeuronDbrxForCausalLM(
         self.sampler = Sampler(config)
 
     @staticmethod
-    def load_hf_model(model_path, hf_config):
-        return DbrxForCausalLM.from_pretrained(model_path, torch_dtype=hf_config.torch_dtype)
+    def load_hf_model(model_path):
+        return DbrxForCausalLM.from_pretrained(model_path)
 
     @classmethod
     def get_config_cls(cls):

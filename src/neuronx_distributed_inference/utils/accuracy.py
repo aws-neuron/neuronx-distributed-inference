@@ -5,10 +5,12 @@ Some of the utitlies functions need to be redo or removed.
 """
 # flake8: noqa
 
-from typing import List, Optional, Type, Union
+from functools import partial
+from typing import List, Optional, Union
 
 import torch
-from transformers import AutoTokenizer, PreTrainedModel
+from torch_neuronx.testing.validation import logit_validation
+from transformers import GenerationConfig, PreTrainedModel, PreTrainedTokenizer
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
@@ -41,6 +43,8 @@ def get_generate_outputs(
     outputs = model.generate(
         inputs.input_ids, attention_mask=inputs.attention_mask, **generate_kwargs
     )
+    if not is_hf:
+        model.reset()
 
     if isinstance(outputs, SampleOutput.__args__):
         # Get token ids from output when return_dict_in_generate=True
@@ -51,18 +55,18 @@ def get_generate_outputs(
         output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
 
-    return output_ids, output_tokens
+    return outputs, output_tokens
 
 
 # FIXME: add on cpu check support
 def check_accuracy(
     neuron_model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    generation_config: GenerationConfig,
     expected_token_ids: Optional[List] = None,
     do_sample: bool = True,
     draft_model: PreTrainedModel = None,
-    speculation_length: int = 0,
     prompt: Optional[str] = None,
-    tokenizer: Optional[AutoTokenizer] = None,
     image=None,
 ):
     """
@@ -89,14 +93,26 @@ def check_accuracy(
     else:
         # Generate goldens with HF on CPU
         hf_model = neuron_model.load_hf_model(neuron_model.model_path)
-        output_token_ids, outputs_expected = get_generate_outputs(
-            hf_model, prompts, tokenizer, is_hf=True, draft_model=draft_model, **generation_kwargs
+        expected_token_ids, outputs_expected = get_generate_outputs(
+            hf_model,
+            prompts,
+            tokenizer,
+            is_hf=True,
+            draft_model=draft_model,
+            generation_config=generation_config,
+            **generation_kwargs,
         )
 
     print(f"Expected output: {outputs_expected}")
 
     output_token_ids, outputs_actual = get_generate_outputs(
-        neuron_model, prompts, tokenizer, is_hf=False, draft_model=draft_model, **generation_kwargs
+        neuron_model,
+        prompts,
+        tokenizer,
+        is_hf=False,
+        draft_model=draft_model,
+        generation_config=generation_config,
+        **generation_kwargs,
     )
     print(f"Actual output  : {outputs_actual}")
 
@@ -120,57 +136,78 @@ def check_accuracy(
     print(f"The output from Neuronx NxD on {device} is accurate!")
 
 
-# TODO: comment out for now given none of test is using logits check
-# def check_accuracy_logits(
-#     self,
-#     traced_model: PreTrainedModel,
-#     batch_size: int,
-#     max_length: int,
-#     expected_logits: torch.Tensor = None,
-#     divergence_difference_tol: float = 0.001,
-#     remove_shift: bool = True,
-#     tol_map: dict = None,
-# ):
-#     if traced_model.neuron_config.on_device_sampling:
-#         raise ValueError("Logits validation is not supported with on-device sampling.")
+def check_accuracy_logits(
+    neuron_model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    generation_config: GenerationConfig,
+    expected_logits: torch.Tensor = None,
+    divergence_difference_tol: float = 0.001,
+    tol_map: dict = None,
+):
+    if neuron_model.neuron_config.on_device_sampling:
+        raise ValueError("Logits validation is not supported with on-device sampling.")
 
-#     prompts = [TEST_PROMPT] * batch_size
-#     tokenizer = self.load_tokenizer()
-#     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+    generation_kwargs = {
+        "max_length": neuron_model.config.neuron_config.max_length,
+    }
 
-#     if not expected_logits:
-#         # logit_validation assumes greedy sampling
-#         expected_outputs, _ = self.generate_with_hf(
-#             prompts, max_length, do_sample=False, output_logits=True, return_dict_in_generate=True,
-#         )
-#         expected_logits = torch.stack(expected_outputs.logits)
-#     expected_token_ids = expected_logits.argmax(dim=2).T
-#     expected_tokens = tokenizer.batch_decode(
-#         expected_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-#     )
-#     print("Expected Output: ", expected_tokens, expected_token_ids)
-#     print("Expected Logits Shape: ", expected_logits.shape)
+    prompts = [TEST_PROMPT] * neuron_model.config.neuron_config.batch_size
+    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
 
-#     def generate_logits(model, tokenizer, input_ids):
-#         prompt = tokenizer.batch_decode(input_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-#         actual_outputs, actual_tokens = self.generate_on_neuron(
-#             prompt, traced_model, do_sample=True, output_logits=True, return_dict_in_generate=True,
-#             max_length=max_length
-#         )
-#         actual_logits = torch.stack(actual_outputs.logits)
-#         actual_token_ids = actual_logits.argmax(dim=2).T
-#         print("Actual Output: ", actual_tokens, actual_token_ids)
-#         print("Actual Logits Shape: ", actual_logits.shape)
-#         model.reset()
-#         return actual_logits
+    if not expected_logits:
+        # Generate goldens with HF on CPU
+        # logit_validation assumes greedy sampling
+        hf_model = neuron_model.load_hf_model(neuron_model.model_path)
+        expected_outputs, _ = get_generate_outputs(
+            hf_model,
+            prompts,
+            tokenizer,
+            is_hf=True,
+            do_sample=False,
+            output_logits=True,
+            return_dict_in_generate=True,
+            generation_config=generation_config,
+            **generation_kwargs,
+        )
+        expected_logits = torch.stack(expected_outputs.logits)
+    expected_token_ids = expected_logits.argmax(dim=2).T
+    expected_tokens = tokenizer.batch_decode(
+        expected_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    print("Expected Output: ", expected_tokens, expected_token_ids)
+    print("Expected Logits Shape: ", expected_logits.shape)
 
-#     generate_fn = partial(generate_logits, traced_model, tokenizer)
-#     passed, result, status_msg = logit_validation(inputs.input_ids,
-#                                                     generate_fn,
-#                                                     expected_logits,
-#                                                     divergence_difference_tol=divergence_difference_tol,
-#                                                     tol_map=tol_map,
-#                                                     pad_token_id=tokenizer.pad_token_id,
-#                                                     padding_side=tokenizer.padding_side)
-#     assert passed, status_msg
-#     print("Passed logits validation")
+    def generate_logits(model, tokenizer, input_ids):
+        prompt = tokenizer.batch_decode(
+            input_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        actual_outputs, actual_tokens = get_generate_outputs(
+            neuron_model,
+            prompt,
+            tokenizer,
+            is_hf=False,
+            do_sample=True,
+            output_logits=True,
+            return_dict_in_generate=True,
+            generation_config=generation_config,
+            **generation_kwargs,
+        )
+        actual_logits = torch.stack(actual_outputs.logits)
+        actual_token_ids = actual_logits.argmax(dim=2).T
+        print("Actual Output: ", actual_tokens, actual_token_ids)
+        print("Actual Logits Shape: ", actual_logits.shape)
+        model.reset()
+        return actual_logits
+
+    generate_fn = partial(generate_logits, neuron_model, tokenizer)
+    passed, result, status_msg = logit_validation(
+        inputs.input_ids,
+        generate_fn,
+        expected_logits,
+        divergence_difference_tol=divergence_difference_tol,
+        tol_map=tol_map,
+        pad_token_id=tokenizer.pad_token_id,
+        padding_side=tokenizer.padding_side,
+    )
+    assert passed, status_msg
+    print("Passed logits validation")

@@ -1,5 +1,6 @@
 import argparse
 import copy
+from enum import Enum
 from typing import Type
 
 import torch
@@ -10,6 +11,8 @@ from neuronx_distributed_inference.models.application_base import NeuronApplicat
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+from neuronx_distributed_inference.utils.accuracy import check_accuracy, check_accuracy_logits
+from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 
 torch.manual_seed(0)
 
@@ -18,6 +21,12 @@ MODEL_TYPES = {
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
 }
+
+
+class CheckAccuracyMode(Enum):
+    SKIP_ACCURACY_CHECK = "skip-accuracy-check"
+    TOKEN_MATCHING = "token-matching"
+    LOGIT_MATCHING = "logit-matching"
 
 
 def get_torch_dtype(dtype_str: str) -> torch.dtype:
@@ -44,6 +53,15 @@ def parse_args():
 def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--model-path", type=str, required=True)
     run_parser.add_argument("--compiled-model-path", type=str, required=True)
+
+    # Evaluation
+    run_parser.add_argument("--benchmark", action="store_true")
+    run_parser.add_argument(
+        "--check-accuracy-mode",
+        type=CheckAccuracyMode,
+        choices=list(CheckAccuracyMode),
+        default=CheckAccuracyMode.SKIP_ACCURACY_CHECK,
+    )
 
     # Generation
     run_parser.add_argument("--prompt", type=str, action="append", required=True)
@@ -130,6 +148,9 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     print("\nLoading model to Neuron...")
     model.load(args.compiled_model_path)
 
+    # Check accuracy.
+    run_accuracy_check(model, tokenizer, generation_config, args.check_accuracy_mode)
+
     # Generate outputs.
     print("\nGenerating outputs...")
     prompts = ["I believe the meaning of life is", "The color of the sky is"]
@@ -147,6 +168,31 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     print("Generated outputs:")
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
+
+    # Benchmarking.
+    if args.benchmark:
+        benchmark_sampling(model)
+
+
+def run_accuracy_check(model, tokenizer, generation_config, check_accuracy_mode):
+    if check_accuracy_mode == CheckAccuracyMode.SKIP_ACCURACY_CHECK:
+        print("\nSkipping accuracy check")
+    elif check_accuracy_mode == CheckAccuracyMode.TOKEN_MATCHING:
+        print("\nChecking accuracy by token matching")
+        check_accuracy(
+            model,
+            tokenizer,
+            generation_config,
+        )
+    elif check_accuracy_mode == CheckAccuracyMode.LOGIT_MATCHING:
+        print("\nChecking accuracy by logit matching")
+        check_accuracy_logits(
+            model,
+            tokenizer,
+            generation_config,
+        )
+    else:
+        raise ValueError(f"Unsupported check accuracy mode: {check_accuracy_mode}")
 
 
 def main():
