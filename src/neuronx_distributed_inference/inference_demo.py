@@ -120,27 +120,30 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     }
     generation_config.update(**generation_config_kwargs)
 
-    config = model_cls.get_config_cls().from_pretrained(args.model_path, **generation_config_kwargs)
+    torch_dtype = torch.bfloat16
     if hasattr(args, "torch_dtype") and args.torch_dtype is not None:
-        config.torch_dtype = args.torch_dtype
+        torch_dtype = args.torch_dtype
 
     # Skip values not specified in the args to avoid setting values to None in the config.
     config_kwargs = copy.deepcopy(vars(args))
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
-    config.neuron_config = model_cls.get_config_cls().get_neuron_config_cls()(**config_kwargs)
+    neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, padding_side=config.neuron_config.padding_side
+        args.model_path, padding_side=neuron_config.padding_side
     )
     tokenizer.pad_token = tokenizer.eos_token
 
-    if config.neuron_config.quantized:
+    model = model_cls(args.model_path, neuron_config, torch_dtype=torch_dtype, generation_kwargs=generation_config_kwargs)
+
+    config = model.config
+
+    if neuron_config.quantized:
         # Quantize model.
         model_cls.save_quantized_state_dict(args.model_path, config)
 
     # Compile and save model.
     print("\nCompiling and saving model...")
-    model = model_cls(args.model_path, config)
     model.compile(args.compiled_model_path)
     tokenizer.save_pretrained(args.compiled_model_path)
 
@@ -160,7 +163,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         inputs.input_ids,
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,
-        max_length=model.config.neuron_config.max_length,
+        max_length=neuron_config.max_length,
     )
     output_tokens = tokenizer.batch_decode(
         outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False

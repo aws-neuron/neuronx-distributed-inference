@@ -308,9 +308,9 @@ class NeuronMixtralForCausalLM(
 
     _model_cls = NeuronMixtralModel
 
-    def __init__(self, model_path: str, config: MixtralConfigAdapter):
-        super().__init__(model_path, config)
-        self.sampler = Sampler(config)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sampler = Sampler(self.config)
 
     @staticmethod
     def load_hf_model(model_path):

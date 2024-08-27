@@ -29,7 +29,7 @@ def get_generate_outputs(
             }
         )
 
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if is_hf:
         tokenizer.padding_side = "left"
@@ -62,7 +62,7 @@ def get_generate_outputs(
 def check_accuracy(
     neuron_model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
-    generation_config: GenerationConfig,
+    generation_config: Optional[GenerationConfig] = None,
     expected_token_ids: Optional[List] = None,
     do_sample: bool = True,
     draft_model: PreTrainedModel = None,

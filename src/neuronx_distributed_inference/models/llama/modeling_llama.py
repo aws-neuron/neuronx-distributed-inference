@@ -392,9 +392,6 @@ class NeuronLlamaForCausalLM(
 
     _model_cls = NeuronLlamaModel
 
-    def __init__(self, model_path: str, config: PretrainedConfigAdapter):
-        super().__init__(model_path, config)
-
     @staticmethod
     def load_hf_model(model_path):
         return LlamaForCausalLM.from_pretrained(model_path)

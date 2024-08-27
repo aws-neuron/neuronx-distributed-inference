@@ -262,12 +262,12 @@ class NeuronLlavaForConditionalGeneration(
     _NEW_STATE_DICT_MODEL_PREFIX = "language_model."
     _model_cls = NeuronLlavaModel
 
-    def __init__(self, model_path: str, config: LlavaConfigAdapter):
-        super().__init__(model_path, config)
-        self.torch_dtype = config.torch_dtype
-        self.image_size = config.vision_config.image_size
-        self.patch_size = config.vision_config.patch_size
-        self.image_token_index = config.image_token_index
+    def __init__(self, *arg, **kwargs):
+        super().__init__(*arg, **kwargs)
+        self.torch_dtype = self.config.torch_dtype
+        self.image_size = self.config.vision_config.image_size
+        self.patch_size = self.config.vision_config.patch_size
+        self.image_token_index = self.config.image_token_index
 
     @staticmethod
     def load_hf_model(model_path):

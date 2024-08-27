@@ -385,22 +385,22 @@ class NeuronBaseModel(PreTrainedModel):
 class NeuronBaseForCausalLM(NeuronApplicationBase):
     _model_cls = None
 
-    def __init__(self, model_path: str, config: PretrainedConfigAdapter):
-        super().__init__(model_path=model_path, config=config)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-        self.vocab_size = config.vocab_size
-        self.padding_side = config.neuron_config.padding_side
+        self.vocab_size = self.config.vocab_size
+        self.padding_side = self.neuron_config.padding_side
         self.kv_cache_populated = False
 
         self.sampler = None
         self.model_wrapper = self.get_model_wrapper_cls()
 
         self.enable_context_encoding()
-        if config.neuron_config.trace_tokengen_model:
+        if self.neuron_config.trace_tokengen_model:
             self.enable_token_generation()
-        if config.neuron_config.speculation_length > 0:
+        if self.neuron_config.speculation_length > 0:
             self.enable_speculation()
-        if config.neuron_config.medusa_speculation_length > 0:
+        if self.neuron_config.medusa_speculation_length > 0:
             self.enable_medusa_speculation()
 
     def get_model_wrapper_cls(self):

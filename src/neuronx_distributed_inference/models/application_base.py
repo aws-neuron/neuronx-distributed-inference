@@ -12,7 +12,7 @@ from neuronx_distributed.quantization.quantization_utils import (
 from neuronx_distributed.trace.model_builder import ModelBuilder
 from safetensors.torch import load_file
 
-from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import NeuronConfig, PretrainedConfigAdapter
 from neuronx_distributed_inference.models.model_wrapper import ModelWrapper
 from neuronx_distributed_inference.modules.checkpoint import load_state_dict, prune_state_dict
 
@@ -27,12 +27,26 @@ class NeuronApplicationBase(torch.nn.Module):
     _STATE_DICT_MODEL_PREFIX = "model."
     _NEW_STATE_DICT_MODEL_PREFIX = ""
 
-    def __init__(self, model_path: str, config: PretrainedConfigAdapter):
-        self.validate_config(config)
+    # TODO: clear torch_dtype and generation_config
+    def __init__(self, model_path: str, neuron_config: NeuronConfig, torch_dtype=None, generation_kwargs={
+        "do_sample": True, "top_k" : 1
+    }):
+
+        config = self.get_config_cls().from_pretrained(
+            model_path, **generation_kwargs)
+
+        config.neuron_config = neuron_config
+        
+        if torch_dtype:
+            config.torch_dtype = torch_dtype
+
+        # TODO: clear depedency on NeuronBaseForCasualLM on HF's PretrainedModel
+        #  so it could be super().__init__()
         super().__init__(config)
 
+        self.validate_config(config)
+        self.neuron_config = neuron_config
         self.config = config
-        self.neuron_config = config.neuron_config
         self.model_path = model_path
         self.models: List[ModelWrapper] = []
         self.traced_model = None
@@ -53,6 +67,11 @@ class NeuronApplicationBase(torch.nn.Module):
     def get_config_cls(cls) -> PretrainedConfigAdapter:
         """Gets the config class for this model."""
         raise NotImplementedError("get_config_cls is not implemented")
+
+    @classmethod
+    def get_neuron_config_cls(cls) -> NeuronConfig:
+        # TODO: improve the config access
+        return cls.get_config_cls().get_neuron_config_cls()
 
     def get_compiler_args(self) -> str:
         """Gets the Neuron compiler arguments to use when compiling this model."""
