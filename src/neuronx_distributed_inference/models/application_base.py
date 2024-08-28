@@ -28,15 +28,17 @@ class NeuronApplicationBase(torch.nn.Module):
     _NEW_STATE_DICT_MODEL_PREFIX = ""
 
     # TODO: clear torch_dtype and generation_config
-    def __init__(self, model_path: str, neuron_config: NeuronConfig, torch_dtype=None, generation_kwargs={
-        "do_sample": True, "top_k" : 1
-    }):
-
-        config = self.get_config_cls().from_pretrained(
-            model_path, **generation_kwargs)
+    def __init__(
+        self,
+        model_path: str,
+        neuron_config: NeuronConfig,
+        torch_dtype=None,
+        generation_kwargs={"do_sample": True, "top_k": 1},
+    ):
+        config = self.get_config_cls().from_pretrained(model_path, **generation_kwargs)
 
         config.neuron_config = neuron_config
-        
+
         if torch_dtype:
             config.torch_dtype = torch_dtype
 

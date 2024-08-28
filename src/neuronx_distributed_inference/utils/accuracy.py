@@ -21,7 +21,11 @@ from neuronx_distributed_inference.utils.constants import *
 def get_generate_outputs(
     model, prompts, tokenizer, is_hf=False, draft_model=None, device="neuron", **generate_kwargs
 ):
-    if draft_model is not None:
+    if draft_model is not None and not is_hf:
+        # TODO: Fix draft model support on HF. HF supports speculative decoding, but output is garbage currently.
+        #       The current check_accuracy behavior (compare Neuron w/ speculation against HF w/o speculation)
+        #       is consistent with the old runner.py implementation.
+        assert not is_hf, "Draft model not supported for generating on HF"
         generate_kwargs.update(
             {
                 "assistant_model": draft_model,
@@ -45,6 +49,8 @@ def get_generate_outputs(
     )
     if not is_hf:
         model.reset()
+        if draft_model is not None:
+            draft_model.reset()
 
     if isinstance(outputs, SampleOutput.__args__):
         # Get token ids from output when return_dict_in_generate=True
@@ -98,7 +104,6 @@ def check_accuracy(
             prompts,
             tokenizer,
             is_hf=True,
-            draft_model=draft_model,
             generation_config=generation_config,
             **generation_kwargs,
         )

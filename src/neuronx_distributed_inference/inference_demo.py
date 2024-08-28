@@ -64,10 +64,10 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     )
 
     # Generation
-    run_parser.add_argument("--prompt", type=str, action="append", required=True)
-    run_parser.add_argument("--top-k", type=int)
-    run_parser.add_argument("--do-sample", action="store_true")
-    run_parser.add_argument("--pad-token-id", type=int)
+    run_parser.add_argument("--prompt", dest="prompts", type=str, action="append", required=True)
+    run_parser.add_argument("--top-k", type=int, default=1)
+    run_parser.add_argument("--do-sample", action="store_true", default=True)
+    run_parser.add_argument("--pad-token-id", type=int, default=0)
 
     # Basic config
     run_parser.add_argument("--torch-dtype", type=get_torch_dtype)
@@ -106,7 +106,17 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # MoE
     run_parser.add_argument("--capacity-factor", type=float)
 
-    # TODO: Add speculation/lora
+    # Speculative decoding
+    run_parser.add_argument("--draft-model-path", type=str)
+    run_parser.add_argument("--compiled-draft-model-path", type=str)
+
+    run_parser.add_argument(
+        "--no-trace-tokengen-model", dest="trace_tokengen_model", action="store_false"
+    )
+    run_parser.add_argument("--speculation-length", type=int)
+    run_parser.add_argument("--spec-batch-size", type=int)
+
+    # TODO: Add medusa/lora
 
 
 def run_inference(model_cls: Type[NeuronApplicationBase], args):
@@ -129,42 +139,91 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, padding_side=neuron_config.padding_side
+    model = model_cls(
+        args.model_path,
+        neuron_config,
+        torch_dtype=torch_dtype,
+        generation_kwargs=generation_config_kwargs,
     )
-    tokenizer.pad_token = tokenizer.eos_token
-
-    model = model_cls(args.model_path, neuron_config, torch_dtype=torch_dtype, generation_kwargs=generation_config_kwargs)
 
     config = model.config
 
+    # Initialize draft model.
+    draft_model = None
+    if neuron_config.speculation_length > 0:
+        # Reset speculation options to defaults for the draft model.
+        draft_neuron_config = copy.deepcopy(neuron_config)
+        draft_neuron_config.speculation_length = 0
+        draft_neuron_config.trace_tokengen_model = True
+        draft_model = model_cls(
+            args.draft_model_path,
+            draft_neuron_config,
+            torch_dtype=torch_dtype,
+            generation_kwargs=generation_config_kwargs,
+        )
+
+    # Quantize model.
     if neuron_config.quantized:
-        # Quantize model.
         model_cls.save_quantized_state_dict(args.model_path, config)
 
     # Compile and save model.
     print("\nCompiling and saving model...")
     model.compile(args.compiled_model_path)
-    tokenizer.save_pretrained(args.compiled_model_path)
+    if draft_model is not None:
+        print("\nCompiling and saving draft model...")
+        draft_model.compile(args.compiled_draft_model_path)
 
     # Load compiled model to Neuron.
     print("\nLoading model to Neuron...")
     model.load(args.compiled_model_path)
+    if draft_model is not None:
+        print("\nLoading draft model to Neuron...")
+        draft_model.load(args.compiled_draft_model_path)
+
+    # Load tokenizer.
+    tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
 
     # Check accuracy.
-    run_accuracy_check(model, tokenizer, generation_config, args.check_accuracy_mode)
+    run_accuracy_check(
+        model, tokenizer, generation_config, args.check_accuracy_mode, draft_model=draft_model
+    )
 
     # Generate outputs.
+    run_generation(model, tokenizer, args.prompts, generation_config, draft_model=draft_model)
+
+    # Benchmarking.
+    if args.benchmark:
+        benchmark_sampling(model, draft_model)
+
+
+def load_tokenizer(model_path, compiled_model_path, neuron_config):
+    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side=neuron_config.padding_side)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.save_pretrained(compiled_model_path)
+    return tokenizer
+
+
+def run_generation(model, tokenizer, prompts, generation_config, draft_model=None):
     print("\nGenerating outputs...")
-    prompts = ["I believe the meaning of life is", "The color of the sky is"]
     print(f"Prompts: {prompts}")
+
+    kwargs = {}
+    if draft_model is not None:
+        kwargs.update({"assistant_model": draft_model, "do_sample": False})
+
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
     outputs = model.generate(
         inputs.input_ids,
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,
-        max_length=neuron_config.max_length,
+        max_length=model.neuron_config.max_length,
+        **kwargs,
     )
+
+    model.reset()
+    if draft_model is not None:
+        draft_model.reset()
+
     output_tokens = tokenizer.batch_decode(
         outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
@@ -172,12 +231,8 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
 
-    # Benchmarking.
-    if args.benchmark:
-        benchmark_sampling(model)
 
-
-def run_accuracy_check(model, tokenizer, generation_config, check_accuracy_mode):
+def run_accuracy_check(model, tokenizer, generation_config, check_accuracy_mode, draft_model=None):
     if check_accuracy_mode == CheckAccuracyMode.SKIP_ACCURACY_CHECK:
         print("\nSkipping accuracy check")
     elif check_accuracy_mode == CheckAccuracyMode.TOKEN_MATCHING:
@@ -186,9 +241,11 @@ def run_accuracy_check(model, tokenizer, generation_config, check_accuracy_mode)
             model,
             tokenizer,
             generation_config,
+            draft_model=draft_model,
         )
     elif check_accuracy_mode == CheckAccuracyMode.LOGIT_MATCHING:
         print("\nChecking accuracy by logit matching")
+        assert draft_model is None, "Logit matching not supported for speculation"
         check_accuracy_logits(
             model,
             tokenizer,
