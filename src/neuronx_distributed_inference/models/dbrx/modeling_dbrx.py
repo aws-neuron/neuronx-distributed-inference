@@ -317,6 +317,6 @@ class NeuronDbrxForCausalLM(
         # Prevent auto-downcasting when running with fp32
         if self.config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
-        # TODO: Remove this flag after compiler fix is merged (NCC-2677)
-        compiler_args += " --internal-hlo2tensorizer-options=--expand-batch-norm-training"
+        # Enable vector-offset DGE
+        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         return compiler_args
