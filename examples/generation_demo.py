@@ -3,7 +3,7 @@ import torch
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.models.llama.modeling_llama import LlamaConfigAdapter, NeuronLlamaForCausalLM
+from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 
 model_path = "/home/ubuntu/model_hf/Llama-2-7b/"
 traced_model_path = "/home/ubuntu/traced_model/Llama-2-7b/"
@@ -22,8 +22,7 @@ def run_llama_generate():
     generation_config.update(**generation_config_kwargs)
 
     # TODO: Separate GenerationConfig from PretrainedConfig
-    config = LlamaConfigAdapter.from_pretrained(model_path, torch_dtype = torch.bfloat16, **generation_config_kwargs)
-    config.neuron_config = NeuronConfig(
+    neuron_config = NeuronConfig(
         tp_degree=32,
         batch_size=2,
         max_context_length=32,
@@ -37,14 +36,18 @@ def run_llama_generate():
         
     # Compile and save model.
     print("\nCompiling and saving model...")
-    model = NeuronLlamaForCausalLM(model_path, config)
+    model = NeuronLlamaForCausalLM(
+        model_path,
+        neuron_config,
+        torch_dtype=torch.bfloat16,
+        generation_kwargs=generation_config_kwargs
+    )
     model.compile(traced_model_path)
     tokenizer.save_pretrained(traced_model_path)
 
     # Load from compiled checkpoint.
     print("\nLoading model from compiled checkpoint...")
-    config = NeuronLlamaForCausalLM.get_config_cls().from_pretrained(traced_model_path)
-    model = NeuronLlamaForCausalLM(traced_model_path, config)
+    model = NeuronLlamaForCausalLM(traced_model_path)
     model.load(traced_model_path)
     tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
 

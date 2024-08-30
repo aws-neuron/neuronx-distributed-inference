@@ -31,20 +31,17 @@ class NeuronApplicationBase(torch.nn.Module):
     def __init__(
         self,
         model_path: str,
-        neuron_config: NeuronConfig,
+        neuron_config: NeuronConfig = None,
         torch_dtype=None,
         generation_kwargs={"do_sample": True, "top_k": 1},
     ):
         config = self.get_config_cls().from_pretrained(model_path, **generation_kwargs)
 
-        config.neuron_config = neuron_config
+        if neuron_config is not None:
+            config.neuron_config = neuron_config
 
         if torch_dtype:
             config.torch_dtype = torch_dtype
-
-        # TODO: clear depedency on NeuronBaseForCasualLM on HF's PretrainedModel
-        #  so it could be super().__init__()
-        super().__init__(config)
 
         self.validate_config(config)
         self.neuron_config = neuron_config
@@ -54,6 +51,10 @@ class NeuronApplicationBase(torch.nn.Module):
         self.traced_model = None
         self.is_compiled = is_compiled(model_path)
         self.is_loaded_to_neuron = False
+
+        # TODO: clear depedency on NeuronBaseForCasualLM on HF's PretrainedModel
+        #  so it could be super().__init__()
+        super().__init__(config)
 
     def forward(self, **kwargs):
         """Forward pass for this model."""
