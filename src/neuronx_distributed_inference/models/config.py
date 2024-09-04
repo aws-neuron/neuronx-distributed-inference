@@ -14,7 +14,6 @@ class NeuronConfig:
 
     def __init__(self, **kwargs) -> None:
         # Basic config for inference in NxD
-        self.tp_degree = kwargs.pop("tp_degree", 1)
         self.batch_size = kwargs.pop("batch_size", 1)
         self.padding_side = kwargs.pop("padding_side", "right")
         # TODO: see if we can consolidate n_active_tokens and n_positions into one
@@ -77,6 +76,14 @@ class NeuronConfig:
         self.lora_config = kwargs.pop("lora_config", None)
         if type(self.lora_config) is dict:
             self.lora_config = LoraServingConfig(**self.lora_config)
+
+        # Distributed config
+        self.tp_degree = kwargs.pop("tp_degree", 1)
+        self.world_size = kwargs.pop("world_size", self.tp_degree)
+        self.pp_degree = kwargs.pop("pp_degree", 1)
+        self.ep_degree = kwargs.pop("ep_degree", 1)
+        self.start_rank_id = kwargs.pop("start_rank_id", 0)
+        self.local_world_size = kwargs.pop("local_world_size", self.world_size)
 
 
 class MoENeuronConfig(NeuronConfig):

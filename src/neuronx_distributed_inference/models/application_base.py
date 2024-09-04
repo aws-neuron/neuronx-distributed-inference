@@ -88,7 +88,10 @@ class NeuronApplicationBase(torch.nn.Module):
 
         builder = ModelBuilder(
             router=None,
-            tp_degree=self.config.neuron_config.tp_degree,
+            tp_degree=self.neuron_config.tp_degree,
+            pp_degree=self.neuron_config.pp_degree,
+            ep_degree=self.neuron_config.ep_degree,
+            world_size=self.neuron_config.world_size,
             checkpoint_loader=self.checkpoint_loader_fn,
             compiler_workdir=base_compile_work_dir,
         )
