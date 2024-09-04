@@ -117,7 +117,8 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--spec-batch-size", type=int)
 
     # TODO: Add medusa/lora
-
+    run_parser.add_argument("--enable-lora", action="store_true", default=False)
+    
 
 def run_inference(model_cls: Type[NeuronApplicationBase], args):
     # Initialize configs.
