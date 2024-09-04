@@ -19,6 +19,10 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; 
 from neuronx_distributed_inference.modules.autobucketing import generate_buckets
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
+from neuronx_distributed_inference.modules.lora_serving import (
+    update_weights_for_lora,
+    LoraModel,
+)
 
 
 class NeuronBaseModel(PreTrainedModel):
@@ -46,6 +50,9 @@ class NeuronBaseModel(PreTrainedModel):
         if optimize_inference:
             self.init_inference_optimization(config)
         self.post_init()
+
+        if self.neuron_config.lora_config is not None:
+            LoraModel(self, self.neuron_config.lora_config)
 
     def setup_attr_for_model(self, config: PretrainedConfigAdapter):
         """
@@ -380,6 +387,9 @@ class NeuronBaseModel(PreTrainedModel):
         hidden_states = self.norm(hidden_states)
 
         return (hidden_states, next_decoder_cache)
+
+    def update_weights_for_lora(self, model_sd):
+        return update_weights_for_lora(self, model_sd)
 
 
 class NeuronBaseForCausalLM(NeuronApplicationBase):

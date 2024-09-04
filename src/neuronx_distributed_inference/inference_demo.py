@@ -13,6 +13,7 @@ from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlam
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
 from neuronx_distributed_inference.utils.accuracy import check_accuracy, check_accuracy_logits
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
+from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 
 torch.manual_seed(0)
 
@@ -116,9 +117,15 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--speculation-length", type=int)
     run_parser.add_argument("--spec-batch-size", type=int)
 
-    # TODO: Add medusa/lora
-    run_parser.add_argument("--enable-lora", action="store_true", default=False)
-    
+    # lora
+    run_parser.add_argument("--enable-lora", action="store_true")
+    run_parser.add_argument("--max-loras", type=int, default=1)
+    run_parser.add_argument("--max-lora-rank", type=int, default=16)
+    run_parser.add_argument("--target-modules", nargs='+')
+    run_parser.add_argument("--max-loras-on-cpu", type=int, default=2)
+
+    # TODO: Add medusa
+
 
 def run_inference(model_cls: Type[NeuronApplicationBase], args):
     # Initialize configs.
@@ -138,6 +145,13 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     # Skip values not specified in the args to avoid setting values to None in the config.
     config_kwargs = copy.deepcopy(vars(args))
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
+    if args.enable_lora:
+        config_kwargs["lora_config"] = LoraServingConfig(
+            max_loras = args.max_loras,
+            max_lora_rank = args.max_lora_rank,
+            target_modules = args.target_modules,
+            max_loras_on_cpu = args.max_loras_on_cpu,
+        )
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
     model = model_cls(

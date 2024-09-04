@@ -2,7 +2,13 @@ import torch
 import torch.nn as nn
 
 from .config import LoraServingConfig
-from .lora_layer import MultiLoraConv2d, MultiLoraEmbedding, MultiLoraLinear
+from .lora_layer import (
+    MultiLoraLinear,
+    MultiLoraConv2d,
+    MultiLoraEmbedding,
+    MultiLoraColumnParallelLinear,
+    MultiLoraRowParallelLinear,
+)
 
 
 class MultiLoraModule(nn.Module):
@@ -15,8 +21,8 @@ class MultiLoraModule(nn.Module):
         super().__init__()
         self.lora_max_rank = lora_config.max_lora_rank
         self.max_loras = lora_config.max_loras
-        self.lora_dtype = lora_config.lora_dtype
         self.base_layer = base_layer
+        self.lora_dtype = base_layer.weight.dtype
         self.lora_config = lora_config
         self.lora_scaling = [1] * self.max_loras
         self.skip_dtype_convert = False
@@ -55,16 +61,7 @@ class MultiLoraModule(nn.Module):
         raise NotImplementedError
 
     def get_base_layer(self) -> nn.Module:
-        r"""
-        (Recursively) get the base_layer.
-
-        This is necessary for the case that the tuner layer wraps another tuner layer.
-
-        """
-        base_layer = self
-        while hasattr(base_layer, "base_layer"):
-            base_layer = base_layer.base_layer
-        return base_layer
+        return self.base_layer
 
     def forward(
         self, x: torch.Tensor, adapter_ids: torch.Tensor = None, *args, **kwargs
@@ -137,3 +134,15 @@ class MultiLoraModuleEmbedding(MultiLoraModule):
             self.max_loras, self.lora_max_rank, self.out_features, self.lora_dtype
         )
         self.skip_dtype_convert = True
+
+
+class MultiLoraModuleColumnParallelLinear(MultiLoraModule):
+    def create_lora(self):
+        self.lora_A = MultiLoraLinear(self.max_loras, self.in_features, self.lora_max_rank, self.lora_dtype,)
+        self.lora_B = MultiLoraColumnParallelLinear(self.max_loras, self.lora_max_rank, self.out_features, self.lora_dtype)
+
+
+class MultiLoraModuleRowParallelLinear(MultiLoraModule):
+    def create_lora(self):
+        self.lora_A = MultiLoraRowParallelLinear(self.max_loras, self.in_features, self.lora_max_rank, self.lora_dtype)
+        self.lora_B = MultiLoraLinear(self.max_loras, self.lora_max_rank, self.out_features, self.lora_dtype)

@@ -1,30 +1,31 @@
 from __future__ import annotations
 
 import re
-
 import torch
 
+from neuronx_distributed.parallel_layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    ParallelEmbedding,
+)
 from .config import LoraServingConfig
-from .lora_module import MultiLoraModuleConv2d, MultiLoraModuleEmbedding, MultiLoraModuleLinear
+from .lora_module import (
+    MultiLoraModuleLinear,
+    MultiLoraModuleEmbedding,
+    MultiLoraModuleConv2d,
+    MultiLoraModuleColumnParallelLinear,
+    MultiLoraModuleRowParallelLinear,
+)
 
 
 class LoraModel(torch.nn.Module):
-    prefix: str = "lora_"
-
-    def __init__(self, module, config: LoraServingConfig) -> None:
-        assert config is not None
-        super().__init__()
-
-        self.module = module
-        self.lora_config = config
-        self.adapter_ids = None
-        self.inject_adapter()
-
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-
-    def generate(self, *args, **kwargs):
-        return self.module.generate(*args, **kwargs)
+    def __init__(self, module, config: LoraServingConfig = None) -> None:
+        if config is not None:
+            super().__init__()
+            self.module = module
+            self.lora_config = config
+            self.inject_adapter()
+            setattr(module, "lora_wrapped_model", True)
 
     def inject_adapter(self):
         r"""
@@ -35,9 +36,10 @@ class LoraModel(torch.nn.Module):
             Step 3: Create a LoraLayer for this module and replace it with the LoraLayer
         """
         lora_config = self.lora_config
-        config = self.lora_config
-        if config.target_modules is None:
-            raise ValueError("Target modules are not set for the base model.")
+        if lora_config.target_modules is None:
+            raise ValueError(
+                "Target modules are not set for the base model."
+            )
 
         is_target_modules_in_base_model = False
         key_list = self.get_leave_module_names()
@@ -56,6 +58,11 @@ class LoraModel(torch.nn.Module):
             )
 
     def get_leave_module_names(self):
+        r"""
+        Return the leave module names.
+        The keys of module.named_modules() may include non-leave module names.
+        For example, both "self_attn.o_proj" and "self_attn.o_proj.o_proj" are included for Llama2, but only the leave module "self_attn.o_proj.o_proj" needs LoRA.
+        """
         key_list = [key for key, _ in self.module.named_modules()]
         key_list = sorted(key_list, key=len, reverse=True)
         result = []
@@ -88,9 +95,7 @@ class LoraModel(torch.nn.Module):
             # this module is specified directly in target_modules
             target_module_found = True
         else:
-            target_module_found = any(
-                key.endswith(f".{target_key}") for target_key in config.target_modules
-            )
+            target_module_found = any(key.endswith(f".{target_key}") for target_key in config.target_modules)
 
         return target_module_found
 
@@ -129,13 +134,18 @@ class LoraModel(torch.nn.Module):
         Create the corresponding LoraLayer according to its module type, such as torch.nn.Linear and torch.nn.Embedding.
         """
         lora_config = self.lora_config
+        lora_adapters = None
         # check basic module types
-        if isinstance(target, (torch.nn.Embedding)):
+        if isinstance(target, (torch.nn.Embedding, ParallelEmbedding)):
             lora_adapters = MultiLoraModuleEmbedding(target, lora_config)
         elif isinstance(target, torch.nn.Linear):
             lora_adapters = MultiLoraModuleLinear(target, lora_config)
         elif isinstance(target, torch.nn.Conv2d):
             lora_adapters = MultiLoraModuleConv2d(target, lora_config)
+        elif isinstance(target, ColumnParallelLinear):
+            lora_adapters = MultiLoraModuleColumnParallelLinear(target, lora_config)
+        elif isinstance(target, RowParallelLinear):
+            lora_adapters = MultiLoraModuleRowParallelLinear(target, lora_config)
 
         if lora_adapters is None:
             # no module could be matched
@@ -144,19 +154,9 @@ class LoraModel(torch.nn.Module):
                     torch.nn.Linear,
                     torch.nn.Embedding,
                     torch.nn.Conv2d,
+                    nxd.parallel_layers.ColumnParallelLinear,
+                    nxd.parallel_layers.RowParallelLinear,
+                    nxd.parallel_layers.ParallelEmbedding,
                 """
             )
         return lora_adapters
-
-    def get_base_model(self) -> torch.nn.Module:
-        """
-        Returns the base model.
-        """
-        return self.module
-
-    def __getattr__(self, name: str):
-        """Forward missing attributes to the wrapped module."""
-        try:
-            return super().__getattr__(name)  # defer to nn.Module's logic
-        except AttributeError:
-            return getattr(self.module, name)

@@ -31,9 +31,13 @@ def update_weights_for_lora(model, model_sd):
     model_sd.update(base_layer_weights)
 
     lora_weights = {}
-    for name, parameters in model.named_parameters():
-        if name not in model_sd:
-            lora_weights[name] = torch.zeros_like(parameters, dtype=parameters.dtype, device="cpu")
+    for name, module in model.named_modules():
+        if is_lora_module(name):
+            weight_shape = module.get_checkpoint_shape()
+            weight_dtype = module.get_weight_dtype()
+            weight_name = f"{name}.weight"
+            if weight_name not in model_sd:
+                lora_weights[weight_name] = torch.zeros(*weight_shape, dtype=weight_dtype, device="cpu")
     model_sd.update(lora_weights)
 
     return model_sd
