@@ -1,6 +1,6 @@
 ## My Project
 
-This package provides a model hub for running inference on Neuronx Distributed (NxD). 
+This package provides a model hub for running inference on Neuronx Distributed (NxD).
 
 ## Examples
 This package includes examples that you can reference when you implement code that uses NxD Inference.
@@ -9,7 +9,7 @@ This package includes examples that you can reference when you implement code th
 ## Run inference with the inference demo
 This package includes an inference demo console script that you can use to run inference. This script includes benchmarking and accuracy checking features that are useful for developers to verify that their models and modules work correctly.
 
-After you install this package, you can run the inference demo with `inference-demo`. See examples below for how to run the inference demo. You can also run `inference-demo --help` to view all available arguments.
+After you install this package, you can run the inference demo with `inference-demo`. See examples below for how to run the inference demo. You can also run `inference_demo --help` to view all available arguments.
 
 ### Example 1: Llama inference with token matching accuracy check
 ```
