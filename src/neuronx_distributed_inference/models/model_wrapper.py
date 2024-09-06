@@ -26,6 +26,16 @@ SPECULATION_MODEL_TAG = "speculation_model"
 MEDUSA_MODEL_TAG = "medusa_speculation_model"
 
 
+def _reorder_helper(*args: torch.Tensor):
+    # sorting is needed due to compiler issues with gather and hence can't support arbitrary order of seq_ids
+    seq_ids = args[3]
+    indices = torch.argsort(seq_ids)
+    reorder_args = []
+    for arg in args:
+        reorder_args.append(torch.index_select(arg, 0, indices))
+    return reorder_args
+
+
 def get_bucket_model_config_from_tag(tag, config: PretrainedConfigAdapter):
     bucket_degree = len(config.neuron_config.buckets)
     if bucket_degree == 1:
@@ -65,12 +75,12 @@ def get_bucket_model_config_from_tag(tag, config: PretrainedConfigAdapter):
 
 class ModelWrapper(torch.nn.Module):
     def __init__(
-        self,
-        config: PretrainedConfigAdapter,
-        model_cls,
-        tag="",
-        compiler_args: str = None,
-        priority_model_idx: int = None,
+            self,
+            config: PretrainedConfigAdapter,
+            model_cls,
+            tag="",
+            compiler_args: str = None,
+            priority_model_idx: int = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -129,7 +139,7 @@ class ModelWrapper(torch.nn.Module):
         self.model.load_state_dict(state_dict, strict=strict, assign=assign)
 
     def input_generator(
-        self,
+            self,
     ):
         inputs = []
         for bucket in self.neuron_config.buckets:
@@ -238,40 +248,20 @@ class ModelWrapper(torch.nn.Module):
             logits, *kv_cache = outputs
             return [logits[: seq_ids.shape[0]], *kv_cache]
 
-    def reorder_helper(self, *args):
-        # we then reorder the other inputs based on padded_seq_ids
-        # because there are issue with compiler to do gather, we cannot fully support arbitrary order of seq_ids for now
-        seq_ids = args[3]
-
-        reorder_args = []
-
-        for arg in args:
-            reorder_args.append(torch.index_select(arg, 0, seq_ids))
-
-        return [seq_ids] + reorder_args
-
     def _forward(self, *args):
-        if (
-            self.neuron_config.is_continuous_batching
-            and self.neuron_config.batch_size == self.neuron_config.max_batch_size
-        ):
+        if self.neuron_config.is_continuous_batching and self.neuron_config.batch_size == self.neuron_config.max_batch_size:
             logging.debug("running forward and reorder the inputs based on seq_ids")
-            seq_ids, *args = self.reorder_helper(*args)
+            preserved_seq_ids = args[3]
+            updated_args = _reorder_helper(*args)
+            logging.debug(f"Processed inputs to the model. tag={self.tag}, args={args}")
+            outputs = self.model(*updated_args)
+            if self.is_neuron():
+                return torch.index_select(outputs, 0, preserved_seq_ids)
+            else:
+                return [torch.index_select(outputs[0], 0, preserved_seq_ids), *outputs[1:]]
 
         logging.debug(f"Processed inputs to the model. tag={self.tag}, args={args}")
-
-        outputs = self.model(*args)
-
-        if (
-            self.neuron_config.is_continuous_batching
-            and self.neuron_config.batch_size == self.neuron_config.max_batch_size
-        ):
-            if self.is_neuron():
-                return torch.index_select(outputs, 0, seq_ids)
-            else:
-                return [torch.index_select(outputs[0], 0, seq_ids), *outputs[1:]]
-
-        return outputs
+        return self.model(*args)
 
     def pad_to_max_compiled_seq(self, *args):
         if self.tag == CONTEXT_ENCODING_MODEL_TAG:
@@ -318,10 +308,10 @@ class ModelWrapper(torch.nn.Module):
             if cur_batch + self.neuron_config.batch_size <= input_batch_size:
                 # we only process part of the input to run
                 logging.debug(
-                    f"running foward on batch {cur_batch}:{cur_batch+self.neuron_config.batch_size}"
+                    f"running foward on batch {cur_batch}:{cur_batch + self.neuron_config.batch_size}"
                 )
                 outputs = self._forward(
-                    *[arg[cur_batch : cur_batch + self.neuron_config.batch_size] for arg in args]
+                    *[arg[cur_batch: cur_batch + self.neuron_config.batch_size] for arg in args]
                 )
             else:
                 # we need to pad the input to run
