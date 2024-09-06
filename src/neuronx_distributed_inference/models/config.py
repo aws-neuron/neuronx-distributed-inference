@@ -110,11 +110,18 @@ class NeuronConfig:
 
         # Distributed config
         self.tp_degree = kwargs.pop("tp_degree", 1)
-        self.world_size = kwargs.pop("world_size", self.tp_degree)
         self.pp_degree = kwargs.pop("pp_degree", 1)
         self.ep_degree = kwargs.pop("ep_degree", 1)
+
+        self.world_size = kwargs.pop("world_size", None)
+        if self.world_size is None:
+            self.world_size = self.tp_degree * self.pp_degree * self.ep_degree
+
         self.start_rank_id = kwargs.pop("start_rank_id", 0)
-        self.local_world_size = kwargs.pop("local_world_size", self.world_size)
+        self.local_ranks_size = kwargs.pop("local_ranks_size", None)
+
+        if self.local_ranks_size is None:
+            self.local_ranks_size = self.world_size
 
 
 class MoENeuronConfig(NeuronConfig):

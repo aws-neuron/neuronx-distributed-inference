@@ -89,6 +89,8 @@ class NeuronApplicationBase(torch.nn.Module):
             pp_degree=self.neuron_config.pp_degree,
             ep_degree=self.neuron_config.ep_degree,
             world_size=self.neuron_config.world_size,
+            start_rank_id=self.neuron_config.start_rank_id,
+            local_ranks_size=self.neuron_config.local_ranks_size,
             checkpoint_loader=self.checkpoint_loader_fn,
             compiler_workdir=base_compile_work_dir,
         )
@@ -136,14 +138,13 @@ class NeuronApplicationBase(torch.nn.Module):
             raise ValueError("Model is not loaded")
 
         weights = []
-        for rank in range(self.config.neuron_config.tp_degree):
+        for rank in range(self.neuron_config.start_rank_id, self.neuron_config.start_rank_id+self.neuron_config.local_ranks_size):
             ckpt = load_file(
                 os.path.join(
                     compiled_model_path, f"weights/tp{rank}_sharded_checkpoint.safetensors"
                 )
             )
             weights.append(ckpt)
-
         self.traced_model.nxd_model.initialize(weights)
 
     def checkpoint_loader_fn(self, mmap: bool = False):

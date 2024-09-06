@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 from enum import Enum
 from typing import Type
 
@@ -87,6 +88,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--max-batch-size", type=int)
     run_parser.add_argument("--is-continuous-batching", action="store_true")
 
+    # On device sampling
     run_parser.add_argument("--on-device-sampling", action="store_true")
 
     # Bucketing
@@ -113,12 +115,20 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--speculation-length", type=int)
     run_parser.add_argument("--spec-batch-size", type=int)
 
+    # Parallism
+    run_parser.add_argument("--tp-degree", type=int)
+    run_parser.add_argument("--pp-degree", type=int)
+    run_parser.add_argument("--ep-degree", type=int)
+    run_parser.add_argument("--world-size", type=int)
+    run_parser.add_argument("--start_rank_id", type=int)
+    run_parser.add_argument("--local_ranks_size", type=int)
+
     # lora
     run_parser.add_argument("--enable-lora", action="store_true")
-    run_parser.add_argument("--max-loras", type=int, default=1)
-    run_parser.add_argument("--max-lora-rank", type=int, default=16)
+    run_parser.add_argument("--max-loras", type=int)
+    run_parser.add_argument("--max-lora-rank", type=int)
     run_parser.add_argument("--target-modules", nargs="+")
-    run_parser.add_argument("--max-loras-on-cpu", type=int, default=2)
+    run_parser.add_argument("--max-loras-on-cpu", type=int)
 
     # TODO: Add medusa
 
@@ -146,6 +156,8 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         )
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
+    print("Running with neuron_config:\n", json.dumps(neuron_config.__dict__, indent=4))
+
     config = model_cls.get_config_cls()(
         neuron_config,
         load_config=load_pretrained_config(args.model_path),
@@ -156,7 +168,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
 
     # Initialize draft model.
     draft_model = None
-    if neuron_config.speculation_length > 0:
+    if neuron_config.speculation_length > 0 and args.draft_model_path is not None:
         # Reset speculation options to defaults for the draft model.
         draft_neuron_config = copy.deepcopy(config.neuron_config)
         draft_neuron_config.speculation_length = 0
