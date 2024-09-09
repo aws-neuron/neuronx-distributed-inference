@@ -115,7 +115,9 @@ class KVCacheManager(nn.Module):
         """
         slice_index, gather_index = None, None
         if self.is_medusa:
-            slice_index, gather_index = self.configure_medusa_gather_slice_idx(kwargs)
+            assert 'medusa_metadata' in kwargs, 'medusa_metadata should be specified for medusa decoding!'
+            medusa_metadata = kwargs['medusa_metadata']
+            slice_index, gather_index = self.configure_medusa_gather_slice_idx(medusa_metadata)
         past_key_values = []
         for key_layer_idx in range(0, len(self.past_key_values), 2):
             # get kv per layer

@@ -140,7 +140,7 @@ class NeuronBaseModel(nn.Module):
                 "current_length": current_length,
                 "accepted_indices": accepted_indices,
             }
-            past_key_values = self.kv_mgr.get_cache(self.n_positions, medusa_metadata)
+            past_key_values = self.kv_mgr.get_cache(self.n_positions, medusa_metadata=medusa_metadata)
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
