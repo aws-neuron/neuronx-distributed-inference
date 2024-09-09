@@ -50,6 +50,7 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 
 _LLAMA_MODULE_MAP = {}
 
@@ -188,13 +189,16 @@ class NeuronLlamaMLP(nn.Module):
             self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
             self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, adapter_ids=None):
         # all-gather is done here instead of CPL layers to
         # avoid 2 all-gathers from up and gate projections
         if self.sequence_parallel_enabled:
             x = _gather_along_dim(x, self.sequence_dimension)
 
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate_proj_output = self.gate_proj(x) if not is_lora_module(self.gate_proj) else self.gate_proj(x, adapter_ids)
+        up_proj_output = self.up_proj(x) if not is_lora_module(self.up_proj) else  self.up_proj(x, adapter_ids)
+        down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
+        return self.down_proj(down_proj_input) if not is_lora_module(self.up_proj) else self.down_proj(down_proj_input, adapter_ids)
 
 
 @register_module("NeuronLlamaAttention")
@@ -301,6 +305,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        adapter_ids = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -312,6 +317,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
+            adapter_ids=adapter_ids,
             **kwargs,
         )
 
@@ -321,7 +327,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, adapter_ids=adapter_ids)
         hidden_states = residual + hidden_states
 
         return (hidden_states, present_key_value)

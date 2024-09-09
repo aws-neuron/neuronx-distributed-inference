@@ -154,6 +154,8 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
     if args.on_device_sampling:
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
+
+    adapter_ids = None
     if args.enable_lora:
         config_kwargs["lora_config"] = LoraServingConfig(
             max_loras=args.max_loras,
@@ -161,6 +163,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
             target_modules=args.target_modules,
             max_loras_on_cpu=args.max_loras_on_cpu,
         )
+        adapter_ids = torch.tensor([0, 1], dtype=torch.int64)
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
     config = model_cls.get_config_cls()(
@@ -228,7 +231,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     )
 
     # Generate outputs.
-    run_generation(model, tokenizer, args.prompts, generation_config, draft_model=draft_model)
+    run_generation(model, tokenizer, args.prompts, generation_config, draft_model=draft_model, adapter_ids=adapter_ids)
 
     # Benchmarking.
     if args.benchmark:
@@ -242,7 +245,7 @@ def load_tokenizer(model_path, compiled_model_path, neuron_config):
     return tokenizer
 
 
-def run_generation(model, tokenizer, prompts, generation_config, draft_model=None):
+def run_generation(model, tokenizer, prompts, generation_config, draft_model=None, adapter_ids=None):
     print("\nGenerating outputs...")
     print(f"Prompts: {prompts}")
 
@@ -258,6 +261,7 @@ def run_generation(model, tokenizer, prompts, generation_config, draft_model=Non
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,
         max_length=model.neuron_config.max_length,
+        adapter_ids=adapter_ids,
         **kwargs,
     )
 

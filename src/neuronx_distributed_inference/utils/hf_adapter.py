@@ -236,6 +236,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache", False),
                 "attention_mask": attention_mask,
+                "adapter_ids": kwargs.get("adapter_ids", None),
                 "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
             }
         )
@@ -260,6 +261,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
+                "adapter_ids": kwargs.get("adapter_ids", None),
                 "medusa_args": (
                     kwargs.get("accepted_indices"),
                     kwargs.get("current_length"),

@@ -19,6 +19,12 @@ from .lora_module import (
 )
 
 
+def wrap_model_with_lora(model, config: LoraServingConfig):
+    if config is not None:
+        LoraModel(model, config)
+        setattr(model, "lora_wrapped_model", True)
+
+
 class LoraModel(torch.nn.Module):
     def __init__(self, module, config: LoraServingConfig = None) -> None:
         if config is not None:

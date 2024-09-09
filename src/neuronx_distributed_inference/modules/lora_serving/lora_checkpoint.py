@@ -14,7 +14,6 @@ def update_weights_for_lora(model, model_sd):
         if ".base_layer" in name:
             lora_modules.append(name.replace(".base_layer", ""))
 
-    base_layer_weights = {}
     for name in lora_modules:
         weight_name = f"{name}.weight"
         lora_weight_name = f"{name}.base_layer.weight"
@@ -27,8 +26,7 @@ def update_weights_for_lora(model, model_sd):
                     weight_name = key
                     break
         if lora_weight_name not in model_sd:
-            base_layer_weights[lora_weight_name] = model_sd[weight_name]
-    model_sd.update(base_layer_weights)
+            model_sd[lora_weight_name] = model_sd.pop(weight_name)
 
     lora_weights = {}
     for name, module in model.named_modules():

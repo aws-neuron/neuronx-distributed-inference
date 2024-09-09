@@ -21,5 +21,5 @@ inference_demo \
     --enable-lora \
     --max-loras 2 \
     --max-lora-rank 16 \
-    --target-modules tokens_embed q_proj k_proj v_proj o_proj up_proj down_proj \
+    --target-modules embed_tokens q_proj k_proj v_proj o_proj up_proj down_proj \
 ```

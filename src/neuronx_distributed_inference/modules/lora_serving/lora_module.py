@@ -11,6 +11,10 @@ from .lora_layer import (
 )
 
 
+def is_lora_module(module):
+    return isinstance(module, MultiLoraModule)
+
+
 class MultiLoraModule(nn.Module):
     def __init__(self, base_layer: nn.Module, lora_config: LoraServingConfig) -> None:
         if lora_config.max_lora_rank <= 0:
@@ -72,8 +76,8 @@ class MultiLoraModule(nn.Module):
         base_layer = self.get_base_layer()
         result = base_layer(x, *args, **kwargs)
         A_result = self.lora_A(x, adapter_ids)
-        scaling = self.get_scaling(adapter_ids)
-        result = result + self.lora_B(A_result, adapter_ids) * scaling
+        # ignore the LoRA scaling for now. will multiple scaling to lora_A weights directly later.
+        result = result + self.lora_B(A_result, adapter_ids)
 
         if not self.skip_dtype_convert:
             result = result.to(previous_dtype)

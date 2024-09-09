@@ -7,9 +7,6 @@ from neuronx_distributed.parallel_layers import ColumnParallelLinear, RowParalle
 
 
 class BaseMultiLora(nn.Module):
-    def __init__(self):
-        super().__init__()
-
     def get_checkpoint_shape(self):
         raise NotImplementedError
 
@@ -20,6 +17,18 @@ class BaseMultiLora(nn.Module):
         if adapter_ids is None:
             adapter_ids = 0
         return self.weight[adapter_ids].squeeze()
+
+    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor) -> torch.Tensor:
+        ret = []
+        weights = self.get_weight(adapter_ids)
+
+        for i in range(adapter_ids.numel()):
+            output = self._forward(x[i], weights[i])
+            ret.append(output)
+        return torch.stack(ret)
 
 
 class MultiLoraLinear(BaseMultiLora):
@@ -43,12 +52,11 @@ class MultiLoraLinear(BaseMultiLora):
     def get_checkpoint_shape(self):
         return self.weight_shape
 
-    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor = None) -> torch.Tensor:
-        weight = self.get_weight(adapter_ids)
+    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return F.linear(x, weight)
 
 
-class MultiLoraConv2d(nn.Conv2d, BaseMultiLora):
+class MultiLoraConv2d(BaseMultiLora, nn.Conv2d):
     def __init__(
         self,
         max_loras: int,
@@ -87,8 +95,7 @@ class MultiLoraConv2d(nn.Conv2d, BaseMultiLora):
     def get_checkpoint_shape(self):
         return self.weight.size()
 
-    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor = None) -> torch.Tensor:
-        weight = self.get_weight(adapter_ids)
+    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return self._conv_forward(x, weight, None)
 
 
@@ -123,8 +130,7 @@ class MultiLoraEmbedding(BaseMultiLora):
     def get_checkpoint_shape(self):
         return self.weight_shape
 
-    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor = None) -> torch.Tensor:
-        weight = self.get_weight(adapter_ids)
+    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return F.embedding(
             x,
             weight.T,
@@ -136,7 +142,7 @@ class MultiLoraEmbedding(BaseMultiLora):
         )
 
 
-class MultiLoraColumnParallelLinear(ColumnParallelLinear, BaseMultiLora):
+class MultiLoraColumnParallelLinear(BaseMultiLora, ColumnParallelLinear):
     def __init__(
         self,
         max_loras: int,
@@ -168,8 +174,7 @@ class MultiLoraColumnParallelLinear(ColumnParallelLinear, BaseMultiLora):
     def get_checkpoint_shape(self):
         return (self.max_loras, self.output_size, self.input_size)
 
-    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor = None) -> torch.Tensor:
-        weight = self.get_weight(adapter_ids)
+    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return self._forward_impl(
             input=x,
             weight=weight,
@@ -180,7 +185,7 @@ class MultiLoraColumnParallelLinear(ColumnParallelLinear, BaseMultiLora):
         )
 
 
-class MultiLoraRowParallelLinear(RowParallelLinear, BaseMultiLora):
+class MultiLoraRowParallelLinear(BaseMultiLora, RowParallelLinear):
     def __init__(
         self,
         max_loras: int,
@@ -207,8 +212,7 @@ class MultiLoraRowParallelLinear(RowParallelLinear, BaseMultiLora):
     def get_checkpoint_shape(self):
         return (self.max_loras, self.output_size, self.input_size)
 
-    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor = None) -> torch.Tensor:
-        weight = self.get_weight(adapter_ids)
+    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         output_parallel = self._forward_impl(
             input=x,
             weight=weight,

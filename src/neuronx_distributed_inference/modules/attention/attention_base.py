@@ -94,9 +94,9 @@ class NeuronAttentionBase(nn.Module):
         QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
         return QK
 
-    def prep_qkv_tensors(self, position_ids, hidden_states, past_key_value):
+    def prep_qkv_tensors(self, position_ids, hidden_states, past_key_value, adapter_ids=None):
         """take care of the shape, layout, group query, custom position encoding, etc."""
-        Q, K, V = self.qkv_proj(hidden_states=hidden_states)
+        Q, K, V = self.qkv_proj(hidden_states=hidden_states, adapter_ids=adapter_ids)
 
         # Divide hidden_dim across heads for MHA
         # Change layout: BSHD -> BHSD
@@ -212,12 +212,13 @@ class NeuronAttentionBase(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         active_mask: Optional[torch.LongTensor] = None,
+        adapter_ids = None,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """Implements each layer's forward pass for the attention block."""
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
             q_len *= get_tensor_model_parallel_size()
-        Q, K, V = self.prep_qkv_tensors(position_ids, hidden_states, past_key_value)
+        Q, K, V = self.prep_qkv_tensors(position_ids, hidden_states, past_key_value, adapter_ids=adapter_ids)
 
         if past_key_value is None:
             attn_output = self.perform_prefill(Q, K, V, q_len, bsz, attention_mask)
@@ -233,7 +234,7 @@ class NeuronAttentionBase(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
 
         # Z = Z.Wo
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output, adapter_ids=adapter_ids)
 
         past_key_value: Tuple[Tensor, Tensor] = (K, V)
 

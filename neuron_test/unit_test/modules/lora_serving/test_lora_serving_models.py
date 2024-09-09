@@ -9,7 +9,7 @@ from neuronx_distributed.parallel_layers import (
     RowParallelLinear,
 )
 
-from neuronx_distributed_inference.modules.lora_serving import LoraModel, LoraServingConfig
+from neuronx_distributed_inference.modules.lora_serving import wrap_model_with_lora, LoraServingConfig
 from neuronx_distributed_inference.modules.lora_serving.lora_module import MultiLoraModule
 
 
@@ -60,7 +60,7 @@ class TestLoraModels(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=8))
     def test_nxd_model(self):
         model = NxDModule()
-        LoraModel(model, lora_config)
+        wrap_model_with_lora(model, lora_config)
 
         assert isinstance(model.rpl, MultiLoraModule)
         assert isinstance(model.cpl, MultiLoraModule)

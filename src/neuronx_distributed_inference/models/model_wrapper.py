@@ -157,6 +157,7 @@ class ModelWrapper(torch.nn.Module):
                 (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int64
             )
             seq_ids = torch.zeros((self.neuron_config.batch_size), dtype=torch.int64)
+            adapter_ids = torch.zeros((self.neuron_config.batch_size), dtype=torch.int64) if self.neuron_config.lora_config is not None else None
 
             if self.is_medusa:
                 accepted_indices = torch.zeros(
@@ -179,20 +180,39 @@ class ModelWrapper(torch.nn.Module):
                     (self.neuron_config.batch_size, self.neuron_config.medusa_speculation_length),
                     dtype=torch.int64,
                 )
-                inputs.append(
-                    (
-                        input_ids,
-                        attention_mask,
-                        position_ids,
-                        seq_ids,
-                        accepted_indices,
-                        current_length,
-                        medusa_mask,
-                        scatter_index,
+                if self.neuron_config.lora_config is not None:
+                    inputs.append(
+                        (
+                            input_ids,
+                            attention_mask,
+                            position_ids,
+                            seq_ids,
+                            adapter_ids,
+                            accepted_indices,
+                            current_length,
+                            medusa_mask,
+                            scatter_index,
+                        )
                     )
-                )
+                else:
+                    inputs.append(
+                        (
+                            input_ids,
+                            attention_mask,
+                            position_ids,
+                            seq_ids,
+                            accepted_indices,
+                            current_length,
+                            medusa_mask,
+                            scatter_index,
+                        )
+                    )
             else:
-                inputs.append((input_ids, attention_mask, position_ids, seq_ids))
+                if self.neuron_config.lora_config is not None:
+                    inputs.append((input_ids, attention_mask, position_ids, seq_ids, adapter_ids))
+                else:
+                    inputs.append((input_ids, attention_mask, position_ids, seq_ids))
+
 
         return inputs
 
@@ -291,6 +311,9 @@ class ModelWrapper(torch.nn.Module):
             raise RuntimeError(
                 "Forward called before load. Run load() or load_state_dict() making calling forward"
             )
+        # if adapter_ids for LoRA is None, pop it out
+        if args[4] is None:
+            args = (*args[:4], *args[5:])
 
         args = self.pad_to_max_compiled_seq(*args)
 
