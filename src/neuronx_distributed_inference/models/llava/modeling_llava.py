@@ -24,23 +24,23 @@ import torch
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
 from torch import nn
-from transformers import LlavaConfig, LlavaPreTrainedModel
+from transformers import LlavaPreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.models.llava.modeling_llava import (
     LlavaCausalLMOutputWithPast,
     LlavaForConditionalGeneration,
 )
 
-from neuronx_distributed_inference.models.config import NeuronConfig, PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaModel
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
-from neuronx_distributed_inference.modules.generation.hf_adapter import HuggingFaceGenerationAdapter
+from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
 from .model_wrapper_llava import ModelWrapperLlava
 from .modeling_clip import NeuronCLIPVisionModel
 
 
-class LlavaConfigAdapter(PretrainedConfigAdapter, LlavaConfig):
+class LlavaInferenceConfig(InferenceConfig):
     def __init__(self, neuron_config: NeuronConfig = None, **kwargs):
         super().__init__(neuron_config, **kwargs)
         self.text_config.attn_cls = "NeuronLlamaAttention"
@@ -66,7 +66,7 @@ class NeuronLlavaMultiModalProjector(nn.Module):
     The linear layers are replaced with ColumnParallelLinear
     """
 
-    def __init__(self, config: LlavaConfigAdapter):
+    def __init__(self, config: LlavaInferenceConfig):
         super().__init__()
 
         self.act = ACT2FN[config.projector_hidden_act]
@@ -77,7 +77,7 @@ class NeuronLlavaMultiModalProjector(nn.Module):
                 config.text_config.hidden_size,
                 bias=True,
                 gather_output=False,
-                dtype=config.torch_dtype,
+                dtype=config.neuron_config.torch_dtype,
                 pad=True,
             )
 
@@ -86,7 +86,7 @@ class NeuronLlavaMultiModalProjector(nn.Module):
                 config.text_config.hidden_size,
                 bias=True,
                 input_is_parallel=True,
-                dtype=config.torch_dtype,
+                dtype=config.neuron_config.torch_dtype,
                 pad=True,
             )
         else:
@@ -105,17 +105,17 @@ class NeuronLlavaMultiModalProjector(nn.Module):
 
 
 class NeuronLlavaModel(NeuronBaseModel, LlavaPreTrainedModel):
-    def __init__(self, config: LlavaConfigAdapter):
+    def __init__(self, config: LlavaInferenceConfig):
         super().__init__(config, optimize_inference=False)
 
-    def setup_attr_for_model(self, config: LlavaConfigAdapter):
+    def setup_attr_for_model(self, config: LlavaInferenceConfig):
         self.on_device_sampling = config.neuron_config.on_device_sampling
         self.tp_degree = config.neuron_config.tp_degree
         self.neuron_config = config.neuron_config
 
-    def init_model(self, config: LlavaConfigAdapter):
+    def init_model(self, config: LlavaInferenceConfig):
         config.vision_config.tp_degree = config.neuron_config.tp_degree
-        config.vision_config.torch_dtype = config.torch_dtype
+        config.vision_config.torch_dtype = config.neuron_config.torch_dtype
         self.vision_tower = NeuronCLIPVisionModel(config.vision_config)
         self.multi_modal_projector = NeuronLlavaMultiModalProjector(config)
         self.language_model = NeuronLlamaModel(config)
@@ -264,7 +264,7 @@ class NeuronLlavaForConditionalGeneration(
 
     def __init__(self, *arg, **kwargs):
         super().__init__(*arg, **kwargs)
-        self.torch_dtype = self.config.torch_dtype
+        self.torch_dtype = self.config.neuron_config.torch_dtype
         self.image_size = self.config.vision_config.image_size
         self.patch_size = self.config.vision_config.patch_size
         self.image_token_index = self.config.image_token_index
@@ -275,7 +275,7 @@ class NeuronLlavaForConditionalGeneration(
 
     @classmethod
     def get_config_cls(cls):
-        return LlavaConfigAdapter
+        return LlavaInferenceConfig
 
     def get_model_wrapper_cls(self):
         return ModelWrapperLlava

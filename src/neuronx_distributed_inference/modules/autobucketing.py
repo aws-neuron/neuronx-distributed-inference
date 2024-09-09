@@ -5,7 +5,7 @@ import torch
 
 
 def generate_buckets(min_length: int, max_length: int):
-    if (min_length == max_length):
+    if min_length == max_length:
         return [max_length]
 
     min_bound = int(log2(min_length))

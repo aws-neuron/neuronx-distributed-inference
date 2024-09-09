@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import re
-import torch
 
+import torch
 from neuronx_distributed.parallel_layers import (
     ColumnParallelLinear,
-    RowParallelLinear,
     ParallelEmbedding,
+    RowParallelLinear,
 )
+
 from .config import LoraServingConfig
 from .lora_module import (
-    MultiLoraModuleLinear,
-    MultiLoraModuleEmbedding,
-    MultiLoraModuleConv2d,
     MultiLoraModuleColumnParallelLinear,
+    MultiLoraModuleConv2d,
+    MultiLoraModuleEmbedding,
+    MultiLoraModuleLinear,
     MultiLoraModuleRowParallelLinear,
 )
 
@@ -37,9 +38,7 @@ class LoraModel(torch.nn.Module):
         """
         lora_config = self.lora_config
         if lora_config.target_modules is None:
-            raise ValueError(
-                "Target modules are not set for the base model."
-            )
+            raise ValueError("Target modules are not set for the base model.")
 
         is_target_modules_in_base_model = False
         key_list = self.get_leave_module_names()
@@ -95,7 +94,9 @@ class LoraModel(torch.nn.Module):
             # this module is specified directly in target_modules
             target_module_found = True
         else:
-            target_module_found = any(key.endswith(f".{target_key}") for target_key in config.target_modules)
+            target_module_found = any(
+                key.endswith(f".{target_key}") for target_key in config.target_modules
+            )
 
         return target_module_found
 

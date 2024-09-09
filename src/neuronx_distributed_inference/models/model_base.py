@@ -4,11 +4,11 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
-from transformers import PreTrainedModel
+from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
-from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     CONTEXT_ENCODING_MODEL_TAG,
     MEDUSA_MODEL_TAG,
@@ -19,21 +19,18 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; 
 from neuronx_distributed_inference.modules.autobucketing import generate_buckets
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
-from neuronx_distributed_inference.modules.lora_serving import (
-    update_weights_for_lora,
-    LoraModel,
-)
+from neuronx_distributed_inference.modules.lora_serving import LoraModel, update_weights_for_lora
 
 
-class NeuronBaseModel(PreTrainedModel):
+class NeuronBaseModel(nn.Module):
     """
     Base model that NeuronXXXModel classes inherit from.
 
     The forward() function will be traced and compiled by NxD.
     """
 
-    def __init__(self, config: PretrainedConfigAdapter, optimize_inference=True):
-        super().__init__(config)
+    def __init__(self, config: InferenceConfig, optimize_inference=True):
+        super().__init__()
 
         self.sampler = None
         self.kv_mgr = None
@@ -49,12 +46,11 @@ class NeuronBaseModel(PreTrainedModel):
         self.init_model(config)
         if optimize_inference:
             self.init_inference_optimization(config)
-        self.post_init()
 
         if self.neuron_config.lora_config is not None:
             LoraModel(self, self.neuron_config.lora_config)
 
-    def setup_attr_for_model(self, config: PretrainedConfigAdapter):
+    def setup_attr_for_model(self, config: InferenceConfig):
         """
         Please provide model-specific definition for the following attributes
             self.on_device_sampling
@@ -67,7 +63,7 @@ class NeuronBaseModel(PreTrainedModel):
         """
         raise NotImplementedError("setup_attr_for_model() is not implemented")
 
-    def init_model(self, config: PretrainedConfigAdapter):
+    def init_model(self, config: InferenceConfig):
         """
         Please provide definition for the following components:
             self.embed_tokens
@@ -77,7 +73,7 @@ class NeuronBaseModel(PreTrainedModel):
         """
         raise NotImplementedError("init_model() is not implemented")
 
-    def init_inference_optimization(self, config: PretrainedConfigAdapter):
+    def init_inference_optimization(self, config: InferenceConfig):
         if self.on_device_sampling:
             self.sampler = Sampler(config)
         self.kv_mgr = KVCacheManager(config, num_kv_head=self.num_key_value_heads)
@@ -563,7 +559,11 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             if output_hidden_states is not None
             else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict
+            if return_dict is not None
+            else getattr(self.config, "use_return_dict", None)
+        )
         return output_attentions, output_hidden_states, return_dict
 
     def _infer_attention_mask(self, position_ids):

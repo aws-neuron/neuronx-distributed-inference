@@ -13,6 +13,8 @@ from torch_neuronx.testing.validation import logit_validation
 from transformers import GenerationConfig, PreTrainedModel, PreTrainedTokenizer
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 
+from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
+
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 from neuronx_distributed_inference.utils.constants import *
@@ -26,9 +28,10 @@ def get_generate_outputs(
         #       The current check_accuracy behavior (compare Neuron w/ speculation against HF w/o speculation)
         #       is consistent with the old runner.py implementation.
         assert not is_hf, "Draft model not supported for generating on HF"
+        draft_generation_model = HuggingFaceGenerationAdapter(draft_model)
         generate_kwargs.update(
             {
-                "assistant_model": draft_model,
+                "assistant_model": draft_generation_model,
                 "do_sample": False,
             }
         )
@@ -44,7 +47,9 @@ def get_generate_outputs(
         tokenizer.padding_side = "right"
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
 
-    outputs = model.generate(
+    generation_config = generate_kwargs.get("generation_config", None)
+    generation_model = model if is_hf else HuggingFaceGenerationAdapter(model)
+    outputs = generation_model.generate(
         inputs.input_ids, attention_mask=inputs.attention_mask, **generate_kwargs
     )
     if not is_hf:

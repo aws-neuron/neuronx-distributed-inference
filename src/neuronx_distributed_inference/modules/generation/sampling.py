@@ -1,7 +1,7 @@
 from torch import argmax, count_nonzero, cumsum, gather, nn, rand, subtract, topk
 from torch_neuronx.xla_impl.ops import Argmax, Softmax, TopK
 
-from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import InferenceConfig
 
 
 class Sampler:
@@ -10,7 +10,7 @@ class Sampler:
 
     """
 
-    def __init__(self, config: PretrainedConfigAdapter):
+    def __init__(self, config: InferenceConfig):
         self.on_device_sampling = config.neuron_config.on_device_sampling
         if hasattr(config.neuron_config, "is_medusa"):
             self.is_medusa = config.neuron_config.is_medusa

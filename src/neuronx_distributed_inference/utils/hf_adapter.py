@@ -1,4 +1,6 @@
 import copy
+import os
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -8,7 +10,7 @@ from neuronx_distributed.utils.medusa_utils import (
     generate_medusa_buffers,
     update_inference_inputs,
 )
-from transformers import GenerationMixin
+from transformers import AutoConfig, GenerationConfig, PretrainedConfig, PreTrainedModel
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import (
@@ -17,20 +19,63 @@ from transformers.generation.stopping_criteria import (
 )
 from transformers.modeling_outputs import ModelOutput
 
-from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
+from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
+from neuronx_distributed_inference.models.config import InferenceConfig, to_dict, to_torch_dtype
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 
-class HuggingFaceGenerationAdapter(GenerationMixin):
-    def __init__(self, config: PretrainedConfigAdapter):
-        super().__init__(config)
-        self.config = config
-        self.neuron_config = config.neuron_config
-        self.padding_side = config.neuron_config.padding_side
-        self.kv_cache_populated = False
+def load_pretrained_config(model_path_or_name: Union[str, os.PathLike]):
+    """Return a load_config hook for InferenceConfig that loads the config from a PretrainedConfig."""
+
+    def load_config(self: InferenceConfig):
+        config: PretrainedConfig = AutoConfig.from_pretrained(model_path_or_name)
+        config_dict = config.to_dict()
+
+        # Set torch_dtype in NeuronConfig.
+        if "torch_dtype" in config_dict:
+            self.neuron_config.torch_dtype = config_dict["torch_dtype"]
+            if isinstance(self.neuron_config.torch_dtype, str):
+                self.neuron_config.torch_dtype = to_torch_dtype(self.neuron_config.torch_dtype)
+            del config_dict["torch_dtype"]
+
+        # Convert nested configs to namespaces.
+        for k, v in config_dict.items():
+            if isinstance(getattr(config, k), PretrainedConfig):
+                config_dict[k] = SimpleNamespace(**v)
+
+        self.__dict__.update(config_dict)
+        if hasattr(config, "attribute_map"):
+            self.attribute_map = config.attribute_map
+
+    return load_config
+
+
+def to_pretrained_config(config: InferenceConfig):
+    """Convert an InferenceConfig into a PretrainedConfig."""
+    config_dict = copy.deepcopy(to_dict(config))
+    config_dict["torch_dtype"] = config.neuron_config.torch_dtype
+    del config_dict["neuron_config"]
+    return PretrainedConfig(**config_dict)
+
+
+class HuggingFaceGenerationAdapter(PreTrainedModel):
+    def __init__(self, model: NeuronApplicationBase, generation_config: GenerationConfig = None):
+        hf_config = to_pretrained_config(model.config)
+        super().__init__(hf_config)
+
+        self.neuron_model = model
+        self.neuron_config = model.config.neuron_config
+        self.padding_side = self.neuron_config.padding_side
+        self.sampler = None
         self.prev_kv_cache_populated = False
+        if generation_config is not None:
+            self.generation_config = generation_config
+            self.generation_config.max_length = self.neuron_config.max_length
+
+    def forward(self, *args, **kwargs):
+        return self.neuron_model(*args, **kwargs)
 
     def _sample(
         self,
@@ -102,8 +147,8 @@ class HuggingFaceGenerationAdapter(GenerationMixin):
 
             if not self.neuron_config.on_device_sampling:
                 if self.sampler is None:
-                    self.config.do_sample = True
-                    self.sampler = Sampler(self.config)
+                    self.neuron_model.config.do_sample = True
+                    self.sampler = Sampler(self.neuron_model.config)
                 next_tokens = self.sampler.sample(outputs.logits[:, -1, :])
             else:
                 next_tokens = outputs.tokens
@@ -143,8 +188,8 @@ class HuggingFaceGenerationAdapter(GenerationMixin):
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
         # Store KV cache flag before forward pass.
-        self.prev_kv_cache_populated = self.kv_cache_populated
-        if self.kv_cache_populated:
+        self.prev_kv_cache_populated = self.neuron_model.kv_cache_populated
+        if self.neuron_model.kv_cache_populated:
             input_ids = input_ids[:, -1:]
 
         accepted_indices = kwargs.get("accepted_indices", None)
@@ -157,7 +202,7 @@ class HuggingFaceGenerationAdapter(GenerationMixin):
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if self.kv_cache_populated:
+            if self.neuron_model.kv_cache_populated:
                 position_ids = torch.amax(position_ids, 1, keepdim=True)
                 position_ids = position_ids + 1
 
@@ -181,7 +226,7 @@ class HuggingFaceGenerationAdapter(GenerationMixin):
     def prepare_medusa_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        if self.kv_cache_populated:
+        if self.neuron_model.kv_cache_populated:
             input_ids = input_ids[:, -self.neuron_config.medusa_speculation_length :]
         position_ids = kwargs.get("position_ids")
 
@@ -350,7 +395,7 @@ class HuggingFaceGenerationAdapter(GenerationMixin):
                     candidate_input_ids,
                     **assistant_kwargs,
                 )
-                is_for_token_generation = assistant_model.kv_cache_populated
+                is_for_token_generation = assistant_model.neuron_model.kv_cache_populated
 
                 # 1.2 Use the assistant model to obtain the next candidate logits
                 assistant_model_outputs = assistant_model(**assistant_inputs)
@@ -597,3 +642,12 @@ class HuggingFaceGenerationAdapter(GenerationMixin):
         logits = outputs["hidden_states"][:1, :, :]
         medusa_logits = outputs["hidden_states"][1:, :, :].unsqueeze(1)
         return logits, medusa_logits
+
+    @property
+    def device(self) -> torch.device:
+        """
+        `torch.device`: The device on which the module is (assuming that all the module parameters are on the same
+        device).
+        """
+        # We dont want HF to move parameters to device
+        return torch.device("cpu")

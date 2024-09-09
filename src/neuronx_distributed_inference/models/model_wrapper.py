@@ -14,7 +14,7 @@ from neuronx_distributed.trace import parallel_model_load, parallel_model_trace
 from neuronx_distributed.trace.model_builder import BaseModelInstance
 from torch_neuronx import BucketModelConfig
 
-from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.modules.autobucketing import (
     get_context_encoder_bk,
     get_token_generation_bk,
@@ -36,7 +36,7 @@ def _reorder_helper(*args: torch.Tensor):
     return reorder_args
 
 
-def get_bucket_model_config_from_tag(tag, config: PretrainedConfigAdapter):
+def get_bucket_model_config_from_tag(tag, config: InferenceConfig):
     bucket_degree = len(config.neuron_config.buckets)
     if bucket_degree == 1:
         return None
@@ -75,19 +75,19 @@ def get_bucket_model_config_from_tag(tag, config: PretrainedConfigAdapter):
 
 class ModelWrapper(torch.nn.Module):
     def __init__(
-            self,
-            config: PretrainedConfigAdapter,
-            model_cls,
-            tag="",
-            compiler_args: str = None,
-            priority_model_idx: int = None,
+        self,
+        config: InferenceConfig,
+        model_cls,
+        tag="",
+        compiler_args: str = None,
+        priority_model_idx: int = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.neuron_config = config.neuron_config
 
-        if not config.torch_dtype:
-            config.torch_dtype = torch.float32
+        if not self.neuron_config.torch_dtype:
+            self.neuron_config.torch_dtype = torch.float32
 
         if config.pad_token_id is None:
             config.pad_token_id = 0
@@ -139,7 +139,7 @@ class ModelWrapper(torch.nn.Module):
         self.model.load_state_dict(state_dict, strict=strict, assign=assign)
 
     def input_generator(
-            self,
+        self,
     ):
         inputs = []
         for bucket in self.neuron_config.buckets:
@@ -249,7 +249,10 @@ class ModelWrapper(torch.nn.Module):
             return [logits[: seq_ids.shape[0]], *kv_cache]
 
     def _forward(self, *args):
-        if self.neuron_config.is_continuous_batching and self.neuron_config.batch_size == self.neuron_config.max_batch_size:
+        if (
+            self.neuron_config.is_continuous_batching
+            and self.neuron_config.batch_size == self.neuron_config.max_batch_size
+        ):
             logging.debug("running forward and reorder the inputs based on seq_ids")
             preserved_seq_ids = args[3]
             updated_args = _reorder_helper(*args)
@@ -311,7 +314,7 @@ class ModelWrapper(torch.nn.Module):
                     f"running foward on batch {cur_batch}:{cur_batch + self.neuron_config.batch_size}"
                 )
                 outputs = self._forward(
-                    *[arg[cur_batch: cur_batch + self.neuron_config.batch_size] for arg in args]
+                    *[arg[cur_batch : cur_batch + self.neuron_config.batch_size] for arg in args]
                 )
             else:
                 # we need to pad the input to run
@@ -337,7 +340,7 @@ class ModelWrapper(torch.nn.Module):
 
 
 class DecoderModelInstance(BaseModelInstance):
-    def __init__(self, model_cls, config: PretrainedConfigAdapter):
+    def __init__(self, model_cls, config: InferenceConfig):
         self.model_cls = model_cls
         self.module = None
         self.input_output_aliases = None
@@ -348,7 +351,7 @@ class DecoderModelInstance(BaseModelInstance):
         float_model = self.model_cls(self.config)
         float_model.eval()
 
-        if self.config.torch_dtype == torch.bfloat16:
+        if self.neuron_config.torch_dtype == torch.bfloat16:
             float_model.bfloat16()
 
         if self.neuron_config.quantized is True:
@@ -383,12 +386,12 @@ class DecoderModelInstance(BaseModelInstance):
         return self.module, self.input_output_aliases
 
 
-def get_trace_callable(model_cls, config: PretrainedConfigAdapter, bucket_rank=None):
+def get_trace_callable(model_cls, config: InferenceConfig, bucket_rank=None):
     if bucket_rank is not None:
         config.neuron_config.n_positions = config.neuron_config.buckets[bucket_rank]
     float_model = model_cls(config)
     float_model.eval()
-    if config.torch_dtype == torch.bfloat16:
+    if config.neuron_config.torch_dtype == torch.bfloat16:
         float_model.bfloat16()
 
     if config.neuron_config.quantized is True:

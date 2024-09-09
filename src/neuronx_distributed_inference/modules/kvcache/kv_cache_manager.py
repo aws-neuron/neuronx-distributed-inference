@@ -4,7 +4,7 @@ import torch
 from neuronx_distributed.parallel_layers import parallel_state, utils
 from torch import Tensor, nn
 
-from neuronx_distributed_inference.models.config import PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402; noqa: E402; noqa: E402
     determine_sharding_strategy,
     get_shardable_head_counts,
@@ -37,7 +37,7 @@ class KVCacheManager(nn.Module):
     and vends out read and write operations.
     """
 
-    def __init__(self, config: PretrainedConfigAdapter, **kwargs):
+    def __init__(self, config: InferenceConfig, **kwargs):
         super().__init__()
         self.is_medusa = config.neuron_config.is_medusa
         self.num_medusa_heads = config.neuron_config.num_medusa_heads
@@ -47,7 +47,7 @@ class KVCacheManager(nn.Module):
         self._init_kv_shape(config)
 
         num_layer = config.num_hidden_layers
-        dtype = config.torch_dtype
+        dtype = config.neuron_config.torch_dtype
         self.past_key_values = nn.ParameterList(
             [
                 nn.Parameter(torch.zeros(self.kv_shape, dtype=dtype), requires_grad=False)
@@ -55,7 +55,7 @@ class KVCacheManager(nn.Module):
             ]
         )
 
-    def _init_kv_shape(self, config: PretrainedConfigAdapter):
+    def _init_kv_shape(self, config: InferenceConfig):
         max_batch_size = config.neuron_config.max_batch_size
         max_len = config.neuron_config.max_length
         tp_degree = config.neuron_config.tp_degree

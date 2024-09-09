@@ -5,17 +5,20 @@ from functools import partial
 
 import numpy as np
 import torch
-from transformers import PreTrainedModel
+from transformers import GenerationConfig, PreTrainedModel
 
+from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.config import NeuronConfig
 from neuronx_distributed_inference.utils.constants import *
+from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
 BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
 
 def benchmark_sampling(
-    model: PreTrainedModel,
-    draft_model: PreTrainedModel = None,
+    model: NeuronApplicationBase,
+    draft_model: NeuronApplicationBase = None,
+    generation_config: GenerationConfig = None,
     target: str = None,
     image=None,
 ):
@@ -31,13 +34,17 @@ def benchmark_sampling(
         input_ids, attention_mask, pixel_values = get_sample_inputs(
             END_TO_END_MODEL, neuron_config, image=image
         )
+        draft_generation_model = (
+            HuggingFaceGenerationAdapter(draft_model) if draft_model is not None else None,
+        )
         input_param = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "max_new_tokens": neuron_config.max_new_tokens,
             "top_k": 1,
             "do_sample": draft_model is None,
-            "assistant_model": draft_model,
+            "generation_config": generation_config,
+            "assistant_model": draft_generation_model,
         }
 
         if pixel_values is not None:
@@ -51,8 +58,9 @@ def benchmark_sampling(
                 register_latency_collectors(latency_collectors, model)
 
         # Register latency collectors after warm-up to avoid recording warm-up metrics.
+        generation_model = HuggingFaceGenerationAdapter(model)
         e2e_benchmark = Benchmark(
-            model.generate,
+            generation_model.generate,
             input_param,
             preprocess_func=model.reset,
             post_warmup_func=post_warmup_func,

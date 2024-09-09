@@ -15,15 +15,13 @@
 import gc
 import logging
 import warnings
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.modules.attention.gqa import GQA
-from neuronx_distributed_inference.modules.generation.hf_adapter import HuggingFaceGenerationAdapter
-from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 try:
     from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
@@ -36,10 +34,10 @@ from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
 from torch_neuronx.xla_impl.ops import nki_jit
-from transformers import DbrxConfig, DbrxForCausalLM, DbrxPreTrainedModel
+from transformers import DbrxForCausalLM
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 
-from neuronx_distributed_inference.models.config import MoENeuronConfig, PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 
@@ -118,14 +116,27 @@ class NeuronDbrxConfig(MoENeuronConfig):
         self.fused_qkv = True
 
 
-class DbrxConfigAdapter(PretrainedConfigAdapter, DbrxConfig):
+class DbrxInferenceConfig(InferenceConfig):
+    def get_required_attributes(self) -> List[str]:
+        return [
+            "d_model",
+            "n_heads",
+            "max_seq_len",
+            "emb_pdrop",
+            "resid_pdrop",
+            "pad_token_id",
+            "vocab_size",
+            "attn_config",
+            "ffn_config",
+        ]
+
     @classmethod
     def get_neuron_config_cls(cls):
         return NeuronDbrxConfig
 
 
 class NeuronDbrxAttention(NeuronAttentionBase):
-    def __init__(self, config: DbrxConfigAdapter):
+    def __init__(self, config: DbrxInferenceConfig):
         super().__init__()
         self.config = config
         self.neuron_config = config.neuron_config
@@ -133,7 +144,7 @@ class NeuronDbrxAttention(NeuronAttentionBase):
         self.num_attention_heads = config.n_heads
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.max_position_embeddings = config.max_seq_len
-        self.torch_dtype = config.torch_dtype
+        self.torch_dtype = config.neuron_config.torch_dtype
         self.padding_side = config.neuron_config.padding_side
         self.num_key_value_heads = config.attn_config.kv_n_heads
         self.rope_theta = config.attn_config.rope_theta
@@ -161,7 +172,7 @@ class NeuronDbrxBlock(nn.Module):
     Just replace the attention with the NXD version, and MLP with the NXD version
     """
 
-    def __init__(self, config: DbrxConfigAdapter, block_idx: int):
+    def __init__(self, config: DbrxInferenceConfig, block_idx: int):
         super().__init__()
         self.hidden_size = config.d_model
         self.resid_pdrop = config.resid_pdrop
@@ -240,7 +251,7 @@ class NeuronDbrxBlock(nn.Module):
         return outputs
 
 
-class NeuronDbrxModel(NeuronBaseModel, DbrxPreTrainedModel):
+class NeuronDbrxModel(NeuronBaseModel):
     """Transformer decoder consisting of *config.num_hidden_layers*. Each layer is a [`DbrxBlock`] layer.
 
     Args:
@@ -249,9 +260,7 @@ class NeuronDbrxModel(NeuronBaseModel, DbrxPreTrainedModel):
             configuration. Check out the [`~PreTrainedModel.from_pretrained`] method to load the model weights.
     """
 
-    _model_cls = DbrxPreTrainedModel
-
-    def setup_attr_for_model(self, config: DbrxConfigAdapter):
+    def setup_attr_for_model(self, config: DbrxInferenceConfig):
         self.emb_pdrop = config.emb_pdrop
 
         # Needed for init_inference_optimization()
@@ -263,7 +272,7 @@ class NeuronDbrxModel(NeuronBaseModel, DbrxPreTrainedModel):
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
 
-    def init_model(self, config: DbrxConfigAdapter):
+    def init_model(self, config: DbrxInferenceConfig):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -271,7 +280,7 @@ class NeuronDbrxModel(NeuronBaseModel, DbrxPreTrainedModel):
             config.vocab_size,
             config.d_model,
             self.padding_idx,
-            dtype=config.torch_dtype,
+            dtype=config.neuron_config.torch_dtype,
             shard_across_embedding=True,
         )
         self.layers = nn.ModuleList(
@@ -281,9 +290,7 @@ class NeuronDbrxModel(NeuronBaseModel, DbrxPreTrainedModel):
         self.lm_head = ColumnParallelLinear(config.d_model, config.vocab_size, bias=False)
 
 
-class NeuronDbrxForCausalLM(
-    NeuronBaseForCausalLM, HuggingFaceGenerationAdapter, DbrxPreTrainedModel
-):
+class NeuronDbrxForCausalLM(NeuronBaseForCausalLM):
     """
     This class can be used as DbrxForCausalLM
     """
@@ -292,20 +299,16 @@ class NeuronDbrxForCausalLM(
 
     _model_cls = NeuronDbrxModel
 
-    def __init__(self, model_path: str, config: DbrxConfigAdapter):
-        super().__init__(model_path, config)
-        self.sampler = Sampler(config)
-
     @staticmethod
     def load_hf_model(model_path):
         return DbrxForCausalLM.from_pretrained(model_path)
 
     @classmethod
     def get_config_cls(cls):
-        return DbrxConfigAdapter
+        return DbrxInferenceConfig
 
     @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, config: DbrxConfigAdapter) -> dict:
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: DbrxInferenceConfig) -> dict:
         return convert_dbrx_to_neuron_state_dict(state_dict, config)
 
     def get_compiler_args(self):
@@ -315,7 +318,7 @@ class NeuronDbrxForCausalLM(
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
         # Prevent auto-downcasting when running with fp32
-        if self.config.torch_dtype == torch.float32:
+        if self.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
         # Enable vector-offset DGE
         compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"

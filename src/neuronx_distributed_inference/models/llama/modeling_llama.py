@@ -18,7 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch LLaMA model for NXD inference."""
-from typing import Optional, Tuple, Type
+from typing import List, Optional, Tuple, Type
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
@@ -28,7 +28,7 @@ from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E4
     RowParallelLinear,
 )
 from torch import nn
-from transformers import LlamaConfig, LlamaForCausalLM, LlamaPreTrainedModel
+from transformers import LlamaForCausalLM
 from transformers.activations import ACT2FN
 from transformers.models.llama.modeling_llama import (
     LlamaDynamicNTKScalingRotaryEmbedding,
@@ -37,10 +37,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaRotaryEmbedding,
 )
 
-from neuronx_distributed_inference.models.config import (  # noqa: E402
-    NeuronConfig,
-    PretrainedConfigAdapter,
-)
+from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig  # noqa: E402
 from neuronx_distributed_inference.models.model_base import (  # noqa: E402
     NeuronBaseForCausalLM,
     NeuronBaseModel,
@@ -51,7 +48,6 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
-from neuronx_distributed_inference.modules.generation.hf_adapter import HuggingFaceGenerationAdapter
 
 _LLAMA_MODULE_MAP = {}
 
@@ -94,9 +90,23 @@ def register_module(key: str):
     return inner
 
 
-class LlamaConfigAdapter(PretrainedConfigAdapter, LlamaConfig):
+class LlamaInferenceConfig(InferenceConfig):
+    def get_required_attributes(self) -> List[str]:
+        return [
+            "hidden_size",
+            "num_attention_heads",
+            "num_hidden_layers",
+            "num_key_value_heads",
+            "pad_token_id",
+            "vocab_size",
+            "max_position_embeddings",
+            "rope_theta",
+            "rms_norm_eps",
+            "hidden_act",
+        ]
+
     @classmethod
-    def get_neuron_config_cls(cls):
+    def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
         return NeuronConfig
 
 
@@ -105,7 +115,7 @@ class NeuronLlamaMLP(nn.Module):
     This class just replace the linear layers (gate_proj, up_proj and down_proj) with column and row parallel layers
     """
 
-    def __init__(self, config: PretrainedConfigAdapter):
+    def __init__(self, config: InferenceConfig):
         super().__init__()
         self.config = config
         self.neuron_config = config.neuron_config
@@ -120,7 +130,7 @@ class NeuronLlamaMLP(nn.Module):
                 self.intermediate_size,
                 bias=False,
                 gather_output=False,
-                dtype=config.torch_dtype,
+                dtype=config.neuron_config.torch_dtype,
                 pad=True,
             )
             self.up_proj = ColumnParallelLinear(
@@ -128,7 +138,7 @@ class NeuronLlamaMLP(nn.Module):
                 self.intermediate_size,
                 bias=False,
                 gather_output=False,
-                dtype=config.torch_dtype,
+                dtype=config.neuron_config.torch_dtype,
                 pad=True,
             )
             self.down_proj = RowParallelLinear(
@@ -136,7 +146,7 @@ class NeuronLlamaMLP(nn.Module):
                 self.hidden_size,
                 bias=False,
                 input_is_parallel=True,
-                dtype=config.torch_dtype,
+                dtype=config.neuron_config.torch_dtype,
                 pad=True,
             )
         else:
@@ -159,7 +169,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
     5. update forward() method to adjust to changes from self.num_head
     """
 
-    def __init__(self, config: PretrainedConfigAdapter):
+    def __init__(self, config: InferenceConfig):
         super().__init__()
 
         self.config = config
@@ -171,7 +181,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.padding_side = config.neuron_config.padding_side
-        self.torch_dtype = config.torch_dtype
+        self.torch_dtype = config.neuron_config.torch_dtype
         self.is_medusa = config.neuron_config.is_medusa
 
         if parallel_state.model_parallel_is_initialized():
@@ -226,7 +236,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
     Just replace the attention with the NXD version, and MLP with the NXD version
     """
 
-    def __init__(self, config: PretrainedConfigAdapter):
+    def __init__(self, config: InferenceConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = _LLAMA_MODULE_MAP[config.neuron_config.attn_cls](config=config)
@@ -304,12 +314,12 @@ class ResBlock(nn.Module):
         return x + self.act(self.linear(x))
 
 
-class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
+class NeuronLlamaModel(NeuronBaseModel):
     """
     The neuron version of the LlamaModel
     """
 
-    def setup_attr_for_model(self, config: PretrainedConfigAdapter):
+    def setup_attr_for_model(self, config: InferenceConfig):
         # Needed for init_inference_optimization()
         self.on_device_sampling = config.neuron_config.on_device_sampling
         self.tp_degree = config.neuron_config.tp_degree
@@ -319,7 +329,7 @@ class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
 
-    def init_model(self, config: PretrainedConfigAdapter):
+    def init_model(self, config: InferenceConfig):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -328,7 +338,7 @@ class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
                 config.vocab_size,
                 config.hidden_size,
                 self.padding_idx,
-                dtype=config.torch_dtype,
+                dtype=config.neuron_config.torch_dtype,
                 shard_across_embedding=True,
                 # We choose to shard across embedding dimension because this stops XLA from introducing
                 # rank specific constant parameters into the HLO. We could shard across vocab, but that
@@ -379,9 +389,7 @@ class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
                 setattr(self, f"medusa_head_{i}", medusa_head)
 
 
-class NeuronLlamaForCausalLM(
-    NeuronBaseForCausalLM, HuggingFaceGenerationAdapter, LlamaPreTrainedModel
-):
+class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
     """
     This class extends LlamaForCausalLM create traceable
     blocks for Neuron.
@@ -398,4 +406,4 @@ class NeuronLlamaForCausalLM(
 
     @classmethod
     def get_config_cls(cls):
-        return LlamaConfigAdapter
+        return LlamaInferenceConfig

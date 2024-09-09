@@ -1,7 +1,7 @@
 import torch
 import torch_xla.core.xla_model as xm
 
-from neuronx_distributed_inference.models.config import NeuronConfig, PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 
@@ -13,7 +13,6 @@ def test_neuron_sampling_accuracy_bs4():
     run_sampler_accuracy_test(batch_size=4, topk=1)
 
 
-# TODO: Move this test to non-Neuron unit tests.
 def test_greedy_sampling_cpu():
     sampler = get_sampler(topk=1, num_beams=1, on_device=False)
     x = torch.tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
@@ -21,7 +20,6 @@ def test_greedy_sampling_cpu():
     assert torch.equal(sampled, torch.tensor([0, 1, 2]))
 
 
-# TODO: Move this test to non-Neuron unit tests.
 def test_multinomial_sampling_cpu():
     """
     To test multinomial sampling, we fix the seed to 5 and compare
@@ -35,17 +33,18 @@ def test_multinomial_sampling_cpu():
 
 
 def get_sampler(topk, num_beams, on_device=True):
-    hf_kwargs = {
+    neuron_kwargs = {
+        "on_device_sampling": on_device,
+    }
+    neuron_config = NeuronConfig(**neuron_kwargs)
+
+    config_kwargs = {
         "do_sample": True,
         "top_k": topk,
         "num_beams": num_beams,
     }
-    config = PretrainedConfigAdapter(**hf_kwargs)
+    config = InferenceConfig(neuron_config, **config_kwargs)
 
-    neuron_kwargs = {
-        "on_device_sampling": on_device,
-    }
-    config.neuron_config = NeuronConfig(**neuron_kwargs)
     return Sampler(config)
 
 

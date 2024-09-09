@@ -12,7 +12,7 @@ from neuronx_distributed.quantization.quantization_utils import (
 from neuronx_distributed.trace.model_builder import ModelBuilder
 from safetensors.torch import load_file
 
-from neuronx_distributed_inference.models.config import NeuronConfig, PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.models.model_wrapper import ModelWrapper
 from neuronx_distributed_inference.modules.checkpoint import load_state_dict, prune_state_dict
 
@@ -27,47 +27,43 @@ class NeuronApplicationBase(torch.nn.Module):
     _STATE_DICT_MODEL_PREFIX = "model."
     _NEW_STATE_DICT_MODEL_PREFIX = ""
 
-    # TODO: clear torch_dtype and generation_config
+    # TODO: clear generation_config
     def __init__(
         self,
         model_path: str,
+        config: InferenceConfig = None,
         neuron_config: NeuronConfig = None,
-        torch_dtype=None,
         generation_kwargs={"do_sample": True, "top_k": 1},
     ):
-        config = self.get_config_cls().from_pretrained(model_path, **generation_kwargs)
+        if config is None:
+            config = self.get_config_cls().load(model_path, **generation_kwargs)
 
         if neuron_config is not None:
             config.neuron_config = neuron_config
 
-        if torch_dtype:
-            config.torch_dtype = torch_dtype
-
         self.validate_config(config)
-        self.neuron_config = neuron_config
         self.config = config
+        self.neuron_config = config.neuron_config
         self.model_path = model_path
         self.models: List[ModelWrapper] = []
         self.traced_model = None
         self.is_compiled = is_compiled(model_path)
         self.is_loaded_to_neuron = False
 
-        # TODO: clear depedency on NeuronBaseForCasualLM on HF's PretrainedModel
-        #  so it could be super().__init__()
-        super().__init__(config)
+        super().__init__()
 
     def forward(self, **kwargs):
         """Forward pass for this model."""
         raise NotImplementedError("forward is not implemented")
 
     @classmethod
-    def validate_config(cls, config: PretrainedConfigAdapter):
+    def validate_config(cls, config: InferenceConfig):
         """Checks whether the config is valid for this model."""
         if not hasattr(config, "neuron_config"):
             raise ValueError("Config must include a NeuronConfig")
 
     @classmethod
-    def get_config_cls(cls) -> PretrainedConfigAdapter:
+    def get_config_cls(cls) -> InferenceConfig:
         """Gets the config class for this model."""
         raise NotImplementedError("get_config_cls is not implemented")
 
@@ -82,7 +78,7 @@ class NeuronApplicationBase(torch.nn.Module):
 
     def compile(self, compiled_model_path):
         """Compiles this model and saves it to the given path."""
-        self.config.save_pretrained(compiled_model_path)
+        self.config.save(compiled_model_path)
 
         base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
 
@@ -120,7 +116,7 @@ class NeuronApplicationBase(torch.nn.Module):
         self.traced_model = torch.jit.load(compiled_model_path + COMPILED_MODEL_FILE_NAME)
 
         self.load_weights(compiled_model_path)
-        if self.config.torch_dtype == torch.bfloat16:
+        if self.neuron_config.torch_dtype == torch.bfloat16:
             self.bfloat16()
 
         for model_wrapper in self.models:
@@ -150,13 +146,13 @@ class NeuronApplicationBase(torch.nn.Module):
             return self.get_quantized_state_dict(self.config)
         else:
             model_sd = self.get_state_dict(self.model_path, self.config)
-            if self.config.torch_dtype == torch.bfloat16:
+            if self.neuron_config.torch_dtype == torch.bfloat16:
                 for name, param in model_sd.items():
                     model_sd[name] = param.bfloat16()
             return model_sd
 
     @classmethod
-    def get_state_dict(cls, model_path: str, config: PretrainedConfigAdapter) -> dict:
+    def get_state_dict(cls, model_path: str, config: InferenceConfig) -> dict:
         """Gets the state dict for this model."""
         model_sd = load_state_dict(model_path)
         param_name_list = list(model_sd.keys())
@@ -174,7 +170,7 @@ class NeuronApplicationBase(torch.nn.Module):
         return model_sd
 
     @classmethod
-    def get_quantized_state_dict(cls, config: PretrainedConfigAdapter, mmap: bool = False) -> dict:
+    def get_quantized_state_dict(cls, config: InferenceConfig, mmap: bool = False) -> dict:
         """
         This function loads the checkpointed float model state dictionary and weights from the quantized hf model
         This will be removed once we move to safe tensors in NxD
@@ -190,7 +186,7 @@ class NeuronApplicationBase(torch.nn.Module):
         model_quant_sd = cls.convert_hf_to_neuron_state_dict(model_quant_sd, config)
 
         # Make sure that the non quantized weights are in bfloat16 and not float32
-        if config.torch_dtype == torch.bfloat16:
+        if config.neuron_config.torch_dtype == torch.bfloat16:
             for name, param in model_quant_sd.items():
                 # TODO: Reduce and clean-up these warnings
                 if param is not None and param.dtype == torch.float32:
@@ -207,12 +203,12 @@ class NeuronApplicationBase(torch.nn.Module):
         return model_quant_sd
 
     @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, config: PretrainedConfigAdapter) -> dict:
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
         """This function should be over-ridden in child classes as needed"""
         return state_dict
 
     @classmethod
-    def save_quantized_state_dict(cls, model_path: str, config: PretrainedConfigAdapter):
+    def save_quantized_state_dict(cls, model_path: str, config: InferenceConfig):
         """
         Quantizes the model and saves the quantized checkpoint to `config.neuron_config.quantized_checkpoints_path`.
         """
@@ -223,9 +219,7 @@ class NeuronApplicationBase(torch.nn.Module):
         torch.save(quantized_state_dict, config.neuron_config.quantized_checkpoints_path)
 
     @classmethod
-    def generate_quantized_state_dict(
-        cls, model_path: str, config: PretrainedConfigAdapter
-    ) -> dict:
+    def generate_quantized_state_dict(cls, model_path: str, config: InferenceConfig) -> dict:
         """Generates the quantized state dict for this model."""
         hf_model = cls.load_hf_model(model_path)
         quantization_type = QuantizationType(config.neuron_config.quantization_type)

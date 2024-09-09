@@ -3,7 +3,8 @@ import torch
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
+from neuronx_distributed_inference.models.llama.modeling_llama import LlamaInferenceConfig, NeuronLlamaForCausalLM
+from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
 
 model_path = "/home/ubuntu/model_hf/Llama-2-7b/"
 traced_model_path = "/home/ubuntu/traced_model/Llama-2-7b/"
@@ -30,18 +31,18 @@ def run_llama_generate():
         on_device_sampling=True,
         enable_bucketing=True,
     )
+    config = LlamaInferenceConfig(
+        neuron_config,
+        load_config=load_pretrained_config(model_path),
+        **generation_config_kwargs,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
     tokenizer.pad_token = tokenizer.eos_token
         
     # Compile and save model.
     print("\nCompiling and saving model...")
-    model = NeuronLlamaForCausalLM(
-        model_path,
-        neuron_config,
-        torch_dtype=torch.bfloat16,
-        generation_kwargs=generation_config_kwargs
-    )
+    model = NeuronLlamaForCausalLM(model_path, config)
     model.compile(traced_model_path)
     tokenizer.save_pretrained(traced_model_path)
 
@@ -56,7 +57,8 @@ def run_llama_generate():
     prompts = ["I believe the meaning of life is", "The color of the sky is"]
     print(f"Prompts: {prompts}")
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
-    outputs = model.generate(
+    generation_model = HuggingFaceGenerationAdapter(model)
+    outputs = generation_model.generate(
         inputs.input_ids,
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,

@@ -1,13 +1,9 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
-
-from neuronx_distributed.parallel_layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    mappings,
-)
+from neuronx_distributed.parallel_layers import ColumnParallelLinear, RowParallelLinear, mappings
 
 
 class BaseMultiLora(nn.Module):
@@ -40,7 +36,9 @@ class MultiLoraLinear(BaseMultiLora):
         self.output_size = output_size
         super().__init__()
         self.weight_shape = (self.max_loras, self.output_size, self.input_size)
-        self.weight = nn.Parameter(torch.empty(*self.weight_shape, dtype=self.dtype), requires_grad=False)
+        self.weight = nn.Parameter(
+            torch.empty(*self.weight_shape, dtype=self.dtype), requires_grad=False
+        )
 
     def get_checkpoint_shape(self):
         return self.weight_shape
@@ -81,8 +79,9 @@ class MultiLoraConv2d(nn.Conv2d, BaseMultiLora):
                 self.input_size,
                 self.output_size,
                 *self.kernel_size,
-                dtype=self.dtype),
-            requires_grad=False
+                dtype=self.dtype,
+            ),
+            requires_grad=False,
         )
 
     def get_checkpoint_shape(self):
@@ -117,7 +116,9 @@ class MultiLoraEmbedding(BaseMultiLora):
         self.sparse = sparse
         super().__init__()
         self.weight_shape = (self.max_loras, self.output_size, self.input_size)
-        self.weight = nn.Parameter(torch.empty(*self.weight_shape, dtype=self.dtype), requires_grad=False)
+        self.weight = nn.Parameter(
+            torch.empty(*self.weight_shape, dtype=self.dtype), requires_grad=False
+        )
 
     def get_checkpoint_shape(self):
         return self.weight_shape
@@ -133,7 +134,6 @@ class MultiLoraEmbedding(BaseMultiLora):
             scale_grad_by_freq=self.scale_grad_by_freq,
             sparse=self.sparse,
         )
-
 
 
 class MultiLoraColumnParallelLinear(ColumnParallelLinear, BaseMultiLora):
@@ -153,7 +153,7 @@ class MultiLoraColumnParallelLinear(ColumnParallelLinear, BaseMultiLora):
             dtype=dtype,
             bias=False,
             gather_output=False,
-            **kwargs
+            **kwargs,
         )
 
     def set_weight_and_bias_config(self) -> None:
@@ -192,11 +192,7 @@ class MultiLoraRowParallelLinear(RowParallelLinear, BaseMultiLora):
         self.max_loras = max_loras
         self.dtype = dtype
         super().__init__(
-            input_size=input_size,
-            output_size=output_size,
-            dtype=dtype,
-            bias=False,
-            **kwargs
+            input_size=input_size, output_size=output_size, dtype=dtype, bias=False, **kwargs
         )
 
     def set_weight_and_bias_config(self) -> None:

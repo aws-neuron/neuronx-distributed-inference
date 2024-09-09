@@ -1,7 +1,35 @@
+import json
+import logging
+import os
+from typing import Dict, List, Type, Union
+
 import torch
-from transformers import PretrainedConfig
 
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
+
+CONFIG_FILE = "neuron_config.json"
+
+
+def to_torch_dtype(dtype_str: str) -> torch.dtype:
+    dtype_mapping = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }
+    assert dtype_str in dtype_mapping, f"Unsupported dtype: {dtype_str}"
+    return dtype_mapping[dtype_str]
+
+
+def to_dict(obj):
+    if type(obj) is dict:
+        return {k: to_dict(v) for k, v in obj.items()}
+    elif type(obj) is list:
+        return [to_dict(v) for v in obj]
+    elif hasattr(obj, "__dict__"):
+        return {k: to_dict(v) for k, v in obj.__dict__.items()}
+    elif type(obj) is torch.dtype:
+        return str(obj).split(".")[1]
+    else:
+        return obj
 
 
 class NeuronConfig:
@@ -22,6 +50,9 @@ class NeuronConfig:
         # Need to provide example input shape for tracing
         self.n_positions = kwargs.pop("n_positions", self.seq_len)
         self.on_cpu = kwargs.pop("on_cpu", False)
+        self.torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        if isinstance(self.torch_dtype, str):
+            self.torch_dtype = to_torch_dtype(self.torch_dtype)
 
         # fallback to sequence_length is for compatibility with vllm
         self.max_context_length = kwargs.pop("max_context_length", self.seq_len)
@@ -102,43 +133,99 @@ class MoENeuronConfig(NeuronConfig):
         super().__init__(**kwargs)
 
 
-class PretrainedConfigAdapter(PretrainedConfig):
-    """
-    Adapts PretrainedConfig to support a nested neuron_config attribute.
-    """
+class InferenceConfig:
+    # Alias map for attributes.
+    attribute_map: Dict[str, str] = {}
 
-    def __init__(self, neuron_config: NeuronConfig = None, **kwargs):
+    def __init__(self, neuron_config: NeuronConfig, load_config=None, **kwargs):
         self.neuron_config = neuron_config
-        super().__init__(**kwargs)
+        if load_config is not None:
+            load_config(self)
+        else:
+            self.load_config()
 
-    def to_dict(self):
-        output = super().to_dict()
-        if isinstance(self.neuron_config, NeuronConfig):
-            output["neuron_config"] = to_dict(self.neuron_config)
-        return output
+        # Override config values from kwargs.
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+        self.validate_config()
+
+    def __setattr__(self, key, value):
+        if key in super().__getattribute__("attribute_map"):
+            key = super().__getattribute__("attribute_map")[key]
+        super().__setattr__(key, value)
+
+    def __getattribute__(self, key):
+        if key != "attribute_map" and key in super().__getattribute__("attribute_map"):
+            key = super().__getattribute__("attribute_map")[key]
+        return super().__getattribute__(key)
+
+    def load_config(self):
+        """
+        Loads the config and sets attributes needed by the model you use.
+        """
+        pass
+
+    def get_required_attributes(self) -> List[str]:
+        """The list of attributes that must be present for validation to pass."""
+        return []
+
+    def validate_config(self):
+        """
+        Validates that the config has all required attributes.
+        """
+        missing_attributes = [x for x in self.get_required_attributes() if not hasattr(self, x)]
+        assert len(missing_attributes) == 0, f"Config must define {missing_attributes}"
+
+    def save(self, model_path: Union[str, os.PathLike]):
+        """
+        Saves the config to a JSON file in the given model directory.
+        """
+        if not os.path.exists(model_path):
+            os.makedirs(model_path)
+        config_file = os.path.join(model_path, CONFIG_FILE)
+        self.to_json_file(config_file)
+
+    def to_json_file(self, json_file: Union[str, os.PathLike]):
+        with open(json_file, "w", encoding="utf-8") as writer:
+            config_json = self.to_json_string()
+            logging.debug(f"Saving config: {config_json}")
+            writer.write(config_json + "\n")
+
+    def to_json_string(self) -> str:
+        config_dict = to_dict(self)
+        return json.dumps(config_dict, indent=2, sort_keys=True)
 
     @classmethod
-    def from_dict(cls, config_dict, **kwargs):
-        config: PretrainedConfigAdapter = super().from_dict(config_dict, **kwargs)
-        if config.neuron_config is not None:
-            merged_kwargs = config.neuron_config
-            merged_kwargs.update(kwargs)
-            config.neuron_config = cls.get_neuron_config_cls()(**merged_kwargs)
-        return config
+    def load(cls, model_path: Union[str, os.PathLike], **kwargs) -> "InferenceConfig":
+        """
+        Loads the config from the given model directory.
+
+        The given kwargs override any properties of the same name from the JSON file.
+        """
+        config_file = os.path.join(model_path, CONFIG_FILE)
+        return cls.from_json_file(config_file, **kwargs)
 
     @classmethod
-    def get_neuron_config_cls(cls) -> NeuronConfig:
-        raise NeuronConfig
+    def from_json_file(cls, json_file: Union[str, os.PathLike], **kwargs) -> "InferenceConfig":
+        with open(json_file, "r", encoding="utf-8") as reader:
+            config = cls.from_json_string(reader.read(), **kwargs)
+            logging.info(f"Loaded Neuron config: {config.to_json_string()}")
+            return config
 
+    @classmethod
+    def from_json_string(cls, json_string: str, **kwargs) -> "InferenceConfig":
+        merged_kwargs = json.loads(json_string)
+        merged_kwargs.update(kwargs)
 
-def to_dict(obj):
-    if type(obj) is dict:
-        return {k: to_dict(v) for k, v in obj.items()}
-    elif type(obj) is list:
-        return [to_dict(v) for v in obj]
-    elif hasattr(obj, "__dict__"):
-        return {k: to_dict(v) for k, v in obj.__dict__.items()}
-    elif type(obj) is torch.dtype:
-        return str(obj).split(".")[1]
-    else:
-        return obj
+        # Initialize NeuronConfig from dict.
+        if "neuron_config" in merged_kwargs and isinstance(merged_kwargs["neuron_config"], dict):
+            merged_kwargs["neuron_config"] = cls.get_neuron_config_cls()(
+                **merged_kwargs["neuron_config"]
+            )
+
+        return cls(**merged_kwargs)
+
+    @classmethod
+    def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
+        return NeuronConfig

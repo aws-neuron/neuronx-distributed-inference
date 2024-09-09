@@ -3,10 +3,10 @@ import torch.nn as nn
 
 from .config import LoraServingConfig
 from .lora_layer import (
-    MultiLoraLinear,
+    MultiLoraColumnParallelLinear,
     MultiLoraConv2d,
     MultiLoraEmbedding,
-    MultiLoraColumnParallelLinear,
+    MultiLoraLinear,
     MultiLoraRowParallelLinear,
 )
 
@@ -140,11 +140,22 @@ class MultiLoraModuleEmbedding(MultiLoraModule):
 
 class MultiLoraModuleColumnParallelLinear(MultiLoraModule):
     def create_lora(self):
-        self.lora_A = MultiLoraLinear(self.max_loras, self.in_features, self.lora_max_rank, self.lora_dtype,)
-        self.lora_B = MultiLoraColumnParallelLinear(self.max_loras, self.lora_max_rank, self.out_features, self.lora_dtype)
+        self.lora_A = MultiLoraLinear(
+            self.max_loras,
+            self.in_features,
+            self.lora_max_rank,
+            self.lora_dtype,
+        )
+        self.lora_B = MultiLoraColumnParallelLinear(
+            self.max_loras, self.lora_max_rank, self.out_features, self.lora_dtype
+        )
 
 
 class MultiLoraModuleRowParallelLinear(MultiLoraModule):
     def create_lora(self):
-        self.lora_A = MultiLoraRowParallelLinear(self.max_loras, self.in_features, self.lora_max_rank, self.lora_dtype)
-        self.lora_B = MultiLoraLinear(self.max_loras, self.lora_max_rank, self.out_features, self.lora_dtype)
+        self.lora_A = MultiLoraRowParallelLinear(
+            self.max_loras, self.in_features, self.lora_max_rank, self.lora_dtype
+        )
+        self.lora_B = MultiLoraLinear(
+            self.max_loras, self.lora_max_rank, self.out_features, self.lora_dtype
+        )

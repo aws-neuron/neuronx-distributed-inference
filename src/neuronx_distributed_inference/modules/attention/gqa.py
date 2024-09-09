@@ -106,8 +106,9 @@ def should_pad_scale(tensor_scale: torch.Tensor, pad_dim: int) -> bool:
 
 
 def verify_scale_dimension(tensor: torch.Tensor, tensor_scale: torch.Tensor):
-    channel_axis = get_tensor_per_channel_scale_axis(scale=tensor_scale)
-    assert tensor_scale.shape[channel_axis] == tensor.shape[channel_axis]
+    if is_per_channel(tensor_scale):
+        channel_axis = get_tensor_per_channel_scale_axis(scale=tensor_scale)
+        assert tensor_scale.shape[channel_axis] == tensor.shape[channel_axis]
 
 
 def maybe_pad_interleaved(

@@ -14,15 +14,13 @@
 """ PyTorch Mixtral model for NXD inference."""
 import gc
 import warnings
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.modules.attention.gqa import GQA
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
-from neuronx_distributed_inference.modules.generation.hf_adapter import HuggingFaceGenerationAdapter
-from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 # Try except for the compatibility with older compiler version
 try:
@@ -37,11 +35,11 @@ from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
 from torch import nn
 from torch_neuronx.xla_impl.ops import nki_jit
-from transformers import MixtralConfig, MixtralForCausalLM, MixtralPreTrainedModel
+from transformers import MixtralForCausalLM
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.models.mixtral.modeling_mixtral import MixtralRMSNorm
 
-from neuronx_distributed_inference.models.config import MoENeuronConfig, PretrainedConfigAdapter
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 
@@ -135,14 +133,29 @@ def get_rmsnorm_cls(config):
     return MixtralRMSNorm if config.neuron_config.on_cpu else CustomRMSNorm
 
 
-class MixtralConfigAdapter(PretrainedConfigAdapter, MixtralConfig):
+class MixtralInferenceConfig(InferenceConfig):
+    def get_required_attributes(self) -> List[str]:
+        return [
+            "hidden_size",
+            "num_attention_heads",
+            "num_hidden_layers",
+            "num_key_value_heads",
+            "pad_token_id",
+            "vocab_size",
+            "max_position_embeddings",
+            "rope_theta",
+            "num_local_experts",
+            "num_experts_per_tok",
+            "rms_norm_eps",
+        ]
+
     @classmethod
     def get_neuron_config_cls(cls):
         return MoENeuronConfig
 
 
 class NeuronMixtralAttention(NeuronAttentionBase):
-    def __init__(self, config: MixtralConfigAdapter):
+    def __init__(self, config: MixtralInferenceConfig):
         super().__init__()
         self.config = config
         self.neuron_config = config.neuron_config
@@ -153,7 +166,7 @@ class NeuronMixtralAttention(NeuronAttentionBase):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.padding_side = config.neuron_config.padding_side
-        self.torch_dtype = config.torch_dtype
+        self.torch_dtype = config.neuron_config.torch_dtype
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
@@ -178,7 +191,7 @@ class NeuronMixtralDecoderLayer(nn.Module):
     Just replace the attention with the NXD version, and MLP with the NXD version
     """
 
-    def __init__(self, config: MixtralConfigAdapter, layer_idx: int):
+    def __init__(self, config: MixtralInferenceConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronMixtralAttention(config=config)
@@ -261,15 +274,13 @@ class NeuronMixtralDecoderLayer(nn.Module):
         return outputs
 
 
-class NeuronMixtralModel(NeuronBaseModel, MixtralPreTrainedModel):
+class NeuronMixtralModel(NeuronBaseModel):
     """
     NeuronMixtralModel extends the MixtralModel to be traceable.
     The forward function of this class is traced.
     """
 
-    _model_cls = MixtralPreTrainedModel
-
-    def setup_attr_for_model(self, config: MixtralConfigAdapter):
+    def setup_attr_for_model(self, config: MixtralInferenceConfig):
         self.on_device_sampling = config.neuron_config.on_device_sampling
         self.tp_degree = config.neuron_config.tp_degree
         self.hidden_size = config.hidden_size
@@ -278,7 +289,7 @@ class NeuronMixtralModel(NeuronBaseModel, MixtralPreTrainedModel):
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
 
-    def init_model(self, config: MixtralConfigAdapter):
+    def init_model(self, config: MixtralInferenceConfig):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -286,7 +297,7 @@ class NeuronMixtralModel(NeuronBaseModel, MixtralPreTrainedModel):
             config.vocab_size,
             config.hidden_size,
             self.padding_idx,
-            dtype=config.torch_dtype,
+            dtype=config.neuron_config.torch_dtype,
             shard_across_embedding=True,
         )
         self.layers = nn.ModuleList(
@@ -299,18 +310,12 @@ class NeuronMixtralModel(NeuronBaseModel, MixtralPreTrainedModel):
         self.lm_head = ColumnParallelLinear(config.hidden_size, self.vocab_size, bias=False)
 
 
-class NeuronMixtralForCausalLM(
-    NeuronBaseForCausalLM, HuggingFaceGenerationAdapter, MixtralPreTrainedModel
-):
+class NeuronMixtralForCausalLM(NeuronBaseForCausalLM):
     """
     This class can be used as MixtralForCausalLM
     """
 
     _model_cls = NeuronMixtralModel
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.sampler = Sampler(self.config)
 
     @staticmethod
     def load_hf_model(model_path):
@@ -318,10 +323,10 @@ class NeuronMixtralForCausalLM(
 
     @classmethod
     def get_config_cls(cls):
-        return MixtralConfigAdapter
+        return MixtralInferenceConfig
 
     @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, config: MixtralConfigAdapter) -> dict:
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: MixtralInferenceConfig) -> dict:
         return convert_mixtral_to_neuron_state_dict(state_dict, config)
 
     def get_compiler_args(self):
@@ -331,7 +336,7 @@ class NeuronMixtralForCausalLM(
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
         # Prevent auto-down casting when running with fp32
-        if self.config.torch_dtype == torch.float32:
+        if self.config.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
         # Enable vector-offset DGE
         compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"

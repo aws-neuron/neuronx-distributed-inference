@@ -52,7 +52,7 @@ class ModelWrapperLlava(ModelWrapper):
                     self.config.vision_config.image_size,
                     self.config.vision_config.image_size,
                 ),
-                dtype=self.config.torch_dtype,
+                dtype=self.neuron_config.torch_dtype,
             )
             text_embedding_indices = torch.zeros(
                 (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int64

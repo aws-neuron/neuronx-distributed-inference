@@ -8,12 +8,17 @@ from neuronx_distributed.quantization.quantization_config import QuantizationTyp
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
+from neuronx_distributed_inference.models.config import to_torch_dtype
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.accuracy import check_accuracy, check_accuracy_logits
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
-from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
+from neuronx_distributed_inference.utils.hf_adapter import (
+    HuggingFaceGenerationAdapter,
+    load_pretrained_config,
+)
 
 torch.manual_seed(0)
 
@@ -28,15 +33,6 @@ class CheckAccuracyMode(Enum):
     SKIP_ACCURACY_CHECK = "skip-accuracy-check"
     TOKEN_MATCHING = "token-matching"
     LOGIT_MATCHING = "logit-matching"
-
-
-def get_torch_dtype(dtype_str: str) -> torch.dtype:
-    dtype_mapping = {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-    }
-    assert dtype_str in dtype_mapping, f"Unsupported dtype: {dtype_str}"
-    return dtype_mapping[dtype_str]
 
 
 def parse_args():
@@ -71,7 +67,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--pad-token-id", type=int, default=0)
 
     # Basic config
-    run_parser.add_argument("--torch-dtype", type=get_torch_dtype)
+    run_parser.add_argument("--torch-dtype", type=to_torch_dtype)
     run_parser.add_argument("--tp-degree", type=int)
     run_parser.add_argument("--batch-size", type=int)
     run_parser.add_argument("--padding-side", type=str)
@@ -121,7 +117,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--enable-lora", action="store_true")
     run_parser.add_argument("--max-loras", type=int, default=1)
     run_parser.add_argument("--max-lora-rank", type=int, default=16)
-    run_parser.add_argument("--target-modules", nargs='+')
+    run_parser.add_argument("--target-modules", nargs="+")
     run_parser.add_argument("--max-loras-on-cpu", type=int, default=2)
 
     # TODO: Add medusa
@@ -138,44 +134,41 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     }
     generation_config.update(**generation_config_kwargs)
 
-    torch_dtype = torch.bfloat16
-    if hasattr(args, "torch_dtype") and args.torch_dtype is not None:
-        torch_dtype = args.torch_dtype
-
     # Skip values not specified in the args to avoid setting values to None in the config.
     config_kwargs = copy.deepcopy(vars(args))
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
     if args.enable_lora:
         config_kwargs["lora_config"] = LoraServingConfig(
-            max_loras = args.max_loras,
-            max_lora_rank = args.max_lora_rank,
-            target_modules = args.target_modules,
-            max_loras_on_cpu = args.max_loras_on_cpu,
+            max_loras=args.max_loras,
+            max_lora_rank=args.max_lora_rank,
+            target_modules=args.target_modules,
+            max_loras_on_cpu=args.max_loras_on_cpu,
         )
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
-    model = model_cls(
-        args.model_path,
+    config = model_cls.get_config_cls()(
         neuron_config,
-        torch_dtype=torch_dtype,
-        generation_kwargs=generation_config_kwargs,
+        load_config=load_pretrained_config(args.model_path),
+        **generation_config_kwargs,
     )
 
-    config = model.config
+    model = model_cls(args.model_path, config)
 
     # Initialize draft model.
     draft_model = None
     if neuron_config.speculation_length > 0:
         # Reset speculation options to defaults for the draft model.
-        draft_neuron_config = copy.deepcopy(neuron_config)
+        draft_neuron_config = copy.deepcopy(config.neuron_config)
         draft_neuron_config.speculation_length = 0
         draft_neuron_config.trace_tokengen_model = True
-        draft_model = model_cls(
-            args.draft_model_path,
+
+        draft_config = model_cls.get_config_cls()(
             draft_neuron_config,
-            torch_dtype=torch_dtype,
-            generation_kwargs=generation_config_kwargs,
+            load_config=load_pretrained_config(args.draft_model_path),
+            **generation_config_kwargs,
         )
+
+        draft_model = model_cls(args.draft_model_path, draft_config)
 
     # Quantize model.
     if neuron_config.quantized:
@@ -208,7 +201,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
 
     # Benchmarking.
     if args.benchmark:
-        benchmark_sampling(model, draft_model)
+        benchmark_sampling(model, draft_model, generation_config)
 
 
 def load_tokenizer(model_path, compiled_model_path, neuron_config):
@@ -224,10 +217,12 @@ def run_generation(model, tokenizer, prompts, generation_config, draft_model=Non
 
     kwargs = {}
     if draft_model is not None:
-        kwargs.update({"assistant_model": draft_model, "do_sample": False})
+        draft_generation_model = HuggingFaceGenerationAdapter(draft_model)
+        kwargs.update({"assistant_model": draft_generation_model, "do_sample": False})
 
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
-    outputs = model.generate(
+    generation_model = HuggingFaceGenerationAdapter(model)
+    outputs = generation_model.generate(
         inputs.input_ids,
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,
