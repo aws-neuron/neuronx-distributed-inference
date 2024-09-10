@@ -10,6 +10,7 @@ from neuronx_distributed.quantization.quantization_utils import (
     quantize_pytorch_model_per_tensor_symmetric,
 )
 from neuronx_distributed.trace.model_builder import ModelBuilder
+import neuronx_distributed.trace.hlo_utils as hlo_utils
 from safetensors.torch import load_file
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
@@ -106,7 +107,13 @@ class NeuronApplicationBase(torch.nn.Module):
         torch.jit.save(traced_model, compiled_model_path + COMPILED_MODEL_FILE_NAME)
         del traced_model
 
-        builder.shard_checkpoint(serialize_path=os.path.join(compiled_model_path, "weights/"))
+        sharded_checkpoint_dir = os.path.join(compiled_model_path, "weights/")
+        builder.shard_checkpoint(serialize_path=sharded_checkpoint_dir)
+
+        if hlo_utils.NXD_LAYOUT_TRANSFORMATION_OPTIONS in os.environ:
+            builder.transform_weight_layout_with_overriden_option(
+                sharded_checkpoint_dir=sharded_checkpoint_dir
+            )
 
         self.is_compiled = True
         self.is_loaded_to_neuron = True
