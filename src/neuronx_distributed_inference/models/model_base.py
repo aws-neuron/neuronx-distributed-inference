@@ -454,6 +454,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             model_cls=self._model_cls,
             tag=TOKEN_GENERATION_MODEL_TAG,
             compiler_args=self.get_compiler_args(),
+            priority_model_idx=0,  # to turn on weight layout optimization
         )
         self.models.append(self.token_generation_model)
 
