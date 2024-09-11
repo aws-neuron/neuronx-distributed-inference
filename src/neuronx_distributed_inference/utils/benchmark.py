@@ -34,9 +34,6 @@ def benchmark_sampling(
         input_ids, attention_mask, pixel_values = get_sample_inputs(
             END_TO_END_MODEL, neuron_config, image=image
         )
-        draft_generation_model = (
-            HuggingFaceGenerationAdapter(draft_model) if draft_model is not None else None,
-        )
         input_param = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -44,8 +41,10 @@ def benchmark_sampling(
             "top_k": 1,
             "do_sample": draft_model is None,
             "generation_config": generation_config,
-            "assistant_model": draft_generation_model,
         }
+
+        if draft_model is not None:
+            input_param["assistant_model"] = HuggingFaceGenerationAdapter(draft_model)
 
         if pixel_values is not None:
             input_param["pixel_values"] = pixel_values
