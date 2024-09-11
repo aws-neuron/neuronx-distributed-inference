@@ -10,7 +10,7 @@ from neuronx_distributed.utils.medusa_utils import (
     generate_medusa_buffers,
     update_inference_inputs,
 )
-from transformers import AutoConfig, GenerationConfig, PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import (
@@ -61,22 +61,32 @@ def to_pretrained_config(config: InferenceConfig):
 
 
 class HuggingFaceGenerationAdapter(PreTrainedModel):
-    def __init__(self, model: NeuronApplicationBase, generation_config: GenerationConfig = None):
+    def __init__(self, model: NeuronApplicationBase):
         hf_config = to_pretrained_config(model.config)
         super().__init__(hf_config)
 
         self.neuron_model = model
         self.neuron_config = model.config.neuron_config
+        self.on_device_sampling = self.neuron_config.on_device_sampling_config is not None
         self.padding_side = self.neuron_config.padding_side
         self.sampler = None
         self.prev_kv_cache_populated = False
-        if generation_config is not None:
-            self.generation_config = generation_config
-            self.generation_config.max_length = self.neuron_config.max_length
+
+        # Temporarily track the generation config for the current generate() call.
+        # In transformers 4.41+, the current generation config is passed to each generation mode function.
+        self.current_generation_config = None
 
     def forward(self, *args, **kwargs):
         return self.neuron_model(*args, **kwargs)
 
+    # Temporary override to capture the current generate() call's generation config.
+    # In transformers 4.41+, the current generation config is passed to each generation mode function.
+    def _prepare_generation_config(self, *args, **kwargs):
+        generation_config, model_kwargs = super()._prepare_generation_config(*args, **kwargs)
+        self.current_generation_config = generation_config
+        return generation_config, model_kwargs
+
+    # TODO: Remove _sample and define separate flow for on-device sampling that doesn't use HF.
     def _sample(
         self,
         input_ids: torch.LongTensor,
@@ -101,14 +111,21 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         stopping_criteria = (
             stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
         )
+        max_length = (
+            max_length if max_length is not None else self.current_generation_config.max_length
+        )
         if max_length is not None:
             stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
         logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
         pad_token_id = (
-            pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
+            pad_token_id
+            if pad_token_id is not None
+            else self.current_generation_config.pad_token_id
         )
         eos_token_id = (
-            eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+            eos_token_id
+            if eos_token_id is not None
+            else self.current_generation_config.eos_token_id
         )
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
@@ -132,7 +149,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             # forward pass to get next token
             outputs = self(**model_inputs, return_dict=True)
 
-            if not self.neuron_config.on_device_sampling:
+            if not self.on_device_sampling:
                 next_token_logits = outputs.logits[:, -1, :]
 
                 # pre-process distribution
@@ -145,10 +162,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                     if output_logits:
                         raw_logits += (next_token_logits,)
 
-            if not self.neuron_config.on_device_sampling:
+            if not self.on_device_sampling:
                 if self.sampler is None:
-                    self.neuron_model.config.do_sample = True
-                    self.sampler = Sampler(self.neuron_model.config)
+                    self.sampler = Sampler(
+                        self.neuron_config, top_k=self.current_generation_config.top_k
+                    )
                 next_tokens = self.sampler.sample(outputs.logits[:, -1, :])
             else:
                 next_tokens = outputs.tokens
@@ -302,6 +320,17 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         eos_token_id: Optional[Union[int, List[int]]] = None,
         **model_kwargs,
     ):
+        do_sample = do_sample if do_sample is not None else self.current_generation_config.do_sample
+        pad_token_id = (
+            pad_token_id
+            if pad_token_id is not None
+            else self.current_generation_config.pad_token_id
+        )
+        eos_token_id = (
+            eos_token_id
+            if eos_token_id is not None
+            else self.current_generation_config.eos_token_id
+        )
         if do_sample:
             raise ValueError(
                 "Sampling is unsupported as part of speculation. Only greedy speculation is supported."

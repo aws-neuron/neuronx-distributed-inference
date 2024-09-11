@@ -1,7 +1,7 @@
 import torch
 import torch_xla.core.xla_model as xm
 
-from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
+from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 
@@ -33,19 +33,15 @@ def test_multinomial_sampling_cpu():
 
 
 def get_sampler(topk, num_beams, on_device=True):
-    neuron_kwargs = {
-        "on_device_sampling": on_device,
-    }
+    neuron_kwargs = {}
+    if on_device:
+        neuron_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(top_k=topk)
     neuron_config = NeuronConfig(**neuron_kwargs)
 
-    config_kwargs = {
-        "do_sample": True,
-        "top_k": topk,
-        "num_beams": num_beams,
-    }
-    config = InferenceConfig(neuron_config, **config_kwargs)
-
-    return Sampler(config)
+    sampler_kwargs = {}
+    if not on_device:
+        sampler_kwargs["top_k"] = topk
+    return Sampler(neuron_config, **sampler_kwargs)
 
 
 def run_sampler_accuracy_test(batch_size, topk, num_beams=1):

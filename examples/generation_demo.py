@@ -2,7 +2,7 @@ import torch
 
 from transformers import AutoTokenizer, GenerationConfig
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.models.llama.modeling_llama import LlamaInferenceConfig, NeuronLlamaForCausalLM
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
 
@@ -22,19 +22,17 @@ def run_llama_generate():
     }
     generation_config.update(**generation_config_kwargs)
 
-    # TODO: Separate GenerationConfig from PretrainedConfig
     neuron_config = NeuronConfig(
         tp_degree=32,
         batch_size=2,
         max_context_length=32,
         seq_len=64,
-        on_device_sampling=True,
+        on_device_sampling_config=OnDeviceSamplingConfig(top_k=1),
         enable_bucketing=True,
     )
     config = LlamaInferenceConfig(
         neuron_config,
         load_config=load_pretrained_config(model_path),
-        **generation_config_kwargs,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")

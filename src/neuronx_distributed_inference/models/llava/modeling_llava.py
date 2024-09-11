@@ -109,7 +109,7 @@ class NeuronLlavaModel(NeuronBaseModel, LlavaPreTrainedModel):
         super().__init__(config, optimize_inference=False)
 
     def setup_attr_for_model(self, config: LlavaInferenceConfig):
-        self.on_device_sampling = config.neuron_config.on_device_sampling
+        self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
         self.tp_degree = config.neuron_config.tp_degree
         self.neuron_config = config.neuron_config
 

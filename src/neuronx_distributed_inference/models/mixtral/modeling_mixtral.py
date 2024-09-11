@@ -281,7 +281,7 @@ class NeuronMixtralModel(NeuronBaseModel):
     """
 
     def setup_attr_for_model(self, config: MixtralInferenceConfig):
-        self.on_device_sampling = config.neuron_config.on_device_sampling
+        self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
         self.tp_degree = config.neuron_config.tp_degree
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads

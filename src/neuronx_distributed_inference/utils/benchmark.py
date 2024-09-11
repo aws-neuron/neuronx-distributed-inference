@@ -5,7 +5,7 @@ from functools import partial
 
 import numpy as np
 import torch
-from transformers import GenerationConfig, PreTrainedModel
+from transformers import GenerationConfig
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.config import NeuronConfig
@@ -36,6 +36,7 @@ def benchmark_sampling(
         )
         input_param = {
             "input_ids": input_ids,
+            "generation_config": generation_config,
             "attention_mask": attention_mask,
             "max_new_tokens": neuron_config.max_new_tokens,
             "top_k": 1,

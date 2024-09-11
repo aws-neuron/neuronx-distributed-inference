@@ -76,7 +76,11 @@ class NeuronConfig:
         self.is_continuous_batching = kwargs.pop("is_continuous_batching", False)
 
         # On-device sampling
-        self.on_device_sampling = kwargs.pop("on_device_sampling", False)
+        self.on_device_sampling_config = kwargs.pop("on_device_sampling_config", None)
+        if type(self.on_device_sampling_config) is dict:
+            self.on_device_sampling_config = OnDeviceSamplingConfig(
+                **self.on_device_sampling_config
+            )
 
         # Bucketing
         self.enable_bucketing = kwargs.pop("enable_bucketing", False)
@@ -237,3 +241,8 @@ class InferenceConfig:
     @classmethod
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
         return NeuronConfig
+
+
+class OnDeviceSamplingConfig:
+    def __init__(self, **kwargs):
+        self.top_k = kwargs.pop("top_k", 1)

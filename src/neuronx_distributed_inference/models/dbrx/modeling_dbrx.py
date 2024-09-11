@@ -264,7 +264,7 @@ class NeuronDbrxModel(NeuronBaseModel):
         self.emb_pdrop = config.emb_pdrop
 
         # Needed for init_inference_optimization()
-        self.on_device_sampling = config.neuron_config.on_device_sampling
+        self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
         self.tp_degree = config.neuron_config.tp_degree
         self.hidden_size = config.d_model
         self.num_attention_heads = config.n_heads

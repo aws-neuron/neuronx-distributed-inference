@@ -83,7 +83,7 @@ class NeuronBaseModel(nn.Module):
 
     def init_inference_optimization(self, config: InferenceConfig):
         if self.on_device_sampling:
-            self.sampler = Sampler(config)
+            self.sampler = Sampler(config.neuron_config)
         self.kv_mgr = KVCacheManager(config, num_kv_head=self.num_key_value_heads)
 
     def _create_context_attn_mask(self, attention_mask):
@@ -148,7 +148,9 @@ class NeuronBaseModel(nn.Module):
                 "current_length": current_length,
                 "accepted_indices": accepted_indices,
             }
-            past_key_values = self.kv_mgr.get_cache(self.n_positions, medusa_metadata=medusa_metadata)
+            past_key_values = self.kv_mgr.get_cache(
+                self.n_positions, medusa_metadata=medusa_metadata
+            )
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
@@ -561,7 +563,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
 
         logging.debug("---output---")
         logging.debug(
-            f"{'tokens' if self.neuron_config.on_device_sampling else 'logits'} = %s, ",
+            f"{'tokens' if self.on_device_sampling else 'logits'} = %s, ",
             logits_or_next_tokens,
         )
 
@@ -670,7 +672,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             next_tokens = logits_or_next_tokens
 
         OutputParams = CausalLMOutputWithPast(
-            logits=None if self.neuron_config.on_device_sampling else logits_or_next_tokens,
+            logits=None if self.on_device_sampling else logits_or_next_tokens,
             hidden_states=logits_or_next_tokens,
             attentions=None,
         )

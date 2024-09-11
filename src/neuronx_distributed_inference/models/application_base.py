@@ -2,6 +2,7 @@ import os
 import warnings
 from typing import List
 
+import neuronx_distributed.trace.hlo_utils as hlo_utils
 import torch
 from neuronx_distributed.quantization.quantization_config import QuantizationType
 from neuronx_distributed.quantization.quantization_utils import (
@@ -10,7 +11,6 @@ from neuronx_distributed.quantization.quantization_utils import (
     quantize_pytorch_model_per_tensor_symmetric,
 )
 from neuronx_distributed.trace.model_builder import ModelBuilder
-import neuronx_distributed.trace.hlo_utils as hlo_utils
 from safetensors.torch import load_file
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
@@ -28,16 +28,14 @@ class NeuronApplicationBase(torch.nn.Module):
     _STATE_DICT_MODEL_PREFIX = "model."
     _NEW_STATE_DICT_MODEL_PREFIX = ""
 
-    # TODO: clear generation_config
     def __init__(
         self,
         model_path: str,
         config: InferenceConfig = None,
         neuron_config: NeuronConfig = None,
-        generation_kwargs={"do_sample": True, "top_k": 1},
     ):
         if config is None:
-            config = self.get_config_cls().load(model_path, **generation_kwargs)
+            config = self.get_config_cls().load(model_path)
 
         if neuron_config is not None:
             config.neuron_config = neuron_config
@@ -45,6 +43,7 @@ class NeuronApplicationBase(torch.nn.Module):
         self.validate_config(config)
         self.config = config
         self.neuron_config = config.neuron_config
+        self.on_device_sampling = self.neuron_config.on_device_sampling_config is not None
         self.model_path = model_path
         self.models: List[ModelWrapper] = []
         self.traced_model = None

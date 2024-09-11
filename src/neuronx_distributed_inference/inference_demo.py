@@ -9,7 +9,7 @@ from neuronx_distributed.quantization.quantization_config import QuantizationTyp
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
-from neuronx_distributed_inference.models.config import to_torch_dtype
+from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig, to_torch_dtype
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
@@ -137,17 +137,12 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 def run_inference(model_cls: Type[NeuronApplicationBase], args):
     # Initialize configs.
     print("Loading configs...")
-    # TODO: Temporary solution until we separate GenerationConfig from PretrainedConfig
-    generation_config = GenerationConfig.from_pretrained(args.model_path)
-    generation_config_args = ["do_sample", "top_k", "pad_token_id"]
-    generation_config_kwargs = {
-        k: getattr(args, k) for k in generation_config_args if getattr(args, k) is not None
-    }
-    generation_config.update(**generation_config_kwargs)
 
     # Skip values not specified in the args to avoid setting values to None in the config.
     config_kwargs = copy.deepcopy(vars(args))
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
+    if args.on_device_sampling:
+        config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
     if args.enable_lora:
         config_kwargs["lora_config"] = LoraServingConfig(
             max_loras=args.max_loras,
@@ -160,9 +155,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     print("Running with neuron_config:\n", json.dumps(neuron_config.__dict__, indent=4))
 
     config = model_cls.get_config_cls()(
-        neuron_config,
-        load_config=load_pretrained_config(args.model_path),
-        **generation_config_kwargs,
+        neuron_config, load_config=load_pretrained_config(args.model_path)
     )
 
     model = model_cls(args.model_path, config)
@@ -176,9 +169,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         draft_neuron_config.trace_tokengen_model = True
 
         draft_config = model_cls.get_config_cls()(
-            draft_neuron_config,
-            load_config=load_pretrained_config(args.draft_model_path),
-            **generation_config_kwargs,
+            draft_neuron_config, load_config=load_pretrained_config(args.draft_model_path)
         )
 
         draft_model = model_cls(args.draft_model_path, draft_config)
@@ -203,6 +194,14 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
 
     # Load tokenizer.
     tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
+
+    # Configure generation config.
+    generation_config = GenerationConfig.from_pretrained(args.model_path)
+    generation_config_args = ["do_sample", "top_k", "pad_token_id"]
+    generation_config_kwargs = {
+        k: getattr(args, k) for k in generation_config_args if getattr(args, k) is not None
+    }
+    generation_config.update(**generation_config_kwargs)
 
     # Check accuracy.
     run_accuracy_check(

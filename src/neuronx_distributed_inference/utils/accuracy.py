@@ -5,6 +5,7 @@ Some of the utitlies functions need to be redo or removed.
 """
 # flake8: noqa
 
+import copy
 from functools import partial
 from typing import List, Optional, Union
 
@@ -13,6 +14,7 @@ from torch_neuronx.testing.validation import logit_validation
 from transformers import GenerationConfig, PreTrainedModel, PreTrainedTokenizer
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 
+from neuronx_distributed_inference.models.config import NeuronConfig
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
@@ -47,7 +49,6 @@ def get_generate_outputs(
         tokenizer.padding_side = "right"
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
 
-    generation_config = generate_kwargs.get("generation_config", None)
     generation_model = model if is_hf else HuggingFaceGenerationAdapter(model)
     outputs = generation_model.generate(
         inputs.input_ids, attention_mask=inputs.attention_mask, **generate_kwargs
@@ -154,7 +155,7 @@ def check_accuracy_logits(
     divergence_difference_tol: float = 0.001,
     tol_map: dict = None,
 ):
-    if neuron_model.neuron_config.on_device_sampling:
+    if neuron_model.neuron_config.on_device_sampling_config is not None:
         raise ValueError("Logits validation is not supported with on-device sampling.")
 
     generation_kwargs = {
