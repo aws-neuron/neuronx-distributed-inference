@@ -81,6 +81,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 
     # Attention
     run_parser.add_argument("--fused-qkv", action="store_true")
+    run_parser.add_argument("--sequence-parallel-norm", action="store_true")
 
     # Continuous batching
     run_parser.add_argument("--ctx-batch-size", type=int)

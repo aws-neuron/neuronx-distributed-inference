@@ -63,6 +63,7 @@ class NeuronConfig:
 
         # Attention
         self.fused_qkv = kwargs.pop("fused_qkv", False)
+        self.sequence_parallel_enabled = kwargs.pop("sequence_parallel_norm", False)
         # TODO: Remove Llama attn_cls and multiple attention feature.
         self.attn_cls = kwargs.pop("attn_cls", "NeuronLlamaAttention")
 

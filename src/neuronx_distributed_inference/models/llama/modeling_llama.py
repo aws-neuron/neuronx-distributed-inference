@@ -27,6 +27,10 @@ from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E4
     ParallelEmbedding,
     RowParallelLinear,
 )
+from neuronx_distributed.parallel_layers.mappings import (
+    _gather_along_dim,
+)
+
 from torch import nn
 from transformers import LlamaForCausalLM
 from transformers.activations import ACT2FN
@@ -88,8 +92,6 @@ def register_module(key: str):
         return cls
 
     return inner
-
-
 class LlamaInferenceConfig(InferenceConfig):
     def get_required_attributes(self) -> List[str]:
         return [
@@ -124,6 +126,9 @@ class NeuronLlamaMLP(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.act_fn = ACT2FN[config.hidden_act]
 
+        self.sequence_parallel_enabled = getattr(self.neuron_config, "sequence_parallel_enabled", False)
+        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
+
         if parallel_state.model_parallel_is_initialized():
             self.gate_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -132,6 +137,8 @@ class NeuronLlamaMLP(nn.Module):
                 gather_output=False,
                 dtype=config.neuron_config.torch_dtype,
                 pad=True,
+                sequence_parallel_enabled=False,
+                sequence_dimension=None
             )
             self.up_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -140,6 +147,8 @@ class NeuronLlamaMLP(nn.Module):
                 gather_output=False,
                 dtype=config.neuron_config.torch_dtype,
                 pad=True,
+                sequence_parallel_enabled=False,
+                sequence_dimension=None
             )
             self.down_proj = RowParallelLinear(
                 self.intermediate_size,
@@ -148,6 +157,8 @@ class NeuronLlamaMLP(nn.Module):
                 input_is_parallel=True,
                 dtype=config.neuron_config.torch_dtype,
                 pad=True,
+                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                sequence_dimension=self.sequence_dimension
             )
         else:
             self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -155,6 +166,11 @@ class NeuronLlamaMLP(nn.Module):
             self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def forward(self, x):
+        # all-gather is done here instead of CPL layers to
+        # avoid 2 all-gathers from up and gate projections
+        if self.sequence_parallel_enabled:
+            x = _gather_along_dim(x, self.sequence_dimension)
+
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -188,8 +204,10 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             self.tp_degree = parallel_state.get_tensor_model_parallel_size()
         else:
             self.tp_degree = 1
-        self.fused_qkv = False
         self.clip_qkv = None
+
+        self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
+        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
 
         self.init_gqa_properties()
 
@@ -239,7 +257,9 @@ class NeuronLlamaDecoderLayer(nn.Module):
     def __init__(self, config: InferenceConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = _LLAMA_MODULE_MAP[config.neuron_config.attn_cls](config=config)
+        self.self_attn = _LLAMA_MODULE_MAP[config.neuron_config.attn_cls](
+            config=config,
+        )
         self.mlp = NeuronLlamaMLP(config)
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
@@ -262,13 +282,15 @@ class NeuronLlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, present_key_value = self.self_attn(
+        attn_outs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             **kwargs,
         )
+
+        hidden_states, present_key_value = attn_outs
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -277,9 +299,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, present_key_value)
-
-        return outputs
+        return (hidden_states, present_key_value)
 
 
 class ResBlock(nn.Module):

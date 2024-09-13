@@ -3,7 +3,13 @@ import logging
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch_xla.core.xla_model as xm
+
 from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
+from neuronx_distributed.parallel_layers.mappings import (
+    _reduce_scatter_along_dim,
+    _gather_along_dim,
+)
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -41,6 +47,8 @@ class NeuronBaseModel(nn.Module):
         self.speculation_length = config.neuron_config.speculation_length
         self.padding_side = config.neuron_config.padding_side
         self.max_length = config.neuron_config.max_length
+        self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
 
         self.setup_attr_for_model(config)
         self.init_model(config)
@@ -360,7 +368,11 @@ class NeuronBaseModel(nn.Module):
         # )
 
         # embed positions
-        hidden_states = inputs_embeds
+        if self.sequence_parallel_enabled:
+            #TODO: Replace this with rankid + scatter call once supported
+            hidden_states = _reduce_scatter_along_dim(inputs_embeds, self.sequence_dimension, xm.REDUCE_MAX)
+        else:
+            hidden_states = inputs_embeds
 
         # decoder layers
         next_decoder_cache = ()
@@ -379,6 +391,9 @@ class NeuronBaseModel(nn.Module):
             hidden_states = layer_outputs[0]
 
             next_decoder_cache += (layer_outputs[1],)
+
+        if self.sequence_parallel_enabled:
+            hidden_states = _gather_along_dim(hidden_states, self.sequence_dimension)
 
         hidden_states = self.norm(hidden_states)
 
@@ -441,6 +456,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         new_config.neuron_config.batch_size = self.neuron_config.tkg_batch_size
         new_config.neuron_config.n_active_tokens = 1
         new_config.neuron_config.bucket_n_active_tokens = False
+        new_config.neuron_config.sequence_parallel_enabled = False
 
         if not new_config.neuron_config.enable_bucketing:
             new_config.neuron_config.buckets = generate_buckets(

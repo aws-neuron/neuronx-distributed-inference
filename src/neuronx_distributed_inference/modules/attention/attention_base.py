@@ -14,13 +14,13 @@ except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
 
 from neuronx_distributed.parallel_layers import utils  # noqa: E402
+from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_size
 from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 
 from .gqa import GroupQueryAttention_O  # noqa: E402; noqa: E402
 from .gqa import GroupQueryAttention_QKV  # noqa: E402
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
-
 
 class NeuronAttentionBase(nn.Module):
     """
@@ -43,6 +43,9 @@ class NeuronAttentionBase(nn.Module):
         self.qkv_proj = None
         self.bias = False
 
+        self.sequence_parallel_enabled = False
+        self.sequence_dimension = None
+
         self.o_proj_layer_name = "o_proj"
 
     def init_gqa_properties(self):
@@ -51,6 +54,7 @@ class NeuronAttentionBase(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_attention_heads})."
             )
+
         self.qkv_proj = GroupQueryAttention_QKV(
             hidden_size=self.hidden_size,
             head_dim=self.head_dim,
@@ -62,6 +66,8 @@ class NeuronAttentionBase(nn.Module):
             gather_output=False,
             fused_qkv=self.fused_qkv,
             clip_qkv=self.clip_qkv,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_dimension=self.sequence_dimension
         )
         self.o_proj = GroupQueryAttention_O(
             hidden_size=self.hidden_size,
@@ -73,6 +79,8 @@ class NeuronAttentionBase(nn.Module):
             bias=self.bias,
             input_is_parallel=True,
             layer_name=self.o_proj_layer_name,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_dimension=self.sequence_dimension
         )
         self.num_heads = utils.divide(self.qkv_proj.get_num_attention_heads(), self.tp_degree)
         self.num_key_value_heads = utils.divide(
@@ -85,13 +93,18 @@ class NeuronAttentionBase(nn.Module):
         QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
         return QK
 
-    def prep_qkv_tensors(self, position_ids, hidden_states, past_key_value):
+    def prep_qkv_tensors(
+        self, position_ids, hidden_states, past_key_value
+    ):
         """take care of the shape, layout, group query, custom position encoding, etc."""
         Q, K, V = self.qkv_proj(hidden_states=hidden_states)
 
         # Divide hidden_dim across heads for MHA
         # Change layout: BSHD -> BHSD
         bsz, q_len, _ = hidden_states.size()
+        if self.sequence_parallel_enabled:
+            q_len *= get_tensor_model_parallel_size()
+
         Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim)
         K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim)
         V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim)
@@ -203,7 +216,11 @@ class NeuronAttentionBase(nn.Module):
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """Implements each layer's forward pass for the attention block."""
         bsz, q_len, _ = hidden_states.size()
-        Q, K, V = self.prep_qkv_tensors(position_ids, hidden_states, past_key_value)
+        if self.sequence_parallel_enabled:
+            q_len *= get_tensor_model_parallel_size()
+        Q, K, V = self.prep_qkv_tensors(
+            position_ids, hidden_states, past_key_value
+        )
 
         if past_key_value is None:
             attn_output = self.perform_prefill(Q, K, V, q_len, bsz, attention_mask)
