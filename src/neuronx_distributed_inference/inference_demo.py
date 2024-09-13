@@ -69,7 +69,6 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 
     # Basic config
     run_parser.add_argument("--torch-dtype", type=to_torch_dtype)
-    run_parser.add_argument("--tp-degree", type=int)
     run_parser.add_argument("--batch-size", type=int)
     run_parser.add_argument("--padding-side", type=str)
     run_parser.add_argument("--seq-len", type=int)
