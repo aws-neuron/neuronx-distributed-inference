@@ -1,6 +1,5 @@
 import argparse
 import copy
-import json
 from enum import Enum
 from typing import Type
 
@@ -150,8 +149,6 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
             max_loras_on_cpu=args.max_loras_on_cpu,
         )
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
-
-    print("Running with neuron_config:\n", json.dumps(neuron_config.__dict__, indent=4))
 
     config = model_cls.get_config_cls()(
         neuron_config, load_config=load_pretrained_config(args.model_path)
