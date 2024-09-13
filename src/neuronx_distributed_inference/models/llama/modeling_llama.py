@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch LLaMA model for NXD inference."""
+import gc
 from typing import List, Optional, Tuple, Type
 
 import torch
@@ -92,6 +93,27 @@ def register_module(key: str):
         return cls
 
     return inner
+
+def convert_state_dict_to_fused_qkv(llama_state_dict, cfg: InferenceConfig):
+    """
+    This function concats the qkv weights to a Wqkv weight for fusedqkv, and deletes the qkv weights.
+    """
+    for l in range(cfg.num_hidden_layers):  # noqa: E741
+        llama_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = torch.cat([
+                llama_state_dict[f"layers.{l}.self_attn.q_proj.weight"],
+                llama_state_dict[f"layers.{l}.self_attn.k_proj.weight"],
+                llama_state_dict[f"layers.{l}.self_attn.v_proj.weight"],
+            ],
+        )
+        del llama_state_dict[f"layers.{l}.self_attn.q_proj.weight"]
+        del llama_state_dict[f"layers.{l}.self_attn.k_proj.weight"]
+        del llama_state_dict[f"layers.{l}.self_attn.v_proj.weight"]
+
+    gc.collect()
+
+    return llama_state_dict
+
+
 class LlamaInferenceConfig(InferenceConfig):
     def get_required_attributes(self) -> List[str]:
         return [
@@ -204,6 +226,8 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             self.tp_degree = parallel_state.get_tensor_model_parallel_size()
         else:
             self.tp_degree = 1
+
+        self.fused_qkv = config.neuron_config.fused_qkv
         self.clip_qkv = None
 
         self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
@@ -423,6 +447,14 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
     @staticmethod
     def load_hf_model(model_path):
         return LlamaForCausalLM.from_pretrained(model_path)
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
+        """ This function should be over-ridden in child classes as needed """
+        neuron_config = config.neuron_config
+        if neuron_config.fused_qkv:
+            state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
+        return state_dict
 
     @classmethod
     def get_config_cls(cls):
