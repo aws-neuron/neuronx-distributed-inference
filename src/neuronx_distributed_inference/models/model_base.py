@@ -4,12 +4,11 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch_xla.core.xla_model as xm
-
-from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
 from neuronx_distributed.parallel_layers.mappings import (
-    _reduce_scatter_along_dim,
     _gather_along_dim,
+    _reduce_scatter_along_dim,
 )
+from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -371,8 +370,10 @@ class NeuronBaseModel(nn.Module):
 
         # embed positions
         if self.sequence_parallel_enabled:
-            #TODO: Replace this with rankid + scatter call once supported
-            hidden_states = _reduce_scatter_along_dim(inputs_embeds, self.sequence_dimension, xm.REDUCE_MAX)
+            # TODO: Replace this with rankid + scatter call once supported
+            hidden_states = _reduce_scatter_along_dim(
+                inputs_embeds, self.sequence_dimension, xm.REDUCE_MAX
+            )
         else:
             hidden_states = inputs_embeds
 
@@ -641,7 +642,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             is_run_on_neuron = self.speculation_model.is_neuron()
         elif input_ids.shape[-1] == self.neuron_config.medusa_speculation_length:
             outputs = self.medusa_speculation_model(
-                input_ids, attention_mask, position_ids, seq_ids
+                input_ids, attention_mask, position_ids, seq_ids, *medusa_args
             )
             is_run_on_neuron = self.medusa_speculation_model.is_neuron()
         else:

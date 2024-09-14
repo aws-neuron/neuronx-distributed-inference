@@ -379,10 +379,14 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
         )
         pad_token_id = (
-            pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
+            pad_token_id
+            if pad_token_id is not None
+            else self.current_generation_config.pad_token_id
         )
         eos_token_id = (
-            eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+            eos_token_id
+            if eos_token_id is not None
+            else self.current_generation_config.eos_token_id
         )
         if eos_token_id is not None and pad_token_id is None:
             raise ValueError(
@@ -545,7 +549,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         medusa_kwargs = copy.deepcopy(model_kwargs)
 
         eos_token_id = (
-            eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+            eos_token_id
+            if eos_token_id is not None
+            else self.current_generation_config.eos_token_id
         )
 
         mc_sim_7b_63 = self.neuron_config.medusa_tree

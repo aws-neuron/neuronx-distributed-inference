@@ -157,11 +157,17 @@ class KVCacheManager(nn.Module):
         for idx, kv_per_layer in enumerate(past_key_values):
             latest_k, latest_v = kv_per_layer[0], kv_per_layer[1]
 
-            # read differently based on padding side and bucket sz
-            k_cache = _slice_kv_cacheline(self.padding_side, seq_len, self.past_key_values[idx * 2])
-            v_cache = _slice_kv_cacheline(
-                self.padding_side, seq_len, self.past_key_values[idx * 2 + 1]
-            )
+            if self.is_medusa:
+                k_cache = self.past_key_values[idx * 2]
+                v_cache = self.past_key_values[idx * 2 + 1]
+            else:
+                # read differently based on padding side and bucket sz
+                k_cache = _slice_kv_cacheline(
+                    self.padding_side, seq_len, self.past_key_values[idx * 2]
+                )
+                v_cache = _slice_kv_cacheline(
+                    self.padding_side, seq_len, self.past_key_values[idx * 2 + 1]
+                )
 
             if is_for_context_encoding:
                 if self.is_continuous_batching:
@@ -174,6 +180,13 @@ class KVCacheManager(nn.Module):
                     # assign back to full kv_cacheline
                     k_cache = latest_k
                     v_cache = latest_v
+                    if self.is_medusa:
+                        k_cache = _gather_slice_into_kv_cacheline(
+                            self.past_key_values[idx * 2], self.padding_side, seq_len, k_cache
+                        )
+                        v_cache = _gather_slice_into_kv_cacheline(
+                            self.past_key_values[idx * 2 + 1], self.padding_side, seq_len, v_cache
+                        )
             else:
                 if self.padding_side == "left":
                     # TODO: fix it with scatter after right padding
@@ -183,26 +196,31 @@ class KVCacheManager(nn.Module):
                     v_cache = torch.cat([v_cache, latest_v], dim=2)
                 else:
                     # copy the tensor of the new position into kv cache
-                    scatter_index = self._get_index_to_update_new_position(
+                    scatter_index_new = self._get_index_to_update_new_position(
                         scatter_index, position_ids, latest_k
                     )
-                    k_cache = torch.scatter(input=k_cache, dim=2, index=scatter_index, src=latest_k)
-                    v_cache = torch.scatter(input=v_cache, dim=2, index=scatter_index, src=latest_v)
+                    k_cache = torch.scatter(
+                        input=k_cache, dim=2, index=scatter_index_new, src=latest_k
+                    )
+                    v_cache = torch.scatter(
+                        input=v_cache, dim=2, index=scatter_index_new, src=latest_v
+                    )
 
             # update
-            k_cache = _gather_slice_into_kv_cacheline(
-                self.past_key_values[idx * 2], self.padding_side, seq_len, k_cache
-            )
-            v_cache = _gather_slice_into_kv_cacheline(
-                self.past_key_values[idx * 2 + 1], self.padding_side, seq_len, v_cache
-            )
+            if not self.is_medusa:
+                k_cache = _gather_slice_into_kv_cacheline(
+                    self.past_key_values[idx * 2], self.padding_side, seq_len, k_cache
+                )
+                v_cache = _gather_slice_into_kv_cacheline(
+                    self.past_key_values[idx * 2 + 1], self.padding_side, seq_len, v_cache
+                )
             updated_kv_cache.append(k_cache)
             updated_kv_cache.append(v_cache)
 
         return updated_kv_cache
 
     def _get_index_to_update_new_position(self, scatter_index, position_ids, full_k):
-        if self.is_medusa and scatter_index is not None:
+        if self.is_medusa:
             scatter_index = scatter_index.view(-1, 1, scatter_index.shape[-1], 1).expand_as(full_k)
         else:
             scatter_index = position_ids.view(-1, 1, position_ids.shape[-1], 1).expand_as(full_k)

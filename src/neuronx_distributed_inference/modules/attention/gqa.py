@@ -281,7 +281,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         fused_qkv: bool = False,
         clip_qkv: Optional[float] = None,
         sequence_parallel_enabled: bool = False,
-        sequence_dimension: Optional[int] = None
+        sequence_dimension: Optional[int] = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -311,7 +311,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     gather_output=self.gather_output,
                     dtype=dtype,
                     sequence_parallel_enabled=sequence_parallel_enabled,
-                    sequence_dimension=sequence_dimension
+                    sequence_dimension=sequence_dimension,
                 )
                 # Set heads info as weight parameter attributes to be used in weights sharding
                 setattr(self.Wqkv.weight, "fused_qkv", True)
@@ -326,7 +326,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     gather_output=self.gather_output,
                     dtype=dtype,
                     sequence_parallel_enabled=sequence_parallel_enabled,
-                    sequence_dimension=sequence_dimension
+                    sequence_dimension=sequence_dimension,
                 )
                 self.k_proj = ColumnParallelLinear(
                     self.hidden_size,
@@ -335,7 +335,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     gather_output=self.gather_output,
                     dtype=dtype,
                     sequence_parallel_enabled=sequence_parallel_enabled,
-                    sequence_dimension=sequence_dimension
+                    sequence_dimension=sequence_dimension,
                 )
                 self.v_proj = ColumnParallelLinear(
                     self.hidden_size,
@@ -344,7 +344,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     gather_output=self.gather_output,
                     dtype=dtype,
                     sequence_parallel_enabled=sequence_parallel_enabled,
-                    sequence_dimension=sequence_dimension
+                    sequence_dimension=sequence_dimension,
                 )
         else:
             if self.fused_qkv:
@@ -712,7 +712,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         input_is_parallel: bool = False,
         layer_name: str = "o_proj",
         sequence_parallel_enabled: bool = False,
-        sequence_dimension: Optional[int] = None
+        sequence_dimension: Optional[int] = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -735,7 +735,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
                 input_is_parallel=self.input_is_parallel,
                 dtype=self.dtype,
                 sequence_parallel_enabled=sequence_parallel_enabled,
-                sequence_dimension=sequence_dimension
+                sequence_dimension=sequence_dimension,
             )
         else:
             self.o_proj = nn.Linear(

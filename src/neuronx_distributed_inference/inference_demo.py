@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 from enum import Enum
 from typing import Type
 
@@ -114,6 +115,12 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--speculation-length", type=int)
     run_parser.add_argument("--spec-batch-size", type=int)
 
+    # Medusa decoding
+    run_parser.add_argument("--is-medusa", action="store_true")
+    run_parser.add_argument("--medusa-speculation-length", type=int)
+    run_parser.add_argument("--num-medusa-heads", type=int)
+    run_parser.add_argument("--medusa-tree-json", type=load_json_file, dest="medusa_tree")
+
     # Parallism
     run_parser.add_argument("--tp-degree", type=int)
     run_parser.add_argument("--pp-degree", type=int)
@@ -129,7 +136,10 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--target-modules", nargs="+")
     run_parser.add_argument("--max-loras-on-cpu", type=int)
 
-    # TODO: Add medusa
+
+def load_json_file(json_path):
+    with open(json_path, "r") as f:
+        return json.load(f)
 
 
 def run_inference(model_cls: Type[NeuronApplicationBase], args):
@@ -199,6 +209,10 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     }
     generation_config.update(**generation_config_kwargs)
 
+    # With Medusa, the model is also the draft model.
+    if neuron_config.is_medusa:
+        draft_model = model
+
     # Check accuracy.
     run_accuracy_check(
         model, tokenizer, generation_config, args.check_accuracy_mode, draft_model=draft_model
@@ -251,6 +265,12 @@ def run_generation(model, tokenizer, prompts, generation_config, draft_model=Non
 
 
 def run_accuracy_check(model, tokenizer, generation_config, check_accuracy_mode, draft_model=None):
+    if model.neuron_config.is_medusa:
+        # Medusa doesn't use greedy sampling, so check accuracy doesn't work.
+        assert (
+            check_accuracy_mode == CheckAccuracyMode.SKIP_ACCURACY_CHECK
+        ), "Accuracy checking not supported for Medusa"
+
     if check_accuracy_mode == CheckAccuracyMode.SKIP_ACCURACY_CHECK:
         print("\nSkipping accuracy check")
     elif check_accuracy_mode == CheckAccuracyMode.TOKEN_MATCHING:

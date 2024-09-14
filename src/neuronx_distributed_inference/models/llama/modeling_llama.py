@@ -28,10 +28,7 @@ from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E4
     ParallelEmbedding,
     RowParallelLinear,
 )
-from neuronx_distributed.parallel_layers.mappings import (
-    _gather_along_dim,
-)
-
+from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
 from torch import nn
 from transformers import LlamaForCausalLM
 from transformers.activations import ACT2FN
@@ -94,12 +91,14 @@ def register_module(key: str):
 
     return inner
 
+
 def convert_state_dict_to_fused_qkv(llama_state_dict, cfg: InferenceConfig):
     """
     This function concats the qkv weights to a Wqkv weight for fusedqkv, and deletes the qkv weights.
     """
     for l in range(cfg.num_hidden_layers):  # noqa: E741
-        llama_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = torch.cat([
+        llama_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = torch.cat(
+            [
                 llama_state_dict[f"layers.{l}.self_attn.q_proj.weight"],
                 llama_state_dict[f"layers.{l}.self_attn.k_proj.weight"],
                 llama_state_dict[f"layers.{l}.self_attn.v_proj.weight"],
@@ -148,7 +147,9 @@ class NeuronLlamaMLP(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.act_fn = ACT2FN[config.hidden_act]
 
-        self.sequence_parallel_enabled = getattr(self.neuron_config, "sequence_parallel_enabled", False)
+        self.sequence_parallel_enabled = getattr(
+            self.neuron_config, "sequence_parallel_enabled", False
+        )
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
 
         if parallel_state.model_parallel_is_initialized():
@@ -160,7 +161,7 @@ class NeuronLlamaMLP(nn.Module):
                 dtype=config.neuron_config.torch_dtype,
                 pad=True,
                 sequence_parallel_enabled=False,
-                sequence_dimension=None
+                sequence_dimension=None,
             )
             self.up_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -170,7 +171,7 @@ class NeuronLlamaMLP(nn.Module):
                 dtype=config.neuron_config.torch_dtype,
                 pad=True,
                 sequence_parallel_enabled=False,
-                sequence_dimension=None
+                sequence_dimension=None,
             )
             self.down_proj = RowParallelLinear(
                 self.intermediate_size,
@@ -180,7 +181,7 @@ class NeuronLlamaMLP(nn.Module):
                 dtype=config.neuron_config.torch_dtype,
                 pad=True,
                 sequence_parallel_enabled=self.sequence_parallel_enabled,
-                sequence_dimension=self.sequence_dimension
+                sequence_dimension=self.sequence_dimension,
             )
         else:
             self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -450,7 +451,7 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
-        """ This function should be over-ridden in child classes as needed """
+        """This function should be over-ridden in child classes as needed"""
         neuron_config = config.neuron_config
         if neuron_config.fused_qkv:
             state_dict = convert_state_dict_to_fused_qkv(state_dict, config)

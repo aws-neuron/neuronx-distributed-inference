@@ -106,7 +106,7 @@ class NeuronConfig:
         self.is_medusa = kwargs.pop("is_medusa", False)
         self.medusa_speculation_length = kwargs.pop("medusa_speculation_length", 0)
         self.num_medusa_heads = kwargs.pop("num_medusa_heads", 0)
-        self.medusa_tree = kwargs.pop("medusa_tree", 0)
+        self.medusa_tree = kwargs.pop("medusa_tree", None)
 
         # Lora
         self.lora_config = kwargs.pop("lora_config", None)

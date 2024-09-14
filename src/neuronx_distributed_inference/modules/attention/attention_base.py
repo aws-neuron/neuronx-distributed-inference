@@ -22,6 +22,7 @@ from .gqa import GroupQueryAttention_QKV  # noqa: E402
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
+
 class NeuronAttentionBase(nn.Module):
     """
     This base attention class implements the core Neuron related adaptation including
@@ -67,7 +68,7 @@ class NeuronAttentionBase(nn.Module):
             fused_qkv=self.fused_qkv,
             clip_qkv=self.clip_qkv,
             sequence_parallel_enabled=self.sequence_parallel_enabled,
-            sequence_dimension=self.sequence_dimension
+            sequence_dimension=self.sequence_dimension,
         )
         self.o_proj = GroupQueryAttention_O(
             hidden_size=self.hidden_size,
@@ -80,7 +81,7 @@ class NeuronAttentionBase(nn.Module):
             input_is_parallel=True,
             layer_name=self.o_proj_layer_name,
             sequence_parallel_enabled=self.sequence_parallel_enabled,
-            sequence_dimension=self.sequence_dimension
+            sequence_dimension=self.sequence_dimension,
         )
         self.num_heads = utils.divide(self.qkv_proj.get_num_attention_heads(), self.tp_degree)
         self.num_key_value_heads = utils.divide(
@@ -93,9 +94,7 @@ class NeuronAttentionBase(nn.Module):
         QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
         return QK
 
-    def prep_qkv_tensors(
-        self, position_ids, hidden_states, past_key_value
-    ):
+    def prep_qkv_tensors(self, position_ids, hidden_states, past_key_value):
         """take care of the shape, layout, group query, custom position encoding, etc."""
         Q, K, V = self.qkv_proj(hidden_states=hidden_states)
 
@@ -218,9 +217,7 @@ class NeuronAttentionBase(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
             q_len *= get_tensor_model_parallel_size()
-        Q, K, V = self.prep_qkv_tensors(
-            position_ids, hidden_states, past_key_value
-        )
+        Q, K, V = self.prep_qkv_tensors(position_ids, hidden_states, past_key_value)
 
         if past_key_value is None:
             attn_output = self.perform_prefill(Q, K, V, q_len, bsz, attention_mask)

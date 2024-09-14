@@ -137,7 +137,10 @@ class NeuronApplicationBase(torch.nn.Module):
             raise ValueError("Model is not loaded")
 
         weights = []
-        for rank in range(self.neuron_config.start_rank_id, self.neuron_config.start_rank_id+self.neuron_config.local_ranks_size):
+        for rank in range(
+            self.neuron_config.start_rank_id,
+            self.neuron_config.start_rank_id + self.neuron_config.local_ranks_size,
+        ):
             ckpt = load_file(
                 os.path.join(
                     compiled_model_path, f"weights/tp{rank}_sharded_checkpoint.safetensors"
