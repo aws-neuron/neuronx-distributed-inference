@@ -1,4 +1,5 @@
 import argparse
+import ast
 import copy
 import json
 from enum import Enum
@@ -60,6 +61,8 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         choices=list(CheckAccuracyMode),
         default=CheckAccuracyMode.SKIP_ACCURACY_CHECK,
     )
+    run_parser.add_argument("--divergence-difference-tol", type=float, default=0.001)
+    run_parser.add_argument("--tol-map", type=str)
 
     # Generation
     run_parser.add_argument("--prompt", dest="prompts", type=str, action="append", required=True)
@@ -215,7 +218,13 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
 
     # Check accuracy.
     run_accuracy_check(
-        model, tokenizer, generation_config, args.check_accuracy_mode, draft_model=draft_model
+        model,
+        tokenizer,
+        generation_config,
+        args.check_accuracy_mode,
+        args.divergence_difference_tol,
+        args.tol_map,
+        draft_model=draft_model,
     )
 
     # Generate outputs.
@@ -264,7 +273,13 @@ def run_generation(model, tokenizer, prompts, generation_config, draft_model=Non
         print(f"Output {i}: {output_token}")
 
 
-def run_accuracy_check(model, tokenizer, generation_config, check_accuracy_mode, draft_model=None):
+def run_accuracy_check(model, 
+                       tokenizer, 
+                       generation_config, 
+                       check_accuracy_mode, 
+                       divergence_difference_tol, 
+                       tol_map,
+                       draft_model=None):
     if model.neuron_config.is_medusa:
         # Medusa doesn't use greedy sampling, so check accuracy doesn't work.
         assert (
@@ -275,19 +290,20 @@ def run_accuracy_check(model, tokenizer, generation_config, check_accuracy_mode,
         print("\nSkipping accuracy check")
     elif check_accuracy_mode == CheckAccuracyMode.TOKEN_MATCHING:
         print("\nChecking accuracy by token matching")
-        check_accuracy(
-            model,
-            tokenizer,
-            generation_config,
-            draft_model=draft_model,
-        )
+        check_accuracy(model, tokenizer, generation_config, draft_model=draft_model)
     elif check_accuracy_mode == CheckAccuracyMode.LOGIT_MATCHING:
-        print("\nChecking accuracy by logit matching")
         assert draft_model is None, "Logit matching not supported for speculation"
+        print("\nChecking accuracy by logit matching")
+
+        if tol_map:
+            tol_map = ast.literal_eval(tol_map)
+
         check_accuracy_logits(
             model,
             tokenizer,
             generation_config,
+            divergence_difference_tol=divergence_difference_tol,
+            tol_map=tol_map,
         )
     else:
         raise ValueError(f"Unsupported check accuracy mode: {check_accuracy_mode}")

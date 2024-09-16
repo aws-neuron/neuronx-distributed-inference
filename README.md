@@ -111,6 +111,31 @@ inference_demo \
     --prompt "The color of the sky is"
 ```
 
+### Example 5. Llama inference with logit matching accuracy check using custom error tolerances
+
+```
+inference_demo \
+  --model-type llama \
+  --task-type causal-lm \
+  run \
+    --model-path /home/ubuntu/model_hf/Llama-2-7b/ \
+    --compiled-model-path /home/ubuntu/traced_model/Llama-2-7b-demo/ \
+    --torch-dtype bfloat16 \
+    --tp-degree 32 \
+    --batch-size 2 \
+    --max-context-length 32 \
+    --seq-len 64 \
+    --check-accuracy-mode logit-matching \
+    --divergence-difference-tol 0.005 \
+    --tol-map "{5: (1e-5, 0.02)}" \
+    --enable-bucketing \
+    --top-k 1 \
+    --do-sample \
+    --pad-token-id 2 \
+    --prompt "I believe the meaning of life is" \
+    --prompt "The color of the sky is"
+```
+
 ## Contributing
 
 ### Formatting code
