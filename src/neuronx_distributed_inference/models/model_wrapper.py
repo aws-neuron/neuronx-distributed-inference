@@ -157,7 +157,11 @@ class ModelWrapper(torch.nn.Module):
                 (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int64
             )
             seq_ids = torch.zeros((self.neuron_config.batch_size), dtype=torch.int64)
-            adapter_ids = torch.zeros((self.neuron_config.batch_size), dtype=torch.int64) if self.neuron_config.lora_config is not None else None
+            adapter_ids = (
+                torch.zeros((self.neuron_config.batch_size), dtype=torch.int64)
+                if self.neuron_config.lora_config is not None
+                else None
+            )
 
             if self.is_medusa:
                 accepted_indices = torch.zeros(
@@ -212,7 +216,6 @@ class ModelWrapper(torch.nn.Module):
                     inputs.append((input_ids, attention_mask, position_ids, seq_ids, adapter_ids))
                 else:
                     inputs.append((input_ids, attention_mask, position_ids, seq_ids))
-
 
         return inputs
 

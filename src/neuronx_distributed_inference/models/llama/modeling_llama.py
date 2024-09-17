@@ -195,10 +195,20 @@ class NeuronLlamaMLP(nn.Module):
         if self.sequence_parallel_enabled:
             x = _gather_along_dim(x, self.sequence_dimension)
 
-        gate_proj_output = self.gate_proj(x) if not is_lora_module(self.gate_proj) else self.gate_proj(x, adapter_ids)
-        up_proj_output = self.up_proj(x) if not is_lora_module(self.up_proj) else  self.up_proj(x, adapter_ids)
+        gate_proj_output = (
+            self.gate_proj(x)
+            if not is_lora_module(self.gate_proj)
+            else self.gate_proj(x, adapter_ids)
+        )
+        up_proj_output = (
+            self.up_proj(x) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
+        )
         down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
-        return self.down_proj(down_proj_input) if not is_lora_module(self.up_proj) else self.down_proj(down_proj_input, adapter_ids)
+        return (
+            self.down_proj(down_proj_input)
+            if not is_lora_module(self.up_proj)
+            else self.down_proj(down_proj_input, adapter_ids)
+        )
 
 
 @register_module("NeuronLlamaAttention")
@@ -305,7 +315,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        adapter_ids = None,
+        adapter_ids=None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states

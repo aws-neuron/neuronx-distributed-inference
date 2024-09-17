@@ -212,13 +212,15 @@ class NeuronAttentionBase(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         active_mask: Optional[torch.LongTensor] = None,
-        adapter_ids = None,
+        adapter_ids=None,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """Implements each layer's forward pass for the attention block."""
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
             q_len *= get_tensor_model_parallel_size()
-        Q, K, V = self.prep_qkv_tensors(position_ids, hidden_states, past_key_value, adapter_ids=adapter_ids)
+        Q, K, V = self.prep_qkv_tensors(
+            position_ids, hidden_states, past_key_value, adapter_ids=adapter_ids
+        )
 
         if past_key_value is None:
             attn_output = self.perform_prefill(Q, K, V, q_len, bsz, attention_mask)

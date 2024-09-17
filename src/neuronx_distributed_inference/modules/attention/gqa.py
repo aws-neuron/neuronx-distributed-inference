@@ -8,7 +8,9 @@ from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
 from neuronx_distributed.quantization.quantization_layers import BaseQuantizeParallelLinear
 from torch import nn
 from torch.nn import functional as F
+
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
+
 
 class GQA(enum.Enum):
     # This transforms a GQA attention mechanism into a traditional MHA mechanism
@@ -366,7 +368,11 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
     def forward(self, hidden_states: torch.Tensor, adapter_ids=None):
         if self.fused_qkv:
-            QKV = self.Wqkv(hidden_states) if not is_lora_module(self.Wqkv) else self.Wqkv(hidden_states, adapter_ids)
+            QKV = (
+                self.Wqkv(hidden_states)
+                if not is_lora_module(self.Wqkv)
+                else self.Wqkv(hidden_states, adapter_ids)
+            )
             if self.clip_qkv is not None:
                 QKV = QKV.clamp(min=-self.clip_qkv, max=self.clip_qkv)
             # torch.split has accuracy issue and leads to more reshapes in hlo.
@@ -382,9 +388,21 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 dim=2,
             )
         else:
-            Q = self.q_proj(hidden_states) if not is_lora_module(self.q_proj) else self.q_proj(hidden_states, adapter_ids)
-            K = self.k_proj(hidden_states) if not is_lora_module(self.k_proj) else self.k_proj(hidden_states, adapter_ids)
-            V = self.v_proj(hidden_states) if not is_lora_module(self.v_proj) else self.v_proj(hidden_states, adapter_ids)
+            Q = (
+                self.q_proj(hidden_states)
+                if not is_lora_module(self.q_proj)
+                else self.q_proj(hidden_states, adapter_ids)
+            )
+            K = (
+                self.k_proj(hidden_states)
+                if not is_lora_module(self.k_proj)
+                else self.k_proj(hidden_states, adapter_ids)
+            )
+            V = (
+                self.v_proj(hidden_states)
+                if not is_lora_module(self.v_proj)
+                else self.v_proj(hidden_states, adapter_ids)
+            )
             if self.clip_qkv is not None:
                 Q = Q.clamp(min=-self.clip_qkv, max=self.clip_qkv)
                 K = K.clamp(min=-self.clip_qkv, max=self.clip_qkv)
@@ -747,7 +765,11 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         self.layer_name = layer_name
 
     def forward(self, attention_output: torch.Tensor, adapter_ids=None):
-        return self.o_proj(attention_output) if not is_lora_module(self.o_proj) else self.o_proj(attention_output, adapter_ids)
+        return (
+            self.o_proj(attention_output)
+            if not is_lora_module(self.o_proj)
+            else self.o_proj(attention_output, adapter_ids)
+        )
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
         prefix_parts = prefix.split(".")

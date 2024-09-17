@@ -24,7 +24,10 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; 
 from neuronx_distributed_inference.modules.autobucketing import generate_buckets
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
-from neuronx_distributed_inference.modules.lora_serving import update_weights_for_lora, wrap_model_with_lora
+from neuronx_distributed_inference.modules.lora_serving import (
+    update_weights_for_lora,
+    wrap_model_with_lora,
+)
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 
 
@@ -342,7 +345,7 @@ class NeuronBaseModel(nn.Module):
         active_mask: Optional[List[torch.FloatTensor]] = None,
         # In llava context encoding model, input_embeds is precomputed
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        adapter_ids = None,
+        adapter_ids=None,
     ):
         batch_size, seq_length = input_ids.shape[:2]
 
@@ -351,7 +354,11 @@ class NeuronBaseModel(nn.Module):
             past_key_values_length = past_key_values[0][0].shape[2]
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids) if not is_lora_module(self.embed_tokens) else self.embed_tokens(input_ids, adapter_ids=adapter_ids)
+            inputs_embeds = (
+                self.embed_tokens(input_ids)
+                if not is_lora_module(self.embed_tokens)
+                else self.embed_tokens(input_ids, adapter_ids=adapter_ids)
+            )
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device  # noqa
@@ -531,7 +538,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        adapter_ids = None,
+        adapter_ids=None,
         medusa_args=None,
         return_dict: Optional[bool] = None,
         llava_args: Optional[List] = [],
@@ -610,7 +617,9 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         attention_mask = (position_ids_to_compare >= mask).to(dtype=position_ids.dtype)
         return attention_mask
 
-    def _log_input(self, input_ids, attention_mask, position_ids, seq_ids, adapter_ids=None, **kwargs):
+    def _log_input(
+        self, input_ids, attention_mask, position_ids, seq_ids, adapter_ids=None, **kwargs
+    ):
         logging.debug("---input---")
         logging.debug("input_ids shape = %s type=%s", input_ids.shape, input_ids.type())
         logging.debug(
@@ -648,7 +657,9 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
         elif input_ids.shape[-1] == self.neuron_config.speculation_length:
-            outputs = self.speculation_model(input_ids, attention_mask, position_ids, seq_ids, adapter_ids)
+            outputs = self.speculation_model(
+                input_ids, attention_mask, position_ids, seq_ids, adapter_ids
+            )
             is_run_on_neuron = self.speculation_model.is_neuron()
         elif input_ids.shape[-1] == self.neuron_config.medusa_speculation_length:
             outputs = self.medusa_speculation_model(

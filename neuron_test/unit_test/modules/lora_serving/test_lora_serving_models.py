@@ -9,7 +9,10 @@ from neuronx_distributed.parallel_layers import (
     RowParallelLinear,
 )
 
-from neuronx_distributed_inference.modules.lora_serving import wrap_model_with_lora, LoraServingConfig
+from neuronx_distributed_inference.modules.lora_serving import (
+    LoraServingConfig,
+    wrap_model_with_lora,
+)
 from neuronx_distributed_inference.modules.lora_serving.lora_module import MultiLoraModule
 
 
