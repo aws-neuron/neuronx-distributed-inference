@@ -108,6 +108,11 @@ class NeuronConfig:
         self.num_medusa_heads = kwargs.pop("num_medusa_heads", 0)
         self.medusa_tree = kwargs.pop("medusa_tree", None)
 
+        # Paged attention
+        self.is_paged_attention = kwargs.pop("is_paged_attention", False)
+        self.pa_num_blocks = kwargs.pop("pa_num_blocks", self.batch_size)
+        self.pa_block_size = kwargs.pop("pa_block_size", self.seq_len)
+
         # Lora
         self.lora_config = kwargs.pop("lora_config", None)
         if type(self.lora_config) is dict:

@@ -33,7 +33,7 @@ def _gather_slice_into_kv_cacheline(cache, padding_side, seq_len: int, bucket_sl
 class KVCacheManager(nn.Module):
     """
     Key Value Cache Management.
-    It stores KV cache as a parameter list of the shape (batch_sz, num_kv_head_per_partition, max_len, hidden_dim),
+    It stores KV cache as a parameter list of the shape (batch_sz, num_kv_head_per_rank, max_len, head_dim),
     and vends out read and write operations.
     """
 
@@ -55,13 +55,10 @@ class KVCacheManager(nn.Module):
             ]
         )
 
-    def _init_kv_shape(self, config: InferenceConfig):
-        max_batch_size = config.neuron_config.max_batch_size
-        max_len = config.neuron_config.max_length
+    def _get_num_kv_heads_per_rank(self, config: InferenceConfig):
         tp_degree = config.neuron_config.tp_degree
         num_kv_head = self.num_kv_head
         num_atten_head = config.num_attention_heads
-        hidden_size = config.hidden_size
 
         gqa_sharding_strategy = determine_sharding_strategy(tp_degree, num_kv_head)
         _, num_key_value_heads = get_shardable_head_counts(
@@ -69,14 +66,27 @@ class KVCacheManager(nn.Module):
         )
 
         if parallel_state.model_parallel_is_initialized():
-            num_kv_heads_per_partition = utils.divide(num_key_value_heads, tp_degree)
+            num_kv_heads_per_rank = utils.divide(num_key_value_heads, tp_degree)
         else:
-            num_kv_heads_per_partition = num_key_value_heads
+            num_kv_heads_per_rank = num_key_value_heads
+        return num_kv_heads_per_rank
+    
+    def _get_hidden_dim_per_head(self, config: InferenceConfig):
+        hidden_size = config.hidden_size
+        num_atten_head = config.num_attention_heads
         hidden_dim_per_head = hidden_size // num_atten_head
+        return hidden_dim_per_head
 
+    def _init_kv_shape(self, config: InferenceConfig):
+        max_batch_size = config.neuron_config.max_batch_size
+        max_len = config.neuron_config.max_length
+        num_kv_heads_per_rank = self._get_num_kv_heads_per_rank(config)
+        hidden_dim_per_head = self._get_hidden_dim_per_head(config)
+
+        # BHSD KV cache layout for classic attention
         self.kv_shape = (
             max_batch_size,
-            num_kv_heads_per_partition,
+            num_kv_heads_per_rank,
             max_len,
             hidden_dim_per_head,
         )
@@ -217,6 +227,7 @@ class KVCacheManager(nn.Module):
             updated_kv_cache.append(k_cache)
             updated_kv_cache.append(v_cache)
 
+        # return updated kv cache to NxD runtime
         return updated_kv_cache
 
     def _get_index_to_update_new_position(self, scatter_index, position_ids, full_k):
