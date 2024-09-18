@@ -113,6 +113,9 @@ class NeuronConfig:
         self.pa_num_blocks = kwargs.pop("pa_num_blocks", self.batch_size)
         self.pa_block_size = kwargs.pop("pa_block_size", self.seq_len)
 
+        # Chunked prefilled
+        self.is_chunked_prefill = kwargs.pop("is_chunked_prefill", False)
+
         # Lora
         self.lora_config = kwargs.pop("lora_config", None)
         if type(self.lora_config) is dict:

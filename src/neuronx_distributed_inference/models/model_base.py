@@ -89,7 +89,12 @@ class NeuronBaseModel(nn.Module):
             self.sampler = Sampler(config.neuron_config)
         self.kv_mgr = KVCacheManager(config, num_kv_head=self.num_key_value_heads)
 
-    def _create_context_attn_mask(self, attention_mask):
+    def _create_context_attn_mask(self, attention_mask, **kwargs):
+        # Block diagonal causal mask for chunked prefill
+        if self.neuron_config.is_chunked_prefill:
+            return self._create_chunked_prefill_attn_mask(**kwargs)
+
+        # Lower triangle causal mask for classic attention
         mask = torch.full(
             (self.n_positions, self.n_positions), True, device=attention_mask.device
         ).tril(diagonal=0)
@@ -104,6 +109,65 @@ class NeuronBaseModel(nn.Module):
                 .to(torch.bool)
             )
             return torch.logical_and(mask, expanded_mask)
+        
+    def _create_chunked_prefill_attn_mask(
+        self, 
+        query_lens: torch.Tensor, 
+        key_lens: torch.Tensor, 
+        max_query_len: int, 
+        max_key_len: int, 
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Return a block diagonal atttention mask for chunked prefill
+
+        Example:
+            query_lens = [2,3,1,0]
+            key_lens = [4,5,4,0]
+            max_query_len = 8
+            max_key_len = 16
+
+            mask = [
+                [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 3 attend to 1st sequence
+                [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 4 attend to 1st sequence
+                [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 3 attend to 2nd sequence
+                [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], # At position 4 attend to 2nd sequence
+                [0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0], # At position 5 attend to 2nd sequence
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0], # At position 3 attend to 3rd sequence
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+            ]
+        
+        Args:
+            query_lens: a list of query lengths for each sequence
+            key_lens: a list of key lengths for each sequence
+            max_query_len: the max value of the sum of query lengths
+            max_key_len: the max value of the sum of key lengths
+
+        Return:
+            mask: the causal attention mask for chunked prefill
+        """
+        
+        query_lens = query_lens.tolist()
+        key_lens = key_lens.tolist()
+        assert len(query_lens) == len(key_lens)
+
+        mask = []
+        for i in range(len(query_lens)):
+            q_len_per_seq = query_lens[i]
+            k_len_per_seq = key_lens[i]
+            if q_len_per_seq == 0:
+                break # 0 means padding, so we can skip creating causal mask for them
+            diag_offset = k_len_per_seq - q_len_per_seq
+            mask_per_seq = torch.ones(q_len_per_seq, k_len_per_seq).tril(diagonal=diag_offset)
+            mask.append(mask_per_seq)
+        
+        mask = torch.block_diag(*mask)
+        q_len, k_len = mask.shape
+        k_len_to_pad = max_key_len - k_len
+        q_len_to_pad = max_query_len - q_len
+        mask = torch.nn.functional.pad(mask, [0, k_len_to_pad, 0, q_len_to_pad])
+        return mask
 
     def _create_spec_attn_mask(self, attention_mask):
         return (
@@ -120,10 +184,10 @@ class NeuronBaseModel(nn.Module):
         )
 
     def create_attn_mask(
-        self, attention_mask, is_for_context_encoding, is_for_speculation, position_ids
+        self, attention_mask, is_for_context_encoding, is_for_speculation, **kwargs
     ):
         if is_for_context_encoding:
-            return self._create_context_attn_mask(attention_mask)
+            return self._create_context_attn_mask(attention_mask, **kwargs)
         elif is_for_speculation:
             return self._create_spec_attn_mask(attention_mask)
         else:
@@ -158,7 +222,7 @@ class NeuronBaseModel(nn.Module):
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
-            attention_mask, is_for_context_encoding, False, position_ids
+            attention_mask, is_for_context_encoding, False,
         )
         active_mask = None
         if is_for_medusa_speculation:
@@ -271,7 +335,7 @@ class NeuronBaseModel(nn.Module):
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
-            attention_mask, is_for_context_encoding, is_for_speculation, position_ids
+            attention_mask, is_for_context_encoding, is_for_speculation
         )
         active_mask = None
         if is_for_speculation:
