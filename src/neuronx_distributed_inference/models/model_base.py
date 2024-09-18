@@ -483,6 +483,9 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         else:
             new_config.neuron_config.buckets = generate_buckets(128, self.neuron_config.max_length)
 
+        # shouldn't be used in token gen models
+        new_config.neuron_config.sequence_parallel_enabled = False
+
         self.token_generation_model = self.model_wrapper(
             config=new_config,
             model_cls=self._model_cls,
