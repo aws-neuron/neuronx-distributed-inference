@@ -94,7 +94,15 @@ class NeuronAttentionBase(nn.Module):
         QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
         return QK
 
-    def prep_qkv_tensors(self, position_ids, hidden_states, past_key_value, adapter_ids=None):
+    def prep_qkv_tensors(
+        self,
+        position_ids,
+        hidden_states,
+        past_key_value,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+    ):
         """take care of the shape, layout, group query, custom position encoding, etc."""
         Q, K, V = self.qkv_proj(hidden_states=hidden_states, adapter_ids=adapter_ids)
 
@@ -110,9 +118,12 @@ class NeuronAttentionBase(nn.Module):
 
         # Rotate Q and K
         if self.rotary_emb is not None:
-            cos, sin = self.rotary_emb(V, position_ids)
-            Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
-        return Q, K, V
+            if cos_cache is None or sin_cache is None:
+                cos_cache, sin_cache = self.rotary_emb(V, position_ids)
+
+            Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
+
+        return Q, K, V, cos_cache, sin_cache
 
     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask) -> Tensor:
         """attention computation at prefilling (context encoding) phase"""
@@ -213,13 +224,20 @@ class NeuronAttentionBase(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         active_mask: Optional[torch.LongTensor] = None,
         adapter_ids=None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """Implements each layer's forward pass for the attention block."""
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
             q_len *= get_tensor_model_parallel_size()
-        Q, K, V = self.prep_qkv_tensors(
-            position_ids, hidden_states, past_key_value, adapter_ids=adapter_ids
+        Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
+            position_ids,
+            hidden_states,
+            past_key_value,
+            adapter_ids=adapter_ids,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
         )
 
         if past_key_value is None:
@@ -240,4 +258,4 @@ class NeuronAttentionBase(nn.Module):
 
         past_key_value: Tuple[Tensor, Tensor] = (K, V)
 
-        return attn_output, past_key_value
+        return attn_output, past_key_value, cos_cache, sin_cache

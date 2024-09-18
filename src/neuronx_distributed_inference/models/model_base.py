@@ -393,7 +393,8 @@ class NeuronBaseModel(nn.Module):
 
         # decoder layers
         next_decoder_cache = ()
-
+        cos_cache = None
+        sin_cache = None
         for idx, decoder_layer in enumerate(self.layers):
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
@@ -404,11 +405,13 @@ class NeuronBaseModel(nn.Module):
                 past_key_value=past_key_value,
                 active_mask=active_mask,
                 adapter_ids=adapter_ids,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
             )
 
             hidden_states = layer_outputs[0]
-
             next_decoder_cache += (layer_outputs[1],)
+            cos_cache, sin_cache = layer_outputs[2:]
 
         if self.sequence_parallel_enabled:
             hidden_states = _gather_along_dim(hidden_states, self.sequence_dimension)

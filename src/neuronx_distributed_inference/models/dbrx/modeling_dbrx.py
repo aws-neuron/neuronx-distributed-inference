@@ -230,7 +230,7 @@ class NeuronDbrxBlock(nn.Module):
         hidden_states = self.input_layernorm(hidden_states).to(dtype=hidden_states.dtype)
 
         # Self Attention
-        hidden_states, present_key_value = self.self_attn(
+        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -246,7 +246,7 @@ class NeuronDbrxBlock(nn.Module):
         hidden_states = self.ffn(hidden_states)[0]
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, present_key_value)
+        outputs = (hidden_states, present_key_value, cos_cache, sin_cache)
 
         return outputs
 

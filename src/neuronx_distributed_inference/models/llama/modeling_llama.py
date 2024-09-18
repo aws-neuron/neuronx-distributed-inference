@@ -322,7 +322,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        attn_outs = self.self_attn(
+        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -331,7 +331,6 @@ class NeuronLlamaDecoderLayer(nn.Module):
             **kwargs,
         )
 
-        hidden_states, present_key_value = attn_outs
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -340,7 +339,9 @@ class NeuronLlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states, adapter_ids=adapter_ids)
         hidden_states = residual + hidden_states
 
-        return (hidden_states, present_key_value)
+        outputs = (hidden_states, present_key_value, cos_cache, sin_cache)
+
+        return outputs
 
 
 class ResBlock(nn.Module):
