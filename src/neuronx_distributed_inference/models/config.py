@@ -126,6 +126,9 @@ class NeuronConfig:
         self.pp_degree = kwargs.pop("pp_degree", 1)
         self.ep_degree = kwargs.pop("ep_degree", 1)
 
+        # QK layer normalization
+        self.qk_layernorm = kwargs.pop("qk_layernorm", False)
+
         self.world_size = kwargs.pop("world_size", None)
         if self.world_size is None:
             self.world_size = self.tp_degree * self.pp_degree * self.ep_degree

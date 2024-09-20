@@ -7,10 +7,13 @@ torch.manual_seed(0)
 
 
 def move_heads_front(
-    tensor: Tensor, bsz: int, seq_len: int, num_head: int, head_dim: int
+    tensor: Tensor, bsz: int, seq_len: int, num_head: int, head_dim: int, layernorm=None
 ) -> Tensor:
-    """BSHD -> BHSD"""
-    return tensor.view(bsz, seq_len, num_head, head_dim).transpose(1, 2).contiguous()
+    """Reshape input tensor: BSHD -> BHSD, and apply layer normalization if layernorm is specified"""
+    tensor = tensor.view(bsz, seq_len, num_head, head_dim)
+    if layernorm:
+        tensor = layernorm(tensor)
+    return tensor.transpose(1, 2).contiguous()
 
 
 def repeat_kv(hidden_states: Tensor, n_rep: int) -> Tensor:

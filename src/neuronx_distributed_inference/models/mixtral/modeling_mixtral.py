@@ -167,6 +167,7 @@ class NeuronMixtralAttention(NeuronAttentionBase):
         self.rope_theta = config.rope_theta
         self.padding_side = config.neuron_config.padding_side
         self.torch_dtype = config.neuron_config.torch_dtype
+        self.qk_layernorm = config.neuron_config.qk_layernorm
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(

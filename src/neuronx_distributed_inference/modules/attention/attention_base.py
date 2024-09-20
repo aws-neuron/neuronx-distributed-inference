@@ -43,6 +43,9 @@ class NeuronAttentionBase(nn.Module):
         self.o_proj = None
         self.qkv_proj = None
         self.bias = False
+        self.k_layernorm = None
+        self.q_layernorm = None
+        self.qk_layernorm = False
 
         self.sequence_parallel_enabled = False
         self.sequence_dimension = None
@@ -88,6 +91,9 @@ class NeuronAttentionBase(nn.Module):
             self.qkv_proj.get_num_key_value_heads(), self.tp_degree
         )
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        if self.qk_layernorm:
+            self.q_layernorm = nn.LayerNorm(self.head_dim)
+            self.k_layernorm = nn.LayerNorm(self.head_dim)
 
     def scaled_qk(self, Q, K, attention_mask):
         QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -112,9 +118,9 @@ class NeuronAttentionBase(nn.Module):
         if self.sequence_parallel_enabled:
             q_len *= get_tensor_model_parallel_size()
 
-        Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim)
-        K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim)
-        V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim)
+        Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernormm)
+        K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm)
+        V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
 
         # Rotate Q and K
         if self.rotary_emb is not None:
