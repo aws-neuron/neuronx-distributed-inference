@@ -6,8 +6,8 @@ from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSa
 from neuronx_distributed_inference.models.llama.modeling_llama import LlamaInferenceConfig, NeuronLlamaForCausalLM
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
 
-model_path = "/home/ubuntu/model_hf/Llama-2-7b/"
-traced_model_path = "/home/ubuntu/traced_model/Llama-2-7b/"
+model_path = "/home/ubuntu/model_hf/Llama-3.1-8B/"
+traced_model_path = "/home/ubuntu/traced_model/Llama-3.1-8B/"
 
 torch.manual_seed(0)
 

@@ -1,7 +1,7 @@
 import copy
 import os
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 from neuronx_distributed.utils.medusa_utils import (
@@ -10,13 +10,10 @@ from neuronx_distributed.utils.medusa_utils import (
     generate_medusa_buffers,
     update_inference_inputs,
 )
-from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, GenerationConfig, PretrainedConfig, PreTrainedModel
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.generation.logits_process import LogitsProcessorList
-from transformers.generation.stopping_criteria import (
-    StoppingCriteriaList,
-    validate_stopping_criteria,
-)
+from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.modeling_outputs import ModelOutput
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
@@ -72,63 +69,31 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         self.sampler = None
         self.prev_kv_cache_populated = False
 
-        # Temporarily track the generation config for the current generate() call.
-        # In transformers 4.41+, the current generation config is passed to each generation mode function.
-        self.current_generation_config = None
-
     def forward(self, *args, **kwargs):
         return self.neuron_model(*args, **kwargs)
-
-    # Temporary override to capture the current generate() call's generation config.
-    # In transformers 4.41+, the current generation config is passed to each generation mode function.
-    def _prepare_generation_config(self, *args, **kwargs):
-        generation_config, model_kwargs = super()._prepare_generation_config(*args, **kwargs)
-        self.current_generation_config = generation_config
-        return generation_config, model_kwargs
 
     # TODO: Remove _sample and define separate flow for on-device sampling that doesn't use HF.
     def _sample(
         self,
         input_ids: torch.LongTensor,
-        logits_processor: Optional[LogitsProcessorList] = None,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
         logits_warper: Optional[LogitsProcessorList] = None,
-        max_length: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[Union[int, List[int]]] = None,
-        output_scores: Optional[bool] = None,
-        output_logits: Optional[bool] = None,
-        return_dict_in_generate: Optional[bool] = None,
         **model_kwargs,
     ) -> Union[SampleOutput, torch.LongTensor]:
         r"""
         We override the GenerationMixin sample function (_sample for transformers>=4.39.0) to add support for right side padding.
         """
         # init values
-        logits_processor = (
-            logits_processor if logits_processor is not None else LogitsProcessorList()
-        )
-        stopping_criteria = (
-            stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-        )
-        max_length = (
-            max_length if max_length is not None else self.current_generation_config.max_length
-        )
-        if max_length is not None:
-            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
         logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
-        pad_token_id = (
-            pad_token_id
-            if pad_token_id is not None
-            else self.current_generation_config.pad_token_id
+        pad_token_id = generation_config._pad_token_tensor
+        output_scores = generation_config.output_scores
+        output_logits = generation_config.output_logits
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        has_eos_stopping_criteria = any(
+            hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
         )
-        eos_token_id = (
-            eos_token_id
-            if eos_token_id is not None
-            else self.current_generation_config.eos_token_id
-        )
-        if isinstance(eos_token_id, int):
-            eos_token_id = [eos_token_id]
 
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
@@ -150,7 +115,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             outputs = self(**model_inputs, return_dict=True)
 
             if not self.on_device_sampling:
-                next_token_logits = outputs.logits[:, -1, :]
+                next_token_logits = outputs.logits[:, -1, :].clone()
 
                 # pre-process distribution
                 next_token_scores = logits_processor(input_ids, next_token_logits)
@@ -164,19 +129,13 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
 
             if not self.on_device_sampling:
                 if self.sampler is None:
-                    self.sampler = Sampler(
-                        self.neuron_config, top_k=self.current_generation_config.top_k
-                    )
+                    self.sampler = Sampler(self.neuron_config, top_k=generation_config.top_k)
                 next_tokens = self.sampler.sample(outputs.logits[:, -1, :])
             else:
                 next_tokens = outputs.tokens
 
             # finished sentences should have their next token be a padding token
-            if eos_token_id is not None:
-                if pad_token_id is None:
-                    raise ValueError(
-                        "If `eos_token_id` is defined, make sure that `pad_token_id` is defined."
-                    )
+            if has_eos_stopping_criteria:
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (
                     1 - unfinished_sequences
                 )
@@ -316,23 +275,13 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         self,
         input_ids: torch.LongTensor,
         candidate_generator: "CandidateGenerator",  # noqa
-        do_sample: bool = False,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[Union[int, List[int]]] = None,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
         **model_kwargs,
     ):
-        do_sample = do_sample if do_sample is not None else self.current_generation_config.do_sample
-        pad_token_id = (
-            pad_token_id
-            if pad_token_id is not None
-            else self.current_generation_config.pad_token_id
-        )
-        eos_token_id = (
-            eos_token_id
-            if eos_token_id is not None
-            else self.current_generation_config.eos_token_id
-        )
+        do_sample = generation_config.do_sample
+        pad_token_id = generation_config.pad_token_id
+        eos_token_id = generation_config.eos_token_id
         if do_sample:
             raise ValueError(
                 "Sampling is unsupported as part of speculation. Only greedy speculation is supported."
@@ -377,19 +326,6 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             num_assistant_tokens = assistant_model.generation_config.num_assistant_tokens
 
         # Init values
-        stopping_criteria = (
-            stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-        )
-        pad_token_id = (
-            pad_token_id
-            if pad_token_id is not None
-            else self.current_generation_config.pad_token_id
-        )
-        eos_token_id = (
-            eos_token_id
-            if eos_token_id is not None
-            else self.current_generation_config.eos_token_id
-        )
         if eos_token_id is not None and pad_token_id is None:
             raise ValueError(
                 "If `eos_token_id` is defined, make sure that `pad_token_id` is defined."
@@ -549,12 +485,6 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         **model_kwargs,
     ):
         medusa_kwargs = copy.deepcopy(model_kwargs)
-
-        eos_token_id = (
-            eos_token_id
-            if eos_token_id is not None
-            else self.current_generation_config.eos_token_id
-        )
 
         mc_sim_7b_63 = self.neuron_config.medusa_tree
 

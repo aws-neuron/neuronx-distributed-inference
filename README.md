@@ -17,8 +17,8 @@ inference_demo \
   --model-type llama \
   --task-type causal-lm \
   run \
-    --model-path /home/ubuntu/model_hf/Llama-2-7b/ \
-    --compiled-model-path /home/ubuntu/traced_model/Llama-2-7b-demo/ \
+    --model-path /home/ubuntu/model_hf/Llama-3.1-8B/ \
+    --compiled-model-path /home/ubuntu/traced_model/Llama-3.1-8B/ \
     --torch-dtype bfloat16 \
     --tp-degree 32 \
     --batch-size 2 \
