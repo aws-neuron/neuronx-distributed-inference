@@ -1,5 +1,5 @@
 import torch
-from neuronx_distributed_inference.models.utils import (
+from neuronx_distributed_inference.modules.kvcache.utils import (
     get_active_block_table,
     contexted_kv,
     contexted_kv_indexing

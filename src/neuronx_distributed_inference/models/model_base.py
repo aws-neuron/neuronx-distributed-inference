@@ -21,6 +21,7 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; 
     TOKEN_GENERATION_MODEL_TAG,
     ModelWrapper,
 )
+from neuronx_distributed_inference.modules.attention import utils as attn_utils
 from neuronx_distributed_inference.modules.autobucketing import generate_buckets
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
@@ -118,56 +119,8 @@ class NeuronBaseModel(nn.Module):
         max_key_len: int, 
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Return a block diagonal atttention mask for chunked prefill
-
-        Example:
-            query_lens = [2,3,1,0]
-            key_lens = [4,5,4,0]
-            max_query_len = 8
-            max_key_len = 16
-
-            mask = [
-                [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 3 attend to 1st sequence
-                [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 4 attend to 1st sequence
-                [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 3 attend to 2nd sequence
-                [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], # At position 4 attend to 2nd sequence
-                [0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0], # At position 5 attend to 2nd sequence
-                [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0], # At position 3 attend to 3rd sequence
-                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
-                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
-            ]
-        
-        Args:
-            query_lens: a list of query lengths for each sequence
-            key_lens: a list of key lengths for each sequence
-            max_query_len: the max value of the sum of query lengths
-            max_key_len: the max value of the sum of key lengths
-
-        Return:
-            mask: the causal attention mask for chunked prefill
-        """
-        
-        query_lens = query_lens.tolist()
-        key_lens = key_lens.tolist()
-        assert len(query_lens) == len(key_lens)
-
-        mask = []
-        for i in range(len(query_lens)):
-            q_len_per_seq = query_lens[i]
-            k_len_per_seq = key_lens[i]
-            if q_len_per_seq == 0:
-                break # 0 means padding, so we can skip creating causal mask for them
-            diag_offset = k_len_per_seq - q_len_per_seq
-            mask_per_seq = torch.ones(q_len_per_seq, k_len_per_seq).tril(diagonal=diag_offset)
-            mask.append(mask_per_seq)
-        
-        mask = torch.block_diag(*mask)
-        q_len, k_len = mask.shape
-        k_len_to_pad = max_key_len - k_len
-        q_len_to_pad = max_query_len - q_len
-        mask = torch.nn.functional.pad(mask, [0, k_len_to_pad, 0, q_len_to_pad])
-        return mask
+        return attn_utils.create_block_diagonal_attn_mask(
+            query_lens, key_lens, max_query_len, max_key_len, **kwargs)
 
     def _create_spec_attn_mask(self, attention_mask):
         return (

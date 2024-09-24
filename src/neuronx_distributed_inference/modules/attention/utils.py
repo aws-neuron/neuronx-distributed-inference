@@ -97,3 +97,74 @@ class RotaryEmbedding(nn.Module):
         cos = emb.cos()
         sin = emb.sin()
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+# Utility functions to create attention mask
+def create_block_diagonal_attn_mask(
+    query_lens: torch.Tensor, 
+    key_lens: torch.Tensor, 
+    max_query_len: torch.Tensor, 
+    max_key_len: torch.Tensor, 
+):
+    """
+    Return a block diagonal atttention mask which can be used by chunked 
+    prefill.
+
+    This function is written in a way that it can be traced, so it can
+    be used inside the NeuronBaseModel class.
+
+    Example:
+        query_lens = [2,3,1,0]
+        key_lens = [4,5,4,0]
+        max_query_len = 8
+        max_key_len = 16
+
+        mask = [
+            [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 3 attend to 1st sequence
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 4 attend to 1st sequence
+            [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 3 attend to 2nd sequence
+            [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], # At position 4 attend to 2nd sequence
+            [0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0], # At position 5 attend to 2nd sequence
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0], # At position 3 attend to 3rd sequence
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+        ]
+    
+    Args:
+        query_lens: a list of query lengths for each sequence
+        key_lens: a list of key lengths for each sequence
+        max_query_len: the max value of the sum of query lengths
+        max_key_len: the max value of the sum of key lengths
+
+    Return:
+        mask: the causal attention mask for chunked prefill
+    """
+    batch_size = query_lens.shape[0]
+
+    row_idx = torch.arange(max_query_len, dtype=torch.int).reshape(-1, 1)
+    col_idx = torch.arange(max_key_len, dtype=torch.int).reshape(1, -1)
+
+    q_cumsum = torch.cumsum(query_lens, dim=0)
+    q_cumsum = torch.cat([torch.tensor(0).reshape(1), q_cumsum])
+    k_cumsum = torch.cumsum(key_lens, dim=0)
+    k_cumsum = torch.cat([torch.tensor(0).reshape(1), k_cumsum])
+
+    mask = torch.zeros(max_query_len, max_key_len, dtype=torch.bool)
+    for seq_id in range(batch_size):
+        ri = q_cumsum[seq_id] # row index
+        ci = k_cumsum[seq_id] # column index
+        nr = query_lens[seq_id] # number of rows
+        nc = key_lens[seq_id] # number of columns
+
+        offset = ci + nc - ri - nr
+        # upper right triangle is set to false
+        diagonal_mask = (row_idx - col_idx + offset) >= 0 
+
+        left_mask = col_idx >= ci
+        top_mask = row_idx >= ri
+        bottom_mask = row_idx < ri+nr
+
+        mask_per_seq = diagonal_mask & left_mask & top_mask & bottom_mask
+        mask = mask | mask_per_seq
+
+    return mask
