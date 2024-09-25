@@ -118,7 +118,7 @@ class NeuronAttentionBase(nn.Module):
         if self.sequence_parallel_enabled:
             q_len *= get_tensor_model_parallel_size()
 
-        Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernormm)
+        Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm)
         K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm)
         V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
 
