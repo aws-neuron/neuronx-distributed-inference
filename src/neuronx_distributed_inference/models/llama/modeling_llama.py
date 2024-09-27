@@ -264,8 +264,8 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                     base=self.rope_theta,
                 )
         else:
-            rope_type = self.config.rope_config.get(
-                "rope_type", self.config.rope_config.get("type", None)
+            rope_type = self.config.rope_scaling.get(
+                "rope_type", self.config.rope_scaling.get("type", None)
             )
             if rope_type == "llama3":
                 self.rotary_emb = Llama3RotaryEmbedding(
