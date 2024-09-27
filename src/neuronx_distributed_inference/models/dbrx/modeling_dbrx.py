@@ -320,4 +320,6 @@ class NeuronDbrxForCausalLM(NeuronBaseForCausalLM):
         # Prevent auto-downcasting when running with fp32
         if self.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
+        # Enable vector-offset DGE
+        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         return compiler_args

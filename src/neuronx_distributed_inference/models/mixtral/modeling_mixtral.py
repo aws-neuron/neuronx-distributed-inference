@@ -339,4 +339,6 @@ class NeuronMixtralForCausalLM(NeuronBaseForCausalLM):
         # Prevent auto-down casting when running with fp32
         if self.config.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
+        # Enable vector-offset DGE
+        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         return compiler_args
