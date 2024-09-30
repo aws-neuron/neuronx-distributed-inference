@@ -107,6 +107,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument(
         "--quantization-type", type=str, choices=[t.value for t in QuantizationType]
     )
+    run_parser.add_argument('--kv-cache-quant', action='store_true')
 
     # MoE
     run_parser.add_argument("--capacity-factor", type=float)

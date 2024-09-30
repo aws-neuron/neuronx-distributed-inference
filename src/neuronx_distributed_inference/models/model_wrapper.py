@@ -104,6 +104,9 @@ class ModelWrapper(torch.nn.Module):
 
         else:
             self.compiler_args = compiler_args
+        
+        if self.neuron_config.kv_cache_quant:
+            self.compiler_args+="--internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3' " 
 
         self.bucket_config = get_bucket_model_config_from_tag(tag, self.config)
         self.priority_model_idx = priority_model_idx
@@ -388,7 +391,7 @@ class DecoderModelInstance(BaseModelInstance):
         float_model.eval()
 
         if self.neuron_config.torch_dtype == torch.bfloat16:
-            float_model.bfloat16()
+            float_model._apply(lambda t: t.bfloat16() if t.is_floating_point() and t.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2] else t)
 
         if self.neuron_config.quantized is True:
             quantization_type = QuantizationType(self.neuron_config.quantization_type)

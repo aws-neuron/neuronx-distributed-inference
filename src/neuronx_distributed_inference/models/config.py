@@ -105,6 +105,7 @@ class NeuronConfig:
             ), "quantized_checkpoints_path is required"
         self.quantization_type = kwargs.pop("quantization_type", "per_tensor_symmetric")
         # TODO: Add validation for quantized_checkpoints_path after the design discussions
+        self.kv_cache_quant = kwargs.pop("kv_cache_quant", False)
 
         # Speculative decoding
         self.trace_tokengen_model = kwargs.pop("trace_tokengen_model", True)
