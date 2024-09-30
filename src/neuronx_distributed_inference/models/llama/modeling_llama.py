@@ -476,6 +476,7 @@ class NeuronLlamaModel(NeuronBaseModel):
             self.lm_head = ColumnParallelLinear(
                 config.hidden_size,
                 config.vocab_size,
+                gather_output=False if self.on_device_sampling else True,
                 bias=False,
                 pad=True,
             )

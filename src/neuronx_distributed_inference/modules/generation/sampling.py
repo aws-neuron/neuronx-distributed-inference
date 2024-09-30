@@ -1,5 +1,7 @@
+from neuronx_distributed.operators.argmax import argmax as nxd_argmax
+from neuronx_distributed.operators.topk import topk as nxd_topk
 from torch import argmax, count_nonzero, cumsum, gather, nn, rand, subtract, topk
-from torch_neuronx.xla_impl.ops import Argmax, Softmax, TopK
+from torch_neuronx.xla_impl.ops import Softmax
 
 from neuronx_distributed_inference.models.config import NeuronConfig
 
@@ -49,17 +51,20 @@ class Sampler:
         # token_logits has dimensions (batch-size, vocabulary-length)
         # we do all aperations on dim=1
         dim = 1
-        keep_dim = False
         num_samples = 1
         if self.top_k == 1:  # do greedy sampling
             if self.on_device_sampling:
-                return Argmax.apply(token_logits, dim, keep_dim)  # custom call
+                return nxd_argmax(
+                    tensor=token_logits, dim=dim, gather_dim=dim, keepdim=False
+                )  # custom call
             else:
                 return argmax(token_logits, dim=dim)
         else:  # do multinomial sampling
             if self.on_device_sampling:  # use TopK and Softmax custom calls
                 # 1 is for dim
-                top_k_logits = TopK.apply(token_logits, self.top_k, dim)  # custom call
+                top_k_logits = nxd_topk(
+                    tensor=token_logits, k=self.top_k, dim=dim, gather_dim=dim
+                )  # custom call
                 top_k_logits_values = top_k_logits[0]
                 top_k_logits_indices = top_k_logits[1]
                 # 1 is for dim
