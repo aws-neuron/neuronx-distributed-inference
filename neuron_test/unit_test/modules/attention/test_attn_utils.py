@@ -1,7 +1,8 @@
+# fmt: off
 import torch
-from neuronx_distributed_inference.modules.attention.utils import (
-    create_block_diagonal_attn_mask
-)
+
+from neuronx_distributed_inference.modules.attention.utils import create_block_diagonal_attn_mask
+
 
 # Tests on create_block_diagonal_attn_mask()
 def test_attn_mask_for_chunked_prefill_mostly_decode():

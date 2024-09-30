@@ -1,9 +1,12 @@
+# fmt: off
 import torch
+
 from neuronx_distributed_inference.modules.kvcache.utils import (
-    get_active_block_table,
     contexted_kv,
-    contexted_kv_indexing
+    contexted_kv_indexing,
+    get_active_block_table,
 )
+
 
 # Tests on get_active_block_table()
 def test_get_active_block_table_case_1():
@@ -23,7 +26,7 @@ def test_get_active_block_table_case_1():
 
     expected = torch.tensor([149, 148, 147, 146, 145, 0])
 
-    assert torch.equal(actual, expected) 
+    assert torch.equal(actual, expected)
 
 
 def test_get_active_block_table_case_2():
@@ -43,7 +46,7 @@ def test_get_active_block_table_case_2():
 
     expected = torch.tensor([123, 128, 148, 147, 146, 163])
 
-    assert torch.equal(actual, expected) 
+    assert torch.equal(actual, expected)
 
 
 def test_get_active_block_table_case_3():
@@ -63,7 +66,7 @@ def test_get_active_block_table_case_3():
 
     expected = torch.tensor([123, 128, 175, 148, 147, 146, 0, 0])
 
-    assert torch.equal(actual, expected) 
+    assert torch.equal(actual, expected)
 
 
 def prepare_traced_get_active_block_table(
@@ -74,9 +77,9 @@ def prepare_traced_get_active_block_table(
 ):
     """Need to test the function in a traced format"""
     example_inputs = (
-        torch.zeros(block_table_shape), 
-        torch.zeros(seq_lens_shape), 
-        torch.tensor(num_active_block), 
+        torch.zeros(block_table_shape),
+        torch.zeros(seq_lens_shape),
+        torch.tensor(num_active_block),
         torch.tensor(block_size),
     )
     traced_func = torch.jit.trace(get_active_block_table, example_inputs)
@@ -189,7 +192,7 @@ def test_contexted_kv_indexing_case_1():
         [0, 1, x, x, x, 4, 5, 6, 7, 8, x, x, 12, 13, 14, 15, x, x, x, x], dtype=torch.int)
     expected_current_reordered_idx = torch.tensor(
         [x, x, 0, 1, 2, x, x, x, x, x, 3, 4,  x,  x,  x,  x, 5, x, x, x], dtype=torch.int)
-    
+
     assert torch.equal(actual_cache_mask, expected_cache_mask)
     assert torch.equal(actual_cache_reordred_idx, expected_cache_reordered_idx)
     assert torch.equal(actual_current_reordered_idx, expected_current_reordered_idx)
@@ -215,7 +218,7 @@ def test_contexted_kv_indexing_case_2():
         [0, 1, 2, 3, x, 6, 7, 8, 9, 10, x, x, 12, 13, x, x, x, 15, 16, 17, x], dtype=torch.int)
     expected_current_reordered_idx = torch.tensor(
         [x, x, x, x, 0, x, x, x, x,  x, 1, 2,  x,  x, 3, 4, 5,  x,  x,  x, 6], dtype=torch.int)
-    
+
     assert torch.equal(actual_cache_mask, expected_cache_mask)
     assert torch.equal(actual_cache_reordred_idx, expected_cache_reordered_idx)
     assert torch.equal(actual_current_reordered_idx, expected_current_reordered_idx)

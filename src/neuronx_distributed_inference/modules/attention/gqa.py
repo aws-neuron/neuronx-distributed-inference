@@ -7,6 +7,7 @@ from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, Row
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
 from neuronx_distributed.quantization.quantization_layers import BaseQuantizeParallelLinear
 from torch import nn
+from torch.distributed import ProcessGroup
 from torch.nn import functional as F
 
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
@@ -220,8 +221,25 @@ class BaseGroupQueryAttention(nn.Module):
         dtype: torch.dtype = torch.float32,
         bias: bool = False,
         desired_sharding_strategy: Optional[GQA] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__()
+
+        if tensor_model_parallel_group is not None:
+            self.tensor_model_parallel_group = tensor_model_parallel_group
+        elif parallel_state.model_parallel_is_initialized():
+            self.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            self.tensor_model_parallel_group = None
+
+        if tensor_model_parallel_group:
+            if tp_degree == 1:
+                # update default value
+                tp_degree = tensor_model_parallel_group.size()
+            else:
+                assert (
+                    tp_degree == self.tensor_model_parallel_group.size()
+                ), "TP Degree and tensor model parallel group size does not match"
 
         self.hidden_size = hidden_size
         self.tp_degree = tp_degree
@@ -284,6 +302,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         clip_qkv: Optional[float] = None,
         sequence_parallel_enabled: bool = False,
         sequence_dimension: Optional[int] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -294,6 +313,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             dtype=dtype,
             bias=bias,
             desired_sharding_strategy=desired_sharding_strategy,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
         if fused_qkv and gather_output:
             raise ValueError(
@@ -304,7 +324,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         self.fused_qkv = fused_qkv
         self.clip_qkv = clip_qkv
 
-        if parallel_state.model_parallel_is_initialized():
+        if self.tensor_model_parallel_group is not None:
             if self.fused_qkv:
                 self.Wqkv = ColumnParallelLinear(
                     self.hidden_size,
@@ -314,6 +334,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     dtype=dtype,
                     sequence_parallel_enabled=sequence_parallel_enabled,
                     sequence_dimension=sequence_dimension,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
                 # Set heads info as weight parameter attributes to be used in weights sharding
                 setattr(self.Wqkv.weight, "fused_qkv", True)
@@ -329,6 +350,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     dtype=dtype,
                     sequence_parallel_enabled=sequence_parallel_enabled,
                     sequence_dimension=sequence_dimension,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
                 self.k_proj = ColumnParallelLinear(
                     self.hidden_size,
@@ -338,6 +360,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     dtype=dtype,
                     sequence_parallel_enabled=sequence_parallel_enabled,
                     sequence_dimension=sequence_dimension,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
                 self.v_proj = ColumnParallelLinear(
                     self.hidden_size,
@@ -347,6 +370,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     dtype=dtype,
                     sequence_parallel_enabled=sequence_parallel_enabled,
                     sequence_dimension=sequence_dimension,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
         else:
             if self.fused_qkv:
@@ -731,6 +755,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         layer_name: str = "o_proj",
         sequence_parallel_enabled: bool = False,
         sequence_dimension: Optional[int] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -741,11 +766,12 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
             dtype=dtype,
             bias=bias,
             desired_sharding_strategy=desired_sharding_strategy,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
 
         self.input_is_parallel = input_is_parallel
 
-        if parallel_state.model_parallel_is_initialized():
+        if self.tensor_model_parallel_group is not None:
             self.o_proj = RowParallelLinear(
                 self.num_attention_heads * self.head_dim,
                 self.hidden_size,
@@ -754,6 +780,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
                 dtype=self.dtype,
                 sequence_parallel_enabled=sequence_parallel_enabled,
                 sequence_dimension=sequence_dimension,
+                tensor_model_parallel_group=self.tensor_model_parallel_group,
             )
         else:
             self.o_proj = nn.Linear(

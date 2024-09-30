@@ -1,8 +1,9 @@
-# Standard Library
 import unittest
-from unittest.mock import MagicMock, patch
 
+import neuronx_distributed as nxd
 import torch
+import torch.distributed
+from neuronx_distributed.trace.mock_torchdist import mock_distributed
 
 from neuronx_distributed_inference.modules.lora_serving.lora_layer import (
     MultiLoraColumnParallelLinear,
@@ -60,55 +61,42 @@ class TestLoraServingLayers(unittest.TestCase):
         )
         assert lora_layer.get_checkpoint_shape() == (max_loras, output_size, input_size)
 
-    @patch(
-        "neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_size",
-        MagicMock(return_value=8),
-    )
-    @patch(
-        "neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_rank",
-        MagicMock(return_value=1),
-    )
-    @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.initialize_model_parallel",
-        MagicMock(return_value=True),
-    )
-    @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.model_parallel_is_initialized",
-        MagicMock(return_value=True),
-    )
-    @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=8))
     def test_column_parallel_linear_layer(self):
-        max_loras = 2
-        input_size = 32
-        output_size = 16
-        dtype = torch.float32
-        lora_layer = MultiLoraColumnParallelLinear(max_loras, input_size, output_size, dtype)
-        assert lora_layer.get_checkpoint_shape() == (max_loras, output_size, input_size)
+        world_size = 8
+        with mock_distributed(world_size=world_size):
+            torch.distributed.init_process_group("xla", rank=0, world_size=world_size)
+            nxd.parallel_layers.parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=world_size,
+                skip_collective_init=True,
+            )
+            max_loras = 2
+            input_size = 32
+            output_size = 16
+            dtype = torch.float32
+            lora_layer = MultiLoraColumnParallelLinear(max_loras, input_size, output_size, dtype)
+            assert lora_layer.get_checkpoint_shape() == (max_loras, output_size, input_size)
 
-    @patch(
-        "neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_size",
-        MagicMock(return_value=8),
-    )
-    @patch(
-        "neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_rank",
-        MagicMock(return_value=1),
-    )
-    @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.initialize_model_parallel",
-        MagicMock(return_value=True),
-    )
-    @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.model_parallel_is_initialized",
-        MagicMock(return_value=True),
-    )
-    @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=8))
+            nxd.parallel_layers.parallel_state.destroy_model_parallel()
+            torch.distributed.destroy_process_group()
+
     def test_row_parallel_linear_layer(self):
-        max_loras = 2
-        input_size = 32
-        output_size = 16
-        dtype = torch.float32
-        lora_layer = MultiLoraRowParallelLinear(max_loras, input_size, output_size, dtype)
-        assert lora_layer.get_checkpoint_shape() == (max_loras, output_size, input_size)
+        world_size = 8
+        with mock_distributed(world_size=world_size):
+            torch.distributed.init_process_group("xla", rank=0, world_size=world_size)
+            nxd.parallel_layers.parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=world_size,
+                skip_collective_init=True,
+            )
+
+            max_loras = 2
+            input_size = 32
+            output_size = 16
+            dtype = torch.float32
+            lora_layer = MultiLoraRowParallelLinear(max_loras, input_size, output_size, dtype)
+            assert lora_layer.get_checkpoint_shape() == (max_loras, output_size, input_size)
+
+            nxd.parallel_layers.parallel_state.destroy_model_parallel()
+            torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

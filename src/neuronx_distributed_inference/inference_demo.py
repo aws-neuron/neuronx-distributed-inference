@@ -17,12 +17,15 @@ from neuronx_distributed_inference.models.mixtral.modeling_mixtral import Neuron
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.accuracy import check_accuracy, check_accuracy_logits
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
+from neuronx_distributed_inference.utils.distributed import get_init_rank, get_init_world_size
 from neuronx_distributed_inference.utils.hf_adapter import (
     HuggingFaceGenerationAdapter,
     load_pretrained_config,
 )
+from neuronx_distributed_inference.utils.random import set_random_seed
 
-torch.manual_seed(0)
+set_random_seed(0)
+
 
 MODEL_TYPES = {
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
@@ -131,6 +134,12 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--world-size", type=int)
     run_parser.add_argument("--start_rank_id", type=int)
     run_parser.add_argument("--local_ranks_size", type=int)
+    run_parser.add_argument(
+        "--enable-torch-dist",
+        action="store_true",
+        help="Use torch.distributed (gloo) backend when running multi-node examples. "
+        "This is useful for ensuring processes on different nodes are in sync",
+    )
 
     # lora
     run_parser.add_argument("--enable-lora", action="store_true")
@@ -138,6 +147,19 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--max-lora-rank", type=int)
     run_parser.add_argument("--target-modules", nargs="+")
     run_parser.add_argument("--max-loras-on-cpu", type=int)
+
+    # optional demo arguments
+    run_parser.add_argument(
+        "--skip-compile",
+        action="store_true",
+        help="skip model compilation. If this option is set, then compiled model must be "
+        "present at path specified by --compiled-model-path argument",
+    )
+    run_parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        help="Only perform model compilation.",
+    )
 
 
 def load_json_file(json_path):
@@ -191,11 +213,18 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         model_cls.save_quantized_state_dict(args.model_path, config)
 
     # Compile and save model.
-    print("\nCompiling and saving model...")
-    model.compile(args.compiled_model_path)
-    if draft_model is not None:
-        print("\nCompiling and saving draft model...")
-        draft_model.compile(args.compiled_draft_model_path)
+    if not args.skip_compile:
+        print("\nCompiling and saving model...")
+        model.compile(args.compiled_model_path)
+        if draft_model is not None:
+            print("\nCompiling and saving draft model...")
+            draft_model.compile(args.compiled_draft_model_path)
+
+    if args.enable_torch_dist:
+        torch.distributed.barrier()
+
+    if args.compile_only:
+        return
 
     # Load compiled model to Neuron.
     print("\nLoading model to Neuron...")
@@ -203,6 +232,9 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     if draft_model is not None:
         print("\nLoading draft model to Neuron...")
         draft_model.load(args.compiled_draft_model_path)
+
+    if args.enable_torch_dist:
+        torch.distributed.barrier()
 
     # Load tokenizer.
     tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
@@ -329,6 +361,17 @@ def main():
     assert (
         args.task_type in MODEL_TYPES[args.model_type]
     ), f"Unsupported task: {args.model_type}/{args.task_type}"
+
+    if args.enable_torch_dist:
+        torch.distributed.init_process_group(
+            backend="gloo",
+            world_size=get_init_world_size(),
+            rank=get_init_rank(),
+        )
+        node_rank = torch.distributed.get_rank()
+        args.start_rank_id = node_rank * args.local_ranks_size
+        torch.distributed.barrier()
+
     model_cls = MODEL_TYPES[args.model_type][args.task_type]
     run_inference(model_cls, args)
 

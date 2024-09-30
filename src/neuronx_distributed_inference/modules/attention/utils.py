@@ -104,13 +104,13 @@ class RotaryEmbedding(nn.Module):
 
 # Utility functions to create attention mask
 def create_block_diagonal_attn_mask(
-    query_lens: torch.Tensor, 
-    key_lens: torch.Tensor, 
-    max_query_len: torch.Tensor, 
-    max_key_len: torch.Tensor, 
+    query_lens: torch.Tensor,
+    key_lens: torch.Tensor,
+    max_query_len: torch.Tensor,
+    max_key_len: torch.Tensor,
 ):
     """
-    Return a block diagonal atttention mask which can be used by chunked 
+    Return a block diagonal atttention mask which can be used by chunked
     prefill.
 
     This function is written in a way that it can be traced, so it can
@@ -132,7 +132,7 @@ def create_block_diagonal_attn_mask(
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
         ]
-    
+
     Args:
         query_lens: a list of query lengths for each sequence
         key_lens: a list of key lengths for each sequence
@@ -154,18 +154,18 @@ def create_block_diagonal_attn_mask(
 
     mask = torch.zeros(max_query_len, max_key_len, dtype=torch.bool)
     for seq_id in range(batch_size):
-        ri = q_cumsum[seq_id] # row index
-        ci = k_cumsum[seq_id] # column index
-        nr = query_lens[seq_id] # number of rows
-        nc = key_lens[seq_id] # number of columns
+        ri = q_cumsum[seq_id]  # row index
+        ci = k_cumsum[seq_id]  # column index
+        nr = query_lens[seq_id]  # number of rows
+        nc = key_lens[seq_id]  # number of columns
 
         offset = ci + nc - ri - nr
         # upper right triangle is set to false
-        diagonal_mask = (row_idx - col_idx + offset) >= 0 
+        diagonal_mask = (row_idx - col_idx + offset) >= 0
 
         left_mask = col_idx >= ci
         top_mask = row_idx >= ri
-        bottom_mask = row_idx < ri+nr
+        bottom_mask = row_idx < ri + nr
 
         mask_per_seq = diagonal_mask & left_mask & top_mask & bottom_mask
         mask = mask | mask_per_seq

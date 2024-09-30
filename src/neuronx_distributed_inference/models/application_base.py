@@ -1,3 +1,4 @@
+import logging
 import os
 import warnings
 from typing import List
@@ -34,6 +35,7 @@ class NeuronApplicationBase(torch.nn.Module):
         config: InferenceConfig = None,
         neuron_config: NeuronConfig = None,
     ):
+        super().__init__()
         if config is None:
             config = self.get_config_cls().load(model_path)
 
@@ -49,8 +51,6 @@ class NeuronApplicationBase(torch.nn.Module):
         self.traced_model = None
         self.is_compiled = is_compiled(model_path)
         self.is_loaded_to_neuron = False
-
-        super().__init__()
 
     def forward(self, **kwargs):
         """Forward pass for this model."""
@@ -115,15 +115,15 @@ class NeuronApplicationBase(torch.nn.Module):
             builder.transform_weight_layout_with_overriden_option(
                 sharded_checkpoint_dir=sharded_checkpoint_dir
             )
-
         self.is_compiled = True
-        self.is_loaded_to_neuron = True
 
-    def load(self, compiled_model_path):
+    def load(self, compiled_model_path, start_rank_id=None, local_ranks_size=None):
         """Loads the compiled model checkpoint to the Neuron device."""
         self.traced_model = torch.jit.load(compiled_model_path + COMPILED_MODEL_FILE_NAME)
 
-        self.load_weights(compiled_model_path)
+        self.load_weights(
+            compiled_model_path, start_rank_id=start_rank_id, local_ranks_size=local_ranks_size
+        )
         if self.neuron_config.torch_dtype == torch.bfloat16:
             self.bfloat16()
 
@@ -131,23 +131,29 @@ class NeuronApplicationBase(torch.nn.Module):
             model_wrapper.model = self.traced_model
         self.is_loaded_to_neuron = True
 
-    def load_weights(self, compiled_model_path):
+    def load_weights(self, compiled_model_path, start_rank_id=None, local_ranks_size=None):
         """Loads the model weights to the Neuron device."""
         if self.traced_model is None:
             raise ValueError("Model is not loaded")
 
+        if start_rank_id is None:
+            start_rank_id = self.neuron_config.start_rank_id
+        if local_ranks_size is None:
+            local_ranks_size = self.neuron_config.local_ranks_size
+
+        logging.info(
+            f"loading models for ranks {start_rank_id}...{start_rank_id + local_ranks_size - 1}"
+        )
         weights = []
-        for rank in range(
-            self.neuron_config.start_rank_id,
-            self.neuron_config.start_rank_id + self.neuron_config.local_ranks_size,
-        ):
+        for rank in range(start_rank_id, start_rank_id + local_ranks_size):
             ckpt = load_file(
                 os.path.join(
                     compiled_model_path, f"weights/tp{rank}_sharded_checkpoint.safetensors"
                 )
             )
             weights.append(ckpt)
-        self.traced_model.nxd_model.initialize(weights)
+        start_rank_tensor = torch.tensor([start_rank_id], dtype=torch.int32, device="cpu")
+        self.traced_model.nxd_model.initialize(weights, start_rank_tensor)
 
     def checkpoint_loader_fn(self, mmap: bool = False):
         """This function loads the model's state dictionary and weights from the hf model"""
@@ -158,8 +164,10 @@ class NeuronApplicationBase(torch.nn.Module):
             model_sd = self.get_state_dict(self.model_path, self.config)
             if self.neuron_config.torch_dtype == torch.bfloat16:
                 for name, param in model_sd.items():
-                    model_sd[name] = param.bfloat16()
-            return model_sd
+                    if torch.is_floating_point(param):
+                        # only cast floating types
+                        model_sd[name] = param.bfloat16()
+        return model_sd
 
     @classmethod
     def get_state_dict(cls, model_path: str, config: InferenceConfig) -> dict:

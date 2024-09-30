@@ -2,6 +2,7 @@ import copy
 import logging
 from typing import List, Optional, Tuple, Union
 
+import neuronx_distributed as nxd
 import torch
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers.mappings import (
@@ -30,6 +31,7 @@ from neuronx_distributed_inference.modules.lora_serving import (
     wrap_model_with_lora,
 )
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
+from neuronx_distributed_inference.utils.random import set_random_seed
 
 
 class NeuronBaseModel(nn.Module):
@@ -85,6 +87,24 @@ class NeuronBaseModel(nn.Module):
         """
         raise NotImplementedError("init_model() is not implemented")
 
+    def initialize_process_group(self, seed: int = 0):
+        if not torch.dist.is_initialized():
+            torch.dist.init_process_group(backend="xla")
+        else:
+            logging.warning("torch.distributed was already initialized, skipping...")
+
+        if not nxd.parallel_layers.parallel_state.model_parallel_is_initialized():
+            nxd.parallel_layers.initialize_model_parallel(
+                tensor_model_parallel_size=self.neuron_config.tp_degree,
+                pipeline_model_parallel_size=self.neuron_config.pp_degree,
+                expert_model_parallel_size=self.neuron_config.ep_degree,
+            )
+        else:
+            logging.warning("NxD was already initialized, skipping...")
+
+        # set seed
+        set_random_seed(seed)
+
     def init_inference_optimization(self, config: InferenceConfig):
         if self.on_device_sampling:
             self.sampler = Sampler(config.neuron_config)
@@ -110,17 +130,18 @@ class NeuronBaseModel(nn.Module):
                 .to(torch.bool)
             )
             return torch.logical_and(mask, expanded_mask)
-        
+
     def _create_chunked_prefill_attn_mask(
-        self, 
-        query_lens: torch.Tensor, 
-        key_lens: torch.Tensor, 
-        max_query_len: int, 
-        max_key_len: int, 
+        self,
+        query_lens: torch.Tensor,
+        key_lens: torch.Tensor,
+        max_query_len: int,
+        max_key_len: int,
         **kwargs,
     ) -> torch.Tensor:
         return attn_utils.create_block_diagonal_attn_mask(
-            query_lens, key_lens, max_query_len, max_key_len, **kwargs)
+            query_lens, key_lens, max_query_len, max_key_len, **kwargs
+        )
 
     def _create_spec_attn_mask(self, attention_mask):
         return (
@@ -175,7 +196,9 @@ class NeuronBaseModel(nn.Module):
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
-            attention_mask, is_for_context_encoding, False,
+            attention_mask,
+            is_for_context_encoding,
+            False,
         )
         active_mask = None
         if is_for_medusa_speculation:
@@ -465,7 +488,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
     def get_model_wrapper_cls(self):
         return ModelWrapper
 
-    def enable_context_encoding(self):
+    def enable_context_encoding(self, **model_init_kwargs):
         new_config = copy.deepcopy(self.config)
         new_config.neuron_config.batch_size = self.neuron_config.ctx_batch_size
         new_config.neuron_config.n_active_tokens = self.neuron_config.max_context_length
@@ -486,10 +509,11 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             model_cls=self._model_cls,
             tag=CONTEXT_ENCODING_MODEL_TAG,
             compiler_args=self.get_compiler_args(),
+            model_init_kwargs=model_init_kwargs,
         )
         self.models.append(self.context_encoding_model)
 
-    def enable_token_generation(self):
+    def enable_token_generation(self, enable_wlt_optimization: bool = True, **model_init_kwargs):
         new_config = copy.deepcopy(self.config)
         new_config.neuron_config.batch_size = self.neuron_config.tkg_batch_size
         new_config.neuron_config.n_active_tokens = 1
@@ -511,7 +535,10 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             model_cls=self._model_cls,
             tag=TOKEN_GENERATION_MODEL_TAG,
             compiler_args=self.get_compiler_args(),
-            priority_model_idx=0,  # to turn on weight layout optimization
+            priority_model_idx=0
+            if enable_wlt_optimization
+            else None,  # to turn on weight layout optimization
+            model_init_kwargs=model_init_kwargs,
         )
         self.models.append(self.token_generation_model)
 

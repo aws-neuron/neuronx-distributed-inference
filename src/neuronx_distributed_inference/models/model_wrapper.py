@@ -81,6 +81,7 @@ class ModelWrapper(torch.nn.Module):
         tag="",
         compiler_args: str = None,
         priority_model_idx: int = None,
+        model_init_kwargs={},
     ) -> None:
         super().__init__()
         self.config = config
@@ -106,6 +107,7 @@ class ModelWrapper(torch.nn.Module):
 
         self.bucket_config = get_bucket_model_config_from_tag(tag, self.config)
         self.priority_model_idx = priority_model_idx
+        self.model_init_kwargs = model_init_kwargs
 
     def is_neuron(self):
         return self.model is not None and isinstance(self.model, torch.jit.ScriptModule)
@@ -220,7 +222,11 @@ class ModelWrapper(torch.nn.Module):
         return inputs
 
     def get_model_instance(self):
-        return DecoderModelInstance(model_cls=self.model_cls, config=self.config)
+        return DecoderModelInstance(
+            model_cls=self.model_cls,
+            config=self.config,
+            **self.model_init_kwargs,
+        )
 
     def _forward_with_pad(self, *args):
         seq_ids = args[3]
@@ -366,15 +372,19 @@ class ModelWrapper(torch.nn.Module):
 
 
 class DecoderModelInstance(BaseModelInstance):
-    def __init__(self, model_cls, config: InferenceConfig):
+    def __init__(self, model_cls, config: InferenceConfig, **kwargs):
         self.model_cls = model_cls
         self.module = None
         self.input_output_aliases = None
         self.config = config
         self.neuron_config = config.neuron_config
+        self.kwargs = kwargs if kwargs is not None else {}
+
+    def initialize_process_group(self, world_size):
+        self.model_cls.initialize_process_group(world_size)
 
     def load_module(self):
-        float_model = self.model_cls(self.config)
+        float_model = self.model_cls(self.config, **self.kwargs)
         float_model.eval()
 
         if self.neuron_config.torch_dtype == torch.bfloat16:

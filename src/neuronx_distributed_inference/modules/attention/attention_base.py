@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch import Tensor, nn
+from torch.distributed import ProcessGroup
 
 from .utils import apply_rotary_pos_emb, manual_softmax, move_heads_front, repeat_kv
 
@@ -13,8 +14,8 @@ try:
 except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
 
+import neuronx_distributed as nxd
 from neuronx_distributed.parallel_layers import utils  # noqa: E402
-from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_size
 from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 
 from .gqa import GroupQueryAttention_O  # noqa: E402; noqa: E402
@@ -33,8 +34,18 @@ class NeuronAttentionBase(nn.Module):
     5. update forward() method to adjust to changes from self.num_head
     """
 
-    def __init__(self):
+    def __init__(self, tensor_model_parallel_group: Optional[ProcessGroup] = None):
         super().__init__()
+
+        if tensor_model_parallel_group is not None:
+            self.tensor_model_parallel_group = tensor_model_parallel_group
+        elif nxd.parallel_layers.parallel_state.model_parallel_is_initialized():
+            self.tensor_model_parallel_group = (
+                nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
+            )
+        else:
+            self.tensor_model_parallel_group = None
+
         self.is_causal = True
         self.num_key_value_groups = None
         self.num_key_value_heads = None
@@ -72,6 +83,7 @@ class NeuronAttentionBase(nn.Module):
             clip_qkv=self.clip_qkv,
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             sequence_dimension=self.sequence_dimension,
+            tensor_model_parallel_group=self.tensor_model_parallel_group,
         )
         self.o_proj = GroupQueryAttention_O(
             hidden_size=self.hidden_size,
@@ -85,6 +97,7 @@ class NeuronAttentionBase(nn.Module):
             layer_name=self.o_proj_layer_name,
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             sequence_dimension=self.sequence_dimension,
+            tensor_model_parallel_group=self.tensor_model_parallel_group,
         )
         self.num_heads = utils.divide(self.qkv_proj.get_num_attention_heads(), self.tp_degree)
         self.num_key_value_heads = utils.divide(
@@ -116,10 +129,14 @@ class NeuronAttentionBase(nn.Module):
         # Change layout: BSHD -> BHSD
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
-            q_len *= get_tensor_model_parallel_size()
+            q_len *= self.tensor_model_parallel_group.size()
 
-        Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm)
-        K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm)
+        Q = move_heads_front(
+            Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm
+        )
+        K = move_heads_front(
+            K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm
+        )
         V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
 
         # Rotate Q and K
@@ -236,7 +253,7 @@ class NeuronAttentionBase(nn.Module):
         """Implements each layer's forward pass for the attention block."""
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
-            q_len *= get_tensor_model_parallel_size()
+            q_len *= self.tensor_model_parallel_group.size()
         Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
             position_ids,
             hidden_states,

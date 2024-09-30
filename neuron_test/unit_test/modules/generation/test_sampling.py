@@ -1,9 +1,9 @@
 import torch
 import torch_xla.core.xla_model as xm
+from neuronx_distributed.parallel_layers import parallel_state
 
 from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.modules.generation.sampling import Sampler
-from neuronx_distributed.parallel_layers import parallel_state
 
 
 def test_neuron_sampling_accuracy_bs1():
@@ -60,7 +60,7 @@ def run_sampler_accuracy_test(batch_size, topk, num_beams=1):
     torch.testing.assert_close(
         neuron_sampler.sample(logits_device).cpu(), cpu_sampler.sample(logits), check_dtype=False
     )
-    
+
     # Reset groups
     parallel_state.destroy_model_parallel()
     torch.distributed.destroy_process_group()
