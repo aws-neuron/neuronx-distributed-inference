@@ -76,7 +76,7 @@ class NeuronApplicationBase(torch.nn.Module):
         """Gets the Neuron compiler arguments to use when compiling this model."""
         return None
 
-    def compile(self, compiled_model_path):
+    def compile(self, compiled_model_path, debug=False):
         """Compiles this model and saves it to the given path."""
         self.config.save(compiled_model_path)
 
@@ -92,6 +92,7 @@ class NeuronApplicationBase(torch.nn.Module):
             local_ranks_size=self.neuron_config.local_ranks_size,
             checkpoint_loader=self.checkpoint_loader_fn,
             compiler_workdir=base_compile_work_dir,
+            debug=debug
         )
 
         for model in self.models:

@@ -160,6 +160,11 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         action="store_true",
         help="Only perform model compilation.",
     )
+    run_parser.add_argument(
+        "--hlo-debug",
+        action="store_true",
+        help="Adds metadata into the generated HLO. This metadata maps the HLO "
+        "operators to the corresponding lines in the PyTorch code")
 
 
 def load_json_file(json_path):
@@ -215,7 +220,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     # Compile and save model.
     if not args.skip_compile:
         print("\nCompiling and saving model...")
-        model.compile(args.compiled_model_path)
+        model.compile(args.compiled_model_path, debug=args.hlo_debug)
         if draft_model is not None:
             print("\nCompiling and saving draft model...")
             draft_model.compile(args.compiled_draft_model_path)
