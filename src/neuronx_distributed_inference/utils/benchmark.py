@@ -67,13 +67,13 @@ def benchmark_sampling(
         )
         e2e_benchmark.run()
         report[END_TO_END_MODEL] = generate_report(
-            e2e_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size
+            e2e_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=e2e_benchmark.num_runs
         )
 
         if target == "all":
             report.update(
                 generate_submodule_reports(
-                    latency_collectors, neuron_config.max_length, neuron_config.max_batch_size
+                    latency_collectors, neuron_config, e2e_benchmark.num_runs
                 )
             )
 
@@ -83,7 +83,7 @@ def benchmark_sampling(
         ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, neuron_config)
         ctx_enc_benchmark.run()
         report[CONTEXT_ENCODING_MODEL] = generate_report(
-            ctx_enc_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size
+            ctx_enc_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=ctx_enc_benchmark.num_runs
         )
 
     # Benchmark token generation model only
@@ -92,7 +92,7 @@ def benchmark_sampling(
         tkn_gen_benchmark = Benchmark(model.token_generation_model, input_param)
         tkn_gen_benchmark.run()
         report[TOKEN_GENERATION_MODEL] = generate_report(
-            tkn_gen_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size
+            tkn_gen_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=tkn_gen_benchmark.num_runs
         )
 
     # Benchmark speculation model only
@@ -101,7 +101,7 @@ def benchmark_sampling(
         spec_benchmark = Benchmark(model.speculation_model, input_param)
         spec_benchmark.run()
         report[SPECULATION_MODEL] = generate_report(
-            spec_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size
+            spec_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=spec_benchmark.num_runs
         )
 
     # Benchmark Medusa speculation model
@@ -110,7 +110,7 @@ def benchmark_sampling(
         spec_benchmark = Benchmark(model.medusa_speculation_model, input_param)
         spec_benchmark.run()
         report[MEDUSA_MODEL] = generate_report(
-            spec_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size
+            spec_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=spec_benchmark.num_runs
         )
 
     model.reset()
@@ -281,11 +281,16 @@ def register_forward_latency_collector(latency_collector, model):
     model.register_forward_hook(latency_collector.hook)
 
 
-def generate_submodule_reports(latency_collectors, max_length, max_batch_size):
-    return {
-        key: generate_report(collector.latency_list, max_length, max_batch_size)
-        for key, collector in latency_collectors.items()
-    }
+def generate_submodule_reports(latency_collectors, neuron_config, num_runs):
+    reports = {}
+    for key, collector in latency_collectors.items():
+        tokens_len = neuron_config.max_length
+        if key == "context_encoding_model":
+            tokens_len = neuron_config.max_context_length
+        elif key == "token_generation_model":
+            tokens_len = neuron_config.max_new_tokens
+        reports[key] = generate_report(collector.latency_list, tokens_len, neuron_config.max_batch_size, num_runs) 
+    return reports
 
 
 class Benchmark:
@@ -335,10 +340,9 @@ class LatencyCollector:
         self.latency_list.append(time.time() - self.start)
 
 
-def generate_report(latency_list, max_length, max_batch_size):
+def generate_report(latency_list, max_length, max_batch_size, n_runs=20):
     latency_array = np.array(latency_list)
 
-    n_runs = len(latency_list)
     total_time = np.sum(latency_array)
     throughput = (n_runs * max_length * max_batch_size) / total_time
 
