@@ -32,9 +32,11 @@ def load_pretrained_config(model_path_or_name: Union[str, os.PathLike]):
 
         # Set torch_dtype in NeuronConfig.
         if "torch_dtype" in config_dict:
-            self.neuron_config.torch_dtype = config_dict["torch_dtype"]
-            if isinstance(self.neuron_config.torch_dtype, str):
-                self.neuron_config.torch_dtype = to_torch_dtype(self.neuron_config.torch_dtype)
+            if self.neuron_config is not None and not self.neuron_config.overrides_torch_dtype:
+                # Update neuron_config's torch_dtype if not overriden by the user.
+                self.neuron_config.torch_dtype = config_dict["torch_dtype"]
+                if isinstance(self.neuron_config.torch_dtype, str):
+                    self.neuron_config.torch_dtype = to_torch_dtype(self.neuron_config.torch_dtype)
             del config_dict["torch_dtype"]
 
         # Convert nested configs to namespaces.

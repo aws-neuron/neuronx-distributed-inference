@@ -50,9 +50,18 @@ class NeuronConfig:
         # Need to provide example input shape for tracing
         self.n_positions = kwargs.pop("n_positions", self.seq_len)
         self.on_cpu = kwargs.pop("on_cpu", False)
-        self.torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        if isinstance(self.torch_dtype, str):
-            self.torch_dtype = to_torch_dtype(self.torch_dtype)
+
+        # Torch dtype
+        if "torch_dtype" in kwargs:
+            self.torch_dtype = kwargs.pop("torch_dtype")
+            if isinstance(self.torch_dtype, str):
+                self.torch_dtype = to_torch_dtype(self.torch_dtype)
+
+            # This flag lets us avoid overriding torch_dtype in HFAdapter's load_pretrained_config.
+            self.overrides_torch_dtype = kwargs.pop("overrides_torch_dtype", True)
+        else:
+            self.torch_dtype = torch.bfloat16
+            self.overrides_torch_dtype = False
 
         # fallback to sequence_length is for compatibility with vllm
         self.max_context_length = kwargs.pop("max_context_length", self.seq_len)

@@ -58,6 +58,7 @@ def test_serialize_deserialize_pretrained_config_adapter():
     # Assert that torch_dtype is copied to neuron_config correctly.
     assert not hasattr(config, "torch_dtype")
     assert neuron_config.torch_dtype == torch.bfloat16
+    assert not neuron_config.overrides_torch_dtype
 
     deserialized_config = verify_serialize_deserialize(config)
     assert deserialized_config.model_type == "llama"
@@ -73,6 +74,17 @@ def test_kwargs_override_load_config():
         pad_token_id=2,
     )
     assert config.pad_token_id == 2
+
+
+def test_serialize_deserialize_pretrained_config_adapter_where_neuron_config_overrides_dtype():
+    neuron_config = NeuronConfig(torch_dtype=torch.float32)
+    config = InferenceConfig(neuron_config, load_config=load_pretrained_config(TEST_CONFIG_PATH))
+    assert neuron_config.torch_dtype == torch.float32
+    assert neuron_config.overrides_torch_dtype
+
+    deserialized_config = verify_serialize_deserialize(config)
+    assert deserialized_config.neuron_config.torch_dtype == torch.float32
+    assert deserialized_config.neuron_config.overrides_torch_dtype
 
 
 def verify_serialize_deserialize(config: InferenceConfig):
