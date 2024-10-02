@@ -184,6 +184,8 @@ class NeuronDbrxBlock(nn.Module):
             num_experts=ffn_config.moe_num_experts,
             top_k=ffn_config.moe_top_k,
             hidden_size=config.d_model,
+            sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+            sequence_dimension=1,
         )
         expert_mlps = ExpertMLPs(
             num_experts=ffn_config.moe_num_experts,
@@ -198,6 +200,8 @@ class NeuronDbrxBlock(nn.Module):
         self.ffn = MoE(
             router=router,
             expert_mlps=expert_mlps,
+            sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+            sequence_dimension=1,
         )
         self.ffn.eval()  # Set MoE module in eval mode
 
@@ -313,10 +317,8 @@ class NeuronDbrxForCausalLM(NeuronBaseForCausalLM):
 
     def get_compiler_args(self):
         compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
-        # Add flags for cc-overlap
-        compiler_args += (
-            " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
-        )
+        # Run collectives without pipelining
+        compiler_args += " --tensorizer-options='--skip-pass=SimpleAllReduceTiling'"
         # Prevent auto-downcasting when running with fp32
         if self.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
