@@ -28,9 +28,6 @@ try:
 except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel
 
-from neuronx_distributed.modules.moe.expert_mlps import ExpertMLPs
-from neuronx_distributed.modules.moe.model import MoE
-from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
 from torch import nn
@@ -42,6 +39,7 @@ from transformers.models.mixtral.modeling_mixtral import MixtralRMSNorm
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.modules.moe import initialize_moe_module
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
@@ -197,26 +195,14 @@ class NeuronMixtralDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronMixtralAttention(config=config)
 
-        router = RouterTopK(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-        )
-        expert_mlps = ExpertMLPs(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
+        self.mlp = initialize_moe_module(
+            config=config, 
+            num_experts=config.num_local_experts, 
+            top_k=config.num_experts_per_tok, 
+            hidden_size=config.hidden_size, 
+            intermediate_size=config.intermediate_size, 
             hidden_act=config.hidden_act,
-            glu_mlp=config.neuron_config.glu_mlp,
-            capacity_factor=config.neuron_config.capacity_factor,
-            normalize_top_k_affinities=True,
         )
-        self.mlp = MoE(
-            router=router,
-            expert_mlps=expert_mlps,
-        )
-        self.mlp.eval()  # Set MoE module in eval mode
 
         self.input_layernorm = get_rmsnorm_cls(config)(
             config.hidden_size,

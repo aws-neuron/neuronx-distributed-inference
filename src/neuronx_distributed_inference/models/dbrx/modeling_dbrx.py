@@ -28,9 +28,6 @@ try:
 except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel
 
-from neuronx_distributed.modules.moe.expert_mlps import ExpertMLPs
-from neuronx_distributed.modules.moe.model import MoE
-from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
 from torch_neuronx.xla_impl.ops import nki_jit
@@ -40,6 +37,7 @@ from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecode
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.modules.moe import initialize_moe_module
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
@@ -179,31 +177,14 @@ class NeuronDbrxBlock(nn.Module):
         self.block_idx = block_idx
         self.self_attn = NeuronDbrxAttention(config=config)
 
-        ffn_config = config.ffn_config
-        router = RouterTopK(
-            num_experts=ffn_config.moe_num_experts,
-            top_k=ffn_config.moe_top_k,
-            hidden_size=config.d_model,
-            sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
-            sequence_dimension=1,
+        self.ffn = initialize_moe_module(
+            config=config, 
+            num_experts=config.ffn_config.moe_num_experts, 
+            top_k=config.ffn_config.moe_top_k, 
+            hidden_size=config.d_model, 
+            intermediate_size=config.ffn_config.ffn_hidden_size, 
+            hidden_act=config.ffn_config.ffn_act_fn["name"],
         )
-        expert_mlps = ExpertMLPs(
-            num_experts=ffn_config.moe_num_experts,
-            top_k=ffn_config.moe_top_k,
-            hidden_size=config.d_model,
-            intermediate_size=ffn_config.ffn_hidden_size,
-            hidden_act=ffn_config.ffn_act_fn["name"],
-            capacity_factor=config.neuron_config.capacity_factor,
-            glu_mlp=config.neuron_config.glu_mlp,
-            normalize_top_k_affinities=True,
-        )
-        self.ffn = MoE(
-            router=router,
-            expert_mlps=expert_mlps,
-            sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
-            sequence_dimension=1,
-        )
-        self.ffn.eval()  # Set MoE module in eval mode
 
         self.input_layernorm = nn.LayerNorm(config.d_model, bias=False)
         self.post_attention_layernorm = nn.LayerNorm(config.d_model, bias=False)
