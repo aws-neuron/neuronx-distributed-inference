@@ -294,7 +294,12 @@ class NeuronMixtralModel(NeuronBaseModel):
             ]
         )
         self.norm = get_rmsnorm_cls(config)(self.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = ColumnParallelLinear(config.hidden_size, self.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            gather_output=False if self.on_device_sampling else True,
+            bias=False,
+        )
 
 
 class NeuronMixtralForCausalLM(NeuronBaseForCausalLM):

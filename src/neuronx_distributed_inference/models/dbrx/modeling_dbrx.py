@@ -272,7 +272,12 @@ class NeuronDbrxModel(NeuronBaseModel):
             [NeuronDbrxBlock(config, block_idx) for block_idx in range(config.n_layers)]
         )
         self.norm = nn.LayerNorm(config.d_model, bias=False)
-        self.lm_head = ColumnParallelLinear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            config.d_model,
+            config.vocab_size,
+            gather_output=False if self.on_device_sampling else True,
+            bias=False,
+        )
 
 
 class NeuronDbrxForCausalLM(NeuronBaseForCausalLM):
