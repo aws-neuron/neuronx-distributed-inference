@@ -156,6 +156,9 @@ class NeuronDbrxAttention(NeuronAttentionBase):
         self.fused_qkv = config.neuron_config.fused_qkv
         self.clip_qkv = config.attn_config.clip_qkv
 
+        self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
+        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
+
         self.init_gqa_properties()
 
         self.rotary_emb = RotaryEmbedding(
