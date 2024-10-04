@@ -136,6 +136,15 @@ def _maybe_pad_interleaved(
 ):
     if tensor is None:
         return tensor
+
+    # Why we convert FP8 tensor to bfloat16?
+    # Torch does not support torch.cat, or torch.zeros (for large dimensions) for f8e4m3/f8e5m2
+    # So we cast it to bfloat16, perform padding, and then recast back to f8e4m3/f8e5m2
+    recast_dtype = None
+    if tensor.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        recast_dtype = tensor.dtype
+        tensor = tensor.to(torch.bfloat16)
+
     shape = (
         tensor.shape[:pad_dim]
         + (source_heads, tensor.shape[pad_dim] // source_heads)
@@ -157,6 +166,10 @@ def _maybe_pad_interleaved(
         + (tensor.shape[pad_dim] * tensor.shape[pad_dim + 1],)
         + tensor.shape[pad_dim + 2 :]
     )
+
+    if recast_dtype is not None:
+        tensor = tensor.to(recast_dtype)
+
     return tensor.view(shape)
 
 

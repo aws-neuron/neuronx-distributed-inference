@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from neuronx_distributed.quantization.quantization_config import (
     QuantizationType,
+    QuantizedDtype,
     get_default_custom_qconfig_dict,
     get_default_per_channel_custom_qconfig_dict,
 )
@@ -105,9 +106,13 @@ class ModelWrapper(torch.nn.Module):
 
         else:
             self.compiler_args = compiler_args
-        
-        if self.neuron_config.kv_cache_quant:
-            self.compiler_args+="--internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3' " 
+
+        if (
+            (self.neuron_config.quantized is True and self.neuron_config.quantization_dtype == "f8e4m3") or self.neuron_config.kv_cache_quant
+        ):
+            self.compiler_args += (
+                " --internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3' "
+            )
 
         self.bucket_config = get_bucket_model_config_from_tag(tag, self.config)
         self.priority_model_idx = priority_model_idx
@@ -435,6 +440,8 @@ class DecoderModelInstance(BaseModelInstance):
                 q_config = get_default_custom_qconfig_dict()
             else:
                 raise RuntimeError(f"{self.neuron_config.quantization_type} is not supported")
+            if self.neuron_config.quantization_dtype == "f8e4m3":
+                q_config["quantized_dtype"] = QuantizedDtype.F8E4M3
             self.module = convert(float_model, q_config=q_config, inplace=False, mapping=None)
         else:
             self.module = float_model

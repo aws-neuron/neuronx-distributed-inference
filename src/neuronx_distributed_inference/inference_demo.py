@@ -110,6 +110,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         "--quantization-type", type=str, choices=[t.value for t in QuantizationType]
     )
     run_parser.add_argument('--kv-cache-quant', action='store_true')
+    run_parser.add_argument("--quantization-dtype", type=str)
 
     # MoE
     run_parser.add_argument("--capacity-factor", type=float)
@@ -186,7 +187,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     if args.on_device_sampling:
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
 
-    if args.kv_cache_quant:
+    if (args.quantized and args.quantization_dtype == "f8e4m3") or args.kv_cache_quant:
         os.environ["XLA_HANDLE_SPECIAL_SCALAR"]="1"
 
     adapter_ids = None

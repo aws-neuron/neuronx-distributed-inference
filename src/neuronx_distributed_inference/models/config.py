@@ -4,6 +4,7 @@ import os
 from typing import Dict, List, Type, Union
 
 import torch
+from neuronx_distributed.quantization.quantization_config import QuantizedDtype
 
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 
@@ -103,7 +104,10 @@ class NeuronConfig:
             assert (
                 self.quantized_checkpoints_path is not None
             ), "quantized_checkpoints_path is required"
-        self.quantization_type = kwargs.pop("quantization_type", "per_tensor_symmetric")
+        self.quantization_type: str = kwargs.pop("quantization_type", "per_tensor_symmetric")
+        self.quantization_dtype: str = kwargs.pop("quantization_dtype", "int8")
+        # Verification for quantized dtype
+        QuantizedDtype.has_dtype(self.quantization_dtype)
         # TODO: Add validation for quantized_checkpoints_path after the design discussions
         self.kv_cache_quant = kwargs.pop("kv_cache_quant", False)
 

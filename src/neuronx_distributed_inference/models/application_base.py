@@ -5,7 +5,7 @@ from typing import List
 
 import neuronx_distributed.trace.hlo_utils as hlo_utils
 import torch
-from neuronx_distributed.quantization.quantization_config import QuantizationType
+from neuronx_distributed.quantization.quantization_config import QuantizationType, QuantizedDtype
 from neuronx_distributed.quantization.quantization_utils import (
     convert_qint8_to_int8_state_dict,
     quantize_pytorch_model_per_channel_symmetric,
@@ -16,7 +16,11 @@ from safetensors.torch import load_file
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.models.model_wrapper import ModelWrapper
-from neuronx_distributed_inference.modules.checkpoint import load_state_dict, prune_state_dict
+from neuronx_distributed_inference.modules.checkpoint import (
+    load_state_dict,
+    prune_state_dict,
+    save_state_dict_safetensors,
+)
 
 COMPILED_MODEL_FILE_NAME = "model.pt"
 
@@ -202,7 +206,10 @@ class NeuronApplicationBase(torch.nn.Module):
             )
 
         print(f"Using existing checkpoint: {existing_checkpoint_path}")
-        model_quant_sd = torch.load(existing_checkpoint_path)
+        if config.neuron_config.quantization_dtype == "f8e4m3":
+            model_quant_sd = load_state_dict(existing_checkpoint_path)
+        else:
+            model_quant_sd = torch.load(existing_checkpoint_path)
         model_quant_sd = cls.convert_hf_to_neuron_state_dict(model_quant_sd, config)
 
         # Make sure that the non quantized weights are in bfloat16 and not float32
@@ -236,20 +243,27 @@ class NeuronApplicationBase(torch.nn.Module):
 
         # Prune None values in the quantized_state_dict. torch.save crashes if None values exist.
         quantized_state_dict = prune_state_dict(quantized_state_dict)
-        torch.save(quantized_state_dict, config.neuron_config.quantized_checkpoints_path)
+        if config.neuron_config.quantization_dtype == "f8e4m3":
+            save_state_dict_safetensors(
+                state_dict=quantized_state_dict,
+                state_dict_dir=config.neuron_config.quantized_checkpoints_path,
+            )
+        else:
+            torch.save(quantized_state_dict, config.neuron_config.quantized_checkpoints_path)
 
     @classmethod
     def generate_quantized_state_dict(cls, model_path: str, config: InferenceConfig) -> dict:
         """Generates the quantized state dict for this model."""
         hf_model = cls.load_hf_model(model_path)
         quantization_type = QuantizationType(config.neuron_config.quantization_type)
+        quantized_dtype = QuantizedDtype.get_dtype(config.neuron_config.quantization_dtype)
         if quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
             hf_model_quant = quantize_pytorch_model_per_tensor_symmetric(
-                float_model=hf_model, inplace=True
+                float_model=hf_model, inplace=True, dtype=quantized_dtype
             )
         elif quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
             hf_model_quant = quantize_pytorch_model_per_channel_symmetric(
-                float_model=hf_model, inplace=True
+                float_model=hf_model, inplace=True, dtype=quantized_dtype
             )
         else:
             raise RuntimeError(f"{config.neuron_config.quantization_type} not supported")
