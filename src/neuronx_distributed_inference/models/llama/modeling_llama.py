@@ -467,11 +467,14 @@ class NeuronLlamaModel(NeuronBaseModel):
                 config.hidden_size,
                 self.padding_idx,
                 dtype=config.neuron_config.torch_dtype,
-                shard_across_embedding=True,
+                shard_across_embedding=config.neuron_config.vocab_parallel,
                 # We choose to shard across embedding dimension because this stops XLA from introducing
                 # rank specific constant parameters into the HLO. We could shard across vocab, but that
                 # would require us to use non SPMD parallel_model_trace.
+                sequence_parallel_enabled=(config.neuron_config.vocab_parallel and config.neuron_config.sequence_parallel_enabled),
+                sequence_dimension=1,
                 pad=True,
+                use_spmd_rank=config.neuron_config.vocab_parallel
             )
             self.lm_head = ColumnParallelLinear(
                 config.hidden_size,
@@ -539,6 +542,11 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
         neuron_config = config.neuron_config
         if neuron_config.fused_qkv:
             state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
+        
+        if neuron_config.vocab_parallel:
+            # TODO: this hack can be removed after replication_id is ready to use
+            state_dict['embed_tokens.rank_util.rank'] = torch.arange(0, neuron_config.local_ranks_size)
+
         return state_dict
 
     @classmethod

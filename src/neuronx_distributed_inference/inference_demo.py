@@ -84,6 +84,8 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--max-new-tokens", type=int)
     run_parser.add_argument("--max-length", type=int)
 
+    run_parser.add_argument("--vocab-parallel", action="store_true")
+
     # Attention
     run_parser.add_argument("--fused-qkv", action="store_true")
     run_parser.add_argument("--sequence-parallel-norm", action="store_true")
@@ -164,7 +166,8 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         "--hlo-debug",
         action="store_true",
         help="Adds metadata into the generated HLO. This metadata maps the HLO "
-        "operators to the corresponding lines in the PyTorch code")
+        "operators to the corresponding lines in the PyTorch code",
+    )
 
 
 def load_json_file(json_path):
