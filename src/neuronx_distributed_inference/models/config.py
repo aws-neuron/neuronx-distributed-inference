@@ -70,9 +70,6 @@ class NeuronConfig:
             self.max_new_tokens = None
         self.max_length = kwargs.pop("max_length", self.seq_len)
 
-        # Embedding Config
-        self.vocab_parallel = kwargs.pop("vocab_parallel", False)
-
         # Attention
         self.fused_qkv = kwargs.pop("fused_qkv", False)
         self.sequence_parallel_enabled = kwargs.pop("sequence_parallel_norm", False)

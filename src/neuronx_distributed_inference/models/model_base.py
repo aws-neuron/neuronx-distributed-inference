@@ -423,7 +423,7 @@ class NeuronBaseModel(nn.Module):
         # )
 
         # embed positions
-        if self.sequence_parallel_enabled and self.embed_tokens.shard_on_embedding:
+        if self.sequence_parallel_enabled:
             # TODO: Replace this with rankid + scatter call once supported
             hidden_states = _reduce_scatter_along_dim(
                 inputs_embeds, self.sequence_dimension, xm.REDUCE_MAX
