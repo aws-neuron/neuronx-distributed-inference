@@ -135,12 +135,3 @@ inference_demo \
     --prompt "I believe the meaning of life is" \
     --prompt "The color of the sky is"
 ```
-
-## Contributing
-
-### Formatting code
-
-To format the code, use the following command:
-```
-pre-commit run --all-files
-```

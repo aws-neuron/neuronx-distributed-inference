@@ -3,7 +3,15 @@ from neuronx_distributed.modules.moe.model import MoE
 from neuronx_distributed.modules.moe.routing import RouterTopK
 
 
-def initialize_moe_module(config, num_experts, top_k, hidden_size, intermediate_size, hidden_act, normalize_top_k_affinities=True):
+def initialize_moe_module(
+    config,
+    num_experts,
+    top_k,
+    hidden_size,
+    intermediate_size,
+    hidden_act,
+    normalize_top_k_affinities=True,
+):
     """
     Initializes and returns an MoE module corresponding to the given configuration.
     """

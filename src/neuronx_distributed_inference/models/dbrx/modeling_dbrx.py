@@ -181,11 +181,11 @@ class NeuronDbrxBlock(nn.Module):
         self.self_attn = NeuronDbrxAttention(config=config)
 
         self.ffn = initialize_moe_module(
-            config=config, 
-            num_experts=config.ffn_config.moe_num_experts, 
-            top_k=config.ffn_config.moe_top_k, 
-            hidden_size=config.d_model, 
-            intermediate_size=config.ffn_config.ffn_hidden_size, 
+            config=config,
+            num_experts=config.ffn_config.moe_num_experts,
+            top_k=config.ffn_config.moe_top_k,
+            hidden_size=config.d_model,
+            intermediate_size=config.ffn_config.ffn_hidden_size,
             hidden_act=config.ffn_config.ffn_act_fn["name"],
         )
 

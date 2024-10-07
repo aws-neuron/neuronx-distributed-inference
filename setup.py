@@ -21,7 +21,7 @@ setup(
     keywords="aws neuron",
     packages=PEP420PackageFinder.find(where="src"),
     package_data={"": []},
-    install_requires=["neuronx_distributed", "transformers==4.43.*", "sentencepiece"],
+    install_requires=["neuronx_distributed", "transformers==4.45.*", "sentencepiece"],
     python_requires=">=3.7",
     package_dir={"": "src"},
     entry_points={

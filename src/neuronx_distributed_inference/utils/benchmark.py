@@ -60,7 +60,11 @@ def benchmark_sampling(
         }
 
         if draft_model is not None:
-            input_param["assistant_model"] = HuggingFaceGenerationAdapter(draft_model)
+            hf_draft_model = HuggingFaceGenerationAdapter(draft_model)
+            hf_draft_model.generation_config.update(
+                num_assistant_tokens=model.neuron_config.speculation_length
+            )
+            input_param["assistant_model"] = hf_draft_model
 
         if pixel_values is not None:
             input_param["pixel_values"] = pixel_values
@@ -82,7 +86,10 @@ def benchmark_sampling(
         )
         e2e_benchmark.run()
         report[END_TO_END_MODEL] = generate_report(
-            e2e_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=e2e_benchmark.num_runs
+            e2e_benchmark.latency_list,
+            neuron_config.max_length,
+            neuron_config.max_batch_size,
+            n_runs=e2e_benchmark.num_runs,
         )
 
         if target == "all":
@@ -100,7 +107,10 @@ def benchmark_sampling(
         ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, neuron_config)
         ctx_enc_benchmark.run()
         report[CONTEXT_ENCODING_MODEL] = generate_report(
-            ctx_enc_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=ctx_enc_benchmark.num_runs
+            ctx_enc_benchmark.latency_list,
+            neuron_config.max_length,
+            neuron_config.max_batch_size,
+            n_runs=ctx_enc_benchmark.num_runs,
         )
 
     # Benchmark token generation model only
@@ -111,7 +121,10 @@ def benchmark_sampling(
         tkn_gen_benchmark = Benchmark(model.token_generation_model, input_param)
         tkn_gen_benchmark.run()
         report[TOKEN_GENERATION_MODEL] = generate_report(
-            tkn_gen_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=tkn_gen_benchmark.num_runs
+            tkn_gen_benchmark.latency_list,
+            neuron_config.max_length,
+            neuron_config.max_batch_size,
+            n_runs=tkn_gen_benchmark.num_runs,
         )
 
     # Benchmark speculation model only
@@ -122,7 +135,10 @@ def benchmark_sampling(
         spec_benchmark = Benchmark(model.speculation_model, input_param)
         spec_benchmark.run()
         report[SPECULATION_MODEL] = generate_report(
-            spec_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=spec_benchmark.num_runs
+            spec_benchmark.latency_list,
+            neuron_config.max_length,
+            neuron_config.max_batch_size,
+            n_runs=spec_benchmark.num_runs,
         )
 
     # Benchmark Medusa speculation model
@@ -133,7 +149,10 @@ def benchmark_sampling(
         spec_benchmark = Benchmark(model.medusa_speculation_model, input_param)
         spec_benchmark.run()
         report[MEDUSA_MODEL] = generate_report(
-            spec_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size, n_runs=spec_benchmark.num_runs
+            spec_benchmark.latency_list,
+            neuron_config.max_length,
+            neuron_config.max_batch_size,
+            n_runs=spec_benchmark.num_runs,
         )
 
     model.reset()
@@ -318,7 +337,9 @@ def generate_submodule_reports(latency_collectors, neuron_config, num_runs):
             tokens_len = neuron_config.max_context_length
         elif key == "token_generation_model":
             tokens_len = neuron_config.max_new_tokens
-        reports[key] = generate_report(collector.latency_list, tokens_len, neuron_config.max_batch_size, num_runs) 
+        reports[key] = generate_report(
+            collector.latency_list, tokens_len, neuron_config.max_batch_size, num_runs
+        )
     return reports
 
 

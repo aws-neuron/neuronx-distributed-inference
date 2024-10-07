@@ -31,6 +31,10 @@ def get_generate_outputs(
         #       is consistent with the old runner.py implementation.
         assert not is_hf, "Draft model not supported for generating on HF"
         draft_generation_model = HuggingFaceGenerationAdapter(draft_model)
+        draft_generation_model.generation_config.update(
+            num_assistant_tokens=model.neuron_config.speculation_length
+        )
+
         generate_kwargs.update(
             {
                 "assistant_model": draft_generation_model,
