@@ -165,7 +165,7 @@ def check_accuracy_logits(
     prompts = [TEST_PROMPT] * neuron_model.config.neuron_config.batch_size
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
 
-    if not expected_logits:
+    if expected_logits is None:
         # Generate goldens with HF on CPU
         # logit_validation assumes greedy sampling
         hf_model = neuron_model.load_hf_model(neuron_model.model_path)
