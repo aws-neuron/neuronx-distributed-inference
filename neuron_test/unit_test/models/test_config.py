@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from transformers import AutoConfig
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
@@ -94,3 +95,20 @@ def verify_serialize_deserialize(config: InferenceConfig):
         deserialized_config = InferenceConfig.load(model_path)
         assert config.to_json_string() == deserialized_config.to_json_string()
         return deserialized_config
+
+
+def test_preloaded_pretrained_config():
+    hf_config = AutoConfig.from_pretrained(TEST_CONFIG_PATH)
+    neuron_config = NeuronConfig()
+    config = InferenceConfig(
+        neuron_config=neuron_config,
+        load_config=load_pretrained_config(hf_config=hf_config),
+    )
+
+    # Assert that an attribute from config.json is set on the config.
+    assert config.model_type == "llama"
+
+    # Assert that torch_dtype is copied to neuron_config correctly.
+    assert not hasattr(config, "torch_dtype")
+    assert neuron_config.torch_dtype == torch.bfloat16
+    assert not neuron_config.overrides_torch_dtype

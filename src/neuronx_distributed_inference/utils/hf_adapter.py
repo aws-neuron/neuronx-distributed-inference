@@ -23,11 +23,22 @@ from neuronx_distributed_inference.modules.generation.sampling import Sampler
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 
-def load_pretrained_config(model_path_or_name: Union[str, os.PathLike]):
+def load_pretrained_config(
+    model_path_or_name: Optional[Union[str, os.PathLike]] = None,
+    hf_config: Optional[PretrainedConfig] = None,
+):
     """Return a load_config hook for InferenceConfig that loads the config from a PretrainedConfig."""
 
     def load_config(self: InferenceConfig):
-        config: PretrainedConfig = AutoConfig.from_pretrained(model_path_or_name)
+        if (model_path_or_name is None and hf_config is None) or (
+            model_path_or_name is not None and hf_config is not None
+        ):
+            raise ValueError('Please provide only one of "model_path_or_name" or "hf_config"')
+
+        if model_path_or_name is not None:
+            config: PretrainedConfig = AutoConfig.from_pretrained(model_path_or_name)
+        else:
+            config: PretrainedConfig = hf_config
         config_dict = config.to_dict()
 
         # Set torch_dtype in NeuronConfig.
