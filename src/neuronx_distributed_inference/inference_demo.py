@@ -4,6 +4,7 @@ import copy
 import json
 from enum import Enum
 from typing import Type
+import os
 
 import torch
 from neuronx_distributed.quantization.quantization_config import QuantizationType
@@ -182,6 +183,9 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
     if args.on_device_sampling:
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
+
+    if args.kv_cache_quant:
+        os.environ["XLA_HANDLE_SPECIAL_SCALAR"]="1"
 
     adapter_ids = None
     if args.enable_lora:
