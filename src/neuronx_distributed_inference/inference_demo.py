@@ -2,9 +2,9 @@ import argparse
 import ast
 import copy
 import json
+import os
 from enum import Enum
 from typing import Type
-import os
 
 import torch
 from neuronx_distributed.quantization.quantization_config import QuantizationType
@@ -109,7 +109,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument(
         "--quantization-type", type=str, choices=[t.value for t in QuantizationType]
     )
-    run_parser.add_argument('--kv-cache-quant', action='store_true')
+    run_parser.add_argument("--kv-cache-quant", action="store_true")
     run_parser.add_argument("--quantization-dtype", type=str)
 
     # MoE
@@ -188,7 +188,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
 
     if (args.quantized and args.quantization_dtype == "f8e4m3") or args.kv_cache_quant:
-        os.environ["XLA_HANDLE_SPECIAL_SCALAR"]="1"
+        os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
 
     adapter_ids = None
     if args.enable_lora:
@@ -354,7 +354,6 @@ def run_accuracy_check(
     elif check_accuracy_mode == CheckAccuracyMode.LOGIT_MATCHING:
         assert draft_model is None, "Logit matching not supported for speculation"
         print("\nChecking accuracy by logit matching")
-
 
         if tol_map:
             tol_map = ast.literal_eval(tol_map)

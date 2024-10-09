@@ -87,9 +87,13 @@ class Sampler(torch.nn.Module):
 
     def _rand_selector(self, probs_cumsum, num_samples=1):
         if self.deterministic:
-            rand_selector = torch.full((probs_cumsum.shape[0], num_samples), 0.5, device=probs_cumsum.device)
+            rand_selector = torch.full(
+                (probs_cumsum.shape[0], num_samples), 0.5, device=probs_cumsum.device
+            )
         else:
-            rand_selector = torch.rand((probs_cumsum.shape[0], num_samples), device=probs_cumsum.device)
+            rand_selector = torch.rand(
+                (probs_cumsum.shape[0], num_samples), device=probs_cumsum.device
+            )
         return rand_selector
 
     def forward(self, token_logits, sampling_params):

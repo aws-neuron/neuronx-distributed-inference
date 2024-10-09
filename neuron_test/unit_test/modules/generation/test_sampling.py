@@ -44,7 +44,7 @@ class TestSampling(unittest.TestCase):
         neuron_kwargs["on_device_sampling_config"] = config
 
         neuron_config = NeuronConfig(**neuron_kwargs)
-        
+
         neuron_config.on_cpu = True if on_cpu else False
 
         model = Sampler(neuron_config)

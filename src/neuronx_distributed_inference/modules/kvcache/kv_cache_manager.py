@@ -67,7 +67,7 @@ class KVCacheManager(nn.Module):
             ]
         )
         if self.quant:
-            self.past_key_values=self.past_key_values.to(self.quant_dtype)
+            self.past_key_values = self.past_key_values.to(self.quant_dtype)
 
     def _get_num_kv_heads_per_rank(self, config: InferenceConfig):
         tp_degree = config.neuron_config.tp_degree
