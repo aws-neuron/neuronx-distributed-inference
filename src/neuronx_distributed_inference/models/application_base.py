@@ -208,7 +208,7 @@ class NeuronApplicationBase(torch.nn.Module):
             )
 
         print(f"Using existing checkpoint: {existing_checkpoint_path}")
-        if config.neuron_config.quantization_dtype == "f8e4m3":
+        if os.path.isdir(existing_checkpoint_path):
             model_quant_sd = load_state_dict(existing_checkpoint_path)
         else:
             model_quant_sd = torch.load(existing_checkpoint_path)
@@ -245,12 +245,14 @@ class NeuronApplicationBase(torch.nn.Module):
 
         # Prune None values in the quantized_state_dict. torch.save crashes if None values exist.
         quantized_state_dict = prune_state_dict(quantized_state_dict)
-        if config.neuron_config.quantization_dtype == "f8e4m3":
+        if os.path.isdir(config.neuron_config.quantized_checkpoints_path):
+            logging.info("Saving quantized state dict as safetensors to: %s", config.neuron_config.quantized_checkpoints_path)
             save_state_dict_safetensors(
                 state_dict=quantized_state_dict,
                 state_dict_dir=config.neuron_config.quantized_checkpoints_path,
             )
         else:
+            logging.info("Saving quantized state dict as torch pt file to: %s", config.neuron_config.quantized_checkpoints_path)
             torch.save(quantized_state_dict, config.neuron_config.quantized_checkpoints_path)
 
     @classmethod
