@@ -2,8 +2,9 @@ from typing import List
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state, utils
-from neuronx_distributed.quantization import quantize, dequantize
+from neuronx_distributed.quantization import dequantize, quantize
 from torch import Tensor, nn
+from torch_neuronx.xla_impl.ops import ConcatenateOp
 
 from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402; noqa: E402; noqa: E402
@@ -11,7 +12,7 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402;
     get_shardable_head_counts,
 )
 from neuronx_distributed_inference.modules.autobucketing import slice_lhs, slice_rhs
-from torch_neuronx.xla_impl.ops import ConcatenateOp
+
 
 def _slice_kv_cacheline(padding_side, seq_len: int, cache: Tensor):
     if padding_side == "right":
@@ -25,12 +26,12 @@ def _gather_slice_into_kv_cacheline(cache, padding_side, seq_len: int, bucket_sl
     max_idx = cache.shape[2]
     if padding_side == "right":
         remaining = slice_rhs(cache, max_idx - seq_len, max_idx, dim=2)
-        if remaining.dtype==torch.float8_e4m3fn:
+        if remaining.dtype == torch.float8_e4m3fn:
             return ConcatenateOp.apply(bucket_slice, remaining, dim=2)
         return torch.cat([bucket_slice, remaining], dim=2)
     else:
         remaining = slice_lhs(cache, max_idx - seq_len, dim=2)
-        if remaining.dtype==torch.float8_e4m3fn:
+        if remaining.dtype == torch.float8_e4m3fn:
             return ConcatenateOp.apply(bucket_slice, remaining, dim=2)
         return torch.cat([remaining, bucket_slice], dim=2)
 
@@ -50,20 +51,21 @@ class KVCacheManager(nn.Module):
         self.is_continuous_batching = config.neuron_config.is_continuous_batching
         self.num_kv_head = kwargs["num_kv_head"]
         self._init_kv_shape(config)
-        self.quant=config.neuron_config.kv_cache_quant
+        self.quant = config.neuron_config.kv_cache_quant
 
         num_layer = config.num_hidden_layers
         dtype = config.neuron_config.torch_dtype
         if self.quant:
-            self.quant_dtype=torch.float8_e4m3fn
-            self.dequant_dtype=torch.bfloat16
-            dtype=self.quant_dtype
+            self.quant_dtype = torch.float8_e4m3fn
+            self.dequant_dtype = torch.bfloat16
         self.past_key_values = nn.ParameterList(
             [
                 nn.Parameter(torch.zeros(self.kv_shape, dtype=dtype), requires_grad=False)
                 for _ in range(num_layer * 2)
             ]
         )
+        if self.quant:
+            self.past_key_values=self.past_key_values.to(self.quant_dtype)
 
     def _get_num_kv_heads_per_rank(self, config: InferenceConfig):
         tp_degree = config.neuron_config.tp_degree
@@ -150,8 +152,8 @@ class KVCacheManager(nn.Module):
             key_state = _slice_kv_cacheline(self.padding_side, seq_len, k_cache)
             value_state = _slice_kv_cacheline(self.padding_side, seq_len, v_cache)
             if self.quant:
-                key_state=dequantize.direct_cast_dequantize(key_state, self.dequant_dtype)
-                value_state=dequantize.direct_cast_dequantize(value_state, self.dequant_dtype)
+                key_state = dequantize.direct_cast_dequantize(key_state, self.dequant_dtype)
+                value_state = dequantize.direct_cast_dequantize(value_state, self.dequant_dtype)
             past_key_values.append([key_state, value_state])
         return past_key_values
 
@@ -181,8 +183,8 @@ class KVCacheManager(nn.Module):
             latest_k, latest_v = kv_per_layer[0], kv_per_layer[1]
 
             if self.quant:
-                latest_k=quantize.direct_cast_quantize(latest_k,self.quant_dtype)
-                latest_v=quantize.direct_cast_quantize(latest_v,self.quant_dtype)
+                latest_k = quantize.direct_cast_quantize(latest_k, self.quant_dtype)
+                latest_v = quantize.direct_cast_quantize(latest_v, self.quant_dtype)
 
             if self.is_medusa:
                 k_cache = self.past_key_values[idx * 2]
