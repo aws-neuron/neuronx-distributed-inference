@@ -9,6 +9,7 @@ from transformers import GenerationConfig
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 from neuronx_distributed_inference.utils.constants import *
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
@@ -24,6 +25,19 @@ def benchmark_sampling(
 ):
     neuron_config = model.neuron_config
 
+    sampling_params = prepare_sampling_params(
+        batch_size=neuron_config.batch_size,
+        top_k=generation_config.top_k
+        if isinstance(generation_config.top_k, list)
+        else [generation_config.top_k],
+        top_p=generation_config.top_p
+        if isinstance(generation_config.top_p, list)
+        else [generation_config.top_p],
+        temperature=generation_config.temperature
+        if isinstance(generation_config.temperature, list)
+        else [generation_config.temperature],
+    )
+
     target = target if target is not None else "all"
 
     report = {}
@@ -31,8 +45,8 @@ def benchmark_sampling(
     # Benchmark E2E model
     if target in ["all", "e2e"]:
         # FIXME: fix pixel values generation
-        input_ids, attention_mask, pixel_values = get_sample_inputs(
-            END_TO_END_MODEL, neuron_config, image=image
+        input_ids, attention_mask, pixel_values, sampling_params = get_sample_inputs(
+            END_TO_END_MODEL, neuron_config, image=image, sampling_params=sampling_params
         )
         input_param = {
             "input_ids": input_ids,
@@ -42,6 +56,7 @@ def benchmark_sampling(
             "top_k": 1,
             "do_sample": draft_model is None,
             "generation_config": generation_config,
+            "sampling_params": sampling_params,
         }
 
         if draft_model is not None:
@@ -79,7 +94,9 @@ def benchmark_sampling(
 
     # Benchmark context encoding model only
     if target == "context_encode":
-        input_param = get_sample_inputs(CONTEXT_ENCODING_MODEL, neuron_config)
+        input_param = get_sample_inputs(
+            CONTEXT_ENCODING_MODEL, neuron_config, sampling_params=sampling_params
+        )
         ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, neuron_config)
         ctx_enc_benchmark.run()
         report[CONTEXT_ENCODING_MODEL] = generate_report(
@@ -88,7 +105,9 @@ def benchmark_sampling(
 
     # Benchmark token generation model only
     if hasattr(model, "token_generation_model") and target == "token_gen":
-        input_param = get_sample_inputs(TOKEN_GENERATION_MODEL, neuron_config)
+        input_param = get_sample_inputs(
+            TOKEN_GENERATION_MODEL, neuron_config, sampling_params=sampling_params
+        )
         tkn_gen_benchmark = Benchmark(model.token_generation_model, input_param)
         tkn_gen_benchmark.run()
         report[TOKEN_GENERATION_MODEL] = generate_report(
@@ -97,7 +116,9 @@ def benchmark_sampling(
 
     # Benchmark speculation model only
     if hasattr(model, "speculation_model") and target == "speculation":
-        input_param = get_sample_inputs(SPECULATION_MODEL, neuron_config)
+        input_param = get_sample_inputs(
+            SPECULATION_MODEL, neuron_config, sampling_params=sampling_params
+        )
         spec_benchmark = Benchmark(model.speculation_model, input_param)
         spec_benchmark.run()
         report[SPECULATION_MODEL] = generate_report(
@@ -106,7 +127,9 @@ def benchmark_sampling(
 
     # Benchmark Medusa speculation model
     if hasattr(model, "medusa_speculation_model") and target == "speculation":
-        input_param = get_sample_inputs(MEDUSA_MODEL, neuron_config)
+        input_param = get_sample_inputs(
+            MEDUSA_MODEL, neuron_config, sampling_params=sampling_params
+        )
         spec_benchmark = Benchmark(model.medusa_speculation_model, input_param)
         spec_benchmark.run()
         report[MEDUSA_MODEL] = generate_report(
@@ -126,7 +149,7 @@ def benchmark_sampling(
     return report
 
 
-def get_sample_inputs(model_type, neuron_config: NeuronConfig, image=None):
+def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, image=None):
     max_context_length = neuron_config.max_length
     max_len = neuron_config.max_length + neuron_config.max_new_tokens
     batch_size = neuron_config.batch_size
@@ -143,7 +166,7 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, image=None):
             image is None
         ), "image is not supported currently for benchmarking for END_TO_END_MODEL"
 
-        sample_inputs = (input_ids, attention_mask, None)
+        sample_inputs = (input_ids, attention_mask, None, sampling_params)
 
     elif model_type == CONTEXT_ENCODING_MODEL:
         input_ids = torch.zeros((batch_size, max_context_length), dtype=torch.int64)
@@ -164,6 +187,7 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, image=None):
                 attention_mask,
                 position_ids,
                 seq_ids,
+                sampling_params,
                 accepted_indices,
                 current_length,
                 medusa_mask,
@@ -191,6 +215,7 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, image=None):
                 attention_mask,
                 position_ids,
                 seq_ids,
+                sampling_params,
                 pixel_values,
                 text_embedding_indices,
                 image_embedding_indices,
@@ -201,6 +226,7 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, image=None):
                 attention_mask,
                 position_ids,
                 seq_ids,
+                sampling_params,
             )
     elif model_type == TOKEN_GENERATION_MODEL:
         input_ids = torch.zeros((batch_size, 1), dtype=torch.int64)
@@ -212,6 +238,7 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, image=None):
             attention_mask,
             position_ids,
             seq_ids,
+            sampling_params,
         )
     elif model_type == SPECULATION_MODEL:
         spec_len = neuron_config.speculation_length
@@ -224,6 +251,7 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, image=None):
             attention_mask,
             position_ids,
             seq_ids,
+            sampling_params,
         )
 
     elif model_type == MEDUSA_MODEL:
@@ -243,6 +271,7 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, image=None):
             attention_mask,
             position_ids,
             seq_ids,
+            sampling_params,
             accepted_indices,
             current_length,
             medusa_mask,

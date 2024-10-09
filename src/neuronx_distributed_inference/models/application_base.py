@@ -92,7 +92,7 @@ class NeuronApplicationBase(torch.nn.Module):
             local_ranks_size=self.neuron_config.local_ranks_size,
             checkpoint_loader=self.checkpoint_loader_fn,
             compiler_workdir=base_compile_work_dir,
-            debug=debug
+            debug=debug,
         )
 
         for model in self.models:

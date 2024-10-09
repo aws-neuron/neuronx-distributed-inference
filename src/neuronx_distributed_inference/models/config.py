@@ -266,4 +266,9 @@ class InferenceConfig:
 
 class OnDeviceSamplingConfig:
     def __init__(self, **kwargs):
+        self.do_sample = kwargs.pop("do_sample", True)
         self.top_k = kwargs.pop("top_k", 1)
+        self.dynamic = kwargs.pop("dynamic", False)
+        self.deterministic = kwargs.pop("deterministic", False)
+        self.global_topk = kwargs.pop("global_topk", 256)
+        self.on_device_sampling_config = kwargs.pop("on_device_sampling_config", True)

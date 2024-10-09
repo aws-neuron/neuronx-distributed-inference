@@ -24,7 +24,10 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; 
 )
 from neuronx_distributed_inference.modules.attention import utils as attn_utils
 from neuronx_distributed_inference.modules.autobucketing import generate_buckets
-from neuronx_distributed_inference.modules.generation.sampling import Sampler
+from neuronx_distributed_inference.modules.generation.sampling import (
+    Sampler,
+    prepare_sampling_params,
+)
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
 from neuronx_distributed_inference.modules.lora_serving import (
     update_weights_for_lora,
@@ -173,6 +176,7 @@ class NeuronBaseModel(nn.Module):
         attention_mask,
         position_ids,
         seq_ids,
+        sampling_params,
         adapter_ids=None,
         accepted_indices=None,
         current_length=None,
@@ -214,6 +218,7 @@ class NeuronBaseModel(nn.Module):
             past_key_values=past_key_values,
             active_mask=active_mask,
             adapter_ids=adapter_ids,
+            sampling_params=sampling_params,
         )
 
         updated_kv_cache = self.kv_mgr.update_cache(
@@ -257,7 +262,7 @@ class NeuronBaseModel(nn.Module):
         res = logits
         if is_for_context_encoding:
             result = [
-                self.sampler.sample(stacked_logits[i : i + 1, -1, :].squeeze(0))
+                self.sampler(stacked_logits[i : i + 1, -1, :].squeeze(0), sampling_params)
                 for i in range(self.neuron_config.num_medusa_heads + 1)
             ]
             res = torch.stack(result, dim=0)  # 5, 1, 10
@@ -265,7 +270,7 @@ class NeuronBaseModel(nn.Module):
             results = []
             for i in range(stacked_logits.shape[1]):
                 result = [
-                    self.sampler.sample(stacked_logits[j : j + 1, i, :].squeeze(0))
+                    self.sampler(stacked_logits[j : j + 1, i, :].squeeze(0), sampling_params)
                     for j in range(self.neuron_config.num_medusa_heads + 1)
                 ]
                 res = torch.stack(result, dim=0)
@@ -279,6 +284,7 @@ class NeuronBaseModel(nn.Module):
         attention_mask,
         position_ids,
         seq_ids,
+        sampling_params,
         adapter_ids=None,
         accepted_indices=None,
         current_length=None,
@@ -366,7 +372,7 @@ class NeuronBaseModel(nn.Module):
         res = logits
         if self.on_device_sampling:
             # perform sampling on Neuron to get tokens
-            res = self.sampler.sample(logits[:, -1, :])
+            res = self.sampler(logits[:, -1, :], sampling_params)
 
         return [res] + updated_kv_cache
 
@@ -399,6 +405,7 @@ class NeuronBaseModel(nn.Module):
                 if not is_lora_module(self.embed_tokens)
                 else self.embed_tokens(input_ids, adapter_ids=adapter_ids)
             )
+            inputs_embeds = self.embed_tokens(input_ids)
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device  # noqa
@@ -475,6 +482,9 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         self.kv_cache_populated = False
 
         self.sampler = None
+        self.default_sampling_params = prepare_sampling_params(
+            batch_size=self.neuron_config.batch_size, top_k=[1], top_p=[1.0], temperature=[1.0]
+        )
         self.model_wrapper = self.get_model_wrapper_cls()
 
         self.enable_context_encoding()
@@ -584,11 +594,12 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        sampling_params: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        adapter_ids=None,
+        adapter_ids: Optional[torch.FloatTensor] = None,
         medusa_args=None,
         return_dict: Optional[bool] = None,
         llava_args: Optional[List] = [],
@@ -600,6 +611,10 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
                 (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
         """
+        sampling_params = (
+            self.default_sampling_params if sampling_params is None else sampling_params
+        )
+        self.sampling_params = sampling_params
 
         output_attentions, output_hidden_states, return_dict = self._setup_func_config(
             output_attentions, output_hidden_states, return_dict
@@ -615,7 +630,14 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             seq_ids = torch.arange(input_ids.shape[0])
 
         outputs, is_run_on_neuron = self._get_model_outputs(
-            input_ids, attention_mask, position_ids, seq_ids, adapter_ids, medusa_args, llava_args
+            input_ids,
+            attention_mask,
+            position_ids,
+            seq_ids,
+            sampling_params,
+            adapter_ids,
+            medusa_args,
+            llava_args,
         )
 
         if self.neuron_config.trace_tokengen_model and not self.token_generation_model.is_neuron():
@@ -688,7 +710,15 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             )
 
     def _get_model_outputs(
-        self, input_ids, attention_mask, position_ids, seq_ids, adapter_ids, medusa_args, llava_args
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        adapter_ids,
+        medusa_args,
+        llava_args,
     ):
         if (
             input_ids.shape[-1] > 1
@@ -698,27 +728,45 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             if self.neuron_config.is_medusa:
                 medusa_args = self._prepare_inputs()
                 outputs = self.context_encoding_model(
-                    input_ids, attention_mask, position_ids, seq_ids, adapter_ids, *medusa_args
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    adapter_ids,
+                    *medusa_args,
                 )
             else:
                 outputs = self.context_encoding_model(
-                    input_ids, attention_mask, position_ids, seq_ids, adapter_ids, *llava_args
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    adapter_ids,
+                    *llava_args,
                 )
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
         elif input_ids.shape[-1] == self.neuron_config.speculation_length:
             outputs = self.speculation_model(
-                input_ids, attention_mask, position_ids, seq_ids, adapter_ids
+                input_ids, attention_mask, position_ids, seq_ids, sampling_params, adapter_ids
             )
             is_run_on_neuron = self.speculation_model.is_neuron()
         elif input_ids.shape[-1] == self.neuron_config.medusa_speculation_length:
             outputs = self.medusa_speculation_model(
-                input_ids, attention_mask, position_ids, seq_ids
+                input_ids, attention_mask, position_ids, seq_ids, sampling_params, *medusa_args
             )
             is_run_on_neuron = self.medusa_speculation_model.is_neuron()
         else:
             outputs = self.token_generation_model(
-                input_ids, attention_mask, position_ids, seq_ids, adapter_ids, *llava_args
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                adapter_ids,
+                *llava_args,
             )
             is_run_on_neuron = self.token_generation_model.is_neuron()
 

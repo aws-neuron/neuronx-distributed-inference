@@ -5,6 +5,7 @@ from transformers import AutoTokenizer, GenerationConfig
 from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.models.llama.modeling_llama import LlamaInferenceConfig, NeuronLlamaForCausalLM
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
+from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 
 model_path = "/home/ubuntu/model_hf/Llama-3.1-8B/"
 traced_model_path = "/home/ubuntu/traced_model/Llama-3.1-8B/"
@@ -18,7 +19,7 @@ def run_llama_generate():
     generation_config_kwargs = {
         "do_sample": True,
         "top_k": 1,
-        "pad_token_id": generation_config.eos_token_id
+        "pad_token_id": generation_config.eos_token_id,
     }
     generation_config.update(**generation_config_kwargs)
 
@@ -53,6 +54,7 @@ def run_llama_generate():
     # Generate outputs.
     print("\nGenerating outputs...")
     prompts = ["I believe the meaning of life is", "The color of the sky is"]
+    sampling_params = prepare_sampling_params(batch_size=neuron_config.batch_size, top_k=[10, 5], top_p=[0.5, 0.9],  temperature=[0.9, 0.5])
     print(f"Prompts: {prompts}")
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
     generation_model = HuggingFaceGenerationAdapter(model)
@@ -61,6 +63,7 @@ def run_llama_generate():
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,
         max_length=model.config.neuron_config.max_length,
+        sampling_params=sampling_params,
     )
     output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     print("Generated outputs:")

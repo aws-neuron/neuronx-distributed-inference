@@ -19,6 +19,7 @@ from neuronx_distributed_inference.modules.autobucketing import (
     get_context_encoder_bk,
     get_token_generation_bk,
 )
+from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 
 CONTEXT_ENCODING_MODEL_TAG = "context_encoding_model"
 TOKEN_GENERATION_MODEL_TAG = "token_generation_model"
@@ -143,6 +144,24 @@ class ModelWrapper(torch.nn.Module):
         self.model = self.model_cls(self.config)
         self.model.load_state_dict(state_dict, strict=strict, assign=assign)
 
+    def get_sampling_params(
+        self,
+    ):
+        if self.neuron_config.on_device_sampling_config:
+            if self.neuron_config.on_device_sampling_config.dynamic:
+                # For dynamic sampling, we need sampling params to be != 1 when we trace,
+                # otherwise only greedy sampling will be traced
+                logging.debug("Tracing with dynamic sampling params!")
+                return prepare_sampling_params(
+                    self.neuron_config.batch_size, top_k=[10], top_p=[0.5], temperature=[0.5]
+                )
+
+        # use greedy sampling params
+        logging.debug("Tracing with greedy sampling params!")
+        return prepare_sampling_params(
+            self.neuron_config.batch_size, top_k=[1], top_p=[1.0], temperature=[1.0]
+        )
+
     def input_generator(
         self,
     ):
@@ -167,6 +186,7 @@ class ModelWrapper(torch.nn.Module):
                 if self.neuron_config.lora_config is not None
                 else None
             )
+            sampling_params = self.get_sampling_params()
 
             if self.is_medusa:
                 accepted_indices = torch.zeros(
@@ -189,6 +209,7 @@ class ModelWrapper(torch.nn.Module):
                     (self.neuron_config.batch_size, self.neuron_config.medusa_speculation_length),
                     dtype=torch.int64,
                 )
+
                 if self.neuron_config.lora_config is not None:
                     inputs.append(
                         (
@@ -196,6 +217,7 @@ class ModelWrapper(torch.nn.Module):
                             attention_mask,
                             position_ids,
                             seq_ids,
+                            sampling_params,
                             adapter_ids,
                             accepted_indices,
                             current_length,
@@ -210,6 +232,7 @@ class ModelWrapper(torch.nn.Module):
                             attention_mask,
                             position_ids,
                             seq_ids,
+                            sampling_params,
                             accepted_indices,
                             current_length,
                             medusa_mask,
@@ -218,9 +241,20 @@ class ModelWrapper(torch.nn.Module):
                     )
             else:
                 if self.neuron_config.lora_config is not None:
-                    inputs.append((input_ids, attention_mask, position_ids, seq_ids, adapter_ids))
+                    inputs.append(
+                        (
+                            input_ids,
+                            attention_mask,
+                            position_ids,
+                            seq_ids,
+                            sampling_params,
+                            adapter_ids,
+                        )
+                    )
                 else:
-                    inputs.append((input_ids, attention_mask, position_ids, seq_ids))
+                    inputs.append(
+                        (input_ids, attention_mask, position_ids, seq_ids, sampling_params)
+                    )
 
         return inputs
 
@@ -324,8 +358,8 @@ class ModelWrapper(torch.nn.Module):
                 "Forward called before load. Run load() or load_state_dict() making calling forward"
             )
         # if adapter_ids for LoRA is None, pop it out
-        if args[4] is None:
-            args = (*args[:4], *args[5:])
+        if args[5] is None:
+            args = (*args[:5], *args[6:])
 
         args = self.pad_to_max_compiled_seq(*args)
 

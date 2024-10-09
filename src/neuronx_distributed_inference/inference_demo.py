@@ -166,7 +166,8 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         "--hlo-debug",
         action="store_true",
         help="Adds metadata into the generated HLO. This metadata maps the HLO "
-        "operators to the corresponding lines in the PyTorch code")
+        "operators to the corresponding lines in the PyTorch code",
+    )
 
 
 def load_json_file(json_path):
@@ -351,6 +352,7 @@ def run_accuracy_check(
     elif check_accuracy_mode == CheckAccuracyMode.LOGIT_MATCHING:
         assert draft_model is None, "Logit matching not supported for speculation"
         print("\nChecking accuracy by logit matching")
+
 
         if tol_map:
             tol_map = ast.literal_eval(tol_map)

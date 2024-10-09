@@ -17,8 +17,17 @@ from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.modeling_outputs import ModelOutput
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
-from neuronx_distributed_inference.models.config import InferenceConfig, to_dict, to_torch_dtype
-from neuronx_distributed_inference.modules.generation.sampling import Sampler
+from neuronx_distributed_inference.models.config import (
+    InferenceConfig,
+    NeuronConfig,
+    OnDeviceSamplingConfig,
+    to_dict,
+    to_torch_dtype,
+)
+from neuronx_distributed_inference.modules.generation.sampling import (
+    Sampler,
+    prepare_sampling_params,
+)
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
@@ -98,6 +107,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         r"""
         We override the GenerationMixin sample function (_sample for transformers>=4.39.0) to add support for right side padding.
         """
+
         # init values
         logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
         pad_token_id = generation_config._pad_token_tensor
@@ -106,6 +116,31 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         return_dict_in_generate = generation_config.return_dict_in_generate
         has_eos_stopping_criteria = any(
             hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
+        )
+
+        batch_size = model_kwargs["attention_mask"].shape[0]
+
+        top_k = (
+            generation_config.top_k
+            if isinstance(generation_config.top_k, list)
+            else [generation_config.top_k]
+        )
+        top_p = (
+            generation_config.top_p
+            if isinstance(generation_config.top_p, list)
+            else [generation_config.top_p]
+        )
+        temperature = (
+            generation_config.temperature
+            if isinstance(generation_config.temperature, list)
+            else [generation_config.temperature]
+        )
+
+        sampling_params = prepare_sampling_params(
+            batch_size=batch_size,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
         )
 
         # init attention / hidden states / scores tuples
@@ -142,8 +177,19 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
 
             if not self.on_device_sampling:
                 if self.sampler is None:
-                    self.sampler = Sampler(self.neuron_config, top_k=generation_config.top_k)
-                next_tokens = self.sampler.sample(outputs.logits[:, -1, :])
+                    # Temporary placeholder to support CPU sampling with static batching
+                    neuron_kwargs = {}
+
+                    config_kwargs = {"top_k": generation_config.top_k}
+                    config = OnDeviceSamplingConfig(**config_kwargs)
+
+                    neuron_kwargs["on_device_sampling_config"] = config
+                    sampler_config = NeuronConfig(**neuron_kwargs)
+
+                    sampler_config.on_cpu = True
+                    self.sampler = Sampler(sampler_config)
+
+                next_tokens = self.sampler(outputs.logits[:, -1, :], sampling_params)
             else:
                 next_tokens = outputs.tokens
 
@@ -175,7 +221,13 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             return input_ids
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        sampling_params=None,
+        **kwargs,
     ):
         # Store KV cache flag before forward pass.
         self.prev_kv_cache_populated = self.neuron_model.kv_cache_populated
@@ -186,7 +238,6 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         current_length = kwargs.get("current_length", None)
         medusa_mask = kwargs.get("medusa_mask", None)
         scatter_index = kwargs.get("scatter_index", None)
-
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
@@ -210,6 +261,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 "attention_mask": attention_mask,
                 "adapter_ids": kwargs.get("adapter_ids", None),
                 "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
+                "sampling_params": sampling_params,
             }
         )
         return model_inputs
