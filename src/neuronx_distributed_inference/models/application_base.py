@@ -93,6 +93,7 @@ class NeuronApplicationBase(torch.nn.Module):
             checkpoint_loader=self.checkpoint_loader_fn,
             compiler_workdir=base_compile_work_dir,
             debug=debug,
+            num_cores_per_group=self.config.num_cores_per_group,
         )
 
         for model in self.models:

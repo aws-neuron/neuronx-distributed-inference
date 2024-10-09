@@ -46,7 +46,9 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
+
 
 _LLAMA_MODULE_MAP = {}
 
@@ -111,6 +113,14 @@ def convert_state_dict_to_fused_qkv(llama_state_dict, cfg: InferenceConfig):
 
 
 class LlamaInferenceConfig(InferenceConfig):
+
+    def add_derived_config(self):
+        self.num_cores_per_group = 1
+        if self.neuron_config.flash_decoding_enabled:
+            num_attn_heads, num_kv_heads = self.num_attention_heads, self.num_key_value_heads
+            self.num_cores_per_group = calculate_num_cores_per_group(num_attn_heads, num_kv_heads,
+                                                                     self.neuron_config.tp_degree)
+
     def get_required_attributes(self) -> List[str]:
         return [
             "hidden_size",
@@ -232,6 +242,8 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.padding_side = config.neuron_config.padding_side
         self.torch_dtype = config.neuron_config.torch_dtype
         self.is_medusa = config.neuron_config.is_medusa
+        self.flash_decoding_enabled = config.neuron_config.flash_decoding_enabled
+        self.num_cores_per_group = config.num_cores_per_group
 
         if parallel_state.model_parallel_is_initialized():
             self.tp_degree = parallel_state.get_tensor_model_parallel_size()
@@ -271,6 +283,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 self.rotary_emb = Llama3RotaryEmbedding(
                     dim=self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+
                     base=self.rope_theta,
                     factor=self.config.rope_scaling["factor"],
                     low_freq_factor=self.config.rope_scaling["low_freq_factor"],
@@ -297,14 +310,14 @@ class Llama3RotaryEmbedding(nn.Module):
     """
 
     def __init__(
-        self,
-        dim,
-        max_position_embeddings=131072,
-        base=500000.0,
-        factor=8.0,
-        low_freq_factor=1.0,
-        high_freq_factor=4.0,
-        original_max_position_embeddings=8192,
+            self,
+            dim,
+            max_position_embeddings=131072,
+            base=500000.0,
+            factor=8.0,
+            low_freq_factor=1.0,
+            high_freq_factor=4.0,
+            original_max_position_embeddings=8192,
     ):
         super().__init__()
         self.dim = dim
@@ -321,8 +334,8 @@ class Llama3RotaryEmbedding(nn.Module):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if self.inv_freq is None:
             inv_freq = 1.0 / (
-                self.base
-                ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
+                    self.base
+                    ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
             )
 
             low_freq_wavelen = self.old_context_len / self.low_freq_factor
@@ -337,7 +350,7 @@ class Llama3RotaryEmbedding(nn.Module):
                 else:
                     assert low_freq_wavelen != high_freq_wavelen
                     smooth = (self.old_context_len / wavelen - self.low_freq_factor) / (
-                        self.high_freq_factor - self.low_freq_factor
+                            self.high_freq_factor - self.low_freq_factor
                     )
                     new_freqs.append((1 - smooth) * freq / self.factor + smooth * freq)
             self.inv_freq = torch.tensor(new_freqs, dtype=inv_freq.dtype, device=inv_freq.device)
@@ -376,13 +389,13 @@ class NeuronLlamaDecoderLayer(nn.Module):
         )
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        adapter_ids=None,
-        **kwargs,
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            adapter_ids=None,
+            **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -539,6 +552,14 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
         neuron_config = config.neuron_config
         if neuron_config.fused_qkv:
             state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
+
+        # to facilitate rank usage in attention
+        num_layers = config.num_hidden_layers
+        tp_degree = neuron_config.tp_degree
+        for i in range(num_layers):
+            state_dict[f'layers.{i}.self_attn.rank_util.rank'] = torch.arange(0, tp_degree, dtype=torch.int32)
+        # to facilitate rank usage in base model
+        state_dict['rank_util.rank'] = torch.arange(0, tp_degree, dtype=torch.int32)
         return state_dict
 
     @classmethod

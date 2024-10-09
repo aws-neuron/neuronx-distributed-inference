@@ -30,6 +30,7 @@ def run_llama_generate():
         seq_len=64,
         on_device_sampling_config=OnDeviceSamplingConfig(top_k=1),
         enable_bucketing=True,
+        flash_decoding_enabled=False
     )
     config = LlamaInferenceConfig(
         neuron_config,

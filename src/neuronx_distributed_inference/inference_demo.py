@@ -88,6 +88,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # Attention
     run_parser.add_argument("--fused-qkv", action="store_true")
     run_parser.add_argument("--sequence-parallel-norm", action="store_true")
+    run_parser.add_argument("--flash-decoding-enabled", action="store_true")
 
     # Continuous batching
     run_parser.add_argument("--ctx-batch-size", type=int)
@@ -129,7 +130,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--num-medusa-heads", type=int)
     run_parser.add_argument("--medusa-tree-json", type=load_json_file, dest="medusa_tree")
 
-    # Parallism
+    # Parallelism
     run_parser.add_argument("--tp-degree", type=int)
     run_parser.add_argument("--pp-degree", type=int)
     run_parser.add_argument("--ep-degree", type=int)

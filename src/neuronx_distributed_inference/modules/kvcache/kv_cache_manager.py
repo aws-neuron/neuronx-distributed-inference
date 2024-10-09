@@ -49,6 +49,8 @@ class KVCacheManager(nn.Module):
         self.num_medusa_heads = config.neuron_config.num_medusa_heads
         self.padding_side = config.neuron_config.padding_side
         self.is_continuous_batching = config.neuron_config.is_continuous_batching
+        self.flash_decoding_enabled = config.neuron_config.flash_decoding_enabled
+        self.num_cores_per_group = config.num_cores_per_group
         self.num_kv_head = kwargs["num_kv_head"]
         self._init_kv_shape(config)
         self.quant = config.neuron_config.kv_cache_quant
@@ -94,6 +96,9 @@ class KVCacheManager(nn.Module):
         max_len = config.neuron_config.max_length
         num_kv_heads_per_rank = self._get_num_kv_heads_per_rank(config)
         hidden_dim_per_head = self._get_hidden_dim_per_head(config)
+
+        if self.flash_decoding_enabled:
+            max_len = utils.divide(max_len, self.num_cores_per_group)
 
         # BHSD KV cache layout for classic attention
         self.kv_shape = (
@@ -165,6 +170,7 @@ class KVCacheManager(nn.Module):
         past_key_values: List[Tensor],
         seq_len: int,
         scatter_index=None,
+        active_mask=None,
     ):
         """
         Given the passed-in past_key_values, update the cache
@@ -176,6 +182,7 @@ class KVCacheManager(nn.Module):
         :param past_key_values: list of tuple, the latest kv obtained at the end of the network from forward pass
         :param seq_len: sequence length (or bucket size from auto-bucketing e.g. 128, 512, 1024 etc.)
         :param scatter_index: tensor representing index to update
+        :param active_mask: tensor representing index to update
         :return: list of tuple of (K, V)
         """
         updated_kv_cache = []
@@ -225,9 +232,16 @@ class KVCacheManager(nn.Module):
                     v_cache = torch.cat([v_cache, latest_v], dim=2)
                 else:
                     # copy the tensor of the new position into kv cache
-                    scatter_index_new = self._get_index_to_update_new_position(
-                        scatter_index, position_ids, latest_k
-                    )
+                    if self.flash_decoding_enabled:
+                        assert active_mask is not None, 'active_mask should be specified for flash decoding!'
+                        garbage_pos = seq_len-1  # treat last pos as garbage
+                        updated_pos_ids = position_ids // self.num_cores_per_group
+                        scatter_index = torch.where(active_mask == 1, updated_pos_ids, garbage_pos)
+                        scatter_index_new = scatter_index.view(-1, 1, scatter_index.shape[-1], 1).expand_as(latest_k)
+                    else:
+                        scatter_index_new = self._get_index_to_update_new_position(
+                            scatter_index, position_ids, latest_k
+                        )
                     k_cache = torch.scatter(
                         input=k_cache, dim=2, index=scatter_index_new, src=latest_k
                     )
