@@ -29,7 +29,7 @@ from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E4
     ParallelEmbedding,
     RowParallelLinear,
 )
-from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
+from neuronx_distributed.parallel_layers.mappings import gather_from_sequence_parallel_region
 from torch import nn
 from transformers import LlamaForCausalLM
 from transformers.activations import ACT2FN
@@ -199,7 +199,7 @@ class NeuronLlamaMLP(nn.Module):
         # all-gather is done here instead of CPL layers to
         # avoid 2 all-gathers from up and gate projections
         if self.sequence_parallel_enabled:
-            x = _gather_along_dim(x, self.sequence_dimension)
+            x = gather_from_sequence_parallel_region(x, self.sequence_dimension)
 
         gate_proj_output = (
             self.gate_proj(x)

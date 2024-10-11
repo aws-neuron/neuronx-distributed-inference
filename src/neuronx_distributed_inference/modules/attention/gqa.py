@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
+from neuronx_distributed.parallel_layers.mappings import gather_from_sequence_parallel_region
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
 from neuronx_distributed.quantization.quantization_layers import BaseQuantizeParallelLinear
 from torch import nn
@@ -337,6 +338,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         self.fused_qkv = fused_qkv
         self.clip_qkv = clip_qkv
 
+        self.sequence_parallel_enabled = sequence_parallel_enabled
+        self.sequence_dimension = sequence_dimension
+
         if self.tensor_model_parallel_group is not None:
             if self.fused_qkv:
                 self.Wqkv = ColumnParallelLinear(
@@ -345,8 +349,6 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
-                    sequence_parallel_enabled=sequence_parallel_enabled,
-                    sequence_dimension=sequence_dimension,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
                 # Set heads info as weight parameter attributes to be used in weights sharding
@@ -361,8 +363,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
-                    sequence_parallel_enabled=sequence_parallel_enabled,
-                    sequence_dimension=sequence_dimension,
+                    sequence_parallel_enabled=False,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
                 self.k_proj = ColumnParallelLinear(
@@ -371,8 +372,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
-                    sequence_parallel_enabled=sequence_parallel_enabled,
-                    sequence_dimension=sequence_dimension,
+                    sequence_parallel_enabled=False,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
                 self.v_proj = ColumnParallelLinear(
@@ -381,8 +381,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
-                    sequence_parallel_enabled=sequence_parallel_enabled,
-                    sequence_dimension=sequence_dimension,
+                    sequence_parallel_enabled=False,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
         else:
@@ -404,6 +403,11 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 )
 
     def forward(self, hidden_states: torch.Tensor, adapter_ids=None):
+        if self.tensor_model_parallel_group is not None:
+            # All-Gather tokens
+            if self.sequence_parallel_enabled:
+                hidden_states = gather_from_sequence_parallel_region(hidden_states, self.sequence_dimension)
+
         if self.fused_qkv:
             QKV = (
                 self.Wqkv(hidden_states)

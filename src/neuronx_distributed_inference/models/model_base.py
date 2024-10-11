@@ -8,7 +8,7 @@ from neuronx_distributed.parallel_layers.layers import SPMDRank
 import torch
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers.mappings import (
-    _gather_along_dim,
+    gather_from_sequence_parallel_region,
     _reduce_scatter_along_dim,
 )
 from neuronx_distributed.parallel_layers.parallel_state import get_world_group
@@ -28,7 +28,6 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; 
 from neuronx_distributed_inference.modules.attention import utils as attn_utils
 from neuronx_distributed_inference.modules.autobucketing import generate_buckets
 from neuronx_distributed_inference.modules.flashdecode.utils import mask_util, turn_2d_mask_to_4d
-from neuronx_distributed_inference.modules.generation.sampling import Sampler
 from neuronx_distributed_inference.modules.generation.sampling import (
     Sampler,
     prepare_sampling_params,
@@ -481,7 +480,7 @@ class NeuronBaseModel(nn.Module):
             cos_cache, sin_cache = layer_outputs[2:]
 
         if self.sequence_parallel_enabled:
-            hidden_states = _gather_along_dim(hidden_states, self.sequence_dimension)
+            hidden_states = gather_from_sequence_parallel_region(hidden_states, self.sequence_dimension)
 
         hidden_states = self.norm(hidden_states)
 
