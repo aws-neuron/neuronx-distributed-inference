@@ -191,6 +191,8 @@ class NeuronApplicationBase(torch.nn.Module):
             medusa_head = torch.load(model_path + "/medusa_heads.pt", map_location="cpu")
             model_sd.update(medusa_head)
         model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
+        if getattr(config, "tie_word_embeddings", False):
+            cls.update_state_dict_for_tied_weights(model_sd)
         return model_sd
 
     @classmethod
@@ -281,6 +283,11 @@ class NeuronApplicationBase(torch.nn.Module):
     def load_hf_model(model_path):
         """Loads the HuggingFace model from the given checkpoint path."""
         raise NotImplementedError("load_hf_model is not implemented")
+    
+    @staticmethod
+    def update_state_dict_for_tied_weights(state_dict):
+        """Implement state_dict update for each model class with tied weights"""
+        raise NotImplementedError("State-dict update not implemented")
 
     @property
     def device(self) -> torch.device:

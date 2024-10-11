@@ -561,6 +561,10 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
         # to facilitate rank usage in base model
         state_dict['rank_util.rank'] = torch.arange(0, tp_degree, dtype=torch.int32)
         return state_dict
+    
+    @staticmethod
+    def update_state_dict_for_tied_weights(state_dict):
+        state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"].clone()
 
     @classmethod
     def get_config_cls(cls):
