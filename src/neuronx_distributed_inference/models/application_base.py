@@ -246,13 +246,19 @@ class NeuronApplicationBase(torch.nn.Module):
         # Prune None values in the quantized_state_dict. torch.save crashes if None values exist.
         quantized_state_dict = prune_state_dict(quantized_state_dict)
         if os.path.isdir(config.neuron_config.quantized_checkpoints_path):
-            logging.info("Saving quantized state dict as safetensors to: %s", config.neuron_config.quantized_checkpoints_path)
+            logging.info(
+                "Saving quantized state dict as safetensors to: %s",
+                config.neuron_config.quantized_checkpoints_path,
+            )
             save_state_dict_safetensors(
                 state_dict=quantized_state_dict,
                 state_dict_dir=config.neuron_config.quantized_checkpoints_path,
             )
         else:
-            logging.info("Saving quantized state dict as torch pt file to: %s", config.neuron_config.quantized_checkpoints_path)
+            logging.info(
+                "Saving quantized state dict as torch pt file to: %s",
+                config.neuron_config.quantized_checkpoints_path,
+            )
             torch.save(quantized_state_dict, config.neuron_config.quantized_checkpoints_path)
 
     @classmethod
