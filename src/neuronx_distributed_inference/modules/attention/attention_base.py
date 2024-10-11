@@ -6,7 +6,13 @@ import torch
 from torch import Tensor, nn
 from torch.distributed import ProcessGroup
 
-from .utils import apply_rotary_pos_emb, manual_softmax, move_heads_front, repeat_kv, distributed_softmax
+from .utils import (
+    apply_rotary_pos_emb,
+    distributed_softmax,
+    manual_softmax,
+    move_heads_front,
+    repeat_kv,
+)
 
 # Try except for the compatibility with older compiler version
 try:
@@ -15,6 +21,7 @@ except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
 
 import neuronx_distributed as nxd
+import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import utils  # noqa: E402
 from neuronx_distributed.parallel_layers.layers import SPMDRank
 from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group, get_world_group
@@ -22,8 +29,6 @@ from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 
 from .gqa import GroupQueryAttention_O  # noqa: E402; noqa: E402
 from .gqa import GroupQueryAttention_QKV  # noqa: E402
-
-import torch_xla.core.xla_model as xm
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
@@ -122,13 +127,13 @@ class NeuronAttentionBase(nn.Module):
         return QK
 
     def prep_qkv_tensors(
-            self,
-            position_ids,
-            hidden_states,
-            past_key_value,
-            adapter_ids=None,
-            cos_cache=None,
-            sin_cache=None,
+        self,
+        position_ids,
+        hidden_states,
+        past_key_value,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
     ):
         """take care of the shape, layout, group query, custom position encoding, etc."""
         Q, K, V = self.qkv_proj(hidden_states=hidden_states, adapter_ids=adapter_ids)
@@ -210,20 +215,28 @@ class NeuronAttentionBase(nn.Module):
             attn_output = torch.matmul(active_scores, V_active)
         return attn_output
 
-    def compute_for_flash_decoding(self, Q, K, V, past_key_value, attention_mask, active_mask) -> Tensor:
+    def compute_for_flash_decoding(
+        self, Q, K, V, past_key_value, attention_mask, active_mask
+    ) -> Tensor:
         # TODO: refactor/decompose this to reduce duplication with compute_for_token_gen
         # active attention
         n_repeat = Q.shape[1]
         K_active = repeat_kv(K, n_repeat)
         V_active = repeat_kv(V, n_repeat)
-        active_scores = (torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)).to(torch.float32)
-        active_scores = torch.where(active_mask, active_scores, torch.finfo(active_scores.dtype).min)
+        active_scores = (torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)).to(
+            torch.float32
+        )
+        active_scores = torch.where(
+            active_mask, active_scores, torch.finfo(active_scores.dtype).min
+        )
 
         # prior attention
         K_prior = repeat_kv(past_key_value[0], n_repeat)
         V_prior = repeat_kv(past_key_value[1], n_repeat)
         prior_scores = torch.matmul(Q, K_prior.transpose(2, 3)) / math.sqrt(self.head_dim)
-        prior_scores = torch.where(attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min)
+        prior_scores = torch.where(
+            attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
+        )
         prior_scores = prior_scores.to(torch.float32)
 
         # attention scores
@@ -236,7 +249,7 @@ class NeuronAttentionBase(nn.Module):
         return attn_output
 
     def compute_for_token_gen(
-            self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+        self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
     ) -> Tensor:
         """attention computation at token generation phase"""
         is_speculation = position_ids.shape[-1] > 1
@@ -273,15 +286,15 @@ class NeuronAttentionBase(nn.Module):
         return attn_output
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_value: Optional[Tuple[torch.Tensor]] = None,
-            active_mask: Optional[torch.LongTensor] = None,
-            adapter_ids=None,
-            cos_cache: Optional[torch.Tensor] = None,
-            sin_cache: Optional[torch.Tensor] = None,
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        active_mask: Optional[torch.LongTensor] = None,
+        adapter_ids=None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """Implements each layer's forward pass for the attention block."""
         bsz, q_len, _ = hidden_states.size()
@@ -304,8 +317,13 @@ class NeuronAttentionBase(nn.Module):
                 # shard KV by seq len and pick the values based on rank
                 assert q_len == Q.shape[2], f"Q shape is {Q.shape}"
                 # selecting positions (on S dim) that belongs to the current rank
-                selected_seq_pos = torch.arange(rank_id_in_kv_group.item(), q_len, self.num_cores_per_group,
-                                                dtype=torch.int64, device=Q.device)
+                selected_seq_pos = torch.arange(
+                    rank_id_in_kv_group.item(),
+                    q_len,
+                    self.num_cores_per_group,
+                    dtype=torch.int64,
+                    device=Q.device,
+                )
                 K = torch.index_select(input=K, dim=2, index=selected_seq_pos)
                 V = torch.index_select(input=V, dim=2, index=selected_seq_pos)
         else:
@@ -315,9 +333,18 @@ class NeuronAttentionBase(nn.Module):
                 groups = get_kv_shared_group(as_list=True)
                 Q = xm.all_gather(Q, dim=1, groups=groups, pin_layout=False)
 
-                attn_output = self.compute_for_flash_decoding(Q, K, V, past_key_value, attention_mask, active_mask)
-                attn_output = xm.reduce_scatter(xm.REDUCE_SUM, attn_output, scale=1, scatter_dim=1,
-                                                shard_count=len(groups[0]), groups=groups, pin_layout=False)
+                attn_output = self.compute_for_flash_decoding(
+                    Q, K, V, past_key_value, attention_mask, active_mask
+                )
+                attn_output = xm.reduce_scatter(
+                    xm.REDUCE_SUM,
+                    attn_output,
+                    scale=1,
+                    scatter_dim=1,
+                    shard_count=len(groups[0]),
+                    groups=groups,
+                    pin_layout=False,
+                )
             else:
                 attn_output = self.compute_for_token_gen(
                     Q, K, V, position_ids, past_key_value, attention_mask, active_mask

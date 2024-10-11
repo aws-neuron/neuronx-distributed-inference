@@ -233,11 +233,15 @@ class KVCacheManager(nn.Module):
                 else:
                     # copy the tensor of the new position into kv cache
                     if self.flash_decoding_enabled:
-                        assert active_mask is not None, 'active_mask should be specified for flash decoding!'
-                        garbage_pos = seq_len-1  # treat last pos as garbage
+                        assert (
+                            active_mask is not None
+                        ), "active_mask should be specified for flash decoding!"
+                        garbage_pos = seq_len - 1  # treat last pos as garbage
                         updated_pos_ids = position_ids // self.num_cores_per_group
                         scatter_index = torch.where(active_mask == 1, updated_pos_ids, garbage_pos)
-                        scatter_index_new = scatter_index.view(-1, 1, scatter_index.shape[-1], 1).expand_as(latest_k)
+                        scatter_index_new = scatter_index.view(
+                            -1, 1, scatter_index.shape[-1], 1
+                        ).expand_as(latest_k)
                     else:
                         scatter_index_new = self._get_index_to_update_new_position(
                             scatter_index, position_ids, latest_k

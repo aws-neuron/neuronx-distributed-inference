@@ -33,6 +33,14 @@ if [ "$1" == "flake8" ]; then
     exit
 fi
 
+# Check formatting for dryrun builds only
+if [ -n "${BRAZIL_PACKAGE_VERSION}" ]; then
+    echo "Check code formatting..."
+    brazilpython check_format
+else
+    echo "Skipping formatting check!"
+fi
+
 # `bb`
 echo "Formatting code..."
 brazilpython format

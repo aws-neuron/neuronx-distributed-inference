@@ -1,5 +1,6 @@
-import torch
 from typing import Tuple
+
+import torch
 from neuronx_distributed.parallel_layers.utils import divide
 
 
@@ -8,15 +9,17 @@ def turn_2d_mask_to_4d(attention_mask, n_positions, batch_size):
 
 
 def calculate_num_cores_per_group(num_attn_heads, num_kv_heads, tp_degree):
-    assert num_attn_heads % tp_degree == 0, (f"expect num attention heads is multiples of tp degree but got "
-                                             f"{num_attn_heads} and {tp_degree}")
+    assert num_attn_heads % tp_degree == 0, (
+        f"expect num attention heads is multiples of tp degree but got "
+        f"{num_attn_heads} and {tp_degree}"
+    )
     num_cores_per_group = divide(min(tp_degree, num_attn_heads), num_kv_heads)
     return num_cores_per_group
 
 
-
-def mask_util(pos_ids: torch.Tensor, rank_id: torch.Tensor, num_cores_per_group: int, cache_size: int) -> (
-        Tuple)[torch.Tensor, torch.Tensor]:
+def mask_util(
+    pos_ids: torch.Tensor, rank_id: torch.Tensor, num_cores_per_group: int, cache_size: int
+) -> (Tuple)[torch.Tensor, torch.Tensor]:
     """
     @:param pos_ids: 1d tensor represents position ids for all sequences in a batch
     @:param rank_id: current rank of the device
@@ -57,7 +60,7 @@ def mask_util(pos_ids: torch.Tensor, rank_id: torch.Tensor, num_cores_per_group:
     for pos_id = 19:
     the selected_pos for prior masks to be updated (col index) is 4, derived by 19 // 4
     """
-    selected_pos = torch.div(pos_ids, num_cores_per_group, rounding_mode='floor')
+    selected_pos = torch.div(pos_ids, num_cores_per_group, rounding_mode="floor")
 
     # init prior mask: set True from the start to the selected_pos, and the rest False
     position_ids_to_compare = selected_pos.expand(selected_pos.shape[0], cache_size)

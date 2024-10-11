@@ -406,7 +406,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         if self.tensor_model_parallel_group is not None:
             # All-Gather tokens
             if self.sequence_parallel_enabled:
-                hidden_states = gather_from_sequence_parallel_region(hidden_states, self.sequence_dimension)
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, self.sequence_dimension
+                )
 
         if self.fused_qkv:
             QKV = (

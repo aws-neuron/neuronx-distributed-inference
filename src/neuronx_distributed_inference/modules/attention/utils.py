@@ -1,9 +1,9 @@
 from typing import Tuple
 
 import torch
-from torch import Tensor, nn
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group
+from torch import Tensor, nn
 
 torch.manual_seed(0)
 
@@ -88,8 +88,7 @@ def distributed_softmax(prior_scores, active_scores) -> Tuple[Tensor, Tensor]:
     # collect for global max and exp sum (denominator)
     groups = get_kv_shared_group(as_list=True)
     gather_payload = torch.cat((local_max_score, denominator), dim=0)
-    gathered_res = xm.all_gather(gather_payload, dim=-1,
-                                 groups=groups, pin_layout=False)
+    gathered_res = xm.all_gather(gather_payload, dim=-1, groups=groups, pin_layout=False)
     gathered_max, gathered_denom = torch.chunk(gathered_res, 2, dim=0)
     global_max = torch.max(gathered_max, dim=-1, keepdim=True)[0]
 

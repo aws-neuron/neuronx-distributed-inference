@@ -283,7 +283,7 @@ class NeuronApplicationBase(torch.nn.Module):
     def load_hf_model(model_path):
         """Loads the HuggingFace model from the given checkpoint path."""
         raise NotImplementedError("load_hf_model is not implemented")
-    
+
     @staticmethod
     def update_state_dict_for_tied_weights(state_dict):
         """Implement state_dict update for each model class with tied weights"""

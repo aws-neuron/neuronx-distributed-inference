@@ -39,7 +39,7 @@ def token_generation_bk(tensors: List[torch.Tensor], buckets: torch.Tensor, padd
     """
     # assume tensors[1] is either pos id or attention mask (seq dim == 1 => pos id)
     item = tensors[1]
-    attention_mask_is_removed = item.shape[1] == 1 # indicates item is position Id
+    attention_mask_is_removed = item.shape[1] == 1  # indicates item is position Id
     if attention_mask_is_removed:
         position_ids = tensors[1]
         bucket_mask = (buckets <= position_ids).to(torch.int)

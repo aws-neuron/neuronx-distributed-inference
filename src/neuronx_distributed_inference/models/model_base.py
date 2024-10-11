@@ -3,13 +3,13 @@ import logging
 from typing import List, Optional, Tuple, Union
 
 import neuronx_distributed as nxd
-from neuronx_distributed.parallel_layers import utils
-from neuronx_distributed.parallel_layers.layers import SPMDRank
 import torch
 import torch_xla.core.xla_model as xm
+from neuronx_distributed.parallel_layers import utils
+from neuronx_distributed.parallel_layers.layers import SPMDRank
 from neuronx_distributed.parallel_layers.mappings import (
-    gather_from_sequence_parallel_region,
     _reduce_scatter_along_dim,
+    gather_from_sequence_parallel_region,
 )
 from neuronx_distributed.parallel_layers.parallel_state import get_world_group
 from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
@@ -315,8 +315,11 @@ class NeuronBaseModel(nn.Module):
         is_for_context_encoding = 1 < input_ids.shape[-1] != self.speculation_length
         is_for_speculation = input_ids.shape[-1] == self.speculation_length
 
-        cache_size = utils.divide(self.n_positions, self.num_cores_per_group) \
-            if self.neuron_config.flash_decoding_enabled else self.n_positions
+        cache_size = (
+            utils.divide(self.n_positions, self.num_cores_per_group)
+            if self.neuron_config.flash_decoding_enabled
+            else self.n_positions
+        )
 
         # It is either for context encoding or for token generation
         if is_for_context_encoding:
@@ -343,11 +346,18 @@ class NeuronBaseModel(nn.Module):
         active_mask_2d = None
         if self.neuron_config.flash_decoding_enabled and not is_for_context_encoding:
             rank_id = self.rank_util.get_rank()
-            active_mask_2d, attention_mask_2d = mask_util(pos_ids=position_ids, rank_id=rank_id,
-                                                          num_cores_per_group=self.num_cores_per_group,
-                                                          cache_size=cache_size)
-            active_mask = turn_2d_mask_to_4d(active_mask_2d, n_positions=1, batch_size=self.batch_size)
-            attention_mask = turn_2d_mask_to_4d(attention_mask_2d, n_positions=cache_size, batch_size=self.batch_size)
+            active_mask_2d, attention_mask_2d = mask_util(
+                pos_ids=position_ids,
+                rank_id=rank_id,
+                num_cores_per_group=self.num_cores_per_group,
+                cache_size=cache_size,
+            )
+            active_mask = turn_2d_mask_to_4d(
+                active_mask_2d, n_positions=1, batch_size=self.batch_size
+            )
+            attention_mask = turn_2d_mask_to_4d(
+                attention_mask_2d, n_positions=cache_size, batch_size=self.batch_size
+            )
 
         hidden_states, past_key_values = self.get_model_output(
             input_ids=input_ids,
@@ -360,7 +370,13 @@ class NeuronBaseModel(nn.Module):
         )
 
         updated_kv_cache = self.kv_mgr.update_cache(
-            is_for_context_encoding, seq_ids, position_ids, past_key_values, cache_size, scatter_index, active_mask_2d
+            is_for_context_encoding,
+            seq_ids,
+            position_ids,
+            past_key_values,
+            cache_size,
+            scatter_index,
+            active_mask_2d,
         )
         if self.padding_side == "left":
             index = torch.tensor([hidden_states.shape[1] - 1], device=hidden_states.device)
@@ -480,7 +496,9 @@ class NeuronBaseModel(nn.Module):
             cos_cache, sin_cache = layer_outputs[2:]
 
         if self.sequence_parallel_enabled:
-            hidden_states = gather_from_sequence_parallel_region(hidden_states, self.sequence_dimension)
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, self.sequence_dimension
+            )
 
         hidden_states = self.norm(hidden_states)
 
