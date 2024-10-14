@@ -98,7 +98,7 @@ class KVCacheManager(nn.Module):
         hidden_dim_per_head = self._get_hidden_dim_per_head(config)
 
         if self.flash_decoding_enabled:
-            max_len = utils.divide(max_len, self.num_cores_per_group)
+            max_len = utils.divide(max_len, self.num_cores_per_group) + 128
 
         # BHSD KV cache layout for classic attention
         self.kv_shape = (
@@ -254,12 +254,13 @@ class KVCacheManager(nn.Module):
                     )
 
             # update
+            read_len = k_cache.shape[2]
             if not self.is_medusa:
                 k_cache = _gather_slice_into_kv_cacheline(
-                    self.past_key_values[idx * 2], self.padding_side, seq_len, k_cache
+                    self.past_key_values[idx * 2], self.padding_side, read_len, k_cache
                 )
                 v_cache = _gather_slice_into_kv_cacheline(
-                    self.past_key_values[idx * 2 + 1], self.padding_side, seq_len, v_cache
+                    self.past_key_values[idx * 2 + 1], self.padding_side, read_len, v_cache
                 )
             updated_kv_cache.append(k_cache)
             updated_kv_cache.append(v_cache)

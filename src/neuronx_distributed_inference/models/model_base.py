@@ -316,7 +316,7 @@ class NeuronBaseModel(nn.Module):
         is_for_speculation = input_ids.shape[-1] == self.speculation_length
 
         cache_size = (
-            utils.divide(self.n_positions, self.num_cores_per_group)
+            utils.divide(self.n_positions, self.num_cores_per_group) + 128
             if self.neuron_config.flash_decoding_enabled
             else self.n_positions
         )

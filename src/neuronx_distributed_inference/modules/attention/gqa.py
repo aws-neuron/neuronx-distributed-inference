@@ -27,7 +27,7 @@ class GQA(enum.Enum):
     # | Q1 Q2 | Q3 Q4 | ... | Q55 Q56 | Pad Pad | ... | Pad Pad |
     CONVERT_TO_MHA = "convert-to-mha"
 
-    # This transforms a GQA attention mechanism such that there is extactly
+    # This transforms a GQA attention mechanism such that there is exactly
     # one K/V head per tp_degree through replication e.g. 8 K/V heads with
     # tp_degree=32 results in 32 K/V heads. This is more memory efficient but
     # does not work for all configurations. Q heads are padded interleaved
