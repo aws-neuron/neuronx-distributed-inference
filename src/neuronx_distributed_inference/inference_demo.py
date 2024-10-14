@@ -3,6 +3,7 @@ import ast
 import copy
 import json
 import os
+import time
 from enum import Enum
 from typing import Type
 
@@ -144,6 +145,9 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         help="Use torch.distributed (gloo) backend when running multi-node examples. "
         "This is useful for ensuring processes on different nodes are in sync",
     )
+    run_parser.add_argument(
+        "--skip-save-sharded-checkpoint", dest="save_sharded_checkpoint", action="store_false"
+    )
 
     # lora
     run_parser.add_argument("--enable-lora", action="store_true")
@@ -226,6 +230,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         model_cls.save_quantized_state_dict(args.model_path, config)
 
     # Compile and save model.
+    compiling_start_time = time.monotonic()
     if not args.skip_compile:
         print("\nCompiling and saving model...")
         model.compile(args.compiled_model_path, debug=args.hlo_debug)
@@ -238,10 +243,16 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
 
     if args.compile_only:
         return
-
+    compiling_end_time = time.monotonic()
+    total_compiling_time = compiling_end_time - compiling_start_time
+    print(f"Compiling and tracing time: {total_compiling_time} seconds")
     # Load compiled model to Neuron.
     print("\nLoading model to Neuron...")
     model.load(args.compiled_model_path)
+    loading_end_time = time.monotonic()
+    model_loading_time = loading_end_time - compiling_end_time
+    print(f"Total model loading time: {model_loading_time} seconds")
+
     if draft_model is not None:
         print("\nLoading draft model to Neuron...")
         draft_model.load(args.compiled_draft_model_path)

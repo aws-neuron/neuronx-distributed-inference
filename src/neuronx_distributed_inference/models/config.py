@@ -139,6 +139,7 @@ class NeuronConfig:
         self.tp_degree = kwargs.pop("tp_degree", 1)
         self.pp_degree = kwargs.pop("pp_degree", 1)
         self.ep_degree = kwargs.pop("ep_degree", 1)
+        self.save_sharded_checkpoint = kwargs.pop("save_sharded_checkpoint", True)
 
         # QK layer normalization
         self.qk_layernorm = kwargs.pop("qk_layernorm", False)
