@@ -5,6 +5,8 @@ Some of the utitlies functions need to be redo or removed.
 """
 # flake8: noqa
 
+import warnings
+from contextlib import nullcontext
 from functools import partial
 from typing import List, Optional, Union
 
@@ -15,6 +17,15 @@ from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecode
 
 from neuronx_distributed_inference.utils.constants import *
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
+
+try:
+    import intel_extension_for_pytorch as ipex
+except ImportError:
+    warnings.warn(
+        "Intel extension for pytorch not found. For faster CPU references install `intel-extension-for-pytorch`.",
+        category=UserWarning,
+    )
+    ipex = None
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
@@ -100,15 +111,20 @@ def get_generate_outputs(
 
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
 
-    return get_generate_outputs_from_token_ids(
-        model,
-        inputs.input_ids,
-        tokenizer,
-        attention_mask=inputs.attention_mask,
-        is_hf=is_hf,
-        draft_model=draft_model,
-        **generate_kwargs,
-    )
+    if ipex:
+        model = ipex.optimize(model, dtype=model.config.torch_dtype)
+        model = torch.compile(model, backend="ipex")
+
+    with torch.cpu.amp.autocast() if ipex else nullcontext():
+        return get_generate_outputs_from_token_ids(
+            model,
+            inputs.input_ids,
+            tokenizer,
+            attention_mask=inputs.attention_mask,
+            is_hf=is_hf,
+            draft_model=draft_model,
+            **generate_kwargs,
+        )
 
 
 # FIXME: add on cpu check support
