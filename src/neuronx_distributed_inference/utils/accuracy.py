@@ -5,7 +5,6 @@ Some of the utitlies functions need to be redo or removed.
 """
 # flake8: noqa
 
-import copy
 from functools import partial
 from typing import List, Optional, Union
 
@@ -14,16 +13,20 @@ from torch_neuronx.testing.validation import logit_validation
 from transformers import GenerationConfig, PreTrainedModel, PreTrainedTokenizer
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.utils.constants import *
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
-from neuronx_distributed_inference.utils.constants import *
 
-
-def get_generate_outputs(
-    model, prompts, tokenizer, is_hf=False, draft_model=None, device="neuron", **generate_kwargs
+def get_generate_outputs_from_token_ids(
+    model,
+    token_ids,
+    tokenizer,
+    attention_mask=None,
+    is_hf=False,
+    draft_model=None,
+    **generate_kwargs,
 ):
     if draft_model is not None and not is_hf:
         # TODO: Fix draft model support on HF. HF supports speculative decoding, but output is garbage currently.
@@ -42,21 +45,25 @@ def get_generate_outputs(
             }
         )
 
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    if attention_mask is None:
+        print("attention mask not provided, padding inputs and generating a mask")
 
-    if is_hf:
-        tokenizer.padding_side = "left"
-    else:
-        # FIXME: add cpu generation
-        if device == "cpu":
-            assert "get_generate_outputs from CPU yet avaialble"
-        tokenizer.padding_side = "right"
-    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        padding_side = "left" if is_hf else "right"
+        inputs = tokenizer.pad(
+            {"input_ids": token_ids},
+            padding_side=padding_side,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+
+        token_ids = inputs.input_ids
+        attention_mask = inputs.attention_mask
 
     generation_model = model if is_hf else HuggingFaceGenerationAdapter(model)
-    outputs = generation_model.generate(
-        inputs.input_ids, attention_mask=inputs.attention_mask, **generate_kwargs
-    )
+    outputs = generation_model.generate(token_ids, attention_mask=attention_mask, **generate_kwargs)
+
     if not is_hf:
         model.reset()
         if draft_model is not None:
@@ -72,6 +79,32 @@ def get_generate_outputs(
     )
 
     return outputs, output_tokens
+
+
+def get_generate_outputs(
+    model, prompts, tokenizer, is_hf=False, draft_model=None, device="neuron", **generate_kwargs
+):
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    if is_hf:
+        tokenizer.padding_side = "left"
+    else:
+        # FIXME: add cpu generation
+        if device == "cpu":
+            assert "get_generate_outputs from CPU yet avaialble"
+        tokenizer.padding_side = "right"
+
+    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+
+    return get_generate_outputs_from_token_ids(
+        model,
+        inputs.input_ids,
+        tokenizer,
+        attention_mask=inputs.attention_mask,
+        is_hf=is_hf,
+        draft_model=draft_model,
+        **generate_kwargs,
+    )
 
 
 # FIXME: add on cpu check support
@@ -193,12 +226,9 @@ def check_accuracy_logits(
     print("Expected Logits Shape: ", expected_logits.shape)
 
     def generate_logits(model, tokenizer, input_ids):
-        prompt = tokenizer.batch_decode(
-            input_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        actual_outputs, actual_tokens = get_generate_outputs(
+        actual_outputs, actual_tokens = get_generate_outputs_from_token_ids(
             neuron_model,
-            prompt,
+            input_ids,
             tokenizer,
             is_hf=False,
             do_sample=True,
