@@ -45,6 +45,8 @@ def get_generate_outputs_from_token_ids(
             }
         )
 
+    # If an attention mask is provided, the inputs are also expected to be padded to the correct shape.
+
     if attention_mask is None:
         print("attention mask not provided, padding inputs and generating a mask")
 
@@ -60,6 +62,8 @@ def get_generate_outputs_from_token_ids(
 
         token_ids = inputs.input_ids
         attention_mask = inputs.attention_mask
+
+        attention_mask[token_ids == tokenizer.pad_token_id] = 0
 
     generation_model = model if is_hf else HuggingFaceGenerationAdapter(model)
     outputs = generation_model.generate(token_ids, attention_mask=attention_mask, **generate_kwargs)
