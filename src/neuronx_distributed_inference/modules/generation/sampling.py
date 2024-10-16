@@ -1,3 +1,5 @@
+from typing import Union
+
 import torch
 from neuronx_distributed.operators.argmax import argmax as nxd_argmax
 from neuronx_distributed.operators.topk import topk as nxd_topk
@@ -6,14 +8,9 @@ from neuronx_distributed_inference.models.config import NeuronConfig
 
 
 def prepare_sampling_params(batch_size, top_k=[1], top_p=[1.0], temperature=[1.0]):
-    if not torch.is_tensor(top_k):
-        top_k = torch.tensor(top_k)
-
-    if not torch.is_tensor(top_p):
-        top_p = torch.tensor(top_p)
-
-    if not torch.is_tensor(temperature):
-        temperature = torch.tensor(temperature)
+    top_k = prepare_tensor(top_k)
+    top_p = prepare_tensor(top_p)
+    temperature = prepare_tensor(temperature)
 
     assert (
         top_k.shape[0] == top_p.shape[0] == temperature.shape[0]
@@ -26,6 +23,14 @@ def prepare_sampling_params(batch_size, top_k=[1], top_p=[1.0], temperature=[1.0
         temperature = temperature.broadcast_to(batch_size)
     stacked = torch.stack([top_k, top_p, temperature], dim=1)
     return stacked
+
+
+def prepare_tensor(val: Union[torch.Tensor, list, float]):
+    if not torch.is_tensor(val):
+        if not isinstance(val, list):
+            val = [val]
+        val = torch.tensor(val)
+    return val
 
 
 class Sampler(torch.nn.Module):

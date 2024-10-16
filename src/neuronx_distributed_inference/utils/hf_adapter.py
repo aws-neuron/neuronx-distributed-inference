@@ -119,28 +119,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         )
 
         batch_size = model_kwargs["attention_mask"].shape[0]
-
-        top_k = (
-            generation_config.top_k
-            if isinstance(generation_config.top_k, list)
-            else [generation_config.top_k]
-        )
-        top_p = (
-            generation_config.top_p
-            if isinstance(generation_config.top_p, list)
-            else [generation_config.top_p]
-        )
-        temperature = (
-            generation_config.temperature
-            if isinstance(generation_config.temperature, list)
-            else [generation_config.temperature]
-        )
-
         sampling_params = prepare_sampling_params(
             batch_size=batch_size,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
+            top_k=generation_config.top_k,
+            top_p=generation_config.top_p,
+            temperature=generation_config.temperature,
         )
 
         # init attention / hidden states / scores tuples

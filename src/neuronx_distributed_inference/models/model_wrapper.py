@@ -150,24 +150,6 @@ class ModelWrapper(torch.nn.Module):
         self.model = self.model_cls(self.config)
         self.model.load_state_dict(state_dict, strict=strict, assign=assign)
 
-    def get_sampling_params(
-        self,
-    ):
-        if self.neuron_config.on_device_sampling_config:
-            if self.neuron_config.on_device_sampling_config.dynamic:
-                # For dynamic sampling, we need sampling params to be != 1 when we trace,
-                # otherwise only greedy sampling will be traced
-                logging.debug("Tracing with dynamic sampling params!")
-                return prepare_sampling_params(
-                    self.neuron_config.batch_size, top_k=[10], top_p=[0.5], temperature=[0.5]
-                )
-
-        # use greedy sampling params
-        logging.debug("Tracing with greedy sampling params!")
-        return prepare_sampling_params(
-            self.neuron_config.batch_size, top_k=[1], top_p=[1.0], temperature=[1.0]
-        )
-
     def input_generator(
         self,
     ):
@@ -192,7 +174,12 @@ class ModelWrapper(torch.nn.Module):
                 if self.neuron_config.lora_config is not None
                 else None
             )
-            sampling_params = self.get_sampling_params()
+
+            # Get the count of sampling params currently supported.
+            sampling_params_len = prepare_sampling_params(1).shape[1]
+            sampling_params = torch.zeros(
+                (self.neuron_config.batch_size, sampling_params_len), dtype=torch.float32
+            )
 
             if self.is_medusa:
                 accepted_indices = torch.zeros(
