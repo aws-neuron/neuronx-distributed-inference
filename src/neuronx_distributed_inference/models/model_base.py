@@ -5,7 +5,6 @@ from typing import List, Optional, Tuple, Union
 import neuronx_distributed as nxd
 import torch
 import torch_xla.core.xla_model as xm
-from neuronx_distributed.parallel_layers import utils
 from neuronx_distributed.parallel_layers.layers import SPMDRank
 from neuronx_distributed.parallel_layers.mappings import (
     _reduce_scatter_along_dim,
@@ -27,7 +26,11 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; 
 )
 from neuronx_distributed_inference.modules.attention import utils as attn_utils
 from neuronx_distributed_inference.modules.autobucketing import generate_buckets
-from neuronx_distributed_inference.modules.flashdecode.utils import mask_util, turn_2d_mask_to_4d
+from neuronx_distributed_inference.modules.flashdecode.utils import (
+    get_cache_size,
+    mask_util,
+    turn_2d_mask_to_4d,
+)
 from neuronx_distributed_inference.modules.generation.sampling import (
     Sampler,
     prepare_sampling_params,
@@ -316,7 +319,7 @@ class NeuronBaseModel(nn.Module):
         is_for_speculation = input_ids.shape[-1] == self.speculation_length
 
         cache_size = (
-            utils.divide(self.n_positions, self.num_cores_per_group) + 128
+            get_cache_size(self.n_positions, self.num_cores_per_group)
             if self.neuron_config.flash_decoding_enabled
             else self.n_positions
         )

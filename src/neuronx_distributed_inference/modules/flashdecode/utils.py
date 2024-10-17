@@ -3,6 +3,14 @@ from typing import Tuple
 import torch
 from neuronx_distributed.parallel_layers.utils import divide
 
+# Theoretically one should enough to avoid writing true value to garbage pos (last pos of the cache),
+# pick 128 as is more compatible with compiler
+EXTRA_RESERVED_SPACE = 128
+
+
+def get_cache_size(seq_len, num_cores_per_group):
+    return divide(seq_len, num_cores_per_group) + EXTRA_RESERVED_SPACE
+
 
 def turn_2d_mask_to_4d(attention_mask, n_positions, batch_size):
     return attention_mask[:, None, None, :].expand(batch_size, 1, 1, n_positions).to(torch.bool)

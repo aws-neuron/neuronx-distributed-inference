@@ -1,3 +1,4 @@
+import logging
 from typing import List
 
 import torch
@@ -12,6 +13,7 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402;
     get_shardable_head_counts,
 )
 from neuronx_distributed_inference.modules.autobucketing import slice_lhs, slice_rhs
+from neuronx_distributed_inference.modules.flashdecode.utils import get_cache_size
 
 
 def _slice_kv_cacheline(padding_side, seq_len: int, cache: Tensor):
@@ -98,7 +100,14 @@ class KVCacheManager(nn.Module):
         hidden_dim_per_head = self._get_hidden_dim_per_head(config)
 
         if self.flash_decoding_enabled:
-            max_len = utils.divide(max_len, self.num_cores_per_group) + 128
+            padded_max_len = max_len
+            if max_len % self.num_cores_per_group != 0:
+                padded_max_len += self.num_cores_per_group - max_len % self.num_cores_per_group
+                logging.warning(
+                    f"Max length needs to be multiples of num_cores_per_group {self.num_cores_per_group}"
+                    f" but got {max_len}. Padding it to {padded_max_len} meet the requirement."
+                )
+            max_len = get_cache_size(padded_max_len, self.num_cores_per_group)
 
         # BHSD KV cache layout for classic attention
         self.kv_shape = (
