@@ -158,11 +158,12 @@ class NeuronLlamaMLP(nn.Module):
         )
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
 
+        mlp_bias = getattr(config, "mlp_bias", False)
         if parallel_state.model_parallel_is_initialized():
             self.gate_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.intermediate_size,
-                bias=False,
+                bias=mlp_bias,
                 gather_output=False,
                 dtype=config.neuron_config.torch_dtype,
                 pad=True,
@@ -172,7 +173,7 @@ class NeuronLlamaMLP(nn.Module):
             self.up_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.intermediate_size,
-                bias=False,
+                bias=mlp_bias,
                 gather_output=False,
                 dtype=config.neuron_config.torch_dtype,
                 pad=True,
@@ -182,7 +183,7 @@ class NeuronLlamaMLP(nn.Module):
             self.down_proj = RowParallelLinear(
                 self.intermediate_size,
                 self.hidden_size,
-                bias=False,
+                bias=mlp_bias,
                 input_is_parallel=True,
                 dtype=config.neuron_config.torch_dtype,
                 pad=True,
@@ -190,9 +191,9 @@ class NeuronLlamaMLP(nn.Module):
                 sequence_dimension=self.sequence_dimension,
             )
         else:
-            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
 
     def forward(self, x, adapter_ids=None):
         # all-gather is done here instead of CPL layers to
@@ -243,6 +244,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.is_medusa = config.neuron_config.is_medusa
         self.flash_decoding_enabled = config.neuron_config.flash_decoding_enabled
         self.num_cores_per_group = config.num_cores_per_group
+        self.bias = getattr(config, "attention_bias", False)
 
         if parallel_state.model_parallel_is_initialized():
             self.tp_degree = parallel_state.get_tensor_model_parallel_size()
