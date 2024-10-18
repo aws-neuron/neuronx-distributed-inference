@@ -189,11 +189,18 @@ class ModelWrapper(torch.nn.Module):
                 if self.neuron_config.lora_config is not None
                 else None
             )
-
             # Get the count of sampling params currently supported.
             sampling_params_len = prepare_sampling_params(1).shape[1]
             sampling_params = torch.zeros(
                 (self.neuron_config.batch_size, sampling_params_len), dtype=torch.float32
+            )
+            hidden_states = (
+                torch.zeros(
+                    (self.neuron_config.batch_size, n_active_tokens, self.config.hidden_size),
+                    dtype=self.config.neuron_config.torch_dtype,
+                )
+                if self.neuron_config.is_eagle_draft
+                else None
             )
 
             if self.is_medusa:
@@ -257,6 +264,17 @@ class ModelWrapper(torch.nn.Module):
                             seq_ids,
                             sampling_params,
                             adapter_ids,
+                        )
+                    )
+                elif self.neuron_config.is_eagle_draft:
+                    inputs.append(
+                        (
+                            input_ids,
+                            attention_mask,
+                            position_ids,
+                            seq_ids,
+                            sampling_params,
+                            hidden_states,
                         )
                     )
                 else:
@@ -363,6 +381,11 @@ class ModelWrapper(torch.nn.Module):
                 "Forward called before load. Run load() or load_state_dict() making calling forward"
             )
         # if adapter_ids for LoRA is None, pop it out
+        if args[6] is None:
+            args = (*args[:6], *args[7:])
+
+        # remove hidden state if None
+        # This is hacky and is being fixed
         if args[5] is None:
             args = (*args[:5], *args[6:])
 
@@ -493,6 +516,12 @@ class DecoderModelInstance(BaseModelInstance):
                 self.input_output_aliases[target_past_key_values[j]] = (
                     num_output_from_trace * 2 + len(draft_past_key_values)
                 ) + j
+
+            if self.neuron_config.enable_eagle_speculation:
+                self.input_output_aliases[self.module.hidden_state] = (
+                    num_output_from_trace * 2 + len(draft_past_key_values)
+                ) + len(target_past_key_values)
+
         else:
             # TODO: This else block is a short-term fix for Llava/ViT models to use DecoderModelInstance.
             #       Long-term, these models should use a different implementation of BaseModelInstance.

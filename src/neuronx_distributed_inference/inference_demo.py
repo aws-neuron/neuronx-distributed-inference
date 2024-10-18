@@ -130,6 +130,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--draft-model-tp-degree", type=int, default=None)
     run_parser.add_argument("--compiled-draft-model-path", type=str)
     run_parser.add_argument("--enable-fused-speculation", action="store_true", default=False)
+    run_parser.add_argument("--enable-eagle-speculation", action="store_true", default=False)
 
     run_parser.add_argument(
         "--no-trace-tokengen-model", dest="trace_tokengen_model", action="store_false"
@@ -242,9 +243,13 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     if neuron_config.speculation_length > 0 and args.draft_model_path is not None:
         # Reset speculation options to defaults for the draft model.
         draft_neuron_config = copy.deepcopy(config.neuron_config)
-        draft_neuron_config.speculation_length = 0
+        if not neuron_config.enable_eagle_speculation:
+            draft_neuron_config.speculation_length = 0
         draft_neuron_config.trace_tokengen_model = True
         draft_neuron_config.enable_fused_speculation = False
+        if neuron_config.enable_eagle_speculation:
+            draft_neuron_config.is_eagle_draft = True
+            draft_neuron_config.sequence_parallel_enabled = False
 
         if args.draft_model_tp_degree is not None:
             draft_neuron_config.tp_degree = args.draft_model_tp_degree

@@ -127,6 +127,8 @@ class NeuronConfig:
         self.speculation_length = kwargs.pop("speculation_length", 0)
         self.spec_batch_size = kwargs.pop("spec_batch_size", self.batch_size)
         self.enable_fused_speculation = kwargs.pop("enable_fused_speculation", False)
+        self.enable_eagle_speculation = kwargs.pop("enable_eagle_speculation", False)
+        self.is_eagle_draft = kwargs.pop("is_eagle_draft", False)
 
         if self.speculation_length > 0 and self.async_mode:
             raise IncompatibleConfigError("Speculative Decoding is not yet supported with async.")

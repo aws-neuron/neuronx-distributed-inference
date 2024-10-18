@@ -709,10 +709,15 @@ class NeuronLlamaDecoderLayer(nn.Module):
             config=config, tensor_model_parallel_group=get_tp_group(config)
         )
         self.mlp = NeuronLlamaMLP(config)
-        self.input_layernorm = get_rmsnorm_cls()(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
+        logger.debug(
+            f"Instantiating RMSNorm modules with hidden size {config.hidden_size} and EPS {config.rms_norm_eps}"
         )
+        self.input_layernorm = None
+        if not config.neuron_config.is_eagle_draft:
+            self.input_layernorm = get_rmsnorm_cls()(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+            )
         self.post_attention_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -734,7 +739,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         residual = hidden_states
 
         # RMSNorm (fused with QKV kernel when SP is disabled)
-        if not self.qkv_kernel_enabled or self.sequence_parallel_enabled:
+        if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm:
             hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -872,8 +877,13 @@ class NeuronLlamaModel(NeuronBaseModel):
             else:
                 updated_configs.append(config)
         self.layers = nn.ModuleList([NeuronLlamaDecoderLayer(conf) for conf in updated_configs])
-        self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        if not config.neuron_config.is_eagle_draft:
+            self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
 
+        if config.neuron_config.is_eagle_draft:
+            self.fc = ColumnParallelLinear(
+                config.hidden_size * 2, config.hidden_size, bias=True, gather_output=True
+            )
         self.is_medusa = config.neuron_config.is_medusa
         self.num_medusa_heads = config.neuron_config.num_medusa_heads
         self.medusa_speculation_length = config.neuron_config.medusa_speculation_length

@@ -44,7 +44,12 @@ def generation_model_bk(
     attention_mask_is_removed = item.shape[1] == 1  # indicates item is position Id
     if attention_mask_is_removed:
         position_ids = tensors[1]
-        bucket_mask = (buckets <= position_ids[:, -1].unsqueeze(0)).to(torch.int)
+        max_position_id = (
+            position_ids[:, -1] + speculation_length
+            if (position_ids[:, -1] + speculation_length).all() <= buckets[-1]
+            else position_ids[:, -1]
+        )
+        bucket_mask = (buckets <= (max_position_id).unsqueeze(0)).to(torch.int)
         bucket_idx = torch.max(torch.argmin(bucket_mask, dim=1))
     else:
         attention_mask = tensors[1]

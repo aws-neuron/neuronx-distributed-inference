@@ -429,7 +429,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         outputs = self(**model_inputs)
         new_token = outputs.fused_outputs[1].view(
             bs, -1
-        )  # The target generate token after ctx encoding
+        )  # The target generated token after ctx encoding
 
         returned_ids = new_token
         incremental_len = 0
@@ -449,10 +449,12 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             draft_new_tokens = outputs.fused_outputs[0]
             target_tokens = outputs.fused_outputs[1]
 
-            # 3. draft token matching process
-            # The very last draft token was not used as it was generated when we populate the kv cache for the bonus token
-            candidate_new_tokens = draft_new_tokens[:, :-1]
+            if self.neuron_config.enable_eagle_speculation:
+                candidate_new_tokens = draft_new_tokens[:, 1:]
+            else:
+                candidate_new_tokens = draft_new_tokens[:, :-1]
 
+            # 3. EOS checking
             if eos_token_id in draft_new_tokens:
                 eos_pos = (draft_new_tokens == eos_token_id).nonzero(as_tuple=True)[0]
                 candidate_new_tokens = candidate_new_tokens[:, : eos_pos + 1]
@@ -460,12 +462,13 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
 
             selected_tokens = target_tokens[:, :-1]
 
+            # 4. Checking which draft tokens match for acceptance (we use greedy here)
             n_matches = ((~(candidate_new_tokens == selected_tokens)).cumsum(dim=-1) < 1).sum()
 
             n_matches = min(n_matches, max_len - cur_len - 1)
             incremental_len = n_matches + 1
 
-            accepted_tokens = target_tokens[:, : n_matches + 1]
+            accepted_tokens = target_tokens[:, : n_matches + 1]  # Accept bonus token from target
             if eos_token_id in accepted_tokens:
                 eos_pos = (accepted_tokens == eos_token_id).nonzero(as_tuple=True)[0]
                 end_for_all = True
@@ -473,7 +476,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
 
             returned_ids = torch.cat((returned_ids, accepted_tokens), dim=1)
 
-            # 4. Update with the generated token length and check for stopping condition.
+            # 5. Update with the generated token length and check for stopping condition.
             if end_for_all:
                 break
             if returned_ids[:, -1:][0] == torch.tensor(eos_token_id):
@@ -481,10 +484,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             cur_len = cur_len + n_matches + 1
             if cur_len >= max_len:
                 break
-            # 5. If the rest length is smaller than speculation length, we directly run the target model to finish
             if max_len - cur_len <= spec_len:
-                # @yihsian: TODO: complete with using target tokengen model
                 break
+
         return torch.cat((input_ids, returned_ids), dim=1)
 
     def _standard_assisted_decoding(
