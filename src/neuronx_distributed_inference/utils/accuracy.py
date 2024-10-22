@@ -111,11 +111,17 @@ def get_generate_outputs(
 
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
 
-    if ipex:
+    is_bfloat16 = (
+        model.dtype == torch.bfloat16
+        if is_hf
+        else model.config.neuron_config.torch_dtype == torch.bfloat16
+    )
+    use_ipex = ipex and is_bfloat16
+    if use_ipex:
         model = ipex.optimize(model, dtype=model.config.torch_dtype)
         model = torch.compile(model, backend="ipex")
 
-    with torch.cpu.amp.autocast() if ipex else nullcontext():
+    with torch.cpu.amp.autocast() if use_ipex else nullcontext():
         return get_generate_outputs_from_token_ids(
             model,
             inputs.input_ids,
