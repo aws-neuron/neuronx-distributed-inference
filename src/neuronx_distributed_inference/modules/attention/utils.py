@@ -1,11 +1,155 @@
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 import torch_xla.core.xla_model as xm
-from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group
+from neuronx_distributed.parallel_layers.parallel_state import (
+    get_kv_shared_group,
+    get_tensor_model_parallel_group,
+)
+from neuronx_distributed.parallel_layers.utils import get_padding_length
 from torch import Tensor, nn
 
 torch.manual_seed(0)
+
+weight_cache = {}
+
+
+def _get_weight_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
+    if prefix in weight_cache:
+        return weight_cache[prefix]
+
+    if (prefix + "weight") in state_dict:
+        transposed_weight = state_dict[prefix + "weight"].t()
+        weight_cache[prefix] = transposed_weight
+        return transposed_weight
+
+    else:
+        raise RuntimeError(f"Cannot find {(prefix + 'weight')} in the state_dict")
+
+
+def _set_weight_to_state_dict(
+    prefix: str, tensor: torch.Tensor, state_dict: Dict[str, Any]
+) -> None:
+    if (prefix + "weight") in state_dict:
+        state_dict[prefix + "weight"] = tensor.t()
+    else:
+        raise RuntimeError(f"Cannot find {(prefix + 'weight')} in the state_dict")
+
+
+def transpose_parallel_linear_layer(parallel_layer):
+    """
+    This function clones and transposes a ColumnParallelLinear or RowParallelLinear
+    The attributes are also cloned and partition_dim is updated
+    """
+    orig_attrs = vars(parallel_layer)
+    new_layer = torch.nn.Parameter(parallel_layer.clone().T, requires_grad=False)
+    new_layer.__dict__.update(orig_attrs)
+    # flip the partition_dim from 0->1 or 1->0
+    setattr(new_layer, "partition_dim", 1 - getattr(new_layer, "partition_dim"))
+    setattr(new_layer, "get_tensor_from_state_dict", _get_weight_from_state_dict)
+    setattr(new_layer, "set_tensor_to_state_dict", _set_weight_to_state_dict)
+    return new_layer
+
+
+def pad_to_128_multiple(x, dim):
+    TP_DEGREE = get_tensor_model_parallel_group().size()
+    padding_length = get_padding_length(x.shape[dim] // TP_DEGREE, 128) * TP_DEGREE
+    dimlist = [0] * (len(x.shape) * 2)
+    dimlist[dim * 2] = padding_length
+    return torch.nn.functional.pad(x, tuple(dimlist[::-1]))
+
+
+quantized_weight_cache = {}
+
+
+def _get_weight_from_state_dict_quantized(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
+    if prefix in quantized_weight_cache:
+        return quantized_weight_cache[prefix]
+
+    if (prefix + "weight") in state_dict:
+        # Need to pad tensor to nearest multiple of 128 (after sharding), then transpose.
+        # Padding not supported for fp8 so view as int8 then view back.
+        quantized_tensor = state_dict[prefix + "weight"]
+        assert (
+            quantized_tensor.dtype == torch.float8_e4m3fn
+        ), "Expected weight type to be float8_e4m3fn"
+        dim = 0 if "down_proj" in prefix else 1
+        quantized_tensor = pad_to_128_multiple(quantized_tensor.view(torch.int8).t(), dim)
+        quantized_tensor = quantized_tensor.view(torch.float8_e4m3fn)
+        quantized_tensor = quantized_tensor.contiguous()
+        quantized_weight_cache[prefix] = quantized_tensor
+        return quantized_tensor
+    else:
+        raise RuntimeError(f"Cannot find {(prefix + 'weight')} in the state_dict")
+
+
+quantized_scale_cache = {}
+
+
+def _get_scale_from_state_dict_quantized(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
+    if prefix in quantized_scale_cache:
+        return quantized_scale_cache[prefix]
+
+    if (prefix + "weight_scale") in state_dict:
+        # Transformations for fp8 kernel scale inputs
+
+        # Original shape in checkpoint
+        # gate/up:  [I, 1]
+        # down:     [H, 1]
+
+        # New shape needed (gate/up)
+        # pad I to be multiple of 128 after sharding --> [I_padded, 1]
+        # transpose --> [1, I_padded]
+        # broadcast --> [128, I_padded]
+
+        # New shape needed (down)
+        # transpose --> [1, H]
+        # broadcast --> [128, H]
+        scale = state_dict[prefix + "weight_scale"]
+        if "down_proj" not in prefix:
+            scale = pad_to_128_multiple(scale, 0)
+        scale = scale.t()
+        scale = torch.broadcast_to(scale, (128, scale.shape[1]))
+        scale = scale.contiguous()
+        quantized_scale_cache[prefix] = scale
+        return scale
+    else:
+        raise RuntimeError(f"Cannot find {(prefix + 'scale')} in the state_dict")
+
+
+def preprocess_quantized_linear_weight(layer):
+    orig_weight_attrs = vars(layer.weight)
+    layer.weight = torch.nn.Parameter(layer.weight.clone().T, requires_grad=False)
+
+    # Add methods for loading from checkpoint
+    layer.weight.__dict__.update(orig_weight_attrs)
+    setattr(layer.weight, "partition_dim", 1 - getattr(layer.weight, "partition_dim"))
+    setattr(layer.weight, "get_tensor_from_state_dict", _get_weight_from_state_dict_quantized)
+    # setattr(layer.weight, "set_tensor_to_state_dict", _set_weight_to_state_dict) # TODO: Is this needed?
+
+
+def preprocess_quantized_linear_scale(layer):
+    orig_scale_attrs = vars(layer.scale)
+
+    # Transpose scale
+    scale = layer.scale.clone().T
+    # Broadcast scale
+    scale = torch.broadcast_to(scale, (128, scale.shape[1]))
+    # In the checkpoint the attr is weight_scale, so patch here.
+    setattr(layer, "weight_scale", torch.nn.Parameter(scale))
+
+    # Add methods for loading from checkpoint
+    layer.weight_scale.__dict__.update(orig_scale_attrs)
+    setattr(layer.weight_scale, "partition_dim", 1 - getattr(layer.weight_scale, "partition_dim"))
+    setattr(layer.weight_scale, "get_tensor_from_state_dict", _get_scale_from_state_dict_quantized)
+
+    del layer.scale
+    # setattr(layer.weight, "set_tensor_to_state_dict", _set_weight_to_state_dict) # TODO: Is this needed?
+
+
+def preprocess_quantized_linear_layer(layer):
+    preprocess_quantized_linear_weight(layer)
+    preprocess_quantized_linear_scale(layer)
 
 
 def move_heads_front(

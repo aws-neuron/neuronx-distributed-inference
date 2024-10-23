@@ -71,9 +71,12 @@ class NeuronConfig:
             self.max_new_tokens = None
         self.max_length = kwargs.pop("max_length", self.seq_len)
 
+        # Embedding Config
+        self.vocab_parallel = kwargs.pop("vocab_parallel", False)
+
         # Attention
         self.fused_qkv = kwargs.pop("fused_qkv", False)
-        self.sequence_parallel_enabled = kwargs.pop("sequence_parallel_norm", False)
+        self.sequence_parallel_enabled = kwargs.pop("sequence_parallel_enabled", False)
         # TODO: Remove Llama attn_cls and multiple attention feature.
         self.attn_cls = kwargs.pop("attn_cls", "NeuronLlamaAttention")
 
@@ -106,8 +109,7 @@ class NeuronConfig:
             ), "quantized_checkpoints_path is required"
         self.quantization_type: str = kwargs.pop("quantization_type", "per_tensor_symmetric")
         self.quantization_dtype: str = kwargs.pop("quantization_dtype", "int8")
-        # Verification for quantized dtype
-        QuantizedDtype.has_dtype(self.quantization_dtype)
+
         # TODO: Add validation for quantized_checkpoints_path after the design discussions
         self.kv_cache_quant = kwargs.pop("kv_cache_quant", False)
 
@@ -115,6 +117,7 @@ class NeuronConfig:
         self.trace_tokengen_model = kwargs.pop("trace_tokengen_model", True)
         self.speculation_length = kwargs.pop("speculation_length", 0)
         self.spec_batch_size = kwargs.pop("spec_batch_size", self.batch_size)
+        self.enable_fused_speculation = kwargs.pop("enable_fused_speculation", False)
 
         # Medusa decoding
         self.is_medusa = kwargs.pop("is_medusa", False)
@@ -157,6 +160,41 @@ class NeuronConfig:
         # Flash decoding
         self.flash_decoding_enabled = kwargs.pop("flash_decoding_enabled", False)
 
+        # KV Cache tiling optimizations
+        #   Tiling the sequence dimension of the KV cache enables specific
+        #   compiler optimizations like cascaded reductions
+        self.kv_cache_tiling = False
+        if self.max_length > 128 and self.max_length % 128 == 0:
+            # Our tile size is 128. We can tile only if sequence length is
+            # divisible by 128.
+            self.kv_cache_tiling = True
+
+        # Kernels
+        self.attn_kernel_enabled = kwargs.pop("attn_kernel_enabled", False)
+        self.qkv_kernel_enabled = kwargs.pop("qkv_kernel_enabled", False)
+        self.mlp_kernel_enabled = kwargs.pop("mlp_kernel_enabled", False)
+        self.mlp_kernel_fuse_residual_add = kwargs.pop("mlp_kernel_fuse_residual_add", False)
+        self.quantized_mlp_kernel_enabled = kwargs.pop("quantized_mlp_kernel_enabled", False)
+        self.logical_neuron_cores = kwargs.pop("logical_neuron_cores", 1)
+
+        # compiler flags
+        self.cc_pipeline_tiling_factor = kwargs.pop("cc_pipeline_tiling_factor", 2)
+        self.target = kwargs.pop("target", None)
+
+        if kwargs:
+            logging.warn(f"NeuronConfig init: Unexpected keyword arguments: {kwargs}")
+
+        self._verify_quantized_config()
+
+    def _verify_quantized_config(self):
+        if not self.quantized:
+            return
+        assert self.quantized_checkpoints_path is not None, "quantized_checkpoints_path is required"
+        # Verification for quantized dtype
+        QuantizedDtype.has_dtype(self.quantization_dtype)
+        if self.quantized_mlp_kernel_enabled:
+            assert self.quantization_dtype == "f8e4m3"
+
 
 class MoENeuronConfig(NeuronConfig):
     """
@@ -174,12 +212,34 @@ class MoENeuronConfig(NeuronConfig):
         super().__init__(**kwargs)
 
 
+class FusedSpecNeuronConfig:
+    """
+    Base class for fused speculative decoding on Neuron.
+    """
+
+    # attribute_map: Dict[str, str] = {}
+    def __init__(
+        self,
+        worker_cls,
+        draft_config: Dict[str, str] = None,
+        draft_model_path: str = None,
+        draft_neuron_config: NeuronConfig = None,
+    ) -> None:
+        self.worker_cls = worker_cls
+        self.draft_config = draft_config
+        self.draft_model_path = draft_model_path
+        self.draft_neuron_config = draft_neuron_config
+
+
 class InferenceConfig:
     # Alias map for attributes.
     attribute_map: Dict[str, str] = {}
 
-    def __init__(self, neuron_config: NeuronConfig, load_config=None, **kwargs):
+    def __init__(
+        self, neuron_config: NeuronConfig, fused_spec_config=None, load_config=None, **kwargs
+    ):
         self.neuron_config = neuron_config
+        self.fused_spec_config = fused_spec_config
         if load_config is not None:
             load_config(self)
         else:

@@ -1,10 +1,12 @@
 import logging
 import os
 import warnings
+from functools import partial
 from typing import List
 
 import neuronx_distributed.trace.hlo_utils as hlo_utils
 import torch
+from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.quantization.quantization_config import QuantizationType, QuantizedDtype
 from neuronx_distributed.quantization.quantization_utils import (
     convert_qint8_to_int8_state_dict,
@@ -23,15 +25,24 @@ from neuronx_distributed_inference.modules.checkpoint import (
 )
 
 COMPILED_MODEL_FILE_NAME = "model.pt"
+logger = logging.getLogger("Neuron")
 
 
 def is_compiled(model_path):
     return os.path.isfile(model_path + COMPILED_MODEL_FILE_NAME)
 
 
+def init_custom_process_group_fn(config):
+    if hasattr(config, "fused_spec_config") and config.fused_spec_config is not None:
+        if config.fused_spec_config.draft_neuron_config.tp_degree is not None:
+            draft_tp = config.fused_spec_config.draft_neuron_config.tp_degree
+            parallel_state.initialize_speculative_draft_group(draft_tp)
+
+
 class NeuronApplicationBase(torch.nn.Module):
     _STATE_DICT_MODEL_PREFIX = "model."
     _NEW_STATE_DICT_MODEL_PREFIX = ""
+    _FUSED_PREFIX = ""
 
     def __init__(
         self,
@@ -49,6 +60,7 @@ class NeuronApplicationBase(torch.nn.Module):
         self.validate_config(config)
         self.config = config
         self.neuron_config = config.neuron_config
+        self.fused_spec_config = config.fused_spec_config
         self.on_device_sampling = self.neuron_config.on_device_sampling_config is not None
         self.model_path = model_path
         self.models: List[ModelWrapper] = []
@@ -60,6 +72,11 @@ class NeuronApplicationBase(torch.nn.Module):
     def get_builder(self, debug=False):
         if self._builder is None:
             base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
+
+            # Use this function to intialize non standard TP/PP/DP distributed
+            # process groups.
+            custom_group_fn = partial(init_custom_process_group_fn, self.config)
+
             self._builder = ModelBuilder(
                 router=None,
                 tp_degree=self.neuron_config.tp_degree,
@@ -72,6 +89,7 @@ class NeuronApplicationBase(torch.nn.Module):
                 compiler_workdir=base_compile_work_dir,
                 debug=debug,
                 num_cores_per_group=self.config.num_cores_per_group,
+                init_custom_process_group_fn=custom_group_fn,
             )
             for model in self.models:
                 self._builder.add(
@@ -116,8 +134,12 @@ class NeuronApplicationBase(torch.nn.Module):
         torch.jit.save(traced_model, compiled_model_path + COMPILED_MODEL_FILE_NAME)
         del traced_model
 
-        if self.neuron_config.save_sharded_checkpoint:
-            sharded_checkpoint_dir = os.path.join(compiled_model_path, "weights/")
+        sharded_checkpoint_dir = os.path.join(compiled_model_path, "weights/")
+        if not self.neuron_config.save_sharded_checkpoint:
+            logger.info(
+                f"SKIPPING sharding the checkpoint at {sharded_checkpoint_dir}, assuming it's already sharded"
+            )
+        else:
             self.get_builder(debug).shard_checkpoint(serialize_path=sharded_checkpoint_dir)
 
             if hlo_utils.NXD_LAYOUT_TRANSFORMATION_OPTIONS in os.environ:
@@ -176,11 +198,25 @@ class NeuronApplicationBase(torch.nn.Module):
 
         if self.config.neuron_config.quantized:
             return self.get_quantized_state_dict(self.config)
+        elif self.config.neuron_config.enable_fused_speculation:
+            assert self.fused_spec_config is not None
+            self.__class__._FUSED_PREFIX = "draft_model"
+            model_sd = self.get_state_dict(
+                self.fused_spec_config.draft_model_path, self.fused_spec_config.draft_config
+            )
+            self.__class__._FUSED_PREFIX = "target_model"
+            model_sd.update(self.get_state_dict(self.model_path, self.config))
+
+            if self.neuron_config.torch_dtype == torch.bfloat16:
+                for name, param in model_sd.items():
+                    if torch.is_floating_point(param):
+                        model_sd[name] = param.bfloat16()
+            return model_sd
         else:
             model_sd = self.get_state_dict(self.model_path, self.config)
             if self.neuron_config.torch_dtype == torch.bfloat16:
                 for name, param in model_sd.items():
-                    if torch.is_floating_point(param):
+                    if torch.is_floating_point(param) and param.dtype not in [torch.float8_e4m3fn]:
                         # only cast floating types
                         model_sd[name] = param.bfloat16()
         return model_sd
@@ -203,6 +239,12 @@ class NeuronApplicationBase(torch.nn.Module):
         model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
         if getattr(config, "tie_word_embeddings", False):
             cls.update_state_dict_for_tied_weights(model_sd)
+
+        param_name_list = list(model_sd.keys())
+        if cls._FUSED_PREFIX != "":
+            for param_name in param_name_list:
+                model_sd[f"{cls._FUSED_PREFIX}.{param_name}"] = model_sd[param_name]
+                del model_sd[param_name]
         return model_sd
 
     @classmethod
@@ -222,6 +264,18 @@ class NeuronApplicationBase(torch.nn.Module):
             model_quant_sd = load_state_dict(existing_checkpoint_path)
         else:
             model_quant_sd = torch.load(existing_checkpoint_path)
+
+        # For the case when huggingface models come with existing prefixes. We do not allow
+        # Any prefix like "model."
+        param_name_list = list(model_quant_sd.keys())
+        for param_name in param_name_list:
+            if param_name.startswith(cls._STATE_DICT_MODEL_PREFIX):
+                updated_param_name = param_name.replace(
+                    cls._STATE_DICT_MODEL_PREFIX, cls._NEW_STATE_DICT_MODEL_PREFIX, 1
+                )
+                model_quant_sd[updated_param_name] = model_quant_sd[param_name]
+                del model_quant_sd[param_name]
+
         model_quant_sd = cls.convert_hf_to_neuron_state_dict(model_quant_sd, config)
 
         # Make sure that the non quantized weights are in bfloat16 and not float32

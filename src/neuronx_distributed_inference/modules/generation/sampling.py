@@ -3,6 +3,7 @@ from typing import Union
 import torch
 from neuronx_distributed.operators.argmax import argmax as nxd_argmax
 from neuronx_distributed.operators.topk import topk as nxd_topk
+from neuronx_distributed.parallel_layers import parallel_state
 
 from neuronx_distributed_inference.models.config import NeuronConfig
 
@@ -59,6 +60,17 @@ class Sampler(torch.nn.Module):
             -3000
         )  # large negative values will be transformed to ~0 in softmax, this is to ignore tokens that are beyond topk range
 
+        if not self.neuron_config.on_cpu:
+            if (
+                hasattr(self.neuron_config, "use_draft_group")
+                and self.neuron_config.use_draft_group
+            ):
+                self.process_group = parallel_state.get_speculative_draft_group(as_list=False)
+            else:
+                self.process_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            self.process_group = None
+
     def _soft_max(self, logits, dim):
         return torch.nn.functional.softmax(input=logits, dim=dim)
 
@@ -68,7 +80,11 @@ class Sampler(torch.nn.Module):
                 sorted_logits, indeces = torch.topk(input=logits, k=self.global_topk, dim=dim)
             else:
                 sorted_logits, indeces = nxd_topk(
-                    tensor=logits, k=self.global_topk, dim=dim, gather_dim=dim
+                    tensor=logits,
+                    k=self.global_topk,
+                    dim=dim,
+                    gather_dim=dim,
+                    process_group=self.process_group,
                 )
         else:
             sorted_logits, indeces = torch.sort(input=logits, dim=dim, descending=True)
@@ -137,7 +153,13 @@ class Sampler(torch.nn.Module):
                 return torch.argmax(token_logits, dim=dim)
             else:
                 # distributed argmax
-                return nxd_argmax(tensor=token_logits, dim=dim, gather_dim=dim, keepdim=False)
+                return nxd_argmax(
+                    tensor=token_logits,
+                    dim=dim,
+                    gather_dim=dim,
+                    keepdim=False,
+                    process_group=self.process_group,
+                )
 
         top_k_logits_values, top_k_logits_indices = self._top_k_masked(token_logits, top_k, 1)
 

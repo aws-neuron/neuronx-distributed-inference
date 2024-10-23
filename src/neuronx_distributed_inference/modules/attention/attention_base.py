@@ -25,9 +25,12 @@ import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import utils  # noqa: E402
 from neuronx_distributed.parallel_layers.layers import SPMDRank
 from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group, get_world_group
+from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
 from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 
 from .gqa import GQA, GroupQueryAttention_O, GroupQueryAttention_QKV  # noqa: E402
+
+logger = logging.getLogger("Neuron")
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
@@ -97,6 +100,9 @@ class NeuronAttentionBase(nn.Module):
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             sequence_dimension=self.sequence_dimension,
             tensor_model_parallel_group=self.tensor_model_parallel_group,
+            rms_norm_eps=self.config.rms_norm_eps,
+            qkv_kernel_enabled=self.neuron_config.qkv_kernel_enabled,
+            logical_neuron_cores=self.neuron_config.logical_neuron_cores,
         )
         self.o_proj = GroupQueryAttention_O(
             hidden_size=self.hidden_size,
@@ -121,6 +127,8 @@ class NeuronAttentionBase(nn.Module):
         if self.qk_layernorm:
             self.q_layernorm = nn.LayerNorm(self.head_dim)
             self.k_layernorm = nn.LayerNorm(self.head_dim)
+        self.attn_kernel_enabled = self.neuron_config.attn_kernel_enabled
+        self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
 
     def scaled_qk(self, Q, K, attention_mask):
         QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -135,9 +143,12 @@ class NeuronAttentionBase(nn.Module):
         adapter_ids=None,
         cos_cache=None,
         sin_cache=None,
+        rmsnorm=None,
     ):
         """take care of the shape, layout, group query, custom position encoding, etc."""
-        Q, K, V = self.qkv_proj(hidden_states=hidden_states, adapter_ids=adapter_ids)
+        Q, K, V = self.qkv_proj(
+            hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids
+        )
 
         # Divide hidden_dim across heads for MHA
         # Change layout: BSHD -> BHSD
@@ -167,22 +178,29 @@ class NeuronAttentionBase(nn.Module):
         K_active = repeat_kv(K, self.num_key_value_groups)
         V_active = repeat_kv(V, self.num_key_value_groups)
 
-        # use flash attention if (i) sequence length is large enough to get the best performance,
-        # (ii) Q, K, and V have the same shape. Conditions can be changed in the future.
-        flash_attention_eligible = q_len >= 4096 and Q.shape == K_active.shape == V_active.shape
+        # use flash attention if
+        # (i) attn_kernel_enabled is True in neuron_config
+        # (ii) sequence length is large enough to get the best performance,
+        # (iii) Q, K, and V have the same shape. Conditions can be changed in the future.
+        flash_attention_eligible = (
+            self.attn_kernel_enabled or q_len >= 4096
+        ) and Q.shape == K_active.shape == V_active.shape
 
         if flash_attention_eligible:
+            logger.debug(f"ATTN kernel: logical_neuron_cores={self.logical_neuron_cores}")
             # if we are using left padding, then the bzs needs be 1 (otherwise we get wrong result
             # because flash attention does not use attention_mask). In practice, we use right
             # padding so this is unlikely to cause issues
             assert self.padding_side == "right" or bsz == 1
 
             # original shape of q, k, v is BHSD, and expected output is also BHSD.
-            logging.debug(f"Using flash_fwd for Q.shape={Q.shape}")
+            logger.debug(f"Using flash_fwd for Q.shape={Q.shape}")
             # make sure to cast inputs to torch_dtype (this is needed because the downcast to bf16
             # might happen after the kernel hlo creation step). Also convert shapes as expected by the kernel.
+
+            # original Q shape: batch, num_heads, seqlen, d_head
             Q = (
-                Q.permute(0, 1, 3, 2)
+                Q.permute(0, 1, 3, 2)  # after permute: batch, num_heads, d_head, seqlen
                 .reshape((bsz * self.num_heads, self.head_dim, q_len))
                 .to(self.torch_dtype)
             )
@@ -195,20 +213,44 @@ class NeuronAttentionBase(nn.Module):
             V_active = V_active.reshape((bsz * self.num_heads, q_len, self.head_dim)).to(
                 self.torch_dtype
             )
+            # shape: (B*H)DS
             attn_output = torch.zeros(
-                bsz * self.num_heads, q_len, self.head_dim, dtype=Q.dtype, device=Q.device
+                bsz * self.num_heads, self.head_dim, q_len, dtype=Q.dtype, device=Q.device
             )
-            _flash_fwd_call(
-                Q,
-                K_active,
-                V_active,
-                1.0,
-                attn_output,
-                kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
-            )
-            attn_output = attn_output.reshape((bsz, self.num_heads, q_len, self.head_dim))
+
+            logger.debug("Input parameter shapes")
+            logger.debug(f"Q input shape {Q.shape}")
+            logger.debug(f"K input shape {K_active.shape}")
+            logger.debug(f"V input shape {V_active.shape}")
+            logger.debug(f"Attn output shape {attn_output.shape}")
+
+            if int(self.logical_neuron_cores) > 1:
+                grid = (vnc(self.logical_neuron_cores),)
+
+                _flash_fwd_call[grid](
+                    Q,
+                    K_active,
+                    V_active,
+                    1.0,
+                    attn_output,
+                    kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
+                )
+            else:
+                # attention kernel does not support passing in a grid for LNC=1
+                _flash_fwd_call(
+                    Q,
+                    K_active,
+                    V_active,
+                    1.0,
+                    attn_output,
+                    kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
+                )
+            # shape: BHDS
+            attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
+            logger.debug(f"Attn output after reshape {attn_output.shape}")
         else:
-            logging.debug(f"Not using flash_fwd for Q.shape={Q.shape}")
+            logger.debug("ATTN: native compiler")
+            logger.debug(f"Not using flash_fwd for Q.shape={Q.shape}")
             active_scores = self.scaled_qk(Q, K_active, attention_mask)
             active_scores = nn.functional.softmax(active_scores, dim=-1, dtype=torch.float32).to(
                 Q.dtype
@@ -296,11 +338,13 @@ class NeuronAttentionBase(nn.Module):
         adapter_ids=None,
         cos_cache: Optional[torch.Tensor] = None,
         sin_cache: Optional[torch.Tensor] = None,
+        rmsnorm=None,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """Implements each layer's forward pass for the attention block."""
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
             q_len *= self.tensor_model_parallel_group.size()
+
         Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
             position_ids,
             hidden_states,
@@ -308,6 +352,7 @@ class NeuronAttentionBase(nn.Module):
             adapter_ids=adapter_ids,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
+            rmsnorm=rmsnorm,
         )
 
         if past_key_value is None:
@@ -324,8 +369,13 @@ class NeuronAttentionBase(nn.Module):
                 # shard KV by seq len and pick the values based on rank
                 assert q_len == Q.shape[2], f"Q shape is {Q.shape}"
                 # selecting positions (on S dim) that belongs to the current rank
-                offset = torch.arange(0, q_len, self.num_cores_per_group, device=Q.device)
-                selected_seq_pos = offset + rank_id_in_kv_group
+                selected_seq_pos = torch.arange(
+                    rank_id_in_kv_group.item(),
+                    q_len,
+                    self.num_cores_per_group,
+                    dtype=torch.int64,
+                    device=Q.device,
+                )
                 K = torch.index_select(input=K, dim=2, index=selected_seq_pos)
                 V = torch.index_select(input=V, dim=2, index=selected_seq_pos)
         else:
@@ -352,8 +402,13 @@ class NeuronAttentionBase(nn.Module):
                     Q, K, V, position_ids, past_key_value, attention_mask, active_mask
                 )
 
-        # transpose BHSD -> BSHD
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        if self.attn_kernel_enabled:
+            # transpose BHDS -> BSHD
+            # this layout avoids additional transposes between attention kernel and output projection
+            attn_output = attn_output.permute(0, 3, 1, 2)
+        else:
+            # transpose BHSD -> BSHD
+            attn_output = attn_output.transpose(1, 2).contiguous()
 
         # merge multi head hidden
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)

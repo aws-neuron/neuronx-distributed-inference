@@ -1,4 +1,5 @@
 import enum
+import logging
 from typing import Optional, Tuple
 
 import torch
@@ -7,11 +8,19 @@ from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, Row
 from neuronx_distributed.parallel_layers.mappings import gather_from_sequence_parallel_region
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
 from neuronx_distributed.quantization.quantization_layers import BaseQuantizeParallelLinear
+from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_kernel
+from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
 from torch import nn
 from torch.distributed import ProcessGroup
 from torch.nn import functional as F
+from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 
+from neuronx_distributed_inference.modules.attention.utils import transpose_parallel_linear_layer
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
+
+logger = logging.getLogger("Neuron")
+
+_traced_qkv_kernel = nki_jit()(rmsnorm_qkv_isa_kernel)
 
 
 class GQA(enum.Enum):
@@ -317,6 +326,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         sequence_parallel_enabled: bool = False,
         sequence_dimension: Optional[int] = None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        rms_norm_eps: float = None,
+        qkv_kernel_enabled: bool = False,
+        logical_neuron_cores: int = 1,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -340,6 +352,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
         self.sequence_parallel_enabled = sequence_parallel_enabled
         self.sequence_dimension = sequence_dimension
+        self.qkv_kernel_enabled = qkv_kernel_enabled
+        self.logical_neuron_cores = logical_neuron_cores
 
         if self.tensor_model_parallel_group is not None:
             if self.fused_qkv:
@@ -351,11 +365,17 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     dtype=dtype,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
+                if self.qkv_kernel_enabled:
+                    # we need to transpose the weights on the CPU side to avoid
+                    # needing to transpose on the device when using QKV kernel
+                    self.Wqkv.weight = transpose_parallel_linear_layer(self.Wqkv.weight)
+
                 # Set heads info as weight parameter attributes to be used in weights sharding
                 setattr(self.Wqkv.weight, "fused_qkv", True)
                 setattr(self.Wqkv.weight, "num_attention_heads", self.num_attention_heads)
                 setattr(self.Wqkv.weight, "num_key_value_heads", self.num_key_value_heads)
                 setattr(self.Wqkv.weight, "head_dim", self.head_dim)
+
             else:
                 self.q_proj = ColumnParallelLinear(
                     self.hidden_size,
@@ -402,34 +422,30 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.bias
                 )
 
-    def forward(self, hidden_states: torch.Tensor, adapter_ids=None):
-        if self.tensor_model_parallel_group is not None:
-            # All-Gather tokens
-            if self.sequence_parallel_enabled:
-                hidden_states = gather_from_sequence_parallel_region(
-                    hidden_states, self.sequence_dimension
-                )
+    def forward(self, hidden_states: torch.Tensor, rmsnorm=None, adapter_ids=None):
+        if self.sequence_parallel_enabled and self.tensor_model_parallel_group is not None:
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states,
+                self.sequence_dimension,
+                process_group=self.tensor_model_parallel_group,
+            )
 
+        if self.qkv_kernel_enabled:
+            assert self.fused_qkv, "QKV kernel only supported when fused_qkv is TRUE"
+            fused_rmsnorm = not self.sequence_parallel_enabled
+            return self._kernel_qkv_forward(hidden_states, fused_rmsnorm, rmsnorm)
+        else:
+            return self._native_qkv_forward(hidden_states, adapter_ids)
+
+    def _native_qkv_forward(self, hidden_states: torch.Tensor, adapter_ids=None):
         if self.fused_qkv:
+            logger.debug("QKV: native compiler")
             QKV = (
                 self.Wqkv(hidden_states)
                 if not is_lora_module(self.Wqkv)
                 else self.Wqkv(hidden_states, adapter_ids)
             )
-            if self.clip_qkv is not None:
-                QKV = QKV.clamp(min=-self.clip_qkv, max=self.clip_qkv)
-            # torch.split has accuracy issue and leads to more reshapes in hlo.
-            # Using torch.tensor_split here. NAPP-3145
-            Q, K, V = torch.tensor_split(
-                QKV,
-                (
-                    self.num_attention_heads * self.head_dim // self.tp_degree,
-                    (self.num_attention_heads + self.num_key_value_heads)
-                    * self.head_dim
-                    // self.tp_degree,
-                ),
-                dim=2,
-            )
+            return self._split_fused_qkv(QKV)
         else:
             Q = (
                 self.q_proj(hidden_states)
@@ -450,7 +466,91 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 Q = Q.clamp(min=-self.clip_qkv, max=self.clip_qkv)
                 K = K.clamp(min=-self.clip_qkv, max=self.clip_qkv)
                 V = V.clamp(min=-self.clip_qkv, max=self.clip_qkv)
+            return Q, K, V
+
+    def _split_fused_qkv(self, QKV):
+        logger.debug(f"Fused QKV tensor has shape {QKV.shape}")
+        if self.clip_qkv is not None:
+            QKV = QKV.clamp(min=-self.clip_qkv, max=self.clip_qkv)
+
+        # shape of QKV is [batch, seqlen, fused_qkv_size]
+        # we split the fused QKV (dim=2) into Q, K, V
+        # for example:
+        #   for 405B, TP=128, num_att_heads=128
+        #   LNC=2/TP=64 will split QKV from [batch, seqlen, 512] into:
+        #   Q [batch, seqlen, 256]
+        #   K [batch, seqlen, 128]
+        #   V [batch, seqlen, 128]
+        # torch.split has accuracy issue and leads to more reshapes in hlo.
+        # Using torch.tensor_split here. NAPP-3145
+        q_end_index = self.num_attention_heads * self.head_dim // self.tp_degree
+        k_end_index = q_end_index + self.num_key_value_heads * self.head_dim // self.tp_degree
+        Q, K, V = torch.tensor_split(
+            QKV,
+            (
+                q_end_index,
+                k_end_index
+                # rest of the QKV will go to V output
+            ),
+            dim=2,
+        )
+        logger.debug(f"QKV shape before tensor_split: {QKV.shape}")
+        logger.debug(f"Q shape after tensor_split: {Q.shape}")
+        logger.debug(f"K shape after tensor_split: {K.shape}")
+        logger.debug(f"V shape after tensor_split: {V.shape}")
         return Q, K, V
+
+    def _kernel_qkv_forward(self, hidden_states, fused_rmsnorm, rmsnorm):
+        logger.debug(
+            f"QKV kernel: fused_rmsnorm={fused_rmsnorm} logical_neuron_cores={self.logical_neuron_cores}"
+        )
+
+        bs, seqlen, h = hidden_states.shape
+
+        h2, fused_qkv_size = self.Wqkv.weight.shape
+        logger.debug(
+            f"fused QKV projection weight - shape: {self.Wqkv.weight.shape}, dtype: {self.Wqkv.weight.dtype}"
+        )
+
+        # shape checks
+        assert (
+            fused_qkv_size
+            == (self.num_attention_heads + 2 * self.num_key_value_heads)
+            * self.head_dim
+            // self.tp_degree
+        )
+        assert h == h2
+
+        QKV = torch.zeros(
+            bs,
+            seqlen,
+            fused_qkv_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        logger.debug("TRACE QKV kernel invocation")
+        logger.debug(f"hidden_states - shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        logger.debug(
+            f"rmsnorm weight (gamma) - shape: {rmsnorm.weight.shape}, dtype: {rmsnorm.weight.dtype}"
+        )
+        logger.debug(f"output tensor - shape: {QKV.shape}, dtype: {QKV.dtype}")
+
+        grid = (vnc(self.logical_neuron_cores),)
+
+        # the QKV kernel will automatically switch to the TKG QKV if seqlen==1
+        _traced_qkv_kernel[grid](
+            hidden_states,
+            self.Wqkv.weight,
+            # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
+            # should be fine to pass this is as a dummy even if not using fused rmsnorm
+            rmsnorm.weight.unsqueeze(0),
+            QKV,
+            kernel_name="QKV",
+            # Run RMSNorm inside the kernel if NOT using SP norm
+            fused_rmsnorm=fused_rmsnorm,
+        )
+        return self._split_fused_qkv(QKV)
 
     def get_weight(
         self, prefix: str, layer: torch.nn.Module, layer_name, model_state_dict: dict

@@ -319,6 +319,38 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             model_kwargs["attention_mask"] = attention_mask
         return model_kwargs
 
+    def _update_model_kwargs_for_fused_generation(
+        self,
+        outputs: ModelOutput,
+        model_kwargs: Dict[str, Any],
+        accepted_len: int = 0,
+    ):
+        if getattr(outputs, "state", None) is not None:
+            model_kwargs["state"] = outputs.state
+        # update attention mask
+        if "attention_mask" in model_kwargs:
+            attention_mask = model_kwargs["attention_mask"]
+            if self.padding_side == "left":
+                attention_mask = torch.cat(
+                    [
+                        attention_mask,
+                        attention_mask.new_ones((attention_mask.shape[0], accepted_len)),
+                    ],
+                    dim=-1,
+                )
+                attention_mask = attention_mask[:, 1:]
+            else:
+                attention_mask = torch.cat(
+                    [
+                        attention_mask.new_ones((attention_mask.shape[0], accepted_len)),
+                        attention_mask,
+                    ],
+                    dim=-1,
+                )
+            model_kwargs["attention_mask"] = attention_mask
+
+        return model_kwargs
+
     def _assisted_decoding(
         self,
         input_ids: torch.LongTensor,
@@ -334,13 +366,21 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             raise ValueError(
                 "Sampling is unsupported as part of speculation. Only greedy speculation is supported."
             )
-
-        assistant_model = candidate_generator.assistant_model
+        if not self.neuron_config.enable_fused_speculation:
+            assistant_model = candidate_generator.assistant_model
         if self.neuron_config.is_medusa:
             # TODO: move this to sampling
             return self._medusa_assisted_decoding(
                 input_ids,
                 assistant_model,
+                stopping_criteria,
+                pad_token_id,
+                eos_token_id,
+                **model_kwargs,
+            )
+        elif self.neuron_config.enable_fused_speculation:
+            return self._fused_assisted_decoding(
+                input_ids,
                 stopping_criteria,
                 pad_token_id,
                 eos_token_id,
@@ -355,6 +395,91 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 eos_token_id,
                 **model_kwargs,
             )
+
+    def _fused_assisted_decoding(
+        self,
+        input_ids,
+        stopping_criteria,
+        pad_token_id,
+        eos_token_id,
+        **model_kwargs,
+    ):
+        # Init values
+        if eos_token_id is not None and pad_token_id is None:
+            raise ValueError(
+                "If `eos_token_id` is defined, make sure that `pad_token_id` is defined."
+            )
+
+        fused_assistant_kwargs = copy.deepcopy(model_kwargs)
+        model_inputs = self.prepare_inputs_for_generation(input_ids, **fused_assistant_kwargs)
+
+        # Other auxiliary variables
+        bs = input_ids.shape[0]
+        max_len = stopping_criteria[0].max_length
+        cur_len = input_ids.shape[-1]
+        spec_len = self.neuron_config.speculation_length
+
+        # Prompt encoding
+        outputs = self(**model_inputs)
+        new_token = outputs.fused_outputs[1].view(
+            bs, -1
+        )  # The target generate token after ctx encoding
+
+        returned_ids = new_token
+        incremental_len = 0
+        end_for_all = False
+
+        while True:
+            # 1. update the kwargs for fused generation
+            fused_assistant_kwargs = self._update_model_kwargs_for_fused_generation(
+                outputs, fused_assistant_kwargs, incremental_len
+            )
+            model_inputs = self.prepare_inputs_for_generation(
+                returned_ids, **fused_assistant_kwargs
+            )
+            # 2. get the generated draft tokens and target tokens
+            outputs = self(**model_inputs)
+
+            draft_new_tokens = outputs.fused_outputs[0]
+            target_tokens = outputs.fused_outputs[1]
+
+            # 3. draft token matching process
+            # The very last draft token was not used as it was generated when we populate the kv cache for the bonus token
+            candidate_new_tokens = draft_new_tokens[:, :-1]
+
+            if eos_token_id in draft_new_tokens:
+                eos_pos = (draft_new_tokens == eos_token_id).nonzero(as_tuple=True)[0]
+                candidate_new_tokens = candidate_new_tokens[:, : eos_pos + 1]
+                target_tokens = target_tokens[:, : eos_pos + 2]
+
+            selected_tokens = target_tokens[:, :-1]
+
+            n_matches = ((~(candidate_new_tokens == selected_tokens)).cumsum(dim=-1) < 1).sum()
+
+            n_matches = min(n_matches, max_len - cur_len - 1)
+            incremental_len = n_matches + 1
+
+            accepted_tokens = target_tokens[:, : n_matches + 1]
+            if eos_token_id in accepted_tokens:
+                eos_pos = (accepted_tokens == eos_token_id).nonzero(as_tuple=True)[0]
+                end_for_all = True
+                accepted_tokens = accepted_tokens[:, : eos_pos + 1]
+
+            returned_ids = torch.cat((returned_ids, accepted_tokens), dim=1)
+
+            # 4. Update with the generated token length and check for stopping condition.
+            if end_for_all:
+                break
+            if returned_ids[:, -1:][0] == torch.tensor(eos_token_id):
+                break
+            cur_len = cur_len + n_matches + 1
+            if cur_len >= max_len:
+                break
+            # 5. If the rest length is smaller than speculation length, we directly run the target model to finish
+            if max_len - cur_len < spec_len:
+                # @yihsian: TODO: complete with using target tokengen model
+                break
+        return torch.cat((input_ids, returned_ids), dim=1)
 
     def _standard_assisted_decoding(
         self,

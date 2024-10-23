@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from torch_neuronx.xla_impl.ops import xla_hlo_call
 
 
 def get_active_block_table(
@@ -201,3 +202,12 @@ def _selective_masking(loc, start, length, idx, x_to_ctx):
     mask = torch.logical_and(left_mask, right_mask)
     x_to_ctx = torch.where(mask, x, x_to_ctx)
     return x_to_ctx, mask
+
+
+@xla_hlo_call
+def fill_prefix(tensor, update):
+    scribe = tensor.scribe
+    dtype = tensor.dtype
+    shape = tensor.sizes
+    start_indices = [scribe.u32.Constant(constant_value=0)] * len(shape)
+    return dtype[shape].DynamicUpdateSlice(tensor, update, *start_indices)

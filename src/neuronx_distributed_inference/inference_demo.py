@@ -12,7 +12,11 @@ from neuronx_distributed.quantization.quantization_config import QuantizationTyp
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
-from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig, to_torch_dtype
+from neuronx_distributed_inference.models.config import (
+    FusedSpecNeuronConfig,
+    OnDeviceSamplingConfig,
+    to_torch_dtype,
+)
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
@@ -86,9 +90,11 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--max-new-tokens", type=int)
     run_parser.add_argument("--max-length", type=int)
 
+    run_parser.add_argument("--vocab-parallel", action="store_true")
+
     # Attention
     run_parser.add_argument("--fused-qkv", action="store_true")
-    run_parser.add_argument("--sequence-parallel-norm", action="store_true")
+    run_parser.add_argument("--sequence-parallel-enabled", action="store_true")
     run_parser.add_argument("--flash-decoding-enabled", action="store_true")
 
     # Continuous batching
@@ -118,7 +124,9 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 
     # Speculative decoding
     run_parser.add_argument("--draft-model-path", type=str)
+    run_parser.add_argument("--draft-model-tp-degree", type=int, default=None)
     run_parser.add_argument("--compiled-draft-model-path", type=str)
+    run_parser.add_argument("--enable-fused-speculation", action="store_true", default=False)
 
     run_parser.add_argument(
         "--no-trace-tokengen-model", dest="trace_tokengen_model", action="store_false"
@@ -155,6 +163,14 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--max-lora-rank", type=int)
     run_parser.add_argument("--target-modules", nargs="+")
     run_parser.add_argument("--max-loras-on-cpu", type=int)
+
+    # Kernels
+    run_parser.add_argument("--qkv-kernel-enabled", action="store_true")
+    run_parser.add_argument("--attn-kernel-enabled", action="store_true")
+    run_parser.add_argument("--mlp-kernel-enabled", action="store_true")
+    run_parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
+    run_parser.add_argument("--logical-neuron-cores", type=int, default=1)
+    run_parser.add_argument("--cc-pipeline-tiling-factor", type=int, default=2)
 
     # optional demo arguments
     run_parser.add_argument(
@@ -209,8 +225,6 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         neuron_config, load_config=load_pretrained_config(args.model_path)
     )
 
-    model = model_cls(args.model_path, config)
-
     # Initialize draft model.
     draft_model = None
     if neuron_config.speculation_length > 0 and args.draft_model_path is not None:
@@ -218,12 +232,27 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         draft_neuron_config = copy.deepcopy(config.neuron_config)
         draft_neuron_config.speculation_length = 0
         draft_neuron_config.trace_tokengen_model = True
+        draft_neuron_config.enable_fused_speculation = False
+
+        if args.draft_model_tp_degree is not None:
+            draft_neuron_config.tp_degree = args.draft_model_tp_degree
 
         draft_config = model_cls.get_config_cls()(
             draft_neuron_config, load_config=load_pretrained_config(args.draft_model_path)
         )
+        if neuron_config.enable_fused_speculation:
+            fused_spec_config = FusedSpecNeuronConfig(
+                model_cls._model_cls,
+                draft_config=draft_config,
+                draft_model_path=args.draft_model_path,
+                draft_neuron_config=draft_neuron_config,
+            )
+            config.fused_spec_config = fused_spec_config
 
-        draft_model = model_cls(args.draft_model_path, draft_config)
+        else:
+            draft_model = model_cls(args.draft_model_path, draft_config)
+
+    model = model_cls(args.model_path, config)
 
     # Quantize model.
     if neuron_config.quantized:
@@ -234,7 +263,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     if not args.skip_compile:
         print("\nCompiling and saving model...")
         model.compile(args.compiled_model_path, debug=args.hlo_debug)
-        if draft_model is not None:
+        if draft_model is not None and neuron_config.enable_fused_speculation is False:
             print("\nCompiling and saving draft model...")
             draft_model.compile(args.compiled_draft_model_path)
 
@@ -253,7 +282,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     model_loading_time = loading_end_time - compiling_end_time
     print(f"Total model loading time: {model_loading_time} seconds")
 
-    if draft_model is not None:
+    if draft_model is not None and neuron_config.enable_fused_speculation is False:
         print("\nLoading draft model to Neuron...")
         draft_model.load(args.compiled_draft_model_path)
 
@@ -269,7 +298,13 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     generation_config_kwargs = {
         k: getattr(args, k) for k in generation_config_args if getattr(args, k) is not None
     }
+    if neuron_config.enable_fused_speculation:
+        generation_config_kwargs.update({"do_sample": False})
     generation_config.update(**generation_config_kwargs)
+
+    if neuron_config.enable_fused_speculation:
+        fused_invoke_config = {"prompt_lookup_num_tokens": neuron_config.speculation_length}
+        generation_config.update(**fused_invoke_config)
 
     # With Medusa, the model is also the draft model.
     if neuron_config.is_medusa:
@@ -294,6 +329,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         generation_config,
         draft_model=draft_model,
         adapter_ids=adapter_ids,
+        enable_fused_speculation=neuron_config.enable_fused_speculation,
     )
 
     # Benchmarking.
@@ -309,7 +345,13 @@ def load_tokenizer(model_path, compiled_model_path, neuron_config):
 
 
 def run_generation(
-    model, tokenizer, prompts, generation_config, draft_model=None, adapter_ids=None
+    model,
+    tokenizer,
+    prompts,
+    generation_config,
+    draft_model=None,
+    adapter_ids=None,
+    enable_fused_speculation=False,
 ):
     print("\nGenerating outputs...")
     print(f"Prompts: {prompts}")
@@ -318,7 +360,8 @@ def run_generation(
     if draft_model is not None:
         draft_generation_model = HuggingFaceGenerationAdapter(draft_model)
         kwargs.update({"assistant_model": draft_generation_model, "do_sample": False})
-
+    if enable_fused_speculation:
+        kwargs.update({"do_sample": False})
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
     generation_model = HuggingFaceGenerationAdapter(model)
     outputs = generation_model.generate(

@@ -178,6 +178,8 @@ def check_accuracy(
         )
 
     print(f"Expected output: {outputs_expected}")
+    if neuron_config.enable_fused_speculation:
+        generation_kwargs.update({"do_sample": False})
 
     output_token_ids, outputs_actual = get_generate_outputs(
         neuron_model,

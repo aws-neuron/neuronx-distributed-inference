@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple, Union
 import neuronx_distributed as nxd
 import torch
 import torch_xla.core.xla_model as xm
+from neuronx_distributed.operators.argmax import argmax as nxd_argmax
 from neuronx_distributed.parallel_layers.layers import SPMDRank
 from neuronx_distributed.parallel_layers.mappings import (
     _reduce_scatter_along_dim,
@@ -19,6 +20,7 @@ from neuronx_distributed_inference.models.application_base import NeuronApplicat
 from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     CONTEXT_ENCODING_MODEL_TAG,
+    FUSED_SPECULATION_MODEL_TAG,
     MEDUSA_MODEL_TAG,
     SPECULATION_MODEL_TAG,
     TOKEN_GENERATION_MODEL_TAG,
@@ -35,12 +37,16 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     Sampler,
     prepare_sampling_params,
 )
-from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
+from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
+    KVCacheManager,
+    _slice_kv_cacheline,
+)
 from neuronx_distributed_inference.modules.lora_serving import (
     update_weights_for_lora,
     wrap_model_with_lora,
 )
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
+from neuronx_distributed_inference.utils.distributed import get_tp_group
 from neuronx_distributed_inference.utils.random import set_random_seed
 
 
@@ -54,6 +60,7 @@ class NeuronBaseModel(nn.Module):
     def __init__(self, config: InferenceConfig, optimize_inference=True):
         super().__init__()
 
+        self.config = config
         self.sampler = None
         self.kv_mgr = None
         self.neuron_config = config.neuron_config
@@ -287,6 +294,18 @@ class NeuronBaseModel(nn.Module):
 
         return [res] + updated_kv_cache
 
+    def _slice_kv_cache(self, kv_cache, n_positions):
+        past_key_values = []
+        for idx in range(len(kv_cache)):
+            k_cache = _slice_kv_cacheline(
+                self.config.neuron_config.padding_side, n_positions, kv_cache[idx][0]
+            )
+            v_cache = _slice_kv_cacheline(
+                self.config.neuron_config.padding_side, n_positions, kv_cache[idx][1]
+            )
+            past_key_values.append([k_cache, v_cache])
+        return past_key_values
+
     def forward(
         self,
         input_ids,
@@ -301,6 +320,7 @@ class NeuronBaseModel(nn.Module):
         scatter_index=None,
         # In llava context encoding model, input_embeds is precomputed
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        kv_cache: Optional[torch.Tensor] = None,
     ):
         if self.neuron_config.is_medusa:
             return self._medusa_forward(
@@ -328,7 +348,10 @@ class NeuronBaseModel(nn.Module):
         if is_for_context_encoding:
             past_key_values = None
         else:
-            past_key_values = self.kv_mgr.get_cache(cache_size)
+            if kv_cache is None:
+                past_key_values = self.kv_mgr.get_cache(self.n_positions)
+            else:
+                past_key_values = self._slice_kv_cache(kv_cache, self.n_positions)
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
@@ -372,15 +395,28 @@ class NeuronBaseModel(nn.Module):
             adapter_ids=adapter_ids,
         )
 
-        updated_kv_cache = self.kv_mgr.update_cache(
-            is_for_context_encoding,
-            seq_ids,
-            position_ids,
-            past_key_values,
-            cache_size,
-            scatter_index,
-            active_mask_2d,
-        )
+        if kv_cache is None:
+            updated_kv_cache = self.kv_mgr.update_cache(
+                is_for_context_encoding=is_for_context_encoding,
+                seq_ids=seq_ids,
+                position_ids=position_ids,
+                new_key_values=past_key_values,
+                seq_len=cache_size,
+                scatter_index=scatter_index,
+                active_mask=active_mask_2d,
+            )
+        else:
+            updated_kv_cache = self.kv_mgr.update_cache(
+                is_for_context_encoding=is_for_context_encoding,
+                seq_ids=seq_ids,
+                position_ids=position_ids,
+                new_key_values=past_key_values,
+                seq_len=cache_size,
+                scatter_index=scatter_index,
+                active_mask=active_mask_2d,
+                kvcache_buffer=kv_cache,
+            )
+
         if self.padding_side == "left":
             index = torch.tensor([hidden_states.shape[1] - 1], device=hidden_states.device)
             index = index.unsqueeze(1).expand(self.batch_size, 1, self.hidden_size)
@@ -394,8 +430,10 @@ class NeuronBaseModel(nn.Module):
                 index = torch.arange(
                     index, index + self.speculation_length, device=hidden_states.device
                 )
-                index = index[None, :, None].expand(
-                    self.batch_size, self.speculation_length, self.hidden_size
+                index = (
+                    index.unsqueeze(0)
+                    .unsqueeze(2)
+                    .expand(self.batch_size, self.speculation_length, self.hidden_size)
                 )
                 hidden_states = torch.gather(hidden_states, dim=1, index=index)
             else:
@@ -410,7 +448,11 @@ class NeuronBaseModel(nn.Module):
         res = logits
         if self.on_device_sampling:
             # perform sampling on Neuron to get tokens
-            res = self.sampler(logits[:, -1, :], sampling_params)
+            # FIXME, logits[:, -1, :] is not correct for speculation model, this is a tempory fix.
+            if is_for_speculation:
+                res = nxd_argmax(tensor=logits, dim=2, gather_dim=2, keepdim=False)
+            else:
+                res = self.sampler(logits[:, -1, :], sampling_params)
 
         return [res] + updated_kv_cache
 
@@ -471,7 +513,10 @@ class NeuronBaseModel(nn.Module):
         if self.sequence_parallel_enabled:
             # TODO: Replace this with rankid + scatter call once supported
             hidden_states = _reduce_scatter_along_dim(
-                inputs_embeds, self.sequence_dimension, xm.REDUCE_MAX
+                inputs_embeds,
+                self.sequence_dimension,
+                xm.REDUCE_MAX,
+                process_group=get_tp_group(self.config),
             )
         else:
             hidden_states = inputs_embeds
@@ -500,7 +545,7 @@ class NeuronBaseModel(nn.Module):
 
         if self.sequence_parallel_enabled:
             hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, self.sequence_dimension
+                hidden_states, self.sequence_dimension, process_group=get_tp_group(self.config)
             )
 
         hidden_states = self.norm(hidden_states)
@@ -509,6 +554,133 @@ class NeuronBaseModel(nn.Module):
 
     def update_weights_for_lora(self, model_sd):
         return update_weights_for_lora(self, model_sd)
+
+
+class NeuronFusedSpecModel(nn.Module):
+    """
+    Class to handle fused speculation flow
+    """
+
+    def __init__(self, config: InferenceConfig):
+        super().__init__()
+        self.config = config
+        self.neuron_config = config.neuron_config
+        self.draft_neuron_config = config.fused_spec_config.draft_neuron_config
+        self.worker_cls = config.fused_spec_config.worker_cls
+        self.n_positions = config.neuron_config.n_positions
+
+        config.fused_spec_config.draft_config.neuron_config.use_draft_group = True
+
+        self.draft_model = self.worker_cls(config.fused_spec_config.draft_config)
+        self.target_model = self.worker_cls(config)
+
+    def _context_encoding_forward(
+        self, input_ids, attention_mask, position_ids, seq_ids, sampling_params
+    ):
+        self.draft_model.n_positions = self.n_positions
+        self.target_model.n_positions = self.n_positions
+
+        assert self.neuron_config.on_device_sampling_config
+
+        draft_outputs = self.draft_model(
+            input_ids, attention_mask, position_ids, seq_ids, sampling_params
+        )
+        target_outputs = self.target_model(
+            input_ids, attention_mask, position_ids, seq_ids, sampling_params
+        )
+
+        return [draft_outputs[0]] + [target_outputs[0]] + draft_outputs[1:] + target_outputs[1:]
+
+    def _token_gen_forward(self, input_ids, attention_mask, position_ids, seq_ids, sampling_params):
+        spec_len = self.neuron_config.speculation_length
+        bs = input_ids.shape[0]
+
+        assert self.neuron_config.on_device_sampling_config
+
+        # 1. Generate k-1 candidate tokens
+        draft_position_ids = position_ids.expand(bs, spec_len)  # [1, 5]
+        candidate_input_ids = input_ids
+        target_position_ids = position_ids
+        draft_attention_mask = copy.deepcopy(attention_mask)
+
+        draft_cache = None
+        for i in range(spec_len):
+            draft_position_id = draft_position_ids[:, i : i + 1] + i
+            draft_input_ids = candidate_input_ids[:, -1:]
+
+            target_position_id = draft_position_ids[:, i : i + 1] + i + 1
+            target_position_ids = torch.cat([target_position_ids, target_position_id], dim=1)
+
+            if draft_cache is None:
+                draft_cache = self.draft_model.kv_mgr.get_cache(self.n_positions, skip_slice=True)
+            else:
+                # draft cache returned from the model is flattened. We reshape it to match the expected input schema.
+                # kvcache_buffer is 2D list where, 1st dim for layer and the second denotes K and V.
+                # For example,
+                #     kvcache_buffer[1][0] is the K cache of the 1st layer
+                #     kvcache_buffer[4][1] is the V cache of the 4th layer
+                reshaped_cache = []
+                for i in range(0, len(draft_cache), 2):
+                    reshaped_cache.append([draft_cache[i], draft_cache[i + 1]])
+                draft_cache = reshaped_cache
+
+            model_output = self.draft_model(
+                draft_input_ids,
+                draft_attention_mask,
+                draft_position_id,
+                seq_ids,
+                sampling_params,
+                kv_cache=draft_cache,
+            )
+
+            draft_outputs = model_output[0]
+            draft_cache = model_output[1:]
+
+            draft_attention_mask.index_fill_(1, draft_position_id.squeeze(), 1).view(bs, -1)
+            new_draft_token = draft_outputs[0].view(bs, -1)
+
+            candidate_input_ids = torch.cat((candidate_input_ids, new_draft_token), dim=-1)
+
+        # Retile the cache
+        flat_draft_cache = []
+        for idx in range(len(draft_cache)):
+            flat_draft_cache.append(draft_cache[idx].view(self.draft_model.kv_mgr.kv_shape))
+
+        # # 2. verify candidates
+        outputs = self.target_model(
+            candidate_input_ids[:, :-1],
+            attention_mask,
+            target_position_ids[:, :-1],
+            seq_ids,
+            sampling_params,
+        )
+        target_tokens = outputs[0]
+
+        return [candidate_input_ids[:, 1:]] + [target_tokens] + flat_draft_cache + outputs[1:]
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        seq_ids: Optional[torch.LongTensor] = None,
+        sampling_params: Optional[torch.FloatTensor] = None,
+        adapter_ids=None,
+        llava_args: Optional[List] = [],
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        if (
+            input_ids.shape[-1] > 1
+            and input_ids.shape[-1] != self.neuron_config.speculation_length
+            and input_ids.shape[-1] != self.neuron_config.medusa_speculation_length
+        ):
+            return self._context_encoding_forward(
+                input_ids, attention_mask, position_ids, seq_ids, sampling_params
+            )
+        else:
+            # verify how many tokens here
+            return self._token_gen_forward(
+                input_ids, attention_mask, position_ids, seq_ids, sampling_params
+            )
 
 
 class NeuronBaseForCausalLM(NeuronApplicationBase):
@@ -527,16 +699,49 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         )
         self.model_wrapper = self.get_model_wrapper_cls()
 
-        self.enable_context_encoding()
-        if self.neuron_config.trace_tokengen_model:
-            self.enable_token_generation()
-        if self.neuron_config.speculation_length > 0:
-            self.enable_speculation()
-        if self.neuron_config.medusa_speculation_length > 0:
-            self.enable_medusa_speculation()
+        if self.neuron_config.enable_fused_speculation:
+            self.__class__._model_cls = NeuronFusedSpecModel
+            self.enable_context_encoding()
+            self.enable_fused_spec()
+        else:
+            self.enable_context_encoding()
+            if self.neuron_config.trace_tokengen_model:
+                self.enable_token_generation()
+            if self.neuron_config.speculation_length > 0:
+                self.enable_speculation()
+            if self.neuron_config.medusa_speculation_length > 0:
+                self.enable_medusa_speculation()
 
     def get_model_wrapper_cls(self):
         return ModelWrapper
+
+    def enable_fused_spec(self):
+        new_config = copy.deepcopy(self.config)
+        new_config.neuron_config.batch_size = self.neuron_config.tkg_batch_size
+        new_config.neuron_config.n_active_tokens = 1
+        new_config.neuron_config.bucket_n_active_tokens = False
+        new_config.fused_spec_config.draft_config.neuron_config.sequence_parallel_enabled = False
+
+        if not new_config.neuron_config.enable_bucketing:
+            new_config.neuron_config.buckets = generate_buckets(
+                self.neuron_config.max_length, self.neuron_config.max_length
+            )
+        else:
+            new_config.neuron_config.buckets = generate_buckets(128, self.neuron_config.max_length)
+
+        # Explicitly turn off sequence parallel for token generation
+        new_config.neuron_config.sequence_parallel_enabled = False
+        new_config.fused_spec_config.draft_config.neuron_config.sequence_parallel_enabled = False
+
+        self.fused_spec_model = self.model_wrapper(
+            config=new_config,
+            model_cls=self._model_cls,
+            # call
+            tag=FUSED_SPECULATION_MODEL_TAG,
+            compiler_args=self.get_compiler_args(),
+            priority_model_idx=0,  # to turn on weight layout optimization
+        )
+        self.models.append(self.fused_spec_model)
 
     def enable_context_encoding(self, **model_init_kwargs):
         new_config = copy.deepcopy(self.config)
@@ -596,10 +801,20 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         new_config = copy.deepcopy(self.config)
         new_config.neuron_config.batch_size = self.neuron_config.spec_batch_size
         new_config.neuron_config.n_active_tokens = self.neuron_config.speculation_length
+        new_config.neuron_config.bucket_n_active_tokens = False
+
+        if not new_config.neuron_config.enable_bucketing:
+            new_config.neuron_config.buckets = generate_buckets(
+                self.neuron_config.max_length, self.neuron_config.max_length
+            )
+        else:
+            new_config.neuron_config.buckets = generate_buckets(128, self.neuron_config.max_length)
+
         self.speculation_model = self.model_wrapper(
             config=new_config,
             model_cls=self._model_cls,
             tag=SPECULATION_MODEL_TAG,
+            priority_model_idx=0,  # to turn on weight layout optimization
         )
 
         self.models.append(self.speculation_model)
@@ -786,8 +1001,15 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     adapter_ids,
                     *llava_args,
                 )
+
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
+        elif self.neuron_config.enable_fused_speculation:
+            outputs = self.fused_spec_model(
+                input_ids, attention_mask, position_ids, seq_ids, sampling_params, adapter_ids
+            )
+
+            is_run_on_neuron = self.fused_spec_model.is_neuron()
         elif input_ids.shape[-1] == self.neuron_config.speculation_length:
             outputs = self.speculation_model(
                 input_ids, attention_mask, position_ids, seq_ids, sampling_params, adapter_ids
@@ -820,10 +1042,29 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 token_gen_kv_cache_line._parameters[name] = encoder_kv_cache_line._parameters[name]
 
     def _copy_past_key_values(self, outputs):
-        new_past_key_values = outputs[1:]
-        for i, new_past_key_value in enumerate(new_past_key_values):
-            self.token_generation_model.model.past_key_values[i].data = new_past_key_value
-            self.context_encoding_model.model.past_key_values[i].data = new_past_key_value
+        if self.neuron_config.enable_fused_speculation:
+            draft_model_layers = len(self.fused_spec_model.draft_model.layers)
+            new_draft_past_key_values = outputs[2 : draft_model_layers * 2]
+            new_target_past_key_values = outputs[2 + draft_model_layers * 2 :]
+
+            for i, new_draft_past_key_value in enumerate(new_draft_past_key_values):
+                self.fused_spec_model.draft_model.past_key_values[i].data = new_draft_past_key_value
+                self.context_encoding_model.draft_model.past_key_values[
+                    i
+                ].data = new_draft_past_key_value
+
+            for i, new_target_past_key_value in enumerate(new_target_past_key_values):
+                self.fused_spec_model.target_model.past_key_values[
+                    i
+                ].data = new_target_past_key_value
+                self.context_encoding_model.target_model.past_key_values[
+                    i
+                ].data = new_target_past_key_value
+        else:
+            new_past_key_values = outputs[1:]
+            for i, new_past_key_value in enumerate(new_past_key_values):
+                self.token_generation_model.model.past_key_values[i].data = new_past_key_value
+                self.context_encoding_model.model.past_key_values[i].data = new_past_key_value
 
     def _construct_output(self, logits_or_next_tokens):
         if self.neuron_config.is_medusa:
@@ -840,6 +1081,8 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         if self.neuron_config.is_medusa:
             OutputParams.tokens = next_tokens[:1, :, :]
             OutputParams.medusa_tokens = next_tokens[1:, :, :]
+        elif self.neuron_config.enable_fused_speculation:
+            OutputParams.fused_outputs = next_tokens
         else:
             OutputParams.tokens = next_tokens
 

@@ -18,7 +18,7 @@ from torch_neuronx import BucketModelConfig
 from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.modules.autobucketing import (
     get_context_encoder_bk,
-    get_token_generation_bk,
+    get_generation_model_bk,
 )
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 
@@ -26,6 +26,7 @@ CONTEXT_ENCODING_MODEL_TAG = "context_encoding_model"
 TOKEN_GENERATION_MODEL_TAG = "token_generation_model"
 SPECULATION_MODEL_TAG = "speculation_model"
 MEDUSA_MODEL_TAG = "medusa_speculation_model"
+FUSED_SPECULATION_MODEL_TAG = "fused_speculation_model"
 
 
 def _reorder_helper(*args: torch.Tensor):
@@ -59,9 +60,13 @@ def get_bucket_model_config_from_tag(tag, config: InferenceConfig):
             shared_state_buffer=None,
             func_kwargs=[{"bucket_rank": i} for i in range(bucket_degree)],
         )
-    elif tag == TOKEN_GENERATION_MODEL_TAG:
+    elif (
+        tag == TOKEN_GENERATION_MODEL_TAG
+        or tag == SPECULATION_MODEL_TAG
+        or tag == FUSED_SPECULATION_MODEL_TAG
+    ):
         return BucketModelConfig(
-            bucket_kernel=get_token_generation_bk,
+            bucket_kernel=get_generation_model_bk,
             bucket_kernel_constant_args=(
                 torch.tensor(config.neuron_config.buckets),
                 config.neuron_config.padding_side,
@@ -101,19 +106,37 @@ class ModelWrapper(torch.nn.Module):
         self.serialize_base_path = None
         self.tag = tag
         self.is_medusa = config.neuron_config.is_medusa
+
+        base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
+        self.compiler_workdir = os.path.join(base_compile_work_dir, self.tag)
+
         if compiler_args is None:
-            self.compiler_args = "--enable-saturate-infinity --auto-cast=none --model-type=transformer --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2' -O1 "
+            self.compiler_args = (
+                "--auto-cast=none --model-type=transformer "
+                f"--tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor={self.neuron_config.cc_pipeline_tiling_factor} --vectorize-dge-dma --vectorize-strided-dma'"
+                " -O1 "
+                f" --internal-num-neuroncores-per-sengine={self.neuron_config.logical_neuron_cores}"
+                f" --logfile {self.compiler_workdir}/log-neuron-cc.txt"
+            )
+            if self.neuron_config.target:
+                self.compiler_args += f" --target {self.neuron_config.target}"
 
         else:
             self.compiler_args = compiler_args
 
         if (
-            self.neuron_config.quantized is True
-            and self.neuron_config.quantization_dtype == "f8e4m3"
-        ) or self.neuron_config.kv_cache_quant:
+            (
+                self.neuron_config.quantized is True
+                and self.neuron_config.quantization_dtype == "f8e4m3"
+            )
+            or self.neuron_config.kv_cache_quant
+            or self.neuron_config.quantized_mlp_kernel_enabled
+        ):
             self.compiler_args += (
                 " --internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3' "
             )
+
+        logging.info(f"neuronx-cc compiler_args are: {self.compiler_args}")
 
         self.bucket_config = get_bucket_model_config_from_tag(tag, self.config)
         self.priority_model_idx = priority_model_idx
@@ -125,14 +148,12 @@ class ModelWrapper(torch.nn.Module):
     def compile(self, checkpoint_loader, serialize_base_path):
         inputs = self.input_generator()
 
-        base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
-
         # cannot pass partial func with multiprocess using model directly
         parallel_model_trace(
             partial(get_trace_callable, self.model_cls, self.neuron_config),
             inputs,
             tp_degree=self.neuron_config.tp_degree,
-            compiler_workdir=os.path.join(base_compile_work_dir, self.tag),
+            compiler_workdir=self.compiler_workdir,
             compiler_args=self.compiler_args,
             inline_weights_to_neff=False,
             spmd_mode=True,
@@ -424,7 +445,14 @@ class DecoderModelInstance(BaseModelInstance):
                 else t
             )
 
-        if self.neuron_config.quantized is True:
+            # TODO: In the current case we initialize the float_model which has Quantization layers as well
+            # the above code will convert fp32 scales to bfloat16. This should be fixed when we remove
+            # Quantization layers from NeuronLLamaMLP
+
+        if (
+            self.neuron_config.quantized is True
+            and not self.neuron_config.quantized_mlp_kernel_enabled
+        ):
             quantization_type = QuantizationType(self.neuron_config.quantization_type)
             if quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
                 q_config = get_default_per_channel_custom_qconfig_dict()
@@ -441,20 +469,41 @@ class DecoderModelInstance(BaseModelInstance):
     def get(self, bucket_rank, **kwargs):
         if bucket_rank is not None:
             self.module.n_positions = self.neuron_config.buckets[bucket_rank]
+            if self.neuron_config.enable_fused_speculation:
+                self.module.draft_model.n_positions = self.neuron_config.buckets[bucket_rank]
+                self.module.target_model.n_positions = self.neuron_config.buckets[bucket_rank]
 
         # Currently we have to init an input_output_aliases map for
         # each buckets, otherwise it will fail the aliasing setup when
         # generating HLO
         self.input_output_aliases = {}
         num_output_from_trace = 1
-        # TODO: This else block is a short-term fix for Llava/ViT models to use DecoderModelInstance.
-        #       Long-term, these models should use a different implementation of BaseModelInstance.
-        if self.module.kv_mgr is not None:
-            past_key_values = self.module.kv_mgr.past_key_values
+        if self.neuron_config.enable_fused_speculation:
+            if self.module.draft_model.kv_mgr is not None:
+                draft_past_key_values = self.module.draft_model.kv_mgr.past_key_values
+            else:
+                draft_past_key_values = self.module.draft_model.past_key_values
+
+            if self.module.target_model.kv_mgr is not None:
+                target_past_key_values = self.module.target_model.kv_mgr.past_key_values
+            else:
+                target_past_key_values = self.module.target_model.past_key_values
+
+            for i in range(len(draft_past_key_values)):
+                self.input_output_aliases[draft_past_key_values[i]] = num_output_from_trace * 2 + i
+            for j in range(len(target_past_key_values)):
+                self.input_output_aliases[target_past_key_values[j]] = (
+                    num_output_from_trace * 2 + len(draft_past_key_values)
+                ) + j
         else:
-            past_key_values = self.module.past_key_values
-        for i in range(len(past_key_values)):
-            self.input_output_aliases[past_key_values[i]] = num_output_from_trace + i
+            # TODO: This else block is a short-term fix for Llava/ViT models to use DecoderModelInstance.
+            #       Long-term, these models should use a different implementation of BaseModelInstance.
+            if self.module.kv_mgr is not None:
+                past_key_values = self.module.kv_mgr.past_key_values
+            else:
+                past_key_values = self.module.past_key_values
+            for i in range(len(past_key_values)):
+                self.input_output_aliases[past_key_values[i]] = num_output_from_trace + i
         return self.module, self.input_output_aliases
 
 

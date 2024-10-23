@@ -29,7 +29,7 @@ def slice_lhs(tensor, bucket: int, dim: int):
 
 
 @torch.jit.script
-def token_generation_bk(tensors: List[torch.Tensor], buckets: torch.Tensor, padding_side: str):
+def generation_model_bk(tensors: List[torch.Tensor], buckets: torch.Tensor, padding_side: str):
     """
     The Bucket Kernel for Token Generation Models.
 
@@ -42,12 +42,12 @@ def token_generation_bk(tensors: List[torch.Tensor], buckets: torch.Tensor, padd
     attention_mask_is_removed = item.shape[1] == 1  # indicates item is position Id
     if attention_mask_is_removed:
         position_ids = tensors[1]
-        bucket_mask = (buckets <= position_ids).to(torch.int)
+        bucket_mask = (buckets <= position_ids[:, -1].unsqueeze(0)).to(torch.int)
         bucket_idx = torch.max(torch.argmin(bucket_mask, dim=1))
     else:
         attention_mask = tensors[1]
         position_ids = tensors[2]
-        bucket_mask = (buckets <= position_ids).to(torch.int)
+        bucket_mask = (buckets <= position_ids[:, -1].unsqueeze(0)).to(torch.int)
         bucket_idx = torch.max(torch.argmin(bucket_mask, dim=1))
         bucket = buckets[bucket_idx]
         # slice the attention mask based on the selected bucket size
@@ -59,8 +59,8 @@ def token_generation_bk(tensors: List[torch.Tensor], buckets: torch.Tensor, padd
     return tensors, bucket_idx.to(torch.int)
 
 
-def get_token_generation_bk():
-    return token_generation_bk
+def get_generation_model_bk():
+    return generation_model_bk
 
 
 @torch.jit.script
@@ -116,7 +116,7 @@ def context_encoder_bk(tensors: List[torch.Tensor], buckets, padding_side: str, 
             else:  # all other tensors are of shape (batch_size,seq_len) so we slice on seq_len
                 new_tensors.append(slice_lhs(tens, bucket, 1))
     else:
-        max_idx = buckets[-1]
+        max_idx = buckets[-1][-1]
         for i, tens in enumerate(tensors):
             # identifies the seq_ids, which don't need to be sliced
             if len(tens.shape) == 1:
