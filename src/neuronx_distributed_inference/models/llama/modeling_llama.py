@@ -51,6 +51,10 @@ from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lo
 
 _LLAMA_MODULE_MAP = {}
 
+# Llama currently uses fp32 all_reduce for better accuracy results.
+# TODO: this can be investigated for other models as well and make this a global config.
+LLAMA_ALL_REDUCE_DTYPE = torch.float32
+
 
 def get_rmsnorm_cls():
     # Initialize to the appropriate implementation of RMSNorm
@@ -180,6 +184,7 @@ class NeuronLlamaMLP(nn.Module):
                 sequence_parallel_enabled=False,
                 sequence_dimension=None,
             )
+
             self.down_proj = RowParallelLinear(
                 self.intermediate_size,
                 self.hidden_size,
@@ -189,6 +194,7 @@ class NeuronLlamaMLP(nn.Module):
                 pad=True,
                 sequence_parallel_enabled=self.sequence_parallel_enabled,
                 sequence_dimension=self.sequence_dimension,
+                all_reduce_dtype=LLAMA_ALL_REDUCE_DTYPE,
             )
         else:
             self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
@@ -245,6 +251,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.flash_decoding_enabled = config.neuron_config.flash_decoding_enabled
         self.num_cores_per_group = config.num_cores_per_group
         self.bias = getattr(config, "attention_bias", False)
+        self.rpl_all_reduce_dtype = LLAMA_ALL_REDUCE_DTYPE
 
         if parallel_state.model_parallel_is_initialized():
             self.tp_degree = parallel_state.get_tensor_model_parallel_size()
