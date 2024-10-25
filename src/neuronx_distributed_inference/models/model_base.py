@@ -618,6 +618,7 @@ class NeuronFusedSpecModel(nn.Module):
             )
 
         config.fused_spec_config.draft_config.neuron_config.use_draft_group = True
+        config.fused_spec_config.draft_config.neuron_config.quantized_mlp_kernel_enabled = False
 
         self.draft_model = self.worker_cls(config.fused_spec_config.draft_config)
         self.target_model = self.worker_cls(config)

@@ -48,6 +48,7 @@ from neuronxcc.nki._private_kernels.mlp import (
     quant_mlp_fused_add_isa_kernel,
     quant_mlp_isa_kernel,
 )
+from neuronxcc.nki._private_kernels.rmsnorm import rmsnorm_quant_isa_kernel
 from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
 from torch import nn
 from torch_neuronx.xla_impl.ops import nki_jit
@@ -187,6 +188,8 @@ class NeuronLlamaMLP(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.mlp_kernel_enabled = self.neuron_config.mlp_kernel_enabled
         self.quantized_mlp_kernel_enabled = self.neuron_config.quantized_mlp_kernel_enabled
+        self.rmsnorm_quantize_kernel_enabled = self.neuron_config.rmsnorm_quantize_kernel_enabled
+        self.quantized_kernel_lower_bound = self.neuron_config.quantized_kernel_lower_bound
         self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
         mlp_bias = getattr(config, "mlp_bias", False)
         if parallel_state.model_parallel_is_initialized():
@@ -289,6 +292,7 @@ class NeuronLlamaMLP(nn.Module):
             self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
 
     def _kernel_enabled_quantized_mlp(self, x, fused_rmsnorm, rmsnorm, residual, adapter_ids):
+        grid = (vnc(self.logical_neuron_cores),)
         fused_residual = residual is not None
         logger.debug(
             f"MLP: quantized kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_neuron_cores={self.logical_neuron_cores}"
@@ -306,16 +310,42 @@ class NeuronLlamaMLP(nn.Module):
 
         # Handle SP RMSnorm
         if self.sequence_parallel_enabled:
-            x = gather_from_sequence_parallel_region(
-                x, self.sequence_dimension, process_group=get_tp_group(self.config)
-            )
+            # This RMSNormQuant kernel will do quantization inside, so we pass the
+            # lower_bound for clipping.
+            # If we don't use this kernel, the MLP kernel below will do the
+            # quantization, so we also pass lower_bound to that kernel.
+            if self.rmsnorm_quantize_kernel_enabled:
+                logger.debug(
+                    "Running Quantized MLP kernel with sequence-parallel RMSnorm-Quantize kernel!"
+                )
+                _rmsnorm_quant_fwd_call = nki_jit()(rmsnorm_quant_isa_kernel)
+                quant_rmsnorm_out = torch.zeros(
+                    size=(
+                        x.shape[0],  # batch size
+                        x.shape[1],  # sequence length
+                        x.shape[2] + 4,  # hidden size + 4 bytes for packing fp32 scale
+                    ),
+                    dtype=torch.int8,
+                    device=x.device,
+                )
+                ln_w = rmsnorm.weight.unsqueeze(0)
+                lower_bound = self.quantized_kernel_lower_bound
+                _rmsnorm_quant_fwd_call[grid](
+                    x, ln_w, lower_bound, quant_rmsnorm_out, kernel_name="RMSNormQuant"
+                )
+                x = gather_from_sequence_parallel_region(
+                    quant_rmsnorm_out,
+                    self.sequence_dimension,
+                    process_group=get_tp_group(self.config),
+                )
 
-        # SP is always disbaled for TKG, which will enable fuse_rmsnorm.
-        # For quantized MLP, we cannot do rmsnorm inside the kernel,
-        # so need to do it outside.
-        if x.shape[1] == 1:
-            x = rmsnorm(x)
-            fused_rmsnorm = False
+            else:
+                logger.debug(
+                    "Running Quantized MLP kernel with external (native compiler) sequence-parallel RMSnorm!"
+                )
+                x = gather_from_sequence_parallel_region(
+                    x, self.sequence_dimension, process_group=get_tp_group(self.config)
+                )
 
         # Build output tensor
         output_tensor_seqlen = x.shape[1]
@@ -343,9 +373,7 @@ class NeuronLlamaMLP(nn.Module):
         up_w_scale = self.up_proj.weight_scale
         down_w = self.down_proj.weight.data
         down_w_scale = self.down_proj.weight_scale
-        lower_bound = 1200.0
-
-        grid = (vnc(self.logical_neuron_cores),)
+        lower_bound = self.quantized_kernel_lower_bound
 
         if fused_residual:
             _mlp_fwd_call[grid](
@@ -723,6 +751,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         )
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
+        self.rmsnorm_quantize_kernel_enabled = config.neuron_config.rmsnorm_quantize_kernel_enabled
         self.mlp_kernel_fuse_residual_add = config.neuron_config.mlp_kernel_fuse_residual_add
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
         self.config = config
@@ -768,7 +797,9 @@ class NeuronLlamaDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
             residual = hidden_states
             # RMSNorm (fused with QKV kernel when SP is disabled)
-            if not self.mlp_kernel_enabled or self.sequence_parallel_enabled:
+            if not self.mlp_kernel_enabled or (
+                self.sequence_parallel_enabled and not self.rmsnorm_quantize_kernel_enabled
+            ):
                 hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states, _ = self.mlp(
                 hidden_states,

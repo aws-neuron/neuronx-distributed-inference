@@ -200,6 +200,12 @@ class NeuronConfig:
         self.mlp_kernel_enabled = kwargs.pop("mlp_kernel_enabled", False)
         self.mlp_kernel_fuse_residual_add = kwargs.pop("mlp_kernel_fuse_residual_add", False)
         self.quantized_mlp_kernel_enabled = kwargs.pop("quantized_mlp_kernel_enabled", False)
+        self.rmsnorm_quantize_kernel_enabled = kwargs.pop("rmsnorm_quantize_kernel_enabled", False)
+        if self.rmsnorm_quantize_kernel_enabled:
+            assert (
+                self.quantized_mlp_kernel_enabled
+            ), "quantized_mlp_kernel must be enabled to use rmsomrm_quantize_kernel!"
+        self.quantized_kernel_lower_bound = kwargs.pop("quantized_kernel_lower_bound", 1200.0)
         self.logical_neuron_cores = kwargs.pop("logical_neuron_cores", 1)
 
         # compiler flags
