@@ -29,7 +29,9 @@ def slice_lhs(tensor, bucket: int, dim: int):
 
 
 @torch.jit.script
-def generation_model_bk(tensors: List[torch.Tensor], buckets: torch.Tensor, padding_side: str):
+def generation_model_bk(
+    tensors: List[torch.Tensor], buckets: torch.Tensor, padding_side: str, speculation_length: int
+):
     """
     The Bucket Kernel for Token Generation Models.
 
@@ -47,7 +49,12 @@ def generation_model_bk(tensors: List[torch.Tensor], buckets: torch.Tensor, padd
     else:
         attention_mask = tensors[1]
         position_ids = tensors[2]
-        bucket_mask = (buckets <= position_ids[:, -1].unsqueeze(0)).to(torch.int)
+        max_position_id = (
+            position_ids[:, -1] + speculation_length
+            if (position_ids[:, -1] + speculation_length).all() <= buckets[-1]
+            else position_ids[:, -1]
+        )
+        bucket_mask = (buckets <= (max_position_id).unsqueeze(0)).to(torch.int)
         bucket_idx = torch.max(torch.argmin(bucket_mask, dim=1))
         bucket = buckets[bucket_idx]
         # slice the attention mask based on the selected bucket size

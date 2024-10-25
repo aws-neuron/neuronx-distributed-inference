@@ -476,7 +476,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             if cur_len >= max_len:
                 break
             # 5. If the rest length is smaller than speculation length, we directly run the target model to finish
-            if max_len - cur_len < spec_len:
+            if max_len - cur_len <= spec_len:
                 # @yihsian: TODO: complete with using target tokengen model
                 break
         return torch.cat((input_ids, returned_ids), dim=1)

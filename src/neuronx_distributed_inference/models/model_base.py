@@ -11,7 +11,6 @@ from neuronx_distributed.parallel_layers.mappings import (
     _reduce_scatter_along_dim,
     gather_from_sequence_parallel_region,
 )
-from neuronx_distributed.parallel_layers.parallel_state import get_world_group
 from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -72,7 +71,7 @@ class NeuronBaseModel(nn.Module):
         self.max_length = config.neuron_config.max_length
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
-        self.rank_util = SPMDRank(world_size=get_world_group().size())
+        self.rank_util = SPMDRank(world_size=self.config.neuron_config.tp_degree)
         self.num_cores_per_group = config.num_cores_per_group
 
         self.setup_attr_for_model(config)

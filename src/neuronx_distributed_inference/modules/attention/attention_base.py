@@ -24,7 +24,7 @@ import neuronx_distributed as nxd
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import utils  # noqa: E402
 from neuronx_distributed.parallel_layers.layers import SPMDRank
-from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group, get_world_group
+from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group
 from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
 from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 
@@ -48,16 +48,18 @@ class NeuronAttentionBase(nn.Module):
     def __init__(self, tensor_model_parallel_group: Optional[ProcessGroup] = None):
         super().__init__()
 
-        self.rank_util = SPMDRank(world_size=get_world_group().size())
-
         if tensor_model_parallel_group is not None:
             self.tensor_model_parallel_group = tensor_model_parallel_group
+            self.rank_util = SPMDRank(world_size=self.tensor_model_parallel_group.size())
         elif nxd.parallel_layers.parallel_state.model_parallel_is_initialized():
             self.tensor_model_parallel_group = (
                 nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
             )
+            self.rank_util = SPMDRank(world_size=self.tensor_model_parallel_group.size())
         else:
+            # CPU flow doesn need rank_util and TP group now
             self.tensor_model_parallel_group = None
+            self.rank_util = None
 
         self.is_causal = True
         self.num_key_value_groups = None

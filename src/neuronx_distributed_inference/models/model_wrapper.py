@@ -70,6 +70,9 @@ def get_bucket_model_config_from_tag(tag, config: InferenceConfig):
             bucket_kernel_constant_args=(
                 torch.tensor(config.neuron_config.buckets),
                 config.neuron_config.padding_side,
+                config.neuron_config.speculation_length
+                if tag == FUSED_SPECULATION_MODEL_TAG
+                else 0,
             ),
             shared_state_buffer=None,
             func_kwargs=[{"bucket_rank": i} for i in range(bucket_degree)],
