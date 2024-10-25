@@ -64,6 +64,8 @@ class NeuronConfig:
             self.torch_dtype = torch.bfloat16
             self.overrides_torch_dtype = False
 
+        self.rpl_reduce_dtype = kwargs.pop("rpl_reduce_dtype", self.torch_dtype)
+
         # fallback to sequence_length is for compatibility with vllm
         self.max_context_length = kwargs.pop("max_context_length", self.seq_len)
         self.max_new_tokens = kwargs.pop("max_new_tokens", self.seq_len - self.max_context_length)

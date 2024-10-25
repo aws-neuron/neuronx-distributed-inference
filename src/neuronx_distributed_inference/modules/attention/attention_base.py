@@ -77,7 +77,7 @@ class NeuronAttentionBase(nn.Module):
         self.flash_decoding_enabled = False
         self.sequence_parallel_enabled = False
         self.sequence_dimension = None
-        self.rpl_all_reduce_dtype = None
+        self.rpl_reduce_dtype = None
 
         self.o_proj_layer_name = "o_proj"
 
@@ -119,7 +119,7 @@ class NeuronAttentionBase(nn.Module):
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             sequence_dimension=self.sequence_dimension,
             tensor_model_parallel_group=self.tensor_model_parallel_group,
-            all_reduce_dtype=self.rpl_all_reduce_dtype,
+            rpl_reduce_dtype=self.rpl_reduce_dtype,
         )
         self.num_heads = utils.divide(self.qkv_proj.get_num_attention_heads(), self.tp_degree)
         self.num_key_value_heads = utils.divide(

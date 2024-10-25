@@ -875,7 +875,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         sequence_parallel_enabled: bool = False,
         sequence_dimension: Optional[int] = None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
-        all_reduce_dtype: torch.dtype = None,
+        rpl_reduce_dtype: torch.dtype = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -901,7 +901,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
                 sequence_parallel_enabled=sequence_parallel_enabled,
                 sequence_dimension=sequence_dimension,
                 tensor_model_parallel_group=self.tensor_model_parallel_group,
-                all_reduce_dtype=all_reduce_dtype,
+                reduce_dtype=rpl_reduce_dtype,
             )
         else:
             self.o_proj = nn.Linear(

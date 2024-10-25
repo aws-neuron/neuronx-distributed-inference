@@ -89,6 +89,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--max-context-length", type=int)
     run_parser.add_argument("--max-new-tokens", type=int)
     run_parser.add_argument("--max-length", type=int)
+    run_parser.add_argument("--rpl-reduce-dtype", type=to_torch_dtype)
 
     run_parser.add_argument("--vocab-parallel", action="store_true")
 

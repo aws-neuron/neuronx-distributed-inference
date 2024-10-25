@@ -76,10 +76,6 @@ from neuronx_distributed_inference.utils.distributed import get_tp_group
 
 _LLAMA_MODULE_MAP = {}
 
-# Llama currently uses fp32 all_reduce for better accuracy results.
-# TODO: this can be investigated for other models as well and make this a global config.
-LLAMA_ALL_REDUCE_DTYPE = torch.float32
-
 logger = logging.getLogger("Neuron")
 
 
@@ -272,7 +268,7 @@ class NeuronLlamaMLP(nn.Module):
                     sequence_parallel_enabled=self.sequence_parallel_enabled,
                     sequence_dimension=self.sequence_dimension,
                     tensor_model_parallel_group=get_tp_group(config),
-                    all_reduce_dtype=LLAMA_ALL_REDUCE_DTYPE,
+                    reduce_dtype=config.neuron_config.rpl_reduce_dtype,
                 )
 
             if self.mlp_kernel_enabled:
@@ -568,7 +564,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.flash_decoding_enabled = config.neuron_config.flash_decoding_enabled
         self.num_cores_per_group = config.num_cores_per_group
         self.bias = getattr(config, "attention_bias", False)
-        self.rpl_all_reduce_dtype = LLAMA_ALL_REDUCE_DTYPE
+        self.rpl_reduce_dtype = config.neuron_config.rpl_reduce_dtype
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
 
         if parallel_state.model_parallel_is_initialized():
