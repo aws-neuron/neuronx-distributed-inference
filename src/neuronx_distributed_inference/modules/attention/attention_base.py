@@ -404,7 +404,7 @@ class NeuronAttentionBase(nn.Module):
                     Q, K, V, position_ids, past_key_value, attention_mask, active_mask
                 )
 
-        if self.attn_kernel_enabled:
+        if self.attn_kernel_enabled and past_key_value is None:
             # transpose BHDS -> BSHD
             # this layout avoids additional transposes between attention kernel and output projection
             attn_output = attn_output.permute(0, 3, 1, 2)
