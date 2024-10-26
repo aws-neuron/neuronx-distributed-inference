@@ -184,6 +184,7 @@ class NeuronLlamaMLP(nn.Module):
             self.neuron_config, "sequence_parallel_enabled", False
         )
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
+        self.rms_norm_eps = config.rms_norm_eps
         self.mlp_kernel_enabled = self.neuron_config.mlp_kernel_enabled
         self.quantized_mlp_kernel_enabled = self.neuron_config.quantized_mlp_kernel_enabled
         self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
@@ -361,6 +362,7 @@ class NeuronLlamaMLP(nn.Module):
                 lower_bound,
                 output_tensor,  # out
                 fused_rmsnorm=fused_rmsnorm,
+                eps=self.rms_norm_eps,
                 kernel_name="MLP",
                 store_add=True,
             )
@@ -382,6 +384,7 @@ class NeuronLlamaMLP(nn.Module):
                 output_tensor,  # out
                 # Run RMSNorm inside the kernel if NOT using SP rmsnorm
                 fused_rmsnorm=fused_rmsnorm,
+                eps=self.rms_norm_eps,
                 kernel_name="MLP",
             )
             residual = None
@@ -454,6 +457,7 @@ class NeuronLlamaMLP(nn.Module):
                 down_w,  # down_w
                 output_tensor,  # out
                 fused_rmsnorm=fused_rmsnorm,
+                eps=self.rms_norm_eps,
                 kernel_name="MLP",
                 store_add=True,
             )
@@ -471,6 +475,7 @@ class NeuronLlamaMLP(nn.Module):
                 output_tensor,  # out
                 # Run RMSNorm inside the kernel if NOT using SP rmsnorm
                 fused_rmsnorm=fused_rmsnorm,
+                eps=self.rms_norm_eps,
                 kernel_name="MLP",
             )
             residual = None

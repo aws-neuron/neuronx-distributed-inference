@@ -352,6 +352,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
         self.sequence_parallel_enabled = sequence_parallel_enabled
         self.sequence_dimension = sequence_dimension
+        self.rms_norm_eps = rms_norm_eps
         self.qkv_kernel_enabled = qkv_kernel_enabled
         self.logical_neuron_cores = logical_neuron_cores
 
@@ -546,6 +547,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             # should be fine to pass this is as a dummy even if not using fused rmsnorm
             rmsnorm.weight.unsqueeze(0),
             QKV,
+            eps=self.rms_norm_eps,
             kernel_name="QKV",
             # Run RMSNorm inside the kernel if NOT using SP norm
             fused_rmsnorm=fused_rmsnorm,
