@@ -169,6 +169,7 @@ class Sampler(torch.nn.Module):
         probs_soft_max = self._soft_max(top_k_logits_values, dim)
         probs_cumsum = torch.cumsum(input=probs_soft_max, dim=dim)
         if self.dynamic or torch.any(top_p < 1.0):  # apply top_p sampling
+            top_p = torch.max(torch.min(probs_cumsum), top_p)
             top_p_mask = torch.greater(probs_cumsum, top_p)
             top_k_logits_values = top_k_logits_values.masked_fill_(
                 top_p_mask, self.IGNORED_LOGITS_VALUE
