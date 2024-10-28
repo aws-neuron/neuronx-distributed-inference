@@ -147,7 +147,7 @@ class Sampler(torch.nn.Module):
         dim = 1  # batch_size dimension
 
         if (not self.do_sample) or (
-            not self.dynamic and torch.all(top_k == 1)
+            not self.dynamic and torch.all(top_k <= 1)
         ):  # top_k == 1 mean greedy
             if self.neuron_config.on_cpu:
                 return torch.argmax(token_logits, dim=dim)
