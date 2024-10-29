@@ -29,16 +29,6 @@ MEDUSA_MODEL_TAG = "medusa_speculation_model"
 FUSED_SPECULATION_MODEL_TAG = "fused_speculation_model"
 
 
-def _reorder_helper(*args: torch.Tensor):
-    # sorting is needed due to compiler issues with gather and hence can't support arbitrary order of seq_ids
-    seq_ids = args[3]
-    indices = torch.argsort(seq_ids)
-    reorder_args = []
-    for arg in args:
-        reorder_args.append(torch.index_select(arg, 0, indices))
-    return reorder_args
-
-
 def get_bucket_model_config_from_tag(tag, config: InferenceConfig):
     bucket_degree = len(config.neuron_config.buckets)
     if bucket_degree == 1:
@@ -332,21 +322,6 @@ class ModelWrapper(torch.nn.Module):
             return [logits[: seq_ids.shape[0]], *kv_cache]
 
     def _forward(self, *args):
-        if (
-            self.neuron_config.is_continuous_batching
-            and self.neuron_config.batch_size == self.neuron_config.max_batch_size
-        ):
-            logging.debug("running forward and reorder the inputs based on seq_ids")
-            preserved_seq_ids = args[3]
-            updated_args = _reorder_helper(*args)
-            logging.debug(f"Processed inputs to the model. tag={self.tag}, args={args}")
-            outputs = self.model(*updated_args)
-            if self.is_neuron():
-                return torch.index_select(outputs, 0, preserved_seq_ids)
-            else:
-                return [torch.index_select(outputs[0], 0, preserved_seq_ids), *outputs[1:]]
-
-        logging.debug(f"Processed inputs to the model. tag={self.tag}, args={args}")
         return self.model(*args)
 
     def pad_to_max_compiled_seq(self, *args):
