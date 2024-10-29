@@ -571,6 +571,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.bias = getattr(config, "attention_bias", False)
         self.rpl_reduce_dtype = config.neuron_config.rpl_reduce_dtype
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
+        self.rms_norm_eps = config.rms_norm_eps
 
         if parallel_state.model_parallel_is_initialized():
             self.tp_degree = self.config.neuron_config.tp_degree

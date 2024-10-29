@@ -72,6 +72,7 @@ class NeuronAttentionBase(nn.Module):
         self.k_layernorm = None
         self.q_layernorm = None
         self.qk_layernorm = False
+        self.rms_norm_eps = None
 
         self.num_cores_per_group = 1
         self.flash_decoding_enabled = False
@@ -102,7 +103,7 @@ class NeuronAttentionBase(nn.Module):
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             sequence_dimension=self.sequence_dimension,
             tensor_model_parallel_group=self.tensor_model_parallel_group,
-            rms_norm_eps=self.config.rms_norm_eps,
+            rms_norm_eps=self.rms_norm_eps,
             qkv_kernel_enabled=self.neuron_config.qkv_kernel_enabled,
             logical_neuron_cores=self.neuron_config.logical_neuron_cores,
         )
