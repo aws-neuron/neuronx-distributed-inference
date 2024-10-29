@@ -158,6 +158,9 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         "--skip-save-sharded-checkpoint", dest="save_sharded_checkpoint", action="store_false"
     )
 
+    # async
+    run_parser.add_argument("--async", action="store_true")
+
     # lora
     run_parser.add_argument("--enable-lora", action="store_true")
     run_parser.add_argument("--max-loras", type=int)

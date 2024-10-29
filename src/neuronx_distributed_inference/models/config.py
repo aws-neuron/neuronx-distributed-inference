@@ -33,6 +33,10 @@ def to_dict(obj):
         return obj
 
 
+class IncompatibleConfigError(ValueError):
+    pass
+
+
 class NeuronConfig:
     """
     Base config class for inference in NxD.
@@ -97,6 +101,9 @@ class NeuronConfig:
                 **self.on_device_sampling_config
             )
 
+        # async
+        self.async_mode = kwargs.pop("async", False)
+
         # Bucketing
         self.enable_bucketing = kwargs.pop("enable_bucketing", False)
         self.buckets = kwargs.pop("buckets", [self.seq_len])
@@ -121,11 +128,17 @@ class NeuronConfig:
         self.spec_batch_size = kwargs.pop("spec_batch_size", self.batch_size)
         self.enable_fused_speculation = kwargs.pop("enable_fused_speculation", False)
 
+        if self.speculation_length > 0 and self.async_mode:
+            raise IncompatibleConfigError("Speculative Decoding is not yet supported with async.")
+
         # Medusa decoding
         self.is_medusa = kwargs.pop("is_medusa", False)
         self.medusa_speculation_length = kwargs.pop("medusa_speculation_length", 0)
         self.num_medusa_heads = kwargs.pop("num_medusa_heads", 0)
         self.medusa_tree = kwargs.pop("medusa_tree", None)
+
+        if self.speculation_length > 0 and self.async_mode:
+            raise IncompatibleConfigError("Medusa Decoding is not yet supported with async.")
 
         # Paged attention
         self.is_paged_attention = kwargs.pop("is_paged_attention", False)

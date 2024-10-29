@@ -134,6 +134,7 @@ class ModelWrapper(torch.nn.Module):
         self.bucket_config = get_bucket_model_config_from_tag(tag, self.config)
         self.priority_model_idx = priority_model_idx
         self.model_init_kwargs = model_init_kwargs
+        self.async_mode = self.neuron_config.async_mode
 
     def is_neuron(self):
         return self.model is not None and isinstance(self.model, torch.jit.ScriptModule)
@@ -322,6 +323,7 @@ class ModelWrapper(torch.nn.Module):
             return [logits[: seq_ids.shape[0]], *kv_cache]
 
     def _forward(self, *args):
+        logging.debug(f"Processed inputs to the model. tag={self.tag}, args={args}")
         return self.model(*args)
 
     def pad_to_max_compiled_seq(self, *args):
@@ -341,6 +343,10 @@ class ModelWrapper(torch.nn.Module):
             args = (input_ids, padded_attention_mask, *rest_of_args)
 
         return args
+
+    def _get_async_output(self, ranked_async_tensor):
+        outputs = [[async_tensor[0].cpu()] for async_tensor in ranked_async_tensor]
+        return outputs[0][0]
 
     def forward(self, *args):
         logging.debug(f"calling forward on network {self.tag}")
@@ -395,6 +401,12 @@ class ModelWrapper(torch.nn.Module):
             cur_batch += self.neuron_config.batch_size
 
         if self.is_neuron():
+            if self.async_mode:
+                # block on all requests here, since this is output manipulation
+                output_logits = [
+                    self._get_async_output(ranked_logits) for ranked_logits in output_logits
+                ]
+
             return torch.cat(output_logits, dim=0)
         else:
             return [torch.cat(output_logits, dim=0), *kv_caches]

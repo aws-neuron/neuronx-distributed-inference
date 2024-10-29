@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 from typing import List, Optional, Tuple, Union
 
 import neuronx_distributed as nxd
@@ -719,6 +720,16 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         self.padding_side = self.neuron_config.padding_side
         self.kv_cache_populated = False
 
+        # async related
+        self.async_mode = self.neuron_config.async_mode
+        self.next_cpu_inputs = None
+        self.prior_outputs = None
+        self.unequal_batching = (
+            self.neuron_config.ctx_batch_size != self.neuron_config.tkg_batch_size
+        )
+        if self.async_mode:
+            os.environ["NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS"] = "2"
+
         self.sampler = None
         self.default_sampling_params = prepare_sampling_params(
             batch_size=self.neuron_config.batch_size, top_k=[1], top_p=[1.0], temperature=[1.0]
@@ -892,6 +903,21 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
                 (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
         """
+
+        if self.async_mode:
+            # derive future cpu inputs from current cpu inputs
+            if position_ids.shape[1] == input_ids.shape[1]:
+                next_position_ids = torch.amax(position_ids, 1, keepdim=True)
+            else:
+                next_position_ids = position_ids
+
+            next_position_ids = next_position_ids + 1
+            next_attention_mask = self._infer_attention_mask(next_position_ids)
+            self.next_cpu_inputs = {
+                "attention_mask": next_attention_mask,
+                "position_ids": next_position_ids,
+            }
+
         sampling_params = (
             self.default_sampling_params if sampling_params is None else sampling_params
         )
@@ -990,6 +1016,13 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 f"first layer kv_cache: {self.token_generation_model.model.past_key_values[0][:, 0, :, 0]}"
             )
 
+    def _get_async_output(
+        self,
+        ranked_async_tensor,
+    ):
+        outputs = [[async_tensor[0].cpu()] for async_tensor in ranked_async_tensor]
+        return outputs[0][0]
+
     def _get_model_outputs(
         self,
         input_ids,
@@ -1030,6 +1063,27 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
 
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
+            if self.async_mode:
+                if not self.unequal_batching:
+                    # for now only cte + tkg flow is supported with async (this will be enforced at config level)
+                    next_outputs = self.token_generation_model(
+                        outputs,
+                        self.next_cpu_inputs["attention_mask"],
+                        self.next_cpu_inputs["position_ids"],
+                        seq_ids,
+                        sampling_params,
+                        adapter_ids,
+                        *llava_args,
+                    )
+                    outputs = self._get_async_output(outputs)  # block on cte call
+                    self.prior_outputs = next_outputs
+                else:
+                    if isinstance(
+                        outputs, list
+                    ):  # in case the outputs weren't passed through `torch.cat` in model_wrapper.py
+                        outputs = self._get_async_output(outputs)  # block on cte call
+
+                    self.prior_outputs = None
         elif self.neuron_config.enable_fused_speculation:
             outputs = self.fused_spec_model(
                 input_ids, attention_mask, position_ids, seq_ids, sampling_params, adapter_ids
@@ -1047,15 +1101,50 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             )
             is_run_on_neuron = self.medusa_speculation_model.is_neuron()
         else:
-            outputs = self.token_generation_model(
-                input_ids,
-                attention_mask,
-                position_ids,
+            if (
+                self.next_cpu_inputs is not None and self.prior_outputs is not None
+            ):  # this is never not None and not in async mode
+                _input_ids = self.prior_outputs
+                _attention_mask = self.next_cpu_inputs["attention_mask"]
+                _position_ids = self.next_cpu_inputs["position_ids"]
+            else:
+                _input_ids = input_ids
+                _attention_mask = attention_mask
+                _position_ids = position_ids
+
+            next_outputs = self.token_generation_model(
+                _input_ids,
+                _attention_mask,
+                _position_ids,
                 seq_ids,
                 sampling_params,
                 adapter_ids,
                 *llava_args,
             )
+            if self.async_mode:
+                if (
+                    self.prior_outputs is None
+                ):  # this means that next_outputs is processing token to be returned
+                    self.prior_outputs = next_outputs
+                    next_outputs = self.token_generation_model(  # submit future token request
+                        next_outputs,
+                        self.next_cpu_inputs["attention_mask"],
+                        self.next_cpu_inputs["position_ids"],
+                        seq_ids,
+                        sampling_params,
+                        adapter_ids,
+                        *llava_args,
+                    )
+                outputs = self.prior_outputs
+                if isinstance(outputs, list):
+                    outputs = self._get_async_output(
+                        self.prior_outputs
+                    )  # block on prior (sometimes current) token gen request
+
+                self.prior_outputs = next_outputs
+            else:
+                outputs = next_outputs
+
             is_run_on_neuron = self.token_generation_model.is_neuron()
 
         return outputs, is_run_on_neuron
