@@ -592,7 +592,7 @@ class NeuronFusedSpecModel(nn.Module):
         super().__init__()
         self.config = config
         self.neuron_config = config.neuron_config
-        self.draft_neuron_config = config.fused_spec_config.draft_neuron_config
+        self.draft_neuron_config = config.fused_spec_config.draft_config.neuron_config
         self.worker_cls = config.fused_spec_config.worker_cls
         self.n_positions = config.neuron_config.n_positions
 

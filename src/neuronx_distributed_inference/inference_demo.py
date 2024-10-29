@@ -249,7 +249,6 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
                 model_cls._model_cls,
                 draft_config=draft_config,
                 draft_model_path=args.draft_model_path,
-                draft_neuron_config=draft_neuron_config,
             )
             config.fused_spec_config = fused_spec_config
 

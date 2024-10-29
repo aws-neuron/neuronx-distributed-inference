@@ -227,25 +227,6 @@ class MoENeuronConfig(NeuronConfig):
         super().__init__(**kwargs)
 
 
-class FusedSpecNeuronConfig:
-    """
-    Base class for fused speculative decoding on Neuron.
-    """
-
-    # attribute_map: Dict[str, str] = {}
-    def __init__(
-        self,
-        worker_cls,
-        draft_config: Dict[str, str] = None,
-        draft_model_path: str = None,
-        draft_neuron_config: NeuronConfig = None,
-    ) -> None:
-        self.worker_cls = worker_cls
-        self.draft_config = draft_config
-        self.draft_model_path = draft_model_path
-        self.draft_neuron_config = draft_neuron_config
-
-
 class InferenceConfig:
     # Alias map for attributes.
     attribute_map: Dict[str, str] = {}
@@ -348,12 +329,53 @@ class InferenceConfig:
             merged_kwargs["neuron_config"] = cls.get_neuron_config_cls()(
                 **merged_kwargs["neuron_config"]
             )
+        # Initialize FusedSpecNeuronConfig from dict.
+        if "fused_spec_config" in merged_kwargs and isinstance(
+            merged_kwargs["fused_spec_config"], dict
+        ):
+            if "draft_config" in merged_kwargs["fused_spec_config"] and isinstance(
+                merged_kwargs["fused_spec_config"]["draft_config"], dict
+            ):
+                # Initialize NeuronConfig from dict.
+                if "neuron_config" in merged_kwargs["fused_spec_config"][
+                    "draft_config"
+                ] and isinstance(
+                    merged_kwargs["fused_spec_config"]["draft_config"]["neuron_config"], dict
+                ):
+                    merged_kwargs["fused_spec_config"]["draft_config"][
+                        "neuron_config"
+                    ] = cls.get_neuron_config_cls()(
+                        **merged_kwargs["fused_spec_config"]["draft_config"]["neuron_config"]
+                    )
+                merged_kwargs["fused_spec_config"]["draft_config"] = cls(
+                    **merged_kwargs["fused_spec_config"]["draft_config"]
+                )
+            merged_kwargs["fused_spec_config"] = FusedSpecNeuronConfig(
+                **merged_kwargs["fused_spec_config"]
+            )
 
         return cls(**merged_kwargs)
 
     @classmethod
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
         return NeuronConfig
+
+
+class FusedSpecNeuronConfig:
+    """
+    Base class for fused speculative decoding on Neuron.
+    """
+
+    # attribute_map: Dict[str, str] = {}
+    def __init__(
+        self,
+        worker_cls,
+        draft_config: InferenceConfig = None,
+        draft_model_path: str = None,
+    ) -> None:
+        self.worker_cls = worker_cls
+        self.draft_config = draft_config
+        self.draft_model_path = draft_model_path
 
 
 class OnDeviceSamplingConfig:

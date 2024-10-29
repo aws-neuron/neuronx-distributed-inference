@@ -34,8 +34,8 @@ def is_compiled(model_path):
 
 def init_custom_process_group_fn(config):
     if hasattr(config, "fused_spec_config") and config.fused_spec_config is not None:
-        if config.fused_spec_config.draft_neuron_config.tp_degree is not None:
-            draft_tp = config.fused_spec_config.draft_neuron_config.tp_degree
+        if config.fused_spec_config.draft_config.neuron_config.tp_degree is not None:
+            draft_tp = config.fused_spec_config.draft_config.neuron_config.tp_degree
             parallel_state.initialize_speculative_draft_group(draft_tp)
 
 

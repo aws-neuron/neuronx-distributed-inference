@@ -5,7 +5,12 @@ import pytest
 import torch
 from transformers import AutoConfig
 
-from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
+from neuronx_distributed_inference.models.config import (
+    FusedSpecNeuronConfig,
+    InferenceConfig,
+    NeuronConfig,
+)
+from neuronx_distributed_inference.models.model_base import NeuronBaseModel
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 
@@ -47,6 +52,33 @@ def test_serialize_deserialize_inference_config_with_nested_config():
 
     deserialized_config = verify_serialize_deserialize(config)
     assert deserialized_config.neuron_config.lora_config.max_lora_rank == 32
+
+
+def test_serialize_deserialize_inference_config_with_fused_spec_config():
+    neuron_config = NeuronConfig()
+    draft_config = InferenceConfig(
+        neuron_config=neuron_config,
+        hidden_size=1024,
+    )
+    fused_spec_config = FusedSpecNeuronConfig(
+        NeuronBaseModel, draft_config=draft_config, draft_model_path="draft_model_path"
+    )
+    config = InferenceConfig(
+        neuron_config=neuron_config,
+        fused_spec_config=fused_spec_config,
+        hidden_size=4096,
+    )
+    assert config.hidden_size == 4096
+    assert neuron_config.tp_degree == 1
+    assert config.fused_spec_config.draft_config.hidden_size == 1024
+    assert config.fused_spec_config.draft_config.neuron_config.tp_degree == 1
+
+    deserialized_config = verify_serialize_deserialize(config)
+
+    assert deserialized_config.hidden_size == 4096
+    assert deserialized_config.neuron_config.tp_degree == 1
+    assert deserialized_config.fused_spec_config.draft_config.hidden_size == 1024
+    assert deserialized_config.fused_spec_config.draft_config.neuron_config.tp_degree == 1
 
 
 def test_serialize_deserialize_pretrained_config_adapter():
