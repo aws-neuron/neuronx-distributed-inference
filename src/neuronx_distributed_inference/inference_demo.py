@@ -220,9 +220,6 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     if args.on_device_sampling:
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
 
-    if (args.quantized and args.quantization_dtype == "f8e4m3") or args.kv_cache_quant:
-        os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
-
     adapter_ids = None
     if args.enable_lora:
         config_kwargs["lora_config"] = LoraServingConfig(
