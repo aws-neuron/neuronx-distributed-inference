@@ -853,9 +853,12 @@ class NeuronFusedSpecModel(nn.Module):
         draft_cache = model_output[1:-1]
 
         # Retile the cache
+        # flat_draft_cache = []
+        # for idx in range(len(draft_cache)):
+        #     flat_draft_cache.append(draft_cache[idx].view(self.draft_model.kv_mgr.kv_shape))
         flat_draft_cache = []
         for idx in range(len(draft_cache)):
-            flat_draft_cache.append(draft_cache[idx].view(self.draft_model.kv_mgr.kv_shape))
+            flat_draft_cache.append(draft_cache[idx])
 
         index = ((~(candidate_input_ids[:, 1:] == target_tokens[:, :-1])).cumsum(dim=-1) < 1).sum()
         index = index.unsqueeze(0).expand(self.batch_size, 1, self.hidden_size)

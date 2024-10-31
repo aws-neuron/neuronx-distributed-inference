@@ -324,8 +324,8 @@ class KVCacheManager(nn.Module):
                     )
 
             # Retiling
-            k_cache = k_cache.view(cache_shape)
-            v_cache = v_cache.view(cache_shape)
+            # k_cache = k_cache.view(cache_shape)
+            # v_cache = v_cache.view(cache_shape)
 
             updated_kv_cache.append(k_cache)
             updated_kv_cache.append(v_cache)

@@ -882,7 +882,7 @@ class NeuronLlamaModel(NeuronBaseModel):
 
         if config.neuron_config.is_eagle_draft:
             self.fc = ColumnParallelLinear(
-                config.hidden_size * 2, config.hidden_size, bias=True, gather_output=True
+                config.hidden_size * 2, config.hidden_size, bias=False, gather_output=True
             )
         self.is_medusa = config.neuron_config.is_medusa
         self.num_medusa_heads = config.neuron_config.num_medusa_heads

@@ -530,12 +530,12 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             device=hidden_states.device,
         )
 
-        logger.debug("TRACE QKV kernel invocation")
-        logger.debug(f"hidden_states - shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
-        logger.debug(
-            f"rmsnorm weight (gamma) - shape: {rmsnorm.weight.shape}, dtype: {rmsnorm.weight.dtype}"
-        )
-        logger.debug(f"output tensor - shape: {QKV.shape}, dtype: {QKV.dtype}")
+        # logger.debug("TRACE QKV kernel invocation")
+        # logger.debug(f"hidden_states - shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        # logger.debug(
+        #     f"rmsnorm weight (gamma) - shape: {rmsnorm.weight.shape}, dtype: {rmsnorm.weight.dtype}"
+        # )
+        # logger.debug(f"output tensor - shape: {QKV.shape}, dtype: {QKV.dtype}")
 
         grid = (vnc(self.logical_neuron_cores),)
 
@@ -545,7 +545,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             self.Wqkv.weight,
             # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
             # should be fine to pass this is as a dummy even if not using fused rmsnorm
-            rmsnorm.weight.unsqueeze(0),
+            rmsnorm.weight.unsqueeze(0) if rmsnorm  else torch.ones((1,h), device=hidden_states.device),
             QKV,
             eps=self.rms_norm_eps,
             kernel_name="QKV",
