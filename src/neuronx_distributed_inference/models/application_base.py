@@ -212,8 +212,17 @@ class NeuronApplicationBase(torch.nn.Module):
 
             if self.neuron_config.torch_dtype != torch.float32:
                 for name, param in model_sd.items():
-                    if torch.is_floating_point(param):
-                        model_sd[name] = param.to(self.neuron_config.torch_dtype)
+                    if torch.is_floating_point(param) and param.dtype not in [torch.float8_e4m3fn]:
+                        # only cast floating types
+                        if name.endswith("scale"):
+                            warnings.warn(
+                                f"Found float32 weights in quantized checkpoint: {name}. Will skip converting to bfloat16 as its scale"
+                            )
+                        else:
+                            warnings.warn(
+                                f"Found float32 weights in quantized checkpoint: {name}. Will convert to bfloat16"
+                            )
+                            model_sd[name] = param.to(self.neuron_config.torch_dtype)
             return model_sd
         else:
             model_sd = self.get_state_dict(self.model_path, self.config)
@@ -221,7 +230,15 @@ class NeuronApplicationBase(torch.nn.Module):
                 for name, param in model_sd.items():
                     if torch.is_floating_point(param) and param.dtype not in [torch.float8_e4m3fn]:
                         # only cast floating types
-                        model_sd[name] = param.to(self.neuron_config.torch_dtype)
+                        if name.endswith("scale"):
+                            warnings.warn(
+                                f"Found float32 weights in quantized checkpoint: {name}. Will skip converting to bfloat16 as its scale"
+                            )
+                        else:
+                            warnings.warn(
+                                f"Found float32 weights in quantized checkpoint: {name}. Will convert to bfloat16"
+                            )
+                            model_sd[name] = param.to(self.neuron_config.torch_dtype)
         return model_sd
 
     @classmethod

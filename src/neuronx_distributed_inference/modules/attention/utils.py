@@ -52,11 +52,27 @@ def transpose_parallel_linear_layer(parallel_layer):
 
 
 def pad_to_128_multiple(x, dim):
+    # Strided padding for unsharded weight, so after sharding
+    # each rank will have dense padding at the end.
+    # Eg orig shape = [16384, 53248], with dim = 1
+    # We reshape to [16384, 128, 416] (TP_degree = 128)
+    # Then pad to [16384, 128, 512].
+    # Then collapse the original dim [16384, 65536].
     TP_DEGREE = get_tensor_model_parallel_group().size()
-    padding_length = get_padding_length(x.shape[dim] // TP_DEGREE, 128) * TP_DEGREE
+    orig_shape = x.shape
+    new_shape = list(x.shape)
+    new_shape[dim] = orig_shape[dim] // TP_DEGREE
+    new_shape.insert(dim, TP_DEGREE)
+    x = x.reshape(new_shape)
+    dim += 1
+    padding_length = get_padding_length(x.shape[dim], 128)
     dimlist = [0] * (len(x.shape) * 2)
     dimlist[dim * 2] = padding_length
-    return torch.nn.functional.pad(x, tuple(dimlist[::-1]))
+    padded = torch.nn.functional.pad(x, tuple(dimlist[::-1]))
+    new_padded_shape = list(orig_shape)
+    new_padded_shape[dim - 1] = -1
+    padded = padded.reshape(new_padded_shape)
+    return padded
 
 
 quantized_weight_cache = {}

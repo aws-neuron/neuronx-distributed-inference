@@ -480,6 +480,9 @@ class DecoderModelInstance(BaseModelInstance):
             # TODO: In the current case we initialize the float_model which has Quantization layers as well
             # the above code will convert fp32 scales to bfloat16. This should be fixed when we remove
             # Quantization layers from NeuronLLamaMLP
+            for name, param in float_model.named_parameters():
+                if name.endswith("scale"):
+                    param.data = param.data.to(torch.float32)
 
         if (
             self.neuron_config.quantized is True
