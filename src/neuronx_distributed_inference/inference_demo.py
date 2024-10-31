@@ -70,6 +70,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         choices=list(CheckAccuracyMode),
         default=CheckAccuracyMode.SKIP_ACCURACY_CHECK,
     )
+    run_parser.add_argument("--expected-outputs-path", type=validate_file_exists)
     run_parser.add_argument("--divergence-difference-tol", type=float, default=0.001)
     run_parser.add_argument("--tol-map", type=str)
 
@@ -196,6 +197,12 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     )
 
 
+def validate_file_exists(path):
+    if not os.path.exists(path) or not os.path.isfile(path):
+        raise argparse.ArgumentError("Path must exist and be a file")
+    return path
+
+
 def load_json_file(json_path):
     with open(json_path, "r") as f:
         return json.load(f)
@@ -318,10 +325,12 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         model,
         tokenizer,
         generation_config,
+        args.prompts[0],
         args.check_accuracy_mode,
         args.divergence_difference_tol,
         args.tol_map,
         draft_model=draft_model,
+        expected_outputs_path=args.expected_outputs_path,
     )
 
     # Generate outputs.
@@ -392,10 +401,12 @@ def run_accuracy_check(
     model,
     tokenizer,
     generation_config,
+    prompt,
     check_accuracy_mode,
     divergence_difference_tol,
     tol_map,
     draft_model=None,
+    expected_outputs_path=None,
 ):
     if model.neuron_config.is_medusa:
         # Medusa doesn't use greedy sampling, so check accuracy doesn't work.
@@ -405,12 +416,29 @@ def run_accuracy_check(
 
     if check_accuracy_mode == CheckAccuracyMode.SKIP_ACCURACY_CHECK:
         print("\nSkipping accuracy check")
-    elif check_accuracy_mode == CheckAccuracyMode.TOKEN_MATCHING:
+        return
+
+    expected_outputs = None
+    if expected_outputs_path is not None:
+        expected_outputs = torch.load(expected_outputs_path)
+
+    if check_accuracy_mode == CheckAccuracyMode.TOKEN_MATCHING:
         print("\nChecking accuracy by token matching")
-        check_accuracy(model, tokenizer, generation_config, draft_model=draft_model)
+        check_accuracy(
+            model,
+            tokenizer,
+            generation_config,
+            prompt=prompt,
+            draft_model=draft_model,
+            expected_token_ids=expected_outputs,
+        )
     elif check_accuracy_mode == CheckAccuracyMode.LOGIT_MATCHING:
         assert draft_model is None, "Logit matching not supported for speculation"
         print("\nChecking accuracy by logit matching")
+
+        expected_logits = None
+        if expected_outputs is not None:
+            expected_logits = torch.stack(expected_outputs.scores)
 
         if tol_map:
             tol_map = ast.literal_eval(tol_map)
@@ -419,6 +447,8 @@ def run_accuracy_check(
             model,
             tokenizer,
             generation_config,
+            prompt=prompt,
+            expected_logits=expected_logits,
             divergence_difference_tol=divergence_difference_tol,
             tol_map=tol_map,
         )

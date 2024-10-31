@@ -94,6 +94,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
     def forward(self, *args, **kwargs):
         return self.neuron_model(*args, **kwargs)
 
+    def generate(self, *args, **kwargs):
+        # Keep generation stateless.
+        self.neuron_model.reset()
+        return super().generate(*args, **kwargs)
+
     # TODO: Remove _sample and define separate flow for on-device sampling that doesn't use HF.
     def _sample(
         self,
@@ -117,6 +122,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         has_eos_stopping_criteria = any(
             hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
         )
+        do_sample = generation_config.do_sample
 
         batch_size = model_kwargs["attention_mask"].shape[0]
         sampling_params = prepare_sampling_params(
@@ -150,7 +156,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
 
                 # pre-process distribution
                 next_token_scores = logits_processor(input_ids, next_token_logits)
-                next_token_scores = logits_warper(input_ids, next_token_scores)
+                if do_sample:
+                    next_token_scores = logits_warper(input_ids, next_token_scores)
 
                 if return_dict_in_generate:
                     if output_scores:
@@ -158,7 +165,6 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                     if output_logits:
                         raw_logits += (next_token_logits,)
 
-            if not self.on_device_sampling:
                 if self.sampler is None:
                     # Temporary placeholder to support CPU sampling with static batching
                     neuron_kwargs = {}
@@ -172,7 +178,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                     sampler_config.on_cpu = True
                     self.sampler = Sampler(sampler_config)
 
-                next_tokens = self.sampler(outputs.logits[:, -1, :], sampling_params)
+                next_tokens = self.sampler(next_token_scores, sampling_params)
             else:
                 next_tokens = outputs.tokens
 
