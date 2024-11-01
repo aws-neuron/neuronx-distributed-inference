@@ -188,7 +188,6 @@ class NeuronLlamaMLP(nn.Module):
         self.mlp_kernel_enabled = self.neuron_config.mlp_kernel_enabled
         self.quantized_mlp_kernel_enabled = self.neuron_config.quantized_mlp_kernel_enabled
         self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
-
         mlp_bias = getattr(config, "mlp_bias", False)
         if parallel_state.model_parallel_is_initialized():
             if self.quantized_mlp_kernel_enabled:

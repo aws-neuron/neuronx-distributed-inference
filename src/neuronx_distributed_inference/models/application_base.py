@@ -90,6 +90,7 @@ class NeuronApplicationBase(torch.nn.Module):
                 debug=debug,
                 num_cores_per_group=self.config.num_cores_per_group,
                 init_custom_process_group_fn=custom_group_fn,
+                logical_neuron_cores=self.neuron_config.logical_neuron_cores,
             )
             for model in self.models:
                 self._builder.add(
