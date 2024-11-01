@@ -881,8 +881,9 @@ class NeuronLlamaModel(NeuronBaseModel):
             self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
 
         if config.neuron_config.is_eagle_draft:
+            fc_bias = getattr(config, "fc_bias", False)
             self.fc = ColumnParallelLinear(
-                config.hidden_size * 2, config.hidden_size, bias=False, gather_output=True
+                config.hidden_size * 2, config.hidden_size, bias=fc_bias, gather_output=True
             )
         self.is_medusa = config.neuron_config.is_medusa
         self.num_medusa_heads = config.neuron_config.num_medusa_heads

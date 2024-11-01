@@ -111,6 +111,11 @@ class ModelWrapper(torch.nn.Module):
                 f" --internal-num-neuroncores-per-sengine={self.neuron_config.logical_neuron_cores}"
                 f" --logfile {self.compiler_workdir}/log-neuron-cc.txt"
             )
+
+            if self.neuron_config.enable_fused_speculation:
+                self.compiler_args += (
+                    "--tensorizer-options='--optimize-alias-chain --no-enable-tritium-loopfusion'"
+                )
             if self.neuron_config.target:
                 self.compiler_args += f" --target {self.neuron_config.target}"
 

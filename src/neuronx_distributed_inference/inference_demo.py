@@ -243,10 +243,12 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     if neuron_config.speculation_length > 0 and args.draft_model_path is not None:
         # Reset speculation options to defaults for the draft model.
         draft_neuron_config = copy.deepcopy(config.neuron_config)
+        # eagle requires the draft model to have speculation enabled for the last draft run
         if not neuron_config.enable_eagle_speculation:
             draft_neuron_config.speculation_length = 0
         draft_neuron_config.trace_tokengen_model = True
         draft_neuron_config.enable_fused_speculation = False
+        # Set eagle specific config changes
         if neuron_config.enable_eagle_speculation:
             draft_neuron_config.is_eagle_draft = True
             draft_neuron_config.sequence_parallel_enabled = False

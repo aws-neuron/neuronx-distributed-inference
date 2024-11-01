@@ -721,7 +721,7 @@ class NeuronFusedSpecModel(nn.Module):
         )
         hidden_state = target_outputs[-1]
 
-        # Create draft args from taregt args
+        # Create draft args from target args
         # Draft is always running 1 position behind the target
         # So if target input is ABCDE, draft input will be BCDE
 
@@ -823,7 +823,7 @@ class NeuronFusedSpecModel(nn.Module):
 
             candidate_input_ids = torch.cat((candidate_input_ids, new_draft_token), dim=-1)
 
-        # # 2. verify candidates
+        # 2. Run target model on the draft produced tokens
         outputs = self.target_model(
             candidate_input_ids,
             attention_mask,
@@ -840,7 +840,8 @@ class NeuronFusedSpecModel(nn.Module):
             reshaped_cache.append([draft_cache[i], draft_cache[i + 1]])
         draft_cache = reshaped_cache
 
-        # 3 Final draft run to update KV cache
+        # 3 Final draft run to update KV cache. This is done after the target run since we need to send
+        # the hidden states from the target output as input to the final draft run.
         model_output = self.draft_model(
             candidate_input_ids,
             attention_mask,
@@ -852,14 +853,11 @@ class NeuronFusedSpecModel(nn.Module):
         )
         draft_cache = model_output[1:-1]
 
-        # Retile the cache
-        # flat_draft_cache = []
-        # for idx in range(len(draft_cache)):
-        #     flat_draft_cache.append(draft_cache[idx].view(self.draft_model.kv_mgr.kv_shape))
         flat_draft_cache = []
         for idx in range(len(draft_cache)):
             flat_draft_cache.append(draft_cache[idx])
 
+        # Checking which index of hidden to alias
         index = ((~(candidate_input_ids[:, 1:] == target_tokens[:, :-1])).cumsum(dim=-1) < 1).sum()
         index = index.unsqueeze(0).expand(self.batch_size, 1, self.hidden_size)
         hidden_state = torch.gather(hidden_state, dim=1, index=index)
