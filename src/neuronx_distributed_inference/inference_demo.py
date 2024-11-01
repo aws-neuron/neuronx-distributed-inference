@@ -230,7 +230,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
             target_modules=args.target_modules,
             max_loras_on_cpu=args.max_loras_on_cpu,
         )
-        adapter_ids = torch.tensor([0, 1], dtype=torch.int64)
+        adapter_ids = torch.tensor([0, 1], dtype=torch.int32)
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
     config = model_cls.get_config_cls()(

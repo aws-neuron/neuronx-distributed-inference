@@ -674,7 +674,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         outputs = self(**model_inputs)
 
         non_zero_input_ids = input_ids.nonzero()
-        cur_len = torch.tensor([non_zero_input_ids.size(0)], dtype=torch.int64)
+        cur_len = torch.tensor([non_zero_input_ids.size(0)], dtype=torch.int32)
 
         logits, medusa_logits = self._extract_logits(outputs)
 
@@ -690,7 +690,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         select_indices = torch.arange(
             cur_len[0].item(),
             cur_len[0].item() + self.neuron_config.num_medusa_heads + 1,
-            dtype=torch.int64,
+            dtype=torch.int32,
         )
 
         for i in range(self.neuron_config.max_new_tokens):
@@ -721,7 +721,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             medusa_logits = tree_medusa_logits[:, 0, medusa_buffers["retrieve_indices"]]
 
             best_candidate, accept_length = evaluate_posterior(logits, candidates)
-            cur_len = torch.tensor([input_ids.nonzero().size(0) - 1], dtype=torch.int64)
+            cur_len = torch.tensor([input_ids.nonzero().size(0) - 1], dtype=torch.int32)
 
             input_ids, logits, medusa_logits, new_token, select_indices = update_inference_inputs(
                 input_ids[:, : (int(cur_len[0] + 1))],
@@ -754,7 +754,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         medusa_kwargs["accepted_indices"] = torch.arange(
             cur_len[0].item(),
             cur_len[0].item() + self.neuron_config.num_medusa_heads + 1,
-            dtype=torch.int64,
+            dtype=torch.int32,
         )
         for index, value in enumerate(select_indices):
             medusa_kwargs["accepted_indices"][index] = value
@@ -762,14 +762,14 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         medusa_kwargs["current_length"] = torch.arange(
             cur_len[0].item(),
             cur_len[0].item() + self.neuron_config.num_medusa_heads + 1,
-            dtype=torch.int64,
+            dtype=torch.int32,
         ).unsqueeze(0)
         medusa_mask = medusa_buffers["medusa_attn_mask"].unsqueeze(0)
         medusa_kwargs["medusa_mask"] = medusa_mask.type_as(torch.LongTensor())
         medusa_kwargs["scatter_index"] = torch.arange(
             position_ids[0],
             position_ids[0] + self.neuron_config.medusa_speculation_length,
-            dtype=torch.int64,
+            dtype=torch.int32,
         ).unsqueeze(0)
         return medusa_kwargs
 

@@ -180,7 +180,7 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
     sample_inputs = None
     if model_type == END_TO_END_MODEL:
         input_ids = torch.randint(0, 100, (batch_size, max_context_length))
-        attention_mask = torch.zeros((batch_size, max_context_length), dtype=torch.int64)
+        attention_mask = torch.zeros((batch_size, max_context_length), dtype=torch.int32)
         assert (
             image is None
         ), "image is not supported currently for benchmarking for END_TO_END_MODEL"
@@ -188,19 +188,19 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
         sample_inputs = (input_ids, attention_mask, None, sampling_params)
 
     elif model_type == CONTEXT_ENCODING_MODEL:
-        input_ids = torch.zeros((batch_size, max_context_length), dtype=torch.int64)
-        attention_mask = torch.zeros((batch_size, max_context_length), dtype=torch.int64)
-        position_ids = torch.zeros((batch_size, max_context_length), dtype=torch.int64)
-        seq_ids = torch.zeros((batch_size), dtype=torch.int64)
+        input_ids = torch.zeros((batch_size, max_context_length), dtype=torch.int32)
+        attention_mask = torch.zeros((batch_size, max_context_length), dtype=torch.int32)
+        position_ids = torch.zeros((batch_size, max_context_length), dtype=torch.int32)
+        seq_ids = torch.zeros((batch_size), dtype=torch.int32)
 
         if neuron_config.is_medusa:
-            accepted_indices = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int64)
-            current_length = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int64)
+            accepted_indices = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int32)
+            current_length = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int32)
             medusa_mask = torch.zeros(
                 (batch_size, medusa_speculation_length, medusa_speculation_length),
-                dtype=torch.int64,
+                dtype=torch.int32,
             )
-            scatter_index = torch.zeros((batch_size, medusa_speculation_length), dtype=torch.int64)
+            scatter_index = torch.zeros((batch_size, medusa_speculation_length), dtype=torch.int32)
             sample_inputs = (
                 input_ids,
                 attention_mask,
@@ -223,10 +223,10 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
                 dtype=neuron_config.hf_config.torch_dtype,
             )
             text_embedding_indices = torch.zeros(
-                (batch_size, max_context_length), dtype=torch.int64
+                (batch_size, max_context_length), dtype=torch.int32
             )
             image_embedding_indices = torch.zeros(
-                (batch_size, max_context_length), dtype=torch.int64
+                (batch_size, max_context_length), dtype=torch.int32
             )
 
             sample_inputs = (
@@ -248,10 +248,10 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
                 sampling_params,
             )
     elif model_type == TOKEN_GENERATION_MODEL:
-        input_ids = torch.zeros((batch_size, 1), dtype=torch.int64)
-        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.int64)
-        position_ids = torch.zeros((batch_size, 1), dtype=torch.int64)
-        seq_ids = torch.zeros((batch_size), dtype=torch.int64)
+        input_ids = torch.zeros((batch_size, 1), dtype=torch.int32)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.int32)
+        position_ids = torch.zeros((batch_size, 1), dtype=torch.int32)
+        seq_ids = torch.zeros((batch_size), dtype=torch.int32)
         sample_inputs = (
             input_ids,
             attention_mask,
@@ -261,10 +261,10 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
         )
     elif model_type == SPECULATION_MODEL:
         spec_len = neuron_config.speculation_length
-        input_ids = torch.zeros((batch_size, spec_len), dtype=torch.int64)
-        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.int64)
-        position_ids = torch.zeros((batch_size, spec_len), dtype=torch.int64)
-        seq_ids = torch.zeros((batch_size), dtype=torch.int64)
+        input_ids = torch.zeros((batch_size, spec_len), dtype=torch.int32)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.int32)
+        position_ids = torch.zeros((batch_size, spec_len), dtype=torch.int32)
+        seq_ids = torch.zeros((batch_size), dtype=torch.int32)
         sample_inputs = (
             input_ids,
             attention_mask,
@@ -275,16 +275,16 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
 
     elif model_type == MEDUSA_MODEL:
         spec_len = neuron_config.medusa_speculation_length
-        input_ids = torch.zeros((batch_size, spec_len), dtype=torch.int64)
-        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.int64)
-        position_ids = torch.zeros((batch_size, spec_len), dtype=torch.int64)
-        seq_ids = torch.zeros((batch_size), dtype=torch.int64)
-        accepted_indices = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int64)
-        current_length = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int64)
+        input_ids = torch.zeros((batch_size, spec_len), dtype=torch.int32)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.int32)
+        position_ids = torch.zeros((batch_size, spec_len), dtype=torch.int32)
+        seq_ids = torch.zeros((batch_size), dtype=torch.int32)
+        accepted_indices = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int32)
+        current_length = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int32)
         medusa_mask = torch.zeros(
-            (batch_size, medusa_speculation_length, medusa_speculation_length), dtype=torch.int64
+            (batch_size, medusa_speculation_length, medusa_speculation_length), dtype=torch.int32
         )
-        scatter_index = torch.zeros((batch_size, medusa_speculation_length), dtype=torch.int64)
+        scatter_index = torch.zeros((batch_size, medusa_speculation_length), dtype=torch.int32)
         sample_inputs = (
             input_ids,
             attention_mask,

@@ -177,15 +177,15 @@ class ModelWrapper(torch.nn.Module):
             )
 
             input_ids = torch.zeros(
-                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int64
+                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
             )
-            attention_mask = torch.zeros((self.neuron_config.batch_size, bucket), dtype=torch.int64)
+            attention_mask = torch.zeros((self.neuron_config.batch_size, bucket), dtype=torch.int32)
             position_ids = torch.zeros(
-                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int64
+                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
             )
-            seq_ids = torch.zeros((self.neuron_config.batch_size), dtype=torch.int64)
+            seq_ids = torch.zeros((self.neuron_config.batch_size), dtype=torch.int32)
             adapter_ids = (
-                torch.zeros((self.neuron_config.batch_size), dtype=torch.int64)
+                torch.zeros((self.neuron_config.batch_size), dtype=torch.int32)
                 if self.neuron_config.lora_config is not None
                 else None
             )
@@ -199,11 +199,11 @@ class ModelWrapper(torch.nn.Module):
             if self.is_medusa:
                 accepted_indices = torch.zeros(
                     (self.neuron_config.batch_size, self.neuron_config.num_medusa_heads + 1),
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                 )
                 current_length = torch.zeros(
                     (self.neuron_config.batch_size, self.neuron_config.num_medusa_heads + 1),
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                 )
                 medusa_mask = torch.zeros(
                     (
@@ -211,11 +211,11 @@ class ModelWrapper(torch.nn.Module):
                         self.neuron_config.medusa_speculation_length,
                         self.neuron_config.medusa_speculation_length,
                     ),
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                 )
                 scatter_index = torch.zeros(
                     (self.neuron_config.batch_size, self.neuron_config.medusa_speculation_length),
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                 )
 
                 if self.neuron_config.lora_config is not None:
@@ -326,6 +326,13 @@ class ModelWrapper(torch.nn.Module):
         logging.debug(f"Processed inputs to the model. tag={self.tag}, args={args}")
         return self.model(*args)
 
+    def convert_int64_to_int32(self, *args):
+        """
+        Convert int64 args to int32 to match compiled input types.
+        Neuron compiler handles int32 better than int64. Context: P165494809
+        """
+        return [t.to(torch.int32) if t.dtype == torch.int64 else t for t in args]
+
     def pad_to_max_compiled_seq(self, *args):
         if self.tag == CONTEXT_ENCODING_MODEL_TAG:
             to_pad = args[:3]
@@ -359,6 +366,7 @@ class ModelWrapper(torch.nn.Module):
         if args[5] is None:
             args = (*args[:5], *args[6:])
 
+        args = self.convert_int64_to_int32(*args)
         args = self.pad_to_max_compiled_seq(*args)
 
         seq_ids = args[3]

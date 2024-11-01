@@ -295,7 +295,7 @@ def check_accuracy_logits(
             initial_attention_mask.shape[0],
             expected_token_ids.shape[1] - initial_attention_mask.shape[1],
         ),
-        dtype=torch.int64,
+        dtype=torch.int32,
     )
     extrapolated_attention_mask = torch.cat(
         (initial_attention_mask, expected_attention_mask), dim=1

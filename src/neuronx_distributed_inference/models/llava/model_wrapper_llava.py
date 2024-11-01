@@ -43,7 +43,7 @@ class ModelWrapperLlava(ModelWrapper):
             )
 
             input_ids = torch.zeros(
-                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int64
+                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
             )
             pixel_values = torch.zeros(
                 (
@@ -55,16 +55,16 @@ class ModelWrapperLlava(ModelWrapper):
                 dtype=self.neuron_config.torch_dtype,
             )
             text_embedding_indices = torch.zeros(
-                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int64
+                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
             )
             image_embedding_indices = torch.zeros(
-                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int64
+                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
             )
-            attention_mask = torch.zeros((self.neuron_config.batch_size, bucket), dtype=torch.int64)
+            attention_mask = torch.zeros((self.neuron_config.batch_size, bucket), dtype=torch.int32)
             position_ids = torch.zeros(
-                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int64
+                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
             )
-            seq_ids = torch.zeros((self.neuron_config.batch_size), dtype=torch.int64)
+            seq_ids = torch.zeros((self.neuron_config.batch_size), dtype=torch.int32)
 
             inputs.append(
                 (

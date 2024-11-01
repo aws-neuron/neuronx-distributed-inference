@@ -1206,11 +1206,11 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
     def _prepare_inputs(self):
         accepted_indices = torch.zeros(
             (self.neuron_config.batch_size, self.neuron_config.num_medusa_heads + 1),
-            dtype=torch.int64,
+            dtype=torch.int32,
         )
         current_length = torch.zeros(
             (self.neuron_config.batch_size, self.neuron_config.num_medusa_heads + 1),
-            dtype=torch.int64,
+            dtype=torch.int32,
         )
         medusa_mask = torch.zeros(
             (
@@ -1218,11 +1218,11 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 self.neuron_config.medusa_speculation_length,
                 self.neuron_config.medusa_speculation_length,
             ),
-            dtype=torch.int64,
+            dtype=torch.int32,
         )
         scatter_index = torch.zeros(
             (self.neuron_config.batch_size, self.neuron_config.medusa_speculation_length),
-            dtype=torch.int64,
+            dtype=torch.int32,
         )
         return accepted_indices, current_length, medusa_mask, scatter_index
 
