@@ -249,6 +249,7 @@ def check_accuracy_logits(
     expected_logits: torch.Tensor = None,
     divergence_difference_tol: float = 0.001,
     tol_map: dict = None,
+    num_tokens_to_check: int = None,
     execution_mode="config",
 ):
     if prompt is None:
@@ -276,6 +277,11 @@ def check_accuracy_logits(
             generation_config=generation_config,
         )
         expected_logits = torch.stack(outputs.scores)
+
+    if num_tokens_to_check is not None:
+        print(f"Validating logits for first {num_tokens_to_check} tokens")
+        expected_logits = expected_logits[:num_tokens_to_check, :, :]
+
     expected_token_ids = expected_logits.argmax(dim=2).T
     expected_tokens = tokenizer.batch_decode(
         expected_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False

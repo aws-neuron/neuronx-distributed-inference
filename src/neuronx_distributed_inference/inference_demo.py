@@ -73,6 +73,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--expected-outputs-path", type=validate_file_exists)
     run_parser.add_argument("--divergence-difference-tol", type=float, default=0.001)
     run_parser.add_argument("--tol-map", type=str)
+    run_parser.add_argument("--num-tokens-to-check", type=int)
 
     # Generation
     run_parser.add_argument("--prompt", dest="prompts", type=str, action="append", required=True)
@@ -329,6 +330,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         args.check_accuracy_mode,
         args.divergence_difference_tol,
         args.tol_map,
+        num_tokens_to_check=args.num_tokens_to_check,
         draft_model=draft_model,
         expected_outputs_path=args.expected_outputs_path,
     )
@@ -405,6 +407,7 @@ def run_accuracy_check(
     check_accuracy_mode,
     divergence_difference_tol,
     tol_map,
+    num_tokens_to_check=None,
     draft_model=None,
     expected_outputs_path=None,
 ):
@@ -451,6 +454,7 @@ def run_accuracy_check(
             expected_logits=expected_logits,
             divergence_difference_tol=divergence_difference_tol,
             tol_map=tol_map,
+            num_tokens_to_check=num_tokens_to_check,
         )
     else:
         raise ValueError(f"Unsupported check accuracy mode: {check_accuracy_mode}")
