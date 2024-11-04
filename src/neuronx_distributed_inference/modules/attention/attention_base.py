@@ -216,18 +216,19 @@ class NeuronAttentionBase(nn.Module):
             V_active = V_active.reshape((bsz * self.num_heads, q_len, self.head_dim)).to(
                 self.torch_dtype
             )
-            # shape: (B*H)DS
-            attn_output = torch.zeros(
-                bsz * self.num_heads, self.head_dim, q_len, dtype=Q.dtype, device=Q.device
-            )
 
             logger.debug("Input parameter shapes")
             logger.debug(f"Q input shape {Q.shape}")
             logger.debug(f"K input shape {K_active.shape}")
             logger.debug(f"V input shape {V_active.shape}")
-            logger.debug(f"Attn output shape {attn_output.shape}")
 
             if int(self.logical_neuron_cores) > 1:
+                # shape: (B*H)DS
+                attn_output = torch.zeros(
+                    bsz * self.num_heads, self.head_dim, q_len, dtype=Q.dtype, device=Q.device
+                )
+                logger.debug(f"Attn output shape {attn_output.shape}")
+
                 grid = (vnc(self.logical_neuron_cores),)
 
                 _flash_fwd_call[grid](
@@ -238,7 +239,15 @@ class NeuronAttentionBase(nn.Module):
                     attn_output,
                     kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
                 )
+
+                # shape: BHDS
+                attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
             else:
+                attn_output = torch.zeros(
+                    bsz * self.num_heads, q_len, self.head_dim, dtype=Q.dtype, device=Q.device
+                )
+                logger.debug(f"Attn output shape {attn_output.shape}")
+
                 # attention kernel does not support passing in a grid for LNC=1
                 _flash_fwd_call(
                     Q,
@@ -248,8 +257,7 @@ class NeuronAttentionBase(nn.Module):
                     attn_output,
                     kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
                 )
-            # shape: BHDS
-            attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
+                attn_output = attn_output.reshape((bsz, self.num_heads, q_len, self.head_dim))
             logger.debug(f"Attn output after reshape {attn_output.shape}")
         else:
             logger.debug("ATTN: native compiler")
