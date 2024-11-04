@@ -1,7 +1,6 @@
 import logging
 import os
 import warnings
-from contextlib import contextmanager
 from functools import partial
 from typing import List
 
@@ -38,21 +37,6 @@ def init_custom_process_group_fn(config):
         if config.fused_spec_config.draft_config.neuron_config.tp_degree is not None:
             draft_tp = config.fused_spec_config.draft_config.neuron_config.tp_degree
             parallel_state.initialize_speculative_draft_group(draft_tp)
-
-
-@contextmanager
-def temp_env(var, value):
-    original_value = os.environ.get(var)
-    os.environ[var] = value
-
-    try:
-        yield  # Run the code inside the `with` block
-    finally:
-        # Restore or unset the variable after the block
-        if original_value is None:
-            del os.environ[var]
-        else:
-            os.environ[var] = original_value
 
 
 class NeuronApplicationBase(torch.nn.Module):
@@ -146,16 +130,7 @@ class NeuronApplicationBase(torch.nn.Module):
         """Compiles this model and saves it to the given path."""
         self.config.save(compiled_model_path)
 
-        # Set the XLA Scaler if quantized and dytpe f8e4m3
-        if (
-            self.config.neuron_config.quantized
-            and self.config.neuron_config.quantization_dtype == "1"
-        ) or self.config.neuron_config.kv_cache_quant:
-            with temp_env("XLA_HANDLE_SPECIAL_SCALAR", "1"):
-                traced_model = self.get_builder(debug).trace(initialize_model_weights=False)
-        else:
-            traced_model = self.get_builder(debug).trace(initialize_model_weights=False)
-
+        traced_model = self.get_builder(debug).trace(initialize_model_weights=False)
         torch.jit.save(traced_model, compiled_model_path + COMPILED_MODEL_FILE_NAME)
         del traced_model
 
