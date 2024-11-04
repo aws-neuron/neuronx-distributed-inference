@@ -262,7 +262,7 @@ class BaseGroupQueryAttention(nn.Module):
             else:
                 assert (
                     tp_degree == self.tensor_model_parallel_group.size()
-                ), "TP Degree and tensor model parallel group size does not match"
+                ), f"TP Degree {tp_degree} and tensor model parallel group size {self.tensor_model_parallel_group.size()} does not match"
 
         self.hidden_size = hidden_size
         self.tp_degree = tp_degree

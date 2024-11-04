@@ -106,16 +106,14 @@ class ModelWrapper(torch.nn.Module):
         if compiler_args is None:
             self.compiler_args = (
                 "--auto-cast=none --model-type=transformer "
-                f"--tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor={self.neuron_config.cc_pipeline_tiling_factor} --vectorize-dge-dma --vectorize-strided-dma --optimize-alias-chain --no-enable-tritium-loopfusion'"
+                f"--tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor={self.neuron_config.cc_pipeline_tiling_factor} --vectorize-dge-dma --vectorize-strided-dma'"
                 " -O1 "
                 f" --internal-num-neuroncores-per-sengine={self.neuron_config.logical_neuron_cores}"
                 f" --logfile {self.compiler_workdir}/log-neuron-cc.txt"
             )
 
             if self.neuron_config.enable_fused_speculation:
-                self.compiler_args += (
-                    "--tensorizer-options='--optimize-alias-chain --no-enable-tritium-loopfusion'"
-                )
+                self.compiler_args += " --tensorizer-options='--optimize-alias-chain'"
             if self.neuron_config.target:
                 self.compiler_args += f" --target {self.neuron_config.target}"
 

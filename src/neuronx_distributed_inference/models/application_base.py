@@ -91,6 +91,7 @@ class NeuronApplicationBase(torch.nn.Module):
                 num_cores_per_group=self.config.num_cores_per_group,
                 init_custom_process_group_fn=custom_group_fn,
                 logical_neuron_cores=self.neuron_config.logical_neuron_cores,
+                weights_to_skip_layout_optimization=self.config.neuron_config.weights_to_skip_layout_optimization,
             )
             for model in self.models:
                 self._builder.add(

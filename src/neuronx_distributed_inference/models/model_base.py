@@ -521,7 +521,6 @@ class NeuronBaseModel(nn.Module):
                 if not is_lora_module(self.embed_tokens)
                 else self.embed_tokens(input_ids, adapter_ids=adapter_ids)
             )
-            inputs_embeds = self.embed_tokens(input_ids)
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device  # noqa
@@ -583,13 +582,13 @@ class NeuronBaseModel(nn.Module):
             next_decoder_cache += (layer_outputs[1],)
             cos_cache, sin_cache = layer_outputs[2:]
 
+        if not self.neuron_config.is_eagle_draft:
+            hidden_states = self.norm(hidden_states)
+
         if self.sequence_parallel_enabled:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, self.sequence_dimension, process_group=get_tp_group(self.config)
             )
-
-        if not self.neuron_config.is_eagle_draft:
-            hidden_states = self.norm(hidden_states)
 
         return (hidden_states, next_decoder_cache)
 
@@ -686,7 +685,9 @@ class NeuronFusedSpecModel(nn.Module):
             draft_outputs = model_output[0]
             draft_cache = model_output[1:]
 
-            draft_attention_mask.index_fill_(1, draft_position_id.squeeze(), 1).view(bs, -1)
+            draft_attention_mask.index_fill_(
+                1, draft_position_id.to(torch.int64).squeeze(), 1
+            ).view(bs, -1)
             new_draft_token = draft_outputs[0].view(bs, -1)
 
             candidate_input_ids = torch.cat((candidate_input_ids, new_draft_token), dim=-1)
@@ -694,7 +695,9 @@ class NeuronFusedSpecModel(nn.Module):
         # Retile the cache
         flat_draft_cache = []
         for idx in range(len(draft_cache)):
-            flat_draft_cache.append(draft_cache[idx].view(self.draft_model.kv_mgr.kv_shape))
+            # TODO once compiler fixes CR 158191111 we can turn back output tiling on
+            # flat_draft_cache.append(draft_cache[idx].view(self.draft_model.kv_mgr.kv_shape))
+            flat_draft_cache.append(draft_cache[idx])
 
         # 2. Run target model on the draft produced tokens
         outputs = self.target_model(
@@ -818,7 +821,9 @@ class NeuronFusedSpecModel(nn.Module):
             draft_cache = model_output[1:-1]
             hidden_state = model_output[-1]
 
-            draft_attention_mask.index_fill_(1, draft_position_id.squeeze(), 1).view(bs, -1)
+            draft_attention_mask.index_fill_(
+                1, draft_position_id.to(torch.int64).squeeze(), 1
+            ).view(bs, -1)
             new_draft_token = draft_outputs[0].view(bs, -1)
 
             candidate_input_ids = torch.cat((candidate_input_ids, new_draft_token), dim=-1)
@@ -853,11 +858,13 @@ class NeuronFusedSpecModel(nn.Module):
         )
         draft_cache = model_output[1:-1]
 
+        # Retile the cache
         flat_draft_cache = []
         for idx in range(len(draft_cache)):
+            # TODO once compiler fixes CR 158191111 we can turn back output tiling on
+            # flat_draft_cache.append(draft_cache[idx].view(self.draft_model.kv_mgr.kv_shape))
             flat_draft_cache.append(draft_cache[idx])
 
-        # Checking which index of hidden to alias
         index = ((~(candidate_input_ids[:, 1:] == target_tokens[:, :-1])).cumsum(dim=-1) < 1).sum()
         index = index.unsqueeze(0).expand(self.batch_size, 1, self.hidden_size)
         hidden_state = torch.gather(hidden_state, dim=1, index=index)
@@ -1238,6 +1245,12 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         medusa_args,
         llava_args,
     ):
+        # casting inputs to int32
+        input_ids = input_ids.to(torch.int32)
+        attention_mask = attention_mask.to(torch.int32)
+        position_ids = position_ids.to(torch.int32)
+        seq_ids = seq_ids.to(torch.int32)
+
         if (
             input_ids.shape[-1] > 1
             and input_ids.shape[-1] != self.neuron_config.speculation_length

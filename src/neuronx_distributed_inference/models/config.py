@@ -184,10 +184,14 @@ class NeuronConfig:
         #   Tiling the sequence dimension of the KV cache enables specific
         #   compiler optimizations like cascaded reductions
         self.kv_cache_tiling = False
-        if self.max_length > 128 and self.max_length % 128 == 0:
-            # Our tile size is 128. We can tile only if sequence length is
-            # divisible by 128.
-            self.kv_cache_tiling = True
+        if self.enable_eagle_speculation or self.enable_fused_speculation:
+            # TODO once compiler fixes CR 158191111 we can turn back output tiling on
+            # For all models. For now only use it for fused speculation that needs
+            # chaining of aliased tensors.
+            if self.max_length > 128 and self.max_length % 128 == 0:
+                # Our tile size is 128. We can tile only if sequence length is
+                # divisible by 128.
+                self.kv_cache_tiling = True
 
         # Kernels
         self.attn_kernel_enabled = kwargs.pop("attn_kernel_enabled", False)
@@ -200,6 +204,13 @@ class NeuronConfig:
         # compiler flags
         self.cc_pipeline_tiling_factor = kwargs.pop("cc_pipeline_tiling_factor", 2)
         self.target = kwargs.pop("target", None)
+
+        # weights_to_skip_layout_optimization
+        self.weights_to_skip_layout_optimization = []
+        if self.enable_eagle_speculation or self.enable_fused_speculation:
+            # In fused speculation we want LM_head to retain it
+            self.weights_to_skip_layout_optimization.append("draft_model->lm_head->weight")
+            self.weights_to_skip_layout_optimization.append("target_model->lm_head->weight")
 
         if kwargs:
             logging.warn(f"NeuronConfig init: Unexpected keyword arguments: {kwargs}")

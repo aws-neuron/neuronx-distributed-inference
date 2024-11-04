@@ -323,6 +323,11 @@ class KVCacheManager(nn.Module):
                         input=v_cache, dim=2, index=scatter_index_new, src=latest_v
                     )
 
+            # Retiling
+            # TODO once compiler fixes CR 158191111 we can turn back output tiling on
+            # k_cache = k_cache.view(cache_shape)
+            # v_cache = v_cache.view(cache_shape)
+
             updated_kv_cache.append(k_cache)
             updated_kv_cache.append(v_cache)
 

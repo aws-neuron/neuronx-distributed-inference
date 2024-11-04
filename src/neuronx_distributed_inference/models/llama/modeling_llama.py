@@ -725,6 +725,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
         self.mlp_kernel_fuse_residual_add = config.neuron_config.mlp_kernel_fuse_residual_add
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+        self.config = config
 
     def forward(
         self,
