@@ -14,6 +14,7 @@ CONFIG_FILE = "neuron_config.json"
 def to_torch_dtype(dtype_str: str) -> torch.dtype:
     dtype_mapping = {
         "float32": torch.float32,
+        "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }
     assert dtype_str in dtype_mapping, f"Unsupported dtype: {dtype_str}"

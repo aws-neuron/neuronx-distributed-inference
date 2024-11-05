@@ -462,9 +462,9 @@ class DecoderModelInstance(BaseModelInstance):
         float_model = self.model_cls(self.config, **self.kwargs)
         float_model.eval()
 
-        if self.neuron_config.torch_dtype == torch.bfloat16:
+        if self.neuron_config.torch_dtype != torch.float32:
             float_model._apply(
-                lambda t: t.bfloat16()
+                lambda t: t.to(self.neuron_config.torch_dtype)
                 if t.is_floating_point() and t.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
                 else t
             )
@@ -542,8 +542,8 @@ def get_trace_callable(model_cls, config: InferenceConfig, bucket_rank=None):
         config.neuron_config.n_positions = config.neuron_config.buckets[bucket_rank]
     float_model = model_cls(config)
     float_model.eval()
-    if config.neuron_config.torch_dtype == torch.bfloat16:
-        float_model.bfloat16()
+    if config.neuron_config.torch_dtype != torch.float32:
+        float_model.to(config.neuron_config.torch_dtype)
 
     if config.neuron_config.quantized is True:
         quantization_type = QuantizationType(config.neuron_config.quantization_type)

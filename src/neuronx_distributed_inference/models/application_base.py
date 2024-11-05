@@ -157,8 +157,9 @@ class NeuronApplicationBase(torch.nn.Module):
         self.load_weights(
             compiled_model_path, start_rank_id=start_rank_id, local_ranks_size=local_ranks_size
         )
-        if self.neuron_config.torch_dtype == torch.bfloat16:
-            self.bfloat16()
+
+        if self.neuron_config.torch_dtype != torch.float32:
+            self.to(self.neuron_config.torch_dtype)
 
         for model_wrapper in self.models:
             model_wrapper.model = self.traced_model
@@ -209,18 +210,18 @@ class NeuronApplicationBase(torch.nn.Module):
             self.__class__._FUSED_PREFIX = "target_model"
             model_sd.update(self.get_state_dict(self.model_path, self.config))
 
-            if self.neuron_config.torch_dtype == torch.bfloat16:
+            if self.neuron_config.torch_dtype != torch.float32:
                 for name, param in model_sd.items():
                     if torch.is_floating_point(param):
-                        model_sd[name] = param.bfloat16()
+                        model_sd[name] = param.to(self.neuron_config.torch_dtype)
             return model_sd
         else:
             model_sd = self.get_state_dict(self.model_path, self.config)
-            if self.neuron_config.torch_dtype == torch.bfloat16:
+            if self.neuron_config.torch_dtype != torch.float32:
                 for name, param in model_sd.items():
                     if torch.is_floating_point(param) and param.dtype not in [torch.float8_e4m3fn]:
                         # only cast floating types
-                        model_sd[name] = param.bfloat16()
+                        model_sd[name] = param.to(self.neuron_config.torch_dtype)
         return model_sd
 
     @classmethod
