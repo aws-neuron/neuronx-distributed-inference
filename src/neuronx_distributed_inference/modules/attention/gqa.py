@@ -545,7 +545,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             eps=self.rms_norm_eps,
             kernel_name="QKV",
             # Run RMSNorm inside the kernel if NOT using SP norm
-            fused_rmsnorm=fused_rmsnorm,
+            fused_rmsnorm=(fused_rmsnorm and rmsnorm is not None),
         )
         return self._split_fused_qkv(QKV)
 
