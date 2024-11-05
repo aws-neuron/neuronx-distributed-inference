@@ -415,6 +415,10 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             raise ValueError(
                 "If `eos_token_id` is defined, make sure that `pad_token_id` is defined."
             )
+        if not isinstance(eos_token_id, list):
+            eos_token_id_list = list([eos_token_id])
+        else:
+            eos_token_id_list = eos_token_id
 
         fused_assistant_kwargs = copy.deepcopy(model_kwargs)
         model_inputs = self.prepare_inputs_for_generation(input_ids, **fused_assistant_kwargs)
@@ -455,8 +459,13 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 candidate_new_tokens = draft_new_tokens[:, :-1]
 
             # 3. EOS checking
-            if eos_token_id in draft_new_tokens:
-                eos_pos = (draft_new_tokens == eos_token_id).nonzero(as_tuple=True)[0]
+            eos_pos = draft_new_tokens.shape[1]
+            for eos_token_id in eos_token_id_list:
+                if eos_token_id in draft_new_tokens:
+                    # get column indices
+                    eos_pos_cur = (draft_new_tokens == eos_token_id).nonzero(as_tuple=True)[1]
+                    eos_pos = min(torch.min(eos_pos_cur), eos_pos)
+            if eos_pos < draft_new_tokens.shape[1]:
                 candidate_new_tokens = candidate_new_tokens[:, : eos_pos + 1]
                 target_tokens = target_tokens[:, : eos_pos + 2]
 
@@ -469,8 +478,13 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             incremental_len = n_matches + 1
 
             accepted_tokens = target_tokens[:, : n_matches + 1]  # Accept bonus token from target
-            if eos_token_id in accepted_tokens:
-                eos_pos = (accepted_tokens == eos_token_id).nonzero(as_tuple=True)[0]
+            eos_pos = accepted_tokens.shape[1]
+            for eos_token_id in eos_token_id_list:
+                if eos_token_id in accepted_tokens:
+                    # get column indices
+                    eos_pos_cur = (accepted_tokens == eos_token_id).nonzero(as_tuple=True)[1]
+                    eos_pos = min(torch.min(eos_pos_cur), eos_pos)
+            if eos_pos < accepted_tokens.shape[1]:
                 end_for_all = True
                 accepted_tokens = accepted_tokens[:, : eos_pos + 1]
 
@@ -479,7 +493,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             # 5. Update with the generated token length and check for stopping condition.
             if end_for_all:
                 break
-            if returned_ids[:, -1:][0] == torch.tensor(eos_token_id):
+            if returned_ids[:, -1:][0] in torch.tensor(eos_token_id_list):
                 break
             cur_len = cur_len + n_matches + 1
             if cur_len >= max_len:
