@@ -185,11 +185,11 @@ class NeuronAttentionBase(nn.Module):
         # (i) attn_kernel_enabled is True in neuron_config
         # (ii) sequence length is large enough to get the best performance,
         # (iii) Q, K, and V have the same shape. Conditions can be changed in the future.
-        flash_attention_eligible = (
+        self.attn_kernel_enabled = (
             self.attn_kernel_enabled or q_len >= 4096
         ) and Q.shape == K_active.shape == V_active.shape
 
-        if flash_attention_eligible:
+        if self.attn_kernel_enabled:
             logger.debug(f"ATTN kernel: logical_neuron_cores={self.logical_neuron_cores}")
             # if we are using left padding, then the bzs needs be 1 (otherwise we get wrong result
             # because flash attention does not use attention_mask). In practice, we use right
