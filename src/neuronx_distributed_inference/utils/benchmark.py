@@ -1,4 +1,5 @@
 # flake8: noqa
+import copy
 import json
 import time
 from functools import partial
@@ -42,6 +43,12 @@ def benchmark_sampling(
 
     report = {}
 
+    # on_device_sampling flow does not support min_new_tokens
+    # to override eos_tokens so we remove EOS tokens to ensure
+    # token generation happens.
+    modified_generation_config = copy.deepcopy(generation_config)
+    if model.on_device_sampling:
+        modified_generation_config.eos_token_id = []
     # Benchmark E2E model
     if target in ["all", "e2e"]:
         # FIXME: fix pixel values generation
@@ -50,12 +57,11 @@ def benchmark_sampling(
         )
         input_param = {
             "input_ids": input_ids,
-            "generation_config": generation_config,
+            "generation_config": modified_generation_config,
             "attention_mask": attention_mask,
             "max_new_tokens": neuron_config.max_new_tokens,
             "top_k": 1,
             "do_sample": draft_model is None,
-            "generation_config": generation_config,
             "sampling_params": sampling_params,
         }
 
@@ -169,8 +175,8 @@ def benchmark_sampling(
 
 
 def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, image=None):
-    max_context_length = neuron_config.max_length
-    max_len = neuron_config.max_length + neuron_config.max_new_tokens
+    max_context_length = neuron_config.max_context_length
+    max_len = neuron_config.max_length
     batch_size = neuron_config.batch_size
     num_medusa_heads = neuron_config.num_medusa_heads if neuron_config.num_medusa_heads else 4
     medusa_speculation_length = (
