@@ -198,7 +198,7 @@ class ModelWrapper(torch.nn.Module):
             adapter_ids = (
                 torch.zeros((self.neuron_config.batch_size), dtype=torch.int32)
                 if self.neuron_config.lora_config is not None
-                else None
+                else torch.empty((0))
             )
             # Get the count of sampling params currently supported.
             sampling_params_len = prepare_sampling_params(1).shape[1]
@@ -215,6 +215,7 @@ class ModelWrapper(torch.nn.Module):
             )
 
             if self.is_medusa:
+                sampling_params[:, 0] = self.neuron_config.on_device_sampling_config.global_topk
                 accepted_indices = torch.zeros(
                     (self.neuron_config.batch_size, self.neuron_config.num_medusa_heads + 1),
                     dtype=torch.int32,
@@ -236,35 +237,20 @@ class ModelWrapper(torch.nn.Module):
                     dtype=torch.int32,
                 )
 
-                if self.neuron_config.lora_config is not None:
-                    inputs.append(
-                        (
-                            input_ids,
-                            attention_mask,
-                            position_ids,
-                            seq_ids,
-                            sampling_params,
-                            adapter_ids,
-                            accepted_indices,
-                            current_length,
-                            medusa_mask,
-                            scatter_index,
-                        )
+                inputs.append(
+                    (
+                        input_ids,
+                        attention_mask,
+                        position_ids,
+                        seq_ids,
+                        sampling_params,
+                        adapter_ids,
+                        accepted_indices,
+                        current_length,
+                        medusa_mask,
+                        scatter_index,
                     )
-                else:
-                    inputs.append(
-                        (
-                            input_ids,
-                            attention_mask,
-                            position_ids,
-                            seq_ids,
-                            sampling_params,
-                            accepted_indices,
-                            current_length,
-                            medusa_mask,
-                            scatter_index,
-                        )
-                    )
+                )
             else:
                 if self.neuron_config.lora_config is not None:
                     inputs.append(
@@ -275,6 +261,17 @@ class ModelWrapper(torch.nn.Module):
                             seq_ids,
                             sampling_params,
                             adapter_ids,
+                        )
+                    )
+                elif self.neuron_config.is_eagle_draft:
+                    inputs.append(
+                        (
+                            input_ids,
+                            attention_mask,
+                            position_ids,
+                            seq_ids,
+                            sampling_params,
+                            hidden_states,
                         )
                     )
                 elif self.neuron_config.is_eagle_draft:
@@ -391,8 +388,11 @@ class ModelWrapper(torch.nn.Module):
             raise RuntimeError(
                 "Forward called before load. Run load() or load_state_dict() making calling forward"
             )
-        # if adapter_ids for LoRA is None, pop it out
-        if args[6] is None:
+        if self.is_medusa:
+            # pass a filler value for adapter_ids because medusa args come after it in the arg list
+            args = (*args[:6], torch.empty((0)), *args[7:])
+        elif args[6] is None:
+            # if adapter_ids for LoRA is None, pop it out
             args = (*args[:6], *args[7:])
 
         # remove hidden state if None

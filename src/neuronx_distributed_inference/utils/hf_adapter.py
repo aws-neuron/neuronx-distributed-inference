@@ -275,6 +275,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "adapter_ids": kwargs.get("adapter_ids", None),
+                "sampling_params": kwargs.get("sampling_params", None),
                 "medusa_args": (
                     kwargs.get("accepted_indices"),
                     kwargs.get("current_length"),
@@ -732,9 +733,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             outputs = self(**model_inputs)
 
             tree_logits, tree_medusa_logits = self._extract_logits(outputs)
-
-            logits = tree_logits[0, medusa_buffers["retrieve_indices"]]
-            medusa_logits = tree_medusa_logits[:, 0, medusa_buffers["retrieve_indices"]]
+            logits = tree_logits[0, 0, medusa_buffers["retrieve_indices"]]
+            medusa_logits = tree_medusa_logits[:, 0, 0, medusa_buffers["retrieve_indices"]]
 
             best_candidate, accept_length = evaluate_posterior(logits, candidates)
             cur_len = torch.tensor([input_ids.nonzero().size(0) - 1], dtype=torch.int32)

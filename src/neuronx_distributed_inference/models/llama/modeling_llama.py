@@ -880,7 +880,7 @@ class NeuronLlamaModel(NeuronBaseModel):
             self.lm_head = ColumnParallelLinear(
                 config.hidden_size,
                 config.vocab_size,
-                gather_output=False if self.on_device_sampling else True,
+                gather_output=not self.on_device_sampling,
                 bias=False,
                 pad=True,
                 tensor_model_parallel_group=get_tp_group(config),
@@ -931,6 +931,7 @@ class NeuronLlamaModel(NeuronBaseModel):
                     medusa_head_cls(
                         config.hidden_size,
                         config.vocab_size,
+                        gather_output=not self.on_device_sampling,
                         bias=False,
                     ),
                 )

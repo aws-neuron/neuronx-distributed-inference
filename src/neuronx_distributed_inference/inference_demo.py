@@ -78,6 +78,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # Generation
     run_parser.add_argument("--prompt", dest="prompts", type=str, action="append", required=True)
     run_parser.add_argument("--top-k", type=int, default=1)
+    run_parser.add_argument("--global-topk", type=int)
     run_parser.add_argument("--do-sample", action="store_true", default=True)
     run_parser.add_argument("--pad-token-id", type=int, default=0)
 

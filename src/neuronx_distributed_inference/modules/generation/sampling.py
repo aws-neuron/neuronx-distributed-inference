@@ -89,9 +89,9 @@ class Sampler(torch.nn.Module):
         else:
             sorted_logits, indeces = torch.sort(input=logits, dim=dim, descending=True)
 
-        batch_size, vocab_size = sorted_logits.size()
+        vocab_size = sorted_logits.shape[-1]
         mask = torch.arange(vocab_size, device=logits.device)
-        mask = mask.broadcast_to(batch_size, vocab_size)
+        mask = mask.broadcast_to(*sorted_logits.shape)
 
         mask = torch.greater_equal(mask, top_k)
         sorted_logits = sorted_logits.masked_fill_(mask, self.IGNORED_LOGITS_VALUE)
@@ -122,7 +122,8 @@ class Sampler(torch.nn.Module):
         forward to perform topk, topp, temperature and multinomial sampling.
 
         Inputs:
-            token_logits: tensor of size (Batch Size, Vocabulary Size)
+            token_logits: tensor whose first dimension is Batch Size
+                and whose final dimension is Vocabulary Size
             sampling_params: a 2D tensor of size (Batch Size, 3)
             containing the following sampling params:
                 * top_k: value to use for top_k sampling
@@ -138,13 +139,11 @@ class Sampler(torch.nn.Module):
         validation steps, which is content dependent. Hence we implement multinomial
         distribution here instead.
         """
-        # token_logits has dimensions (batch-size, vocabulary-length)
-        # we do all aperations on dim=1
-        batch_size, _ = token_logits.size()
+        batch_size = token_logits.shape[0]
         top_k = sampling_params[:, 0].reshape(batch_size, 1)
         top_p = sampling_params[:, 1].reshape(batch_size, 1)
         temperature = sampling_params[:, 2].reshape(batch_size, 1)
-        dim = 1  # batch_size dimension
+        dim = len(token_logits.shape) - 1  #  vocab_size dimension
 
         if (not self.do_sample) or (
             not self.dynamic and torch.all(top_k <= 1)
@@ -161,7 +160,9 @@ class Sampler(torch.nn.Module):
                     process_group=self.process_group,
                 )
 
-        top_k_logits_values, top_k_logits_indices = self._top_k_masked(token_logits, top_k, 1)
+        top_k_logits_values, top_k_logits_indices = self._top_k_masked(token_logits, top_k, dim)
+        if self.is_medusa:
+            return top_k_logits_indices
 
         if self.dynamic or torch.any(temperature != 1.0):
             top_k_logits_values = torch.divide(top_k_logits_values, temperature)

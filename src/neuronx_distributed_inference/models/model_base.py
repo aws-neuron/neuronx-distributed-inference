@@ -205,7 +205,10 @@ class NeuronBaseModel(nn.Module):
         medusa_mask=None,
         scatter_index=None,
     ):
-        is_for_context_encoding = 1 < input_ids.shape[-1] != self.medusa_speculation_length
+        is_for_context_encoding = (
+            input_ids.shape[-1] > 1
+            and input_ids.shape[-1] != self.medusa_speculation_length
+        )
         is_for_medusa_speculation = input_ids.shape[-1] == self.medusa_speculation_length
 
         # It is either for context encoding or for token generation
@@ -240,7 +243,6 @@ class NeuronBaseModel(nn.Module):
             past_key_values=past_key_values,
             active_mask=active_mask,
             adapter_ids=adapter_ids,
-            sampling_params=sampling_params,
         )
 
         updated_kv_cache = self.kv_mgr.update_cache(
@@ -277,11 +279,10 @@ class NeuronBaseModel(nn.Module):
 
         medusa_logits = [logits] + [
             head(hidden_states).float()
-            for head in [getattr(self, f"medusa_head_{i}") for i in range(self.num_medusa_heads)]
+            for head in [getattr(self, f"medusa_head_{i}") for i in range(self.neuron_config.num_medusa_heads)]
         ]
         stacked_logits = torch.stack(medusa_logits, dim=0)
 
-        res = logits
         if is_for_context_encoding:
             result = [
                 self.sampler(stacked_logits[i : i + 1, -1, :].squeeze(0), sampling_params)
@@ -289,14 +290,11 @@ class NeuronBaseModel(nn.Module):
             ]
             res = torch.stack(result, dim=0)  # 5, 1, 10
         else:
-            results = []
-            for i in range(stacked_logits.shape[1]):
-                result = [
-                    self.sampler(stacked_logits[j : j + 1, i, :].squeeze(0), sampling_params)
-                    for j in range(self.neuron_config.num_medusa_heads + 1)
-                ]
-                res = torch.stack(result, dim=0)
-                results.append(res)
+            result = [
+                self.sampler(stacked_logits[i : i + 1].squeeze(0), sampling_params)
+                for i in range(self.neuron_config.num_medusa_heads + 1)
+            ]
+            res = torch.stack(result, dim=0)  # 5, 1, 64, 10
 
         return [res] + updated_kv_cache
 
@@ -342,6 +340,7 @@ class NeuronBaseModel(nn.Module):
                 attention_mask,
                 position_ids,
                 seq_ids,
+                sampling_params,
                 adapter_ids,
                 accepted_indices,
                 current_length,
@@ -349,7 +348,10 @@ class NeuronBaseModel(nn.Module):
                 scatter_index,
             )
 
-        is_for_context_encoding = 1 < input_ids.shape[-1] != self.speculation_length
+        is_for_context_encoding = (
+            input_ids.shape[-1] > 1
+            and input_ids.shape[-1] != self.speculation_length
+        )
         is_for_speculation = input_ids.shape[-1] == self.speculation_length
 
         cache_size = (
@@ -1329,7 +1331,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             is_run_on_neuron = self.speculation_model.is_neuron()
         elif input_ids.shape[-1] == self.neuron_config.medusa_speculation_length:
             outputs = self.medusa_speculation_model(
-                input_ids, attention_mask, position_ids, seq_ids, sampling_params, *medusa_args
+                input_ids, attention_mask, position_ids, seq_ids, sampling_params, adapter_ids, *medusa_args
             )
             is_run_on_neuron = self.medusa_speculation_model.is_neuron()
         else:
