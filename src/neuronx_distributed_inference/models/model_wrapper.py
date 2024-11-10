@@ -198,7 +198,7 @@ class ModelWrapper(torch.nn.Module):
             adapter_ids = (
                 torch.zeros((self.neuron_config.batch_size), dtype=torch.int32)
                 if self.neuron_config.lora_config is not None
-                else torch.empty((0))
+                else None
             )
             # Get the count of sampling params currently supported.
             sampling_params_len = prepare_sampling_params(1).shape[1]
@@ -244,7 +244,8 @@ class ModelWrapper(torch.nn.Module):
                         position_ids,
                         seq_ids,
                         sampling_params,
-                        adapter_ids,
+                        torch.empty((0)),  # prev_hidden
+                        torch.empty((0)),  # adapter_ids
                         accepted_indices,
                         current_length,
                         medusa_mask,
@@ -388,10 +389,8 @@ class ModelWrapper(torch.nn.Module):
             raise RuntimeError(
                 "Forward called before load. Run load() or load_state_dict() making calling forward"
             )
-        if self.is_medusa:
-            # pass a filler value for adapter_ids because medusa args come after it in the arg list
-            args = (*args[:6], torch.empty((0)), *args[7:])
-        elif args[6] is None:
+        
+        if args[6] is None:
             # if adapter_ids for LoRA is None, pop it out
             args = (*args[:6], *args[7:])
 
