@@ -100,6 +100,10 @@ def get_generate_outputs_from_token_ids(
 def get_generate_outputs(
     model, prompts, tokenizer, is_hf=False, draft_model=None, device="neuron", **generate_kwargs
 ):
+    if model.neuron_config.enable_fused_speculation:
+        generate_kwargs.update({"do_sample": False})
+        generate_kwargs.update({"prompt_lookup_num_tokens": model.neuron_config.speculation_length})
+
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if is_hf:
@@ -160,6 +164,7 @@ def check_accuracy(
     tokenizer: PreTrainedTokenizer,
     generation_config: Optional[GenerationConfig] = None,
     expected_token_ids: Optional[List] = None,
+    num_tokens_to_check: int = None,
     do_sample: bool = True,
     draft_model: PreTrainedModel = None,
     prompt: Optional[str] = None,
@@ -202,8 +207,6 @@ def check_accuracy(
         )
 
     print(f"Expected output: {outputs_expected}")
-    if neuron_config.enable_fused_speculation:
-        generation_kwargs.update({"do_sample": False})
 
     async_modes_to_test = get_async_modes_to_test(execution_mode, neuron_model)
     for async_mode in async_modes_to_test:
@@ -224,7 +227,14 @@ def check_accuracy(
         pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token) if tokenizer else 0
         output_token_ids = output_token_ids[output_token_ids != pad_token_id]
         expected_token_ids = expected_token_ids[expected_token_ids != pad_token_id]
-        if draft_model is not None:
+        if num_tokens_to_check is not None:
+            print(f"Validating the first {num_tokens_to_check} tokens")
+            expected_token_ids = expected_token_ids[:num_tokens_to_check]
+            output_token_ids = output_token_ids[:num_tokens_to_check]
+
+        if (
+            draft_model is not None or neuron_config.enable_fused_speculation
+        ) and num_tokens_to_check is not None:
             # Handle corner scenario where last few tokens are not generated as part of speculation.
             assert (
                 abs(expected_token_ids.shape[-1] - output_token_ids.shape[-1])

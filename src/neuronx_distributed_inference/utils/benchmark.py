@@ -61,7 +61,7 @@ def benchmark_sampling(
             "attention_mask": attention_mask,
             "max_new_tokens": neuron_config.max_new_tokens,
             "top_k": 1,
-            "do_sample": draft_model is None,
+            "do_sample": draft_model is None and not neuron_config.enable_fused_speculation,
             "sampling_params": sampling_params,
         }
 
@@ -71,6 +71,9 @@ def benchmark_sampling(
                 num_assistant_tokens=model.neuron_config.speculation_length
             )
             input_param["assistant_model"] = hf_draft_model
+
+        if model.neuron_config.enable_fused_speculation:
+            input_param["prompt_lookup_num_tokens"] = model.neuron_config.speculation_length
 
         if pixel_values is not None:
             input_param["pixel_values"] = pixel_values
