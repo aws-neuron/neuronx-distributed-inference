@@ -215,7 +215,12 @@ class ModelWrapper(torch.nn.Module):
             )
 
             if self.is_medusa:
-                sampling_params[:, 0] = self.neuron_config.on_device_sampling_config.global_topk
+                assert (
+                    self.neuron_config.on_device_sampling_config
+                ), "Medusa speculation must use on-device sampling"
+                # Set top_k to signal to the sampler that we're not doing greedy sampling.
+                # This affects the output shape for Medusa speculation
+                sampling_params[:, 0] = self.neuron_config.on_device_sampling_config.top_k
                 accepted_indices = torch.zeros(
                     (self.neuron_config.batch_size, self.neuron_config.num_medusa_heads + 1),
                     dtype=torch.int32,

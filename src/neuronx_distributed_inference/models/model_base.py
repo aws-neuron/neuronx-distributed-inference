@@ -1269,7 +1269,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     seq_ids,
                     sampling_params,
                     torch.empty((0)),  # prev_hidden
-                    torch.empty((0)),  # adapted_ids
+                    torch.empty((0)),  # adapter_ids
                     *medusa_args,
                 )
             else:
@@ -1338,7 +1338,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 seq_ids,
                 sampling_params,
                 torch.empty((0)),  # prev_hidden
-                torch.empty((0)),  # adapted_ids
+                torch.empty((0)),  # adapter_ids
                 *medusa_args,
             )
             is_run_on_neuron = self.medusa_speculation_model.is_neuron()
