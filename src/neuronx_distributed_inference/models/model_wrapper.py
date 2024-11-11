@@ -389,7 +389,7 @@ class ModelWrapper(torch.nn.Module):
             raise RuntimeError(
                 "Forward called before load. Run load() or load_state_dict() making calling forward"
             )
-        
+
         if args[6] is None:
             # if adapter_ids for LoRA is None, pop it out
             args = (*args[:6], *args[7:])

@@ -206,8 +206,7 @@ class NeuronBaseModel(nn.Module):
         scatter_index=None,
     ):
         is_for_context_encoding = (
-            input_ids.shape[-1] > 1
-            and input_ids.shape[-1] != self.medusa_speculation_length
+            input_ids.shape[-1] > 1 and input_ids.shape[-1] != self.medusa_speculation_length
         )
         is_for_medusa_speculation = input_ids.shape[-1] == self.medusa_speculation_length
 
@@ -279,7 +278,10 @@ class NeuronBaseModel(nn.Module):
 
         medusa_logits = [logits] + [
             head(hidden_states).float()
-            for head in [getattr(self, f"medusa_head_{i}") for i in range(self.neuron_config.num_medusa_heads)]
+            for head in [
+                getattr(self, f"medusa_head_{i}")
+                for i in range(self.neuron_config.num_medusa_heads)
+            ]
         ]
         stacked_logits = torch.stack(medusa_logits, dim=0)
 
@@ -349,8 +351,7 @@ class NeuronBaseModel(nn.Module):
             )
 
         is_for_context_encoding = (
-            input_ids.shape[-1] > 1
-            and input_ids.shape[-1] != self.speculation_length
+            input_ids.shape[-1] > 1 and input_ids.shape[-1] != self.speculation_length
         )
         is_for_speculation = input_ids.shape[-1] == self.speculation_length
 
@@ -1338,7 +1339,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 sampling_params,
                 torch.empty((0)),  # prev_hidden
                 torch.empty((0)),  # adapted_ids
-                *medusa_args
+                *medusa_args,
             )
             is_run_on_neuron = self.medusa_speculation_model.is_neuron()
         else:

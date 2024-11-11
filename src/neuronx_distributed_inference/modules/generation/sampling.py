@@ -143,7 +143,7 @@ class Sampler(torch.nn.Module):
         top_k = sampling_params[:, 0].reshape(batch_size, 1)
         top_p = sampling_params[:, 1].reshape(batch_size, 1)
         temperature = sampling_params[:, 2].reshape(batch_size, 1)
-        dim = len(token_logits.shape) - 1  #  vocab_size dimension
+        dim = len(token_logits.shape) - 1  # vocab_size dimension
 
         if (not self.do_sample) or (
             not self.dynamic and torch.all(top_k <= 1)
