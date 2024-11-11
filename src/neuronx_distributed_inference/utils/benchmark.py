@@ -189,7 +189,7 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
     sample_inputs = None
     if model_type == END_TO_END_MODEL:
         input_ids = torch.randint(0, 100, (batch_size, max_context_length))
-        attention_mask = torch.zeros((batch_size, max_context_length), dtype=torch.int32)
+        attention_mask = torch.ones((batch_size, max_context_length), dtype=torch.int32)
         assert (
             image is None
         ), "image is not supported currently for benchmarking for END_TO_END_MODEL"

@@ -1260,11 +1260,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         position_ids = position_ids.to(torch.int32)
         seq_ids = seq_ids.to(torch.int32)
 
-        if (
-            input_ids.shape[-1] > 1
-            and input_ids.shape[-1] != self.neuron_config.speculation_length
-            and input_ids.shape[-1] != self.neuron_config.medusa_speculation_length
-        ):
+        if input_ids.shape[-1] > 1 and not position_ids.min().item():
             if self.neuron_config.is_medusa:
                 medusa_args = self._prepare_inputs()
                 outputs = self.context_encoding_model(
