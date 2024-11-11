@@ -214,10 +214,6 @@ class NeuronConfig:
 
         # weights_to_skip_layout_optimization
         self.weights_to_skip_layout_optimization = []
-        if self.enable_eagle_speculation or self.enable_fused_speculation:
-            # In fused speculation we want LM_head to retain it
-            self.weights_to_skip_layout_optimization.append("draft_model->lm_head->weight")
-            self.weights_to_skip_layout_optimization.append("target_model->lm_head->weight")
 
         if kwargs:
             logging.warn(f"NeuronConfig init: Unexpected keyword arguments: {kwargs}")
