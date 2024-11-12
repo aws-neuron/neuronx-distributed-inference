@@ -227,7 +227,8 @@ class NeuronAttentionBase(nn.Module):
             logger.debug(f"V input shape {V_active.shape}")
             logger.debug(f"Attn output shape {attn_output.shape}")
 
-            if int(self.logical_neuron_cores) > 1:
+            # Grid implementation requires seq_len to be divisible by 1024.
+            if int(self.logical_neuron_cores) > 1 and q_len % 1024:
                 grid = (vnc(self.logical_neuron_cores),)
 
                 _flash_fwd_call[grid](
