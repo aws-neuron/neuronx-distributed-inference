@@ -128,7 +128,7 @@ class NeuronApplicationBase(torch.nn.Module):
         """Gets the Neuron compiler arguments to use when compiling this model."""
         return None
 
-    def compile(self, compiled_model_path, debug=False):
+    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None):
         """Compiles this model and saves it to the given path."""
         self.config.save(compiled_model_path)
 
@@ -137,6 +137,9 @@ class NeuronApplicationBase(torch.nn.Module):
         del traced_model
 
         sharded_checkpoint_dir = os.path.join(compiled_model_path, "weights/")
+        if pre_shard_weights_hook:
+            pre_shard_weights_hook(self)
+
         if not self.neuron_config.save_sharded_checkpoint:
             logger.info(
                 f"SKIPPING sharding the checkpoint at {sharded_checkpoint_dir}, assuming it's already sharded"
