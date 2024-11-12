@@ -280,17 +280,6 @@ class ModelWrapper(torch.nn.Module):
                             hidden_states,
                         )
                     )
-                elif self.neuron_config.is_eagle_draft:
-                    inputs.append(
-                        (
-                            input_ids,
-                            attention_mask,
-                            position_ids,
-                            seq_ids,
-                            sampling_params,
-                            hidden_states,
-                        )
-                    )
                 else:
                     inputs.append(
                         (input_ids, attention_mask, position_ids, seq_ids, sampling_params)

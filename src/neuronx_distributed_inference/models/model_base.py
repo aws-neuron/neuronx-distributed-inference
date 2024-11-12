@@ -205,6 +205,8 @@ class NeuronBaseModel(nn.Module):
         medusa_mask=None,
         scatter_index=None,
     ):
+        # TODO: This will not work for a context encoding model with bucket size
+        # equal to the medusa speculation length
         is_for_context_encoding = (
             input_ids.shape[-1] > 1 and input_ids.shape[-1] != self.medusa_speculation_length
         )
@@ -350,6 +352,8 @@ class NeuronBaseModel(nn.Module):
                 scatter_index,
             )
 
+        # TODO: This will not work for a context encoding model with bucket size
+        # equal to the speculation length
         is_for_context_encoding = (
             input_ids.shape[-1] > 1 and input_ids.shape[-1] != self.speculation_length
         )
