@@ -366,10 +366,10 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     dtype=dtype,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
-                if self.qkv_kernel_enabled:
-                    # we need to transpose the weights on the CPU side to avoid
-                    # needing to transpose on the device when using QKV kernel
-                    self.Wqkv.weight = transpose_parallel_linear_layer(self.Wqkv.weight)
+                # if self.qkv_kernel_enabled:
+                #     # we need to transpose the weights on the CPU side to avoid
+                #     # needing to transpose on the device when using QKV kernel
+                #     self.Wqkv.weight = transpose_parallel_linear_layer(self.Wqkv.weight)
 
                 # Set heads info as weight parameter attributes to be used in weights sharding
                 setattr(self.Wqkv.weight, "fused_qkv", True)
@@ -505,10 +505,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         logger.debug(
             f"QKV kernel: fused_rmsnorm={fused_rmsnorm} logical_neuron_cores={self.logical_neuron_cores}"
         )
-
         bs, seqlen, h = hidden_states.shape
 
-        h2, fused_qkv_size = self.Wqkv.weight.shape
+        h2, fused_qkv_size = self.Wqkv.weight.T.shape
         logger.debug(
             f"fused QKV projection weight - shape: {self.Wqkv.weight.shape}, dtype: {self.Wqkv.weight.dtype}"
         )
@@ -535,7 +534,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         # the QKV kernel will automatically switch to the TKG QKV if seqlen==1
         _traced_qkv_kernel[grid](
             hidden_states,
-            self.Wqkv.weight,
+            self.Wqkv.weight.T,
             # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
             # should be fine to pass this is as a dummy even if not using fused rmsnorm
             rmsnorm.weight.unsqueeze(0)
