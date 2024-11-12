@@ -293,7 +293,7 @@ def check_accuracy_logits(
     expected_attention_mask = torch.ones(
         (
             initial_attention_mask.shape[0],
-            expected_token_ids.shape[1] - initial_attention_mask.shape[1],
+            expected_token_ids.shape[1],
         ),
         dtype=torch.int32,
     )
