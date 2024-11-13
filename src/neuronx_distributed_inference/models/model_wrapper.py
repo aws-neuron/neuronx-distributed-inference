@@ -109,6 +109,7 @@ class ModelWrapper(torch.nn.Module):
                 f"--cc-pipeline-tiling-factor={self.neuron_config.cc_pipeline_tiling_factor} "
                 "--vectorize-dge-dma "
                 "--vectorize-strided-dma "
+                "--allow-rmsnorm-cascaded-reduce "
             )
 
             if self.neuron_config.enable_fused_speculation:
