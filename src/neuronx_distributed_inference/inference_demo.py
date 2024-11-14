@@ -132,6 +132,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--compiled-draft-model-path", type=str)
     run_parser.add_argument("--enable-fused-speculation", action="store_true", default=False)
     run_parser.add_argument("--enable-eagle-speculation", action="store_true", default=False)
+    run_parser.add_argument("--enable-eagle-draft-input-norm", action="store_true", default=False)
 
     run_parser.add_argument(
         "--no-trace-tokengen-model", dest="trace_tokengen_model", action="store_false"

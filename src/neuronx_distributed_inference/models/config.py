@@ -130,6 +130,7 @@ class NeuronConfig:
         self.enable_fused_speculation = kwargs.pop("enable_fused_speculation", False)
         self.enable_eagle_speculation = kwargs.pop("enable_eagle_speculation", False)
         self.is_eagle_draft = kwargs.pop("is_eagle_draft", False)
+        self.enable_eagle_draft_input_norm = kwargs.pop("enable_eagle_draft_input_norm", False)
 
         if self.enable_eagle_speculation:
             self.enable_fused_speculation = True

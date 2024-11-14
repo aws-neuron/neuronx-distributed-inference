@@ -740,7 +740,10 @@ class NeuronLlamaDecoderLayer(nn.Module):
             f"Instantiating RMSNorm modules with hidden size {config.hidden_size} and EPS {config.rms_norm_eps}"
         )
         self.input_layernorm = None
-        if not config.neuron_config.is_eagle_draft:
+        if (
+            not config.neuron_config.is_eagle_draft
+            or config.neuron_config.enable_eagle_draft_input_norm
+        ):
             self.input_layernorm = get_rmsnorm_cls()(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
