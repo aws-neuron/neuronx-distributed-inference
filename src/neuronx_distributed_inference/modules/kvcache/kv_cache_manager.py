@@ -66,7 +66,7 @@ class KVCacheManager(nn.Module):
         dtype = config.neuron_config.torch_dtype
         if self.quant:
             self.quant_dtype = torch.float8_e4m3fn
-            self.dequant_dtype = torch.bfloat16
+            self.dequant_dtype = dtype
         self.past_key_values = nn.ParameterList(
             [
                 nn.Parameter(torch.zeros(self.kv_shape, dtype=dtype), requires_grad=False)
