@@ -793,7 +793,7 @@ class NeuronFusedSpecModel(nn.Module):
         )
         draft_attention_mask = torch.scatter(draft_attention_mask, 1, scatter_index, zeros)
 
-        hidden_state = self.hidden_state
+        orig_hidden = hidden_state
         draft_cache = None
         for i in range(spec_len - 1):
             draft_position_id = draft_position_ids[:, i : i + 1] + i
@@ -847,6 +847,7 @@ class NeuronFusedSpecModel(nn.Module):
         target_tokens = outputs[0]
         target_cache = outputs[1:-1]
         hidden_state = outputs[-1]
+        prev_hidden = torch.cat([orig_hidden, hidden_state[:, : spec_len - 1, :]], dim=1)
 
         reshaped_cache = []
         for i in range(0, len(draft_cache), 2):
@@ -861,7 +862,7 @@ class NeuronFusedSpecModel(nn.Module):
             target_position_ids - 1,
             seq_ids,
             sampling_params,
-            prev_hidden=hidden_state,
+            prev_hidden=prev_hidden,
             kv_cache=draft_cache,
         )
         draft_cache = model_output[1:-1]
