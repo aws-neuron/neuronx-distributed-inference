@@ -1,5 +1,7 @@
 import logging
 import math
+import warnings
+from enum import Enum
 from typing import Optional, Tuple
 
 import torch
@@ -33,6 +35,12 @@ from .gqa import GQA, GroupQueryAttention_O, GroupQueryAttention_QKV  # noqa: E4
 logger = logging.getLogger("Neuron")
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
+
+
+class FlashAttentionStrategy(Enum):
+    NONE = 0
+    UNSHARDED_KERNEL = 1
+    SHARDED_KERNEL = 2
 
 
 class NeuronAttentionBase(nn.Module):
@@ -181,15 +189,10 @@ class NeuronAttentionBase(nn.Module):
         K_active = repeat_kv(K, self.num_key_value_groups)
         V_active = repeat_kv(V, self.num_key_value_groups)
 
-        # use flash attention if
-        # (i) attn_kernel_enabled is True in neuron_config
-        # (ii) sequence length is large enough to get the best performance,
-        # (iii) Q, K, and V have the same shape. Conditions can be changed in the future.
-        self.attn_kernel_enabled = (
-            self.attn_kernel_enabled or q_len >= 4096
-        ) and Q.shape == K_active.shape == V_active.shape
+        flash_attn_strategy = self.get_flash_attention_strategy(q_len)
+        logger.debug(f"Flash attention strategy: {flash_attn_strategy}")
 
-        if self.attn_kernel_enabled:
+        if flash_attn_strategy != FlashAttentionStrategy.NONE:
             logger.debug(f"ATTN kernel: logical_neuron_cores={self.logical_neuron_cores}")
             # if we are using left padding, then the bzs needs be 1 (otherwise we get wrong result
             # because flash attention does not use attention_mask). In practice, we use right
@@ -227,8 +230,7 @@ class NeuronAttentionBase(nn.Module):
             logger.debug(f"V input shape {V_active.shape}")
             logger.debug(f"Attn output shape {attn_output.shape}")
 
-            # Grid implementation requires seq_len to be divisible by 1024.
-            if int(self.logical_neuron_cores) > 1 and q_len % 1024:
+            if flash_attn_strategy == FlashAttentionStrategy.SHARDED_KERNEL:
                 grid = (vnc(self.logical_neuron_cores),)
 
                 _flash_fwd_call[grid](
@@ -239,8 +241,7 @@ class NeuronAttentionBase(nn.Module):
                     attn_output,
                     kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
                 )
-            else:
-                # attention kernel does not support passing in a grid for LNC=1
+            elif flash_attn_strategy == FlashAttentionStrategy.UNSHARDED_KERNEL:
                 _flash_fwd_call(
                     Q,
                     K_active,
@@ -249,6 +250,9 @@ class NeuronAttentionBase(nn.Module):
                     attn_output,
                     kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
                 )
+            else:
+                raise ValueError(f"Invalid flash attention strategy: {flash_attn_strategy}")
+
             # shape: BHDS
             attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
             logger.debug(f"Attn output after reshape {attn_output.shape}")
@@ -260,7 +264,45 @@ class NeuronAttentionBase(nn.Module):
                 Q.dtype
             )
             attn_output = torch.matmul(active_scores, V_active)
-        return attn_output
+        return attn_output, flash_attn_strategy
+
+    def get_flash_attention_strategy(self, q_len) -> FlashAttentionStrategy:
+        """
+        Gets the flash attention strategy.
+
+        For LNC1, use the unsharded kernel if sequence length is at least 4096 to get the best performance.
+        The unsharded kernel requires a sequence length of at least 512.
+
+        For LNC2, use the sharded kernel if sequence length is divisible by 1024. Otherwise, use no
+        kernel, because the unsharded kernel has worse performance than no kernel.
+        The sharded kernel requires a sequence length of at least 1024.
+
+        These constraints may change later.
+
+        TODO: Throw an exception instead of disabling flash attention if explicitly enabled but not eligible.
+              This must consider bucketing to avoid throwing an exception for smaller buckets.
+        """
+        if int(self.logical_neuron_cores) > 1:
+            if q_len < 1024:
+                return FlashAttentionStrategy.NONE
+
+            if q_len % 1024 == 0:
+                return FlashAttentionStrategy.SHARDED_KERNEL
+            else:
+                warnings.warn(
+                    "Flash attention disabled. LNC2 requires seq_len % 1024 for flash attn to be performant"
+                )
+                return FlashAttentionStrategy.NONE
+
+        # If seq_len is at least 4096, enable flash attn automatically to improve performance.
+        if q_len >= 4096:
+            return FlashAttentionStrategy.UNSHARDED_KERNEL
+
+        # At lower seq lens, enable only if explicitly enabled.
+        if self.attn_kernel_enabled and q_len >= 512:
+            return FlashAttentionStrategy.UNSHARDED_KERNEL
+
+        return FlashAttentionStrategy.NONE
 
     def compute_for_flash_decoding(
         self, Q, K, V, past_key_value, attention_mask, active_mask
@@ -359,8 +401,11 @@ class NeuronAttentionBase(nn.Module):
             rmsnorm=rmsnorm,
         )
 
+        flash_attn_strategy = FlashAttentionStrategy.NONE
         if past_key_value is None:
-            attn_output = self.perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+            attn_output, flash_attn_strategy = self.perform_prefill(
+                Q, K, V, q_len, bsz, attention_mask
+            )
             if self.flash_decoding_enabled:
                 assert self.qkv_proj.sharding_strategy == GQA.REPLICATE_TO_TP_DEGREE, (
                     "Flash decoding lives in the context of GQA (grouped query attention) and traditional MHA "
@@ -406,7 +451,7 @@ class NeuronAttentionBase(nn.Module):
                     Q, K, V, position_ids, past_key_value, attention_mask, active_mask
                 )
 
-        if self.attn_kernel_enabled and past_key_value is None:
+        if flash_attn_strategy != FlashAttentionStrategy.NONE:
             # transpose BHDS -> BSHD
             # this layout avoids additional transposes between attention kernel and output projection
             attn_output = attn_output.permute(0, 3, 1, 2)
