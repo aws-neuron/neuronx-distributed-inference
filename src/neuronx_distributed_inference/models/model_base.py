@@ -981,9 +981,12 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 self.neuron_config.max_length, self.neuron_config.max_length
             )
         else:
-            # new_config.neuron_config.buckets = generate_buckets(128, self.neuron_config.max_length)
-            new_config.neuron_config.buckets = [12800]
-            # new_config.neuron_config.buckets = [11520]
+            if new_config.neuron_config.token_generation_buckets is not None:
+                new_config.neuron_config.buckets = new_config.neuron_config.token_generation_buckets
+            else:
+                new_config.neuron_config.buckets = generate_buckets(
+                    128, self.neuron_config.max_length
+                )
 
         # Explicitly turn off sequence parallel for token generation
         new_config.neuron_config.sequence_parallel_enabled = False
@@ -1005,21 +1008,19 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         new_config.neuron_config.n_active_tokens = self.neuron_config.max_context_length
         new_config.neuron_config.bucket_n_active_tokens = True
 
-        # Turn on QKV kernel only for CTE
-        new_config.neuron_config.qkv_kernel_enabled = True
-
         if not new_config.neuron_config.enable_bucketing:
             new_config.neuron_config.buckets = generate_buckets(
                 new_config.neuron_config.max_context_length,
                 new_config.neuron_config.max_context_length,
             )
         else:
-            # new_config.neuron_config.buckets = generate_buckets(
-            #     128, new_config.neuron_config.max_context_length
-            # )
-            new_config.neuron_config.buckets = [1024, 2048, 4096, 10240, 11264]
-            # new_config.neuron_config.buckets = [10240]
-            
+            if new_config.neuron_config.context_encoding_buckets is not None:
+                new_config.neuron_config.buckets = new_config.neuron_config.context_encoding_buckets
+            else:
+                new_config.neuron_config.buckets = generate_buckets(
+                    128, new_config.neuron_config.max_context_length
+                )
+
         self.context_encoding_model = self.model_wrapper(
             config=new_config,
             model_cls=self._model_cls,
@@ -1041,7 +1042,12 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 self.neuron_config.max_length, self.neuron_config.max_length
             )
         else:
-            new_config.neuron_config.buckets = generate_buckets(128, self.neuron_config.max_length)
+            if new_config.neuron_config.token_generation_buckets is not None:
+                new_config.neuron_config.buckets = new_config.neuron_config.token_generation_buckets
+            else:
+                new_config.neuron_config.buckets = generate_buckets(
+                    128, self.neuron_config.max_length
+                )
 
         # shouldn't be used in token gen models
         new_config.neuron_config.sequence_parallel_enabled = False
@@ -1069,7 +1075,12 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 self.neuron_config.max_length, self.neuron_config.max_length
             )
         else:
-            new_config.neuron_config.buckets = generate_buckets(128, self.neuron_config.max_length)
+            if new_config.neuron_config.token_generation_buckets is not None:
+                new_config.neuron_config.buckets = new_config.neuron_config.token_generation_buckets
+            else:
+                new_config.neuron_config.buckets = generate_buckets(
+                    128, self.neuron_config.max_length
+                )
 
         self.speculation_model = self.model_wrapper(
             config=new_config,

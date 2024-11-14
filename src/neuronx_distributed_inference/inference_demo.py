@@ -114,6 +114,8 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # Bucketing
     run_parser.add_argument("--enable-bucketing", action="store_true")
     run_parser.add_argument("--bucket-n-active-tokens", action="store_true")
+    run_parser.add_argument("--context-encoding-buckets", nargs="+", type=int)
+    run_parser.add_argument("--token-generation-buckets", nargs="+", type=int)
 
     # Quantization
     run_parser.add_argument("--quantized", action="store_true")
