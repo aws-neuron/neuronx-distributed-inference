@@ -40,25 +40,29 @@ def get_generate_outputs_from_token_ids(
     draft_model=None,
     **generate_kwargs,
 ):
-    if draft_model is not None and not is_hf:
-        # TODO: Fix draft model support on HF. HF supports speculative decoding, but output is garbage currently.
-        #       The current check_accuracy behavior (compare Neuron w/ speculation against HF w/o speculation)
-        #       is consistent with the old runner.py implementation.
-        assert not is_hf, "Draft model not supported for generating on HF"
-        draft_generation_model = HuggingFaceGenerationAdapter(draft_model)
-        draft_generation_model.generation_config.update(
-            num_assistant_tokens=model.neuron_config.speculation_length
-        )
+    if not is_hf:
+        # Update generation kwargs to run Neuron model.
+        if draft_model is not None:
+            draft_generation_model = HuggingFaceGenerationAdapter(draft_model)
+            draft_generation_model.generation_config.update(
+                num_assistant_tokens=model.neuron_config.speculation_length
+            )
 
-        generate_kwargs.update(
-            {
-                "assistant_model": draft_generation_model,
-                "do_sample": False,
-            }
-        )
+            generate_kwargs.update(
+                {
+                    "assistant_model": draft_generation_model,
+                    "do_sample": False,
+                }
+            )
+        elif model.neuron_config.enable_fused_speculation:
+            generate_kwargs.update(
+                {
+                    "prompt_lookup_num_tokens": model.neuron_config.speculation_length,
+                    "do_sample": False,
+                }
+            )
 
     # If an attention mask is provided, the inputs are also expected to be padded to the correct shape.
-
     if attention_mask is None:
         print("attention mask not provided, padding inputs and generating a mask")
 
@@ -100,10 +104,6 @@ def get_generate_outputs_from_token_ids(
 def get_generate_outputs(
     model, prompts, tokenizer, is_hf=False, draft_model=None, device="neuron", **generate_kwargs
 ):
-    if model.neuron_config.enable_fused_speculation:
-        generate_kwargs.update({"do_sample": False})
-        generate_kwargs.update({"prompt_lookup_num_tokens": model.neuron_config.speculation_length})
-
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if is_hf:
@@ -232,9 +232,7 @@ def check_accuracy(
             expected_token_ids = expected_token_ids[:num_tokens_to_check]
             output_token_ids = output_token_ids[:num_tokens_to_check]
 
-        if (
-            draft_model is not None or neuron_config.enable_fused_speculation
-        ) and num_tokens_to_check is not None:
+        if draft_model is not None or neuron_config.enable_fused_speculation:
             # Handle corner scenario where last few tokens are not generated as part of speculation.
             assert (
                 abs(expected_token_ids.shape[-1] - output_token_ids.shape[-1])
@@ -262,6 +260,9 @@ def check_accuracy_logits(
     num_tokens_to_check: int = None,
     execution_mode="config",
 ):
+    if neuron_model.neuron_config.on_device_sampling_config is not None:
+        raise ValueError("Logits validation is not supported with on-device sampling.")
+
     if prompt is None:
         prompt = TEST_PROMPT
     prompts = [prompt] * neuron_model.config.neuron_config.batch_size

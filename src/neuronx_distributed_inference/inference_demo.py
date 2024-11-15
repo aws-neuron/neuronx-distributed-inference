@@ -21,13 +21,14 @@ from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxFo
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
-from neuronx_distributed_inference.utils.accuracy import check_accuracy, check_accuracy_logits
+from neuronx_distributed_inference.utils.accuracy import (
+    check_accuracy,
+    check_accuracy_logits,
+    get_generate_outputs,
+)
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 from neuronx_distributed_inference.utils.distributed import get_init_rank, get_init_world_size
-from neuronx_distributed_inference.utils.hf_adapter import (
-    HuggingFaceGenerationAdapter,
-    load_pretrained_config,
-)
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 from neuronx_distributed_inference.utils.random import set_random_seed
 
 set_random_seed(0)
@@ -321,13 +322,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     generation_config_kwargs = {
         k: getattr(args, k) for k in generation_config_args if getattr(args, k) is not None
     }
-    if neuron_config.enable_fused_speculation:
-        generation_config_kwargs.update({"do_sample": False})
     generation_config.update(**generation_config_kwargs)
-
-    if neuron_config.enable_fused_speculation:
-        fused_invoke_config = {"prompt_lookup_num_tokens": neuron_config.speculation_length}
-        generation_config.update(**fused_invoke_config)
 
     # With Medusa, the model is also the draft model.
     if neuron_config.is_medusa:
@@ -355,7 +350,6 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         generation_config,
         draft_model=draft_model,
         adapter_ids=adapter_ids,
-        enable_fused_speculation=neuron_config.enable_fused_speculation,
     )
 
     # Benchmarking.
@@ -377,35 +371,20 @@ def run_generation(
     generation_config,
     draft_model=None,
     adapter_ids=None,
-    enable_fused_speculation=False,
 ):
     print("\nGenerating outputs...")
     print(f"Prompts: {prompts}")
 
-    kwargs = {}
-    if draft_model is not None:
-        draft_generation_model = HuggingFaceGenerationAdapter(draft_model)
-        kwargs.update({"assistant_model": draft_generation_model, "do_sample": False})
-    if enable_fused_speculation:
-        kwargs.update({"do_sample": False})
-    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
-    generation_model = HuggingFaceGenerationAdapter(model)
-    outputs = generation_model.generate(
-        inputs.input_ids,
+    _, output_tokens = get_generate_outputs(
+        model,
+        prompts,
+        tokenizer,
+        is_hf=False,
+        draft_model=draft_model,
         generation_config=generation_config,
-        attention_mask=inputs.attention_mask,
-        max_length=model.neuron_config.max_length,
         adapter_ids=adapter_ids,
-        **kwargs,
     )
 
-    model.reset()
-    if draft_model is not None:
-        draft_model.reset()
-
-    output_tokens = tokenizer.batch_decode(
-        outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
     print("Generated outputs:")
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
