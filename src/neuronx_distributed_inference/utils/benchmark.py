@@ -63,6 +63,9 @@ def benchmark_sampling(
             "top_k": 1,
             "do_sample": draft_model is None and not neuron_config.enable_fused_speculation,
             "sampling_params": sampling_params,
+            "max_length": neuron_config.max_length
+            if neuron_config.max_new_tokens is None
+            else None,
         }
 
         if draft_model is not None:
@@ -180,6 +183,11 @@ def benchmark_sampling(
 def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, image=None):
     max_context_length = neuron_config.max_context_length
     max_len = neuron_config.max_length
+    # edge case where seq len == context_len
+    # use seq_len//2 as input size.
+    input_length = max_context_length
+    if max_context_length == max_len:
+        input_length = max_context_length // 2
     batch_size = neuron_config.batch_size
     num_medusa_heads = neuron_config.num_medusa_heads if neuron_config.num_medusa_heads else 4
     medusa_speculation_length = (
@@ -188,8 +196,8 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
 
     sample_inputs = None
     if model_type == END_TO_END_MODEL:
-        input_ids = torch.randint(0, 100, (batch_size, max_context_length))
-        attention_mask = torch.ones((batch_size, max_context_length), dtype=torch.int32)
+        input_ids = torch.randint(0, 100, (batch_size, input_length))
+        attention_mask = torch.ones((batch_size, input_length), dtype=torch.int32)
         assert (
             image is None
         ), "image is not supported currently for benchmarking for END_TO_END_MODEL"
@@ -197,9 +205,9 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
         sample_inputs = (input_ids, attention_mask, None, sampling_params)
 
     elif model_type == CONTEXT_ENCODING_MODEL:
-        input_ids = torch.zeros((batch_size, max_context_length), dtype=torch.int32)
-        attention_mask = torch.zeros((batch_size, max_context_length), dtype=torch.int32)
-        position_ids = torch.zeros((batch_size, max_context_length), dtype=torch.int32)
+        input_ids = torch.zeros((batch_size, input_length), dtype=torch.int32)
+        attention_mask = torch.zeros((batch_size, input_length), dtype=torch.int32)
+        position_ids = torch.zeros((batch_size, input_length), dtype=torch.int32)
         seq_ids = torch.zeros((batch_size), dtype=torch.int32)
 
         if neuron_config.is_medusa:
@@ -345,7 +353,10 @@ def generate_submodule_reports(latency_collectors, neuron_config, num_runs):
         if key == "context_encoding_model":
             tokens_len = neuron_config.max_context_length
         elif key == "token_generation_model":
-            tokens_len = neuron_config.max_new_tokens
+            if neuron_config.max_new_tokens is not None:
+                tokens_len = neuron_config.max_new_tokens
+            else:  # we benchmarked with an input size of max_context_length//2
+                tokens_len = neuron_config.max_length - neuron_config.max_context_length // 2
         reports[key] = generate_report(
             collector.latency_list, tokens_len, neuron_config.max_batch_size, num_runs
         )
