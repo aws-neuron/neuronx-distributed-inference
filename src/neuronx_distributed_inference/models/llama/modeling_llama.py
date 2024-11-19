@@ -904,7 +904,8 @@ class NeuronLlamaModel(NeuronBaseModel):
         # layers are not using fp8.
         updated_configs = []
         for i in range(config.num_hidden_layers):
-            if i == 0 or i == 125:
+            # TODO: Remove hardcoded code to have non-quantized MLPs for first and last decoder block
+            if i == 0 or i == config.num_hidden_layers - 1:
                 non_quant_config = copy.deepcopy(config)
                 non_quant_config.neuron_config.quantized_mlp_kernel_enabled = False
                 updated_configs.append(non_quant_config)
