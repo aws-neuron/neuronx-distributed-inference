@@ -49,7 +49,7 @@ def generation_model_bk(
             if (position_ids[:, -1] + speculation_length).all() <= buckets[-1]
             else position_ids[:, -1]
         )
-        bucket_mask = (buckets <= (max_position_id).unsqueeze(0)).to(torch.int)
+        bucket_mask = (buckets <= (max_position_id).unsqueeze(1)).to(torch.int)
         bucket_idx = torch.max(torch.argmin(bucket_mask, dim=1))
     else:
         attention_mask = tensors[1]
@@ -59,7 +59,7 @@ def generation_model_bk(
             if (position_ids[:, -1] + speculation_length).all() <= buckets[-1]
             else position_ids[:, -1]
         )
-        bucket_mask = (buckets <= (max_position_id).unsqueeze(0)).to(torch.int)
+        bucket_mask = (buckets <= (max_position_id).unsqueeze(1)).to(torch.int)
         bucket_idx = torch.max(torch.argmin(bucket_mask, dim=1))
         bucket = buckets[bucket_idx]
         # slice the attention mask based on the selected bucket size
