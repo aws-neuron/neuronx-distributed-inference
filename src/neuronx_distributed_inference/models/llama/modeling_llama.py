@@ -309,6 +309,7 @@ class NeuronLlamaMLP(nn.Module):
             _mlp_fwd_call = nki_jit()(quant_mlp_isa_kernel)
 
         # Handle SP RMSnorm
+        x_orig_dtype = x.dtype
         if self.sequence_parallel_enabled:
             # This RMSNormQuant kernel will do quantization inside, so we pass the
             # lower_bound for clipping.
@@ -331,7 +332,7 @@ class NeuronLlamaMLP(nn.Module):
                 ln_w = rmsnorm.weight.unsqueeze(0)
                 lower_bound = self.quantized_kernel_lower_bound
                 _rmsnorm_quant_fwd_call[grid](
-                    x, ln_w, lower_bound, quant_rmsnorm_out, kernel_name="RMSNormQuant"
+                    x, ln_w, lower_bound, quant_rmsnorm_out, kernel_name="QuantOnly"
                 )
                 x = gather_from_sequence_parallel_region(
                     quant_rmsnorm_out,
@@ -359,7 +360,7 @@ class NeuronLlamaMLP(nn.Module):
                 output_tensor_seqlen,
                 self.hidden_size,  # hidden size
             ),
-            dtype=x.dtype,
+            dtype=x_orig_dtype,
             device=x.device,
         )
 
@@ -800,9 +801,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
             residual = hidden_states
             # RMSNorm (fused with QKV kernel when SP is disabled)
-            if not self.mlp_kernel_enabled or (
-                self.sequence_parallel_enabled and not self.rmsnorm_quantize_kernel_enabled
-            ):
+            if not self.mlp_kernel_enabled or self.sequence_parallel_enabled:
                 hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states, _ = self.mlp(
                 hidden_states,
