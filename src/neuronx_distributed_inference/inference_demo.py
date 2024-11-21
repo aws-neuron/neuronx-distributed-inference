@@ -79,8 +79,11 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # Generation
     run_parser.add_argument("--prompt", dest="prompts", type=str, action="append", required=True)
     run_parser.add_argument("--top-k", type=int, default=1)
+    run_parser.add_argument("--top-p", type=float, default=1.0)
+    run_parser.add_argument("--temperature", type=float, default=1.0)
     run_parser.add_argument("--global-topk", type=int)
-    run_parser.add_argument("--do-sample", action="store_true", default=True)
+    run_parser.add_argument("--do-sample", action="store_true", default=False)
+    run_parser.add_argument("--dynamic", action="store_true", default=False)
     run_parser.add_argument("--pad-token-id", type=int, default=0)
 
     # Basic config
@@ -323,7 +326,14 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
 
     # Configure generation config.
     generation_config = GenerationConfig.from_pretrained(args.model_path)
-    generation_config_args = ["do_sample", "top_k", "pad_token_id"]
+    generation_config_args = [
+        "do_sample",
+        "top_k",
+        "pad_token_id",
+        "dynamic",
+        "top_p",
+        "temperature",
+    ]
     generation_config_kwargs = {
         k: getattr(args, k) for k in generation_config_args if getattr(args, k) is not None
     }
@@ -388,6 +398,7 @@ def run_generation(
         draft_model=draft_model,
         generation_config=generation_config,
         adapter_ids=adapter_ids,
+        max_length=model.neuron_config.max_length,
     )
 
     print("Generated outputs:")

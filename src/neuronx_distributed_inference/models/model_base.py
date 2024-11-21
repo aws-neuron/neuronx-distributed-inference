@@ -36,6 +36,7 @@ from neuronx_distributed_inference.modules.flashdecode.utils import (
 from neuronx_distributed_inference.modules.generation.sampling import (
     Sampler,
     prepare_sampling_params,
+    rand_like,
 )
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
     KVCacheManager,
@@ -485,9 +486,13 @@ class NeuronBaseModel(nn.Module):
         if self.on_device_sampling:
             # perform sampling on Neuron to get tokens
             # FIXME, logits[:, -1, :] is not correct for speculation model, this is a tempory fix.
-            if is_for_speculation:
+            if is_for_speculation and not self.neuron_config.on_device_sampling_config.do_sample:
                 res = nxd_argmax(tensor=logits, dim=2, gather_dim=2, keepdim=False)
-            else:
+            elif (
+                is_for_context_encoding
+                or not self.neuron_config.enable_eagle_speculation
+                or not self.neuron_config.on_device_sampling_config.do_sample
+            ):
                 res = self.sampler(logits[:, -1, :], sampling_params)
 
         if self._is_reorder_needed(is_for_context_encoding, is_for_speculation):
@@ -629,6 +634,97 @@ class NeuronFusedSpecModel(nn.Module):
 
         self.draft_model = self.worker_cls(config.fused_spec_config.draft_config)
         self.target_model = self.worker_cls(config)
+
+        # currently we enforce draft to be greedy
+        self.draft_sampler = Sampler(config.neuron_config, do_sample=False)
+        self.target_sampler = Sampler(config.neuron_config)
+        self.greedy = not config.neuron_config.on_device_sampling_config.do_sample
+
+    def _select_from(self, to_indices, from_indices, from_values):
+        if to_indices.ndim > from_indices.ndim:
+            from_indices = from_indices[:, :, None].expand(to_indices.shape)
+            from_values = from_values[:, :, None].expand(to_indices.shape)
+            eq = torch.eq(to_indices, from_indices).to(from_values.dtype)
+            to_values = from_values * eq
+        elif to_indices.ndim < from_indices.ndim:
+            to_indices = to_indices[:, :, None].expand(from_indices.shape)
+            eq = torch.eq(to_indices, from_indices)
+            to_values = torch.where(eq, from_values, 0)
+            to_values = torch.sum(to_values, dim=2)
+
+        return to_values
+
+    def _adjust_target_probs(self, draft_probs, draft_indices, target_probs, target_indices, k):
+        sliced_target_indices = target_indices[:, :k, :]
+        sliced_target_probs = target_probs[:, :k, :]
+        last_target_probs = target_probs[:, k : k + 1, :]
+
+        adjusted_draft_probs = self._select_from(sliced_target_indices, draft_indices, draft_probs)
+        adjusted_target_probs = sliced_target_probs - adjusted_draft_probs
+        adjusted_target_probs = torch.clamp(adjusted_target_probs, min=0)
+
+        adjusted_sum = torch.sum(adjusted_target_probs, dim=2, keepdim=True)
+        # TODO: need to fix this!!
+        is_zero = torch.lt(adjusted_sum, 1e-30)
+        adjusted_sum = torch.where(is_zero, 1.0, adjusted_sum)
+        adjusted_target_probs = torch.div(adjusted_target_probs, adjusted_sum)
+        adjusted_target_probs = torch.where(is_zero, 1.0, adjusted_target_probs)
+        adjusted_target_probs = torch.cat([adjusted_target_probs, last_target_probs], dim=1)
+
+        return adjusted_target_probs
+
+    def _speculative_mask(
+        self, draft_ids, draft_probs_indices, draft_probs, target_probs_indices, target_probs
+    ):
+        target_probs = self._select_from(draft_ids, target_probs_indices, target_probs)
+        # we don't need this for greedy draft
+        # draft_probs = self.select_from(draft_ids, draft_probs_indices, draft_probs)
+
+        ratio = torch.div(target_probs, draft_probs)
+        ratio = torch.clamp(ratio, max=1.0).to(torch.float32)
+        random = rand_like(ratio)
+        accepted_mask = torch.lt(random, ratio).to(torch.int)
+        accepted_cumsum = torch.cumsum(accepted_mask, dim=1)
+
+        batch_size, k = ratio.shape
+
+        positions = torch.range(1, k, dtype=accepted_cumsum.dtype, device=ratio.device)[
+            None, :
+        ].expand(ratio.shape)
+        accepted_mask = torch.eq(accepted_cumsum, positions)
+        accepted_mask = torch.nn.functional.pad(accepted_mask, (0, 1), value=False)
+        return accepted_mask
+
+    def _speculative_token_selection(
+        self,
+        draft_ids,
+        target_ids,
+        draft_probs_indices,
+        draft_probs,
+        target_probs_indices,
+        target_probs,
+    ):
+        accepted_mask = self._speculative_mask(
+            draft_ids,
+            draft_probs_indices,
+            draft_probs,
+            target_probs_indices,
+            target_probs,
+        )
+
+        draft_ids = torch.nn.functional.pad(draft_ids, (0, 1), value=0)
+        tokens = torch.where(accepted_mask, draft_ids, target_ids)
+
+        pad_token_id = self.config.pad_token_id
+
+        positions = torch.range(0, tokens.shape[1] - 1, device=tokens.device, dtype=tokens.dtype)[
+            None, :
+        ].expand(tokens.shape)
+        index = torch.sum(accepted_mask.to(torch.int), dim=1, keepdim=True)
+        mask = torch.ge(index, positions)
+        tokens = torch.where(mask, tokens, pad_token_id)
+
+        return tokens, index
 
     def _context_encoding_forward(
         self, input_ids, attention_mask, position_ids, seq_ids, sampling_params
@@ -795,6 +891,7 @@ class NeuronFusedSpecModel(nn.Module):
 
         orig_hidden = hidden_state
         draft_cache = None
+        draft_probs = []
         for i in range(spec_len - 1):
             draft_position_id = draft_position_ids[:, i : i + 1] + i
             draft_input_ids = candidate_input_ids[:, -1:]
@@ -824,8 +921,13 @@ class NeuronFusedSpecModel(nn.Module):
                 prev_hidden=hidden_state,
                 kv_cache=draft_cache,
             )
-
-            draft_outputs = model_output[0]
+            if not self.greedy:
+                draft_outputs, single_draft_probs = self.draft_sampler(
+                    model_output[0], sampling_params, return_values=True
+                )
+                draft_probs.append(single_draft_probs)
+            else:
+                draft_outputs = model_output[0]
             draft_cache = model_output[1:-1]
             hidden_state = model_output[-1]
 
@@ -836,6 +938,9 @@ class NeuronFusedSpecModel(nn.Module):
 
             candidate_input_ids = torch.cat((candidate_input_ids, new_draft_token), dim=-1)
 
+        if not self.greedy:
+            draft_probs = torch.cat(draft_probs, dim=1)
+
         # 2. Run target model on the draft produced tokens
         outputs = self.target_model(
             candidate_input_ids,
@@ -844,7 +949,12 @@ class NeuronFusedSpecModel(nn.Module):
             seq_ids,
             sampling_params,
         )
-        target_tokens = outputs[0]
+        if not self.greedy:
+            target_tokens, target_probs = self.target_sampler(
+                outputs[0], sampling_params, return_values=True
+            )
+        else:
+            target_tokens = outputs[0]
         target_cache = outputs[1:-1]
         hidden_state = outputs[-1]
         prev_hidden = torch.cat([orig_hidden, hidden_state[:, : spec_len - 1, :]], dim=1)
@@ -874,8 +984,32 @@ class NeuronFusedSpecModel(nn.Module):
             # flat_draft_cache.append(draft_cache[idx].view(self.draft_model.kv_mgr.kv_shape))
             flat_draft_cache.append(draft_cache[idx])
 
-        index = ((~(candidate_input_ids[:, 1:] == target_tokens[:, :-1])).cumsum(dim=-1) < 1).sum()
-        index = index.unsqueeze(0).expand(self.batch_size, 1, self.hidden_size)
+        if not self.greedy:
+            adjusted_target_probs = self._adjust_target_probs(
+                draft_probs, candidate_input_ids[:, 1:], target_probs, target_tokens, spec_len - 1
+            )
+            target_ids = self.target_sampler._multinomial(adjusted_target_probs, 2)
+            target_ids = torch.gather(target_tokens, 2, target_ids)
+            target_ids = torch.squeeze(target_ids, 2)
+            draft_ids = candidate_input_ids[:, 1:]
+            sliced_target_indices = target_tokens[:, : spec_len - 1, :]
+            sliced_target_probs = target_probs[:, : spec_len - 1, :]
+
+            tokens, index = self._speculative_token_selection(
+                draft_ids,
+                target_ids,
+                draft_ids,
+                draft_probs,
+                sliced_target_indices,
+                sliced_target_probs,
+            )
+            target_tokens = tokens
+            index = index[:, :, None].expand(self.batch_size, 1, self.hidden_size)
+        else:
+            index = (
+                (~(candidate_input_ids[:, 1:] == target_tokens[:, :-1])).cumsum(dim=-1) < 1
+            ).sum()
+            index = index.unsqueeze(0).expand(self.batch_size, 1, self.hidden_size)
         hidden_state = torch.gather(hidden_state, dim=1, index=index)
 
         return (

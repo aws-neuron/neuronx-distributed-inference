@@ -4,8 +4,18 @@ import torch
 from neuronx_distributed.operators.argmax import argmax as nxd_argmax
 from neuronx_distributed.operators.topk import topk as nxd_topk
 from neuronx_distributed.parallel_layers import parallel_state
+from torch_neuronx.xla_impl.ops import xla_hlo_call
 
 from neuronx_distributed_inference.models.config import NeuronConfig
+
+
+@xla_hlo_call
+def rand_like(tensor):
+    dtype = tensor.dtype
+    shape = tensor.sizes
+    minimum = dtype.Constant(constant_value=0)
+    maximum = dtype.Constant(constant_value=1)
+    return dtype[shape].Rng(minimum, maximum, distribution=1)  # Uniform distribution
 
 
 def prepare_sampling_params(batch_size, top_k=[1], top_p=[1.0], temperature=[1.0]):
@@ -40,7 +50,7 @@ class Sampler(torch.nn.Module):
 
     """
 
-    def __init__(self, neuron_config: NeuronConfig):
+    def __init__(self, neuron_config: NeuronConfig, do_sample=None):
         super().__init__()
         self.on_device_sampling = neuron_config.on_device_sampling_config is not None
 
@@ -52,7 +62,11 @@ class Sampler(torch.nn.Module):
             self.is_medusa = False
 
         self.neuron_config = neuron_config
-        self.do_sample = neuron_config.on_device_sampling_config.do_sample
+        self.do_sample = (
+            do_sample
+            if do_sample is not None
+            else neuron_config.on_device_sampling_config.do_sample
+        )
         self.dynamic = neuron_config.on_device_sampling_config.dynamic
         self.deterministic = neuron_config.on_device_sampling_config.deterministic
         self.global_topk = neuron_config.on_device_sampling_config.global_topk
@@ -112,12 +126,22 @@ class Sampler(torch.nn.Module):
                 (probs_cumsum.shape[0], num_samples), 0.5, device=probs_cumsum.device
             )
         else:
-            rand_selector = torch.rand(
-                (probs_cumsum.shape[0], num_samples), device=probs_cumsum.device
+            zeros = torch.zeros(
+                (probs_cumsum.shape[0], num_samples),
+                device=probs_cumsum.device,
+                dtype=probs_cumsum.dtype,
             )
+            rand_selector = rand_like(zeros)
         return rand_selector
 
-    def forward(self, token_logits, sampling_params):
+    def _multinomial(self, probs, dim, num_samples=1):
+        probs_cumsum = torch.cumsum(input=probs, dim=dim)
+        rand_selector = self._rand_selector(probs_cumsum, num_samples)
+        greater_than_rand = torch.greater(rand_selector, probs_cumsum)
+        counts = torch.sum(greater_than_rand, dim=dim).unsqueeze(dim)
+        return counts
+
+    def forward(self, token_logits, sampling_params, return_values=False):
         """
         forward to perform topk, topp, temperature and multinomial sampling.
 
@@ -152,13 +176,17 @@ class Sampler(torch.nn.Module):
                 return torch.argmax(token_logits, dim=dim)
             else:
                 # distributed argmax
-                return nxd_argmax(
+                tokens = nxd_argmax(
                     tensor=token_logits,
                     dim=dim,
                     gather_dim=dim,
                     keepdim=False,
                     process_group=self.process_group,
                 )
+                values = torch.ones(tokens.shape, dtype=token_logits.dtype, device=tokens.device)
+                if return_values:
+                    return tokens, values
+                return tokens
 
         top_k_logits_values, top_k_logits_indices = self._top_k_masked(token_logits, top_k, dim)
         if self.is_medusa:
@@ -167,18 +195,20 @@ class Sampler(torch.nn.Module):
         if self.dynamic or torch.any(temperature != 1.0):
             top_k_logits_values = torch.divide(top_k_logits_values, temperature)
 
-        probs_soft_max = self._soft_max(top_k_logits_values, dim)
-        probs_cumsum = torch.cumsum(input=probs_soft_max, dim=dim)
         if self.dynamic or torch.any(top_p < 1.0):  # apply top_p sampling
+            probs_soft_max = self._soft_max(top_k_logits_values, dim)
+            probs_cumsum = torch.cumsum(input=probs_soft_max, dim=dim)
             top_p = torch.max(torch.min(probs_cumsum), top_p)
-            top_p_mask = torch.greater(probs_cumsum, top_p)
+            top_p_mask = torch.greater(probs_cumsum, top_p).index_fill_(
+                dim, torch.tensor([0], device=top_p.device), False
+            )  # need to keep at least one token
             top_k_logits_values = top_k_logits_values.masked_fill_(
                 top_p_mask, self.IGNORED_LOGITS_VALUE
             )
-            probs_soft_max = self._soft_max(top_k_logits_values, dim)  # custom call
-            probs_cumsum = torch.cumsum(input=probs_soft_max, dim=dim)
 
-        rand_selector = self._rand_selector(probs_cumsum)
-        greater_than_rand = torch.greater(rand_selector, probs_cumsum)
-        counts = torch.sum(greater_than_rand, dim=dim).unsqueeze(1)
+        probs_soft_max = self._soft_max(top_k_logits_values, dim)  # custom call
+        if return_values:
+            return top_k_logits_indices, probs_soft_max
+
+        counts = self._multinomial(probs_soft_max, dim)
         return torch.gather(input=top_k_logits_indices, dim=dim, index=counts).flatten()

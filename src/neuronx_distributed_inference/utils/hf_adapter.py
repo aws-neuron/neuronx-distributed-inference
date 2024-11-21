@@ -366,13 +366,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         generation_config: GenerationConfig,
         **model_kwargs,
     ):
-        do_sample = generation_config.do_sample
         pad_token_id = generation_config.pad_token_id
         eos_token_id = generation_config.eos_token_id
-        if do_sample:
-            raise ValueError(
-                "Sampling is unsupported as part of speculation. Only greedy speculation is supported."
-            )
         if not self.neuron_config.enable_fused_speculation:
             assistant_model = candidate_generator.assistant_model
         if self.neuron_config.is_medusa:
@@ -391,6 +386,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 stopping_criteria,
                 pad_token_id,
                 eos_token_id,
+                generation_config,
                 **model_kwargs,
             )
         else:
@@ -409,6 +405,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         stopping_criteria,
         pad_token_id,
         eos_token_id,
+        generation_config,
         **model_kwargs,
     ):
         # Init values
@@ -422,7 +419,15 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             eos_token_id_list = eos_token_id
 
         fused_assistant_kwargs = copy.deepcopy(model_kwargs)
-        model_inputs = self.prepare_inputs_for_generation(input_ids, **fused_assistant_kwargs)
+        sampling_params = prepare_sampling_params(
+            batch_size=input_ids.shape[0],
+            top_k=generation_config.top_k,
+            top_p=generation_config.top_p,
+            temperature=generation_config.temperature,
+        )
+        model_inputs = self.prepare_inputs_for_generation(
+            input_ids, sampling_params=sampling_params, **fused_assistant_kwargs
+        )
 
         # Other auxiliary variables
         bs = input_ids.shape[0]
@@ -446,7 +451,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 outputs, fused_assistant_kwargs, incremental_len
             )
             model_inputs = self.prepare_inputs_for_generation(
-                returned_ids, **fused_assistant_kwargs
+                returned_ids, sampling_params=sampling_params, **fused_assistant_kwargs
             )
             # 2. get the generated draft tokens and target tokens
             outputs = self(**model_inputs)
@@ -502,7 +507,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             if max_len - cur_len <= spec_len:
                 break
 
-        return torch.cat((input_ids, returned_ids), dim=1)
+        return torch.cat((input_ids, returned_ids.to(torch.int)), dim=1)
 
     def _standard_assisted_decoding(
         self,

@@ -58,9 +58,14 @@ def get_generate_outputs_from_token_ids(
             generate_kwargs.update(
                 {
                     "prompt_lookup_num_tokens": model.neuron_config.speculation_length,
-                    "do_sample": False,
                 }
             )
+            if not model.neuron_config.enable_eagle_speculation:
+                generate_kwargs.update(
+                    {
+                        "do_sample": False,
+                    }
+                )
 
     # If an attention mask is provided, the inputs are also expected to be padded to the correct shape.
     if attention_mask is None:
