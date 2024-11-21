@@ -184,8 +184,11 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--rmsnorm-quantize-kernel-enabled", action="store_true")
     run_parser.add_argument("--quantized-kernel-lower-bound", type=float, default=1200.0)
     run_parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
+
+    # Compiler Args
     run_parser.add_argument("--logical-neuron-cores", type=int, default=1)
     run_parser.add_argument("--cc-pipeline-tiling-factor", type=int, default=2)
+    run_parser.add_argument("--allow-rmsnorm-cascaded-reduce", action="store_true")
 
     # optional demo arguments
     run_parser.add_argument(

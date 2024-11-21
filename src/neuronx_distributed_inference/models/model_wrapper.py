@@ -111,9 +111,7 @@ class ModelWrapper(torch.nn.Module):
                 "--vectorize-strided-dma "
             )
 
-            # this flag should work for both lnc = 1, 2, but currently causes issues with lnc = 1
-            # this check will be removed after the issue is fixed
-            if self.neuron_config.logical_neuron_cores == 2:
+            if self.neuron_config.allow_rmsnorm_cascaded_reduce:
                 tensorizer_options += "--allow-rmsnorm-cascaded-reduce "
 
             if self.neuron_config.enable_fused_speculation:

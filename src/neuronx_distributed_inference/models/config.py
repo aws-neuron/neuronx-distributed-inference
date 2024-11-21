@@ -225,6 +225,10 @@ class NeuronConfig:
         self.cc_pipeline_tiling_factor = kwargs.pop("cc_pipeline_tiling_factor", 2)
         self.target = kwargs.pop("target", None)
 
+        # this compiler flag is an experimental feature made for llama-3.1-405B performance
+        # there are some known accuracy issues with this flag on trn1
+        self.allow_rmsnorm_cascaded_reduce = kwargs.pop("allow_rmsnorm_cascaded_reduce", False)
+
         # weights_to_skip_layout_optimization
         self.weights_to_skip_layout_optimization = []
 
