@@ -109,8 +109,12 @@ class ModelWrapper(torch.nn.Module):
                 f"--cc-pipeline-tiling-factor={self.neuron_config.cc_pipeline_tiling_factor} "
                 "--vectorize-dge-dma "
                 "--vectorize-strided-dma "
-                "--allow-rmsnorm-cascaded-reduce "
             )
+
+            # this flag should work for both lnc = 1, 2, but currently causes issues with lnc = 1
+            # this check will be removed after the issue is fixed
+            if self.neuron_config.logical_neuron_cores == 2:
+                tensorizer_options += "--allow-rmsnorm-cascaded-reduce "
 
             if self.neuron_config.enable_fused_speculation:
                 tensorizer_options += "--optimize-alias-chain "
