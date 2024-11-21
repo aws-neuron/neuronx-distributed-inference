@@ -418,13 +418,10 @@ class NeuronAttentionBase(nn.Module):
                 # shard KV by seq len and pick the values based on rank
                 assert q_len == Q.shape[2], f"Q shape is {Q.shape}"
                 # selecting positions (on S dim) that belongs to the current rank
-                selected_seq_pos = torch.arange(
-                    rank_id_in_kv_group.item(),
-                    q_len,
-                    self.num_cores_per_group,
-                    dtype=torch.int64,
-                    device=Q.device,
+                offset = torch.arange(
+                    0, q_len, self.num_cores_per_group, dtype=torch.int64, device=Q.device
                 )
+                selected_seq_pos = offset + rank_id_in_kv_group
                 K = torch.index_select(input=K, dim=2, index=selected_seq_pos)
                 V = torch.index_select(input=V, dim=2, index=selected_seq_pos)
         else:

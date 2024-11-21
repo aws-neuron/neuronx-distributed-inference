@@ -381,9 +381,9 @@ class NeuronBaseModel(nn.Module):
             past_key_values = None
         else:
             if kv_cache is None:
-                past_key_values = self.kv_mgr.get_cache(self.n_positions)
+                past_key_values = self.kv_mgr.get_cache(cache_size)
             else:
-                past_key_values = self._slice_kv_cache(kv_cache, self.n_positions)
+                past_key_values = self._slice_kv_cache(kv_cache, cache_size)
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
