@@ -425,9 +425,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             top_p=generation_config.top_p,
             temperature=generation_config.temperature,
         )
-        model_inputs = self.prepare_inputs_for_generation(
-            input_ids, sampling_params=sampling_params, **fused_assistant_kwargs
-        )
+        if "sampling_params" not in fused_assistant_kwargs:
+            fused_assistant_kwargs["sampling_params"] = sampling_params
+        model_inputs = self.prepare_inputs_for_generation(input_ids, **fused_assistant_kwargs)
 
         # Other auxiliary variables
         bs = input_ids.shape[0]
@@ -451,7 +451,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 outputs, fused_assistant_kwargs, incremental_len
             )
             model_inputs = self.prepare_inputs_for_generation(
-                returned_ids, sampling_params=sampling_params, **fused_assistant_kwargs
+                returned_ids, **fused_assistant_kwargs
             )
             # 2. get the generated draft tokens and target tokens
             outputs = self(**model_inputs)
