@@ -1,4 +1,4 @@
-## My Project
+## NeuronX Distributed (NxD) Inference
 
 This package provides a model hub for running inference on Neuronx Distributed (NxD).
 
