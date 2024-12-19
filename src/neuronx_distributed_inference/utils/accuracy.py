@@ -16,6 +16,8 @@ from transformers import GenerationConfig, PreTrainedModel, PreTrainedTokenizer
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
+from neuronx_distributed_inference.models.mllama.utils import create_vision_mask, get_image_tensors
+from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 from neuronx_distributed_inference.utils.constants import *
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
@@ -264,12 +266,20 @@ def check_accuracy_logits(
     tol_map: dict = None,
     num_tokens_to_check: int = None,
     execution_mode="config",
+    draft_model: NeuronApplicationBase = None,
+    image=None,
+    num_image_per_prompt=1,
 ):
-    if neuron_model.neuron_config.on_device_sampling_config is not None:
+    if neuron_model.neuron_config.enable_fused_speculation:
+        generation_config.prompt_lookup_num_tokens = neuron_model.neuron_config.speculation_length
+        assert (
+            neuron_model.neuron_config.output_logits
+        ), "output_logits is required to enable logits tests for fused speculation"
+    elif neuron_model.neuron_config.on_device_sampling_config is not None:
         raise ValueError("Logits validation is not supported with on-device sampling.")
 
     if prompt is None:
-        prompt = TEST_PROMPT
+        prompt = MM_TEST_PROMPT if image else TEST_PROMPT
     prompts = [prompt] * neuron_model.config.neuron_config.batch_size
 
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
@@ -341,21 +351,61 @@ def check_accuracy_logits(
         print("Actual Logits Shape: ", actual_logits.shape)
         return torch.stack(model_outputs.scores)
 
-    original_async_mode = neuron_model.neuron_config.async_mode
-    try:
-        async_modes_to_test = get_async_modes_to_test(execution_mode, neuron_model)
-        for async_mode in async_modes_to_test:
-            neuron_model.neuron_config.async_mode = async_mode
-            mode_being_tested = "async mode" if async_mode else "sync mode"
+    batch_image = []
+    # generate the batch image
+    if image is not None:
+        batch_image = [
+            [image] * num_image_per_prompt
+        ] * neuron_model.config.neuron_config.batch_size
 
-            passed, results, status_msg = logit_validation(
-                initial_input_ids,
-                generate_fn,
-                expected_logits,
-                tol_map=tol_map,
-                divergence_difference_tol=divergence_difference_tol,
+    def generate_mm_fn(input_ids):
+        input_length = input_ids.shape[1]
+        vision_token_id = tokenizer("<|image|>", add_special_tokens=False).input_ids[0]
+        vision_mask = create_vision_mask(initial_input_ids, vision_token_id)
+        attention_mask = extrapolated_attention_mask[:, :input_length]
+        pixel_values, aspect_ratios, num_chunks, has_image = get_image_tensors(
+            neuron_model.config, batch_image
+        )
+        sampling_params = prepare_sampling_params(
+            batch_size=neuron_model.config.neuron_config.batch_size,
+            top_k=[1],
+            top_p=[1.0],
+            temperature=[1.0],
+        )
+        with torch.inference_mode():
+            model_outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=seq_len - input_length,
+                min_new_tokens=seq_len - input_length,
+                sampling_params=sampling_params,
+                pixel_values=pixel_values,
+                aspect_ratios=aspect_ratios,
+                vision_mask=vision_mask,
+                num_chunks=num_chunks,
+                has_image=has_image,
+                return_dict_in_generate=True,
+                output_scores=True,
+                generation_config=generation_config,
             )
-            assert passed, status_msg
-            print(f"Passed logits validation for {mode_being_tested}")
-    finally:
-        neuron_model.neuron_config.async_mode = original_async_mode
+        actual_logits = torch.stack(model_outputs.scores)
+        actual_token_ids = actual_logits.argmax(dim=2).T
+        actual_tokens = tokenizer.batch_decode(
+            actual_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        print("Actual Output: ", actual_tokens, actual_token_ids)
+        print("Actual Logits Shape: ", actual_logits.shape)
+        return torch.stack(model_outputs.scores)
+
+    passed, results, status_msg = logit_validation(
+        input_ids=initial_input_ids,
+        generate_fn=generate_fn
+        if image is None
+        else generate_mm_fn,  # use different generation functions
+        expected_logits=expected_logits,
+        tol_map=tol_map,
+        divergence_difference_tol=divergence_difference_tol,
+    )
+    assert passed, status_msg
+
+    print("Passed logits validation")

@@ -28,6 +28,12 @@ COMPILED_MODEL_FILE_NAME = "model.pt"
 logger = logging.getLogger("Neuron")
 
 
+def normalize_path(path):
+    """Normalize path separators and ensure path ends with a trailing slash"""
+    normalized = os.path.normpath(path)
+    return os.path.join(normalized, "")
+
+
 def is_compiled(model_path):
     return os.path.isfile(model_path + COMPILED_MODEL_FILE_NAME)
 
@@ -51,6 +57,8 @@ class NeuronApplicationBase(torch.nn.Module):
         neuron_config: NeuronConfig = None,
     ):
         super().__init__()
+        model_path = normalize_path(model_path)
+
         if config is None:
             config = self.get_config_cls().load(model_path)
 
@@ -129,6 +137,8 @@ class NeuronApplicationBase(torch.nn.Module):
         return None
 
     def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None):
+        compiled_model_path = normalize_path(compiled_model_path)
+
         """Compiles this model and saves it to the given path."""
         self.config.save(compiled_model_path)
 
@@ -154,6 +164,8 @@ class NeuronApplicationBase(torch.nn.Module):
         self.is_compiled = True
 
     def load(self, compiled_model_path, start_rank_id=None, local_ranks_size=None):
+        compiled_model_path = normalize_path(compiled_model_path)
+
         """Loads the compiled model checkpoint to the Neuron device."""
         self.traced_model = torch.jit.load(compiled_model_path + COMPILED_MODEL_FILE_NAME)
 
@@ -169,6 +181,8 @@ class NeuronApplicationBase(torch.nn.Module):
         self.is_loaded_to_neuron = True
 
     def load_weights(self, compiled_model_path, start_rank_id=None, local_ranks_size=None):
+        compiled_model_path = normalize_path(compiled_model_path)
+
         """Loads the model weights to the Neuron device."""
         if self.traced_model is None:
             raise ValueError("Model is not loaded")
@@ -328,6 +342,7 @@ class NeuronApplicationBase(torch.nn.Module):
         """
         Quantizes the model and saves the quantized checkpoint to `config.neuron_config.quantized_checkpoints_path`.
         """
+        model_path = normalize_path(model_path)
         quantized_state_dict = cls.generate_quantized_state_dict(model_path, config)
 
         # Prune None values in the quantized_state_dict. torch.save crashes if None values exist.

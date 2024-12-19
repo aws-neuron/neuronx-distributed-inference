@@ -11,7 +11,7 @@ from neuronx_distributed.utils.medusa_utils import (
     update_inference_inputs,
 )
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig, PreTrainedModel
-from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
+from transformers.generation import GenerateDecoderOnlyOutput, SampleDecoderOnlyOutput
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.modeling_outputs import ModelOutput
@@ -28,8 +28,6 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     Sampler,
     prepare_sampling_params,
 )
-
-SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 
 def load_pretrained_config(
@@ -71,11 +69,24 @@ def load_pretrained_config(
     return load_config
 
 
+def _convert_modality_config_to_pretrained_config(config_dict: Dict, modality: str):
+    if modality in config_dict:
+        modality_config = config_dict[modality]
+        modality_config.pop("neuron_config", None)
+        config_dict[modality] = PretrainedConfig(**modality_config)
+    return config_dict
+
+
 def to_pretrained_config(config: InferenceConfig):
     """Convert an InferenceConfig into a PretrainedConfig."""
     config_dict = copy.deepcopy(to_dict(config))
     config_dict["torch_dtype"] = config.neuron_config.torch_dtype
     del config_dict["neuron_config"]
+
+    # handle nested configs for multi-modal models
+    config_dict = _convert_modality_config_to_pretrained_config(config_dict, "text_config")
+    config_dict = _convert_modality_config_to_pretrained_config(config_dict, "vision_config")
+
     return PretrainedConfig(**config_dict)
 
 
@@ -91,8 +102,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         self.sampler = None
         self.prev_kv_cache_populated = False
 
-    def forward(self, *args, **kwargs):
-        return self.neuron_model(*args, **kwargs)
+        # WARNING: Neuron Forward is needed by any models with additional input args
+        self.forward = self.neuron_model.forward
 
     def generate(self, *args, **kwargs):
         # Keep generation stateless.
@@ -108,7 +119,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         generation_config: GenerationConfig,
         logits_warper: Optional[LogitsProcessorList] = None,
         **model_kwargs,
-    ) -> Union[SampleOutput, torch.LongTensor]:
+    ) -> Union[SampleDecoderOnlyOutput, torch.LongTensor]:
         r"""
         We override the GenerationMixin sample function (_sample for transformers>=4.39.0) to add support for right side padding.
         """
@@ -132,7 +143,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             temperature=generation_config.temperature,
         )
 
-        # init attention / hidden states / scores tuples
+        # init scores / logits tuples
         scores = () if (return_dict_in_generate and output_scores) else None
         raw_logits = () if (return_dict_in_generate and output_logits) else None
 
@@ -253,6 +264,12 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 "sampling_params": sampling_params,
             }
         )
+
+        # WARNING: This is needed for propagating additional kwargs to the neuron model
+        additional_kwargs = self.neuron_model.get_required_kwargs()
+        for arg in additional_kwargs:
+            model_inputs.update({arg: kwargs.get(arg, None)})
+
         return model_inputs
 
     def prepare_medusa_inputs_for_generation(
@@ -417,6 +434,13 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             eos_token_id_list = list([eos_token_id])
         else:
             eos_token_id_list = eos_token_id
+        output_scores = generation_config.output_scores
+        output_logits = generation_config.output_logits
+        return_dict_in_generate = generation_config.return_dict_in_generate
+
+        # init scores / logits tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        raw_logits = () if (return_dict_in_generate and output_logits) else None
 
         fused_assistant_kwargs = copy.deepcopy(model_kwargs)
         sampling_params = prepare_sampling_params(
@@ -444,6 +468,13 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         returned_ids = new_token
         incremental_len = 0
         end_for_all = False
+
+        if return_dict_in_generate:
+            if output_scores:
+                # TODO: Process raw logits with logits processor when needed
+                scores += (outputs.fused_outputs[3][:, -1, :],)
+            if output_logits:
+                raw_logits += (outputs.fused_outputs[3],)
 
         while True:
             # 1. update the kwargs for fused generation
@@ -496,6 +527,13 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
 
             returned_ids = torch.cat((returned_ids, accepted_tokens), dim=1)
 
+            if return_dict_in_generate:
+                if output_scores:
+                    # TODO: Process raw logits with logits processor when needed
+                    scores += tuple(outputs.fused_outputs[3][:, i, :] for i in range(n_matches + 1))
+                if output_logits:
+                    raw_logits += (outputs.fused_outputs[3],)
+
             # 5. Update with the generated token length and check for stopping condition.
             if end_for_all:
                 break
@@ -507,7 +545,16 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             if max_len - cur_len <= spec_len:
                 break
 
-        return torch.cat((input_ids, returned_ids.to(torch.int)), dim=1)
+        output_ids = torch.cat((input_ids, returned_ids), dim=1)
+
+        if return_dict_in_generate:
+            return GenerateDecoderOnlyOutput(
+                sequences=output_ids,
+                scores=scores,
+                logits=raw_logits,
+            )
+        else:
+            return output_ids
 
     def _standard_assisted_decoding(
         self,

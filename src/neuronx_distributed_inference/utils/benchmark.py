@@ -9,7 +9,9 @@ import torch
 from transformers import GenerationConfig
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import InferenceConfig
+from neuronx_distributed_inference.models.mllama.model_wrapper_mllama import NUM_IMAGE_PER_PROMPT
+from neuronx_distributed_inference.models.mllama.utils import get_image_tensors
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 from neuronx_distributed_inference.utils.constants import *
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
@@ -52,9 +54,17 @@ def benchmark_sampling(
     # Benchmark E2E model
     if target in ["all", "e2e"]:
         # FIXME: fix pixel values generation
-        input_ids, attention_mask, pixel_values, sampling_params = get_sample_inputs(
-            END_TO_END_MODEL, neuron_config, image=image, sampling_params=sampling_params
-        )
+        (
+            input_ids,
+            attention_mask,
+            sampling_params,
+            pixel_values,
+            aspect_ratios,
+            vision_mask,
+            num_chunks,
+            has_image,
+        ) = get_sample_inputs(END_TO_END_MODEL, model.config, sampling_params, image=image)
+
         input_param = {
             "input_ids": input_ids,
             "generation_config": modified_generation_config,
@@ -80,6 +90,18 @@ def benchmark_sampling(
 
         if pixel_values is not None:
             input_param["pixel_values"] = pixel_values
+
+        if aspect_ratios is not None:
+            input_param["aspect_ratios"] = aspect_ratios
+
+        if num_chunks is not None:
+            input_param["num_chunks"] = num_chunks
+
+        if has_image is not None:
+            input_param["has_image"] = has_image
+
+        if vision_mask is not None:
+            input_param["vision_mask"] = vision_mask
 
         if target == "all":
             latency_collectors = create_submodule_latency_collectors(model)
@@ -113,10 +135,8 @@ def benchmark_sampling(
 
     # Benchmark context encoding model only
     if target == "context_encode":
-        input_param = get_sample_inputs(
-            CONTEXT_ENCODING_MODEL, neuron_config, sampling_params=sampling_params
-        )
-        ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, neuron_config)
+        input_param = get_sample_inputs(CONTEXT_ENCODING_MODEL, model.config, sampling_params)
+        ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, model.config)
         ctx_enc_benchmark.run()
         report[CONTEXT_ENCODING_MODEL] = generate_report(
             ctx_enc_benchmark.latency_list,
@@ -127,9 +147,7 @@ def benchmark_sampling(
 
     # Benchmark token generation model only
     if hasattr(model, "token_generation_model") and target == "token_gen":
-        input_param = get_sample_inputs(
-            TOKEN_GENERATION_MODEL, neuron_config, sampling_params=sampling_params
-        )
+        input_param = get_sample_inputs(TOKEN_GENERATION_MODEL, model.config, sampling_params)
         tkn_gen_benchmark = Benchmark(model.token_generation_model, input_param)
         tkn_gen_benchmark.run()
         report[TOKEN_GENERATION_MODEL] = generate_report(
@@ -141,9 +159,7 @@ def benchmark_sampling(
 
     # Benchmark speculation model only
     if hasattr(model, "speculation_model") and target == "speculation":
-        input_param = get_sample_inputs(
-            SPECULATION_MODEL, neuron_config, sampling_params=sampling_params
-        )
+        input_param = get_sample_inputs(SPECULATION_MODEL, model.config, sampling_params)
         spec_benchmark = Benchmark(model.speculation_model, input_param)
         spec_benchmark.run()
         report[SPECULATION_MODEL] = generate_report(
@@ -155,9 +171,7 @@ def benchmark_sampling(
 
     # Benchmark Medusa speculation model
     if hasattr(model, "medusa_speculation_model") and target == "speculation":
-        input_param = get_sample_inputs(
-            MEDUSA_MODEL, neuron_config, sampling_params=sampling_params
-        )
+        input_param = get_sample_inputs(MEDUSA_MODEL, model.config)
         spec_benchmark = Benchmark(model.medusa_speculation_model, input_param)
         spec_benchmark.run()
         report[MEDUSA_MODEL] = generate_report(
@@ -180,7 +194,11 @@ def benchmark_sampling(
     return report
 
 
-def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, image=None):
+def get_sample_inputs(model_type, config: InferenceConfig, sampling_params, image=None):
+    if hasattr(config, "neuron_config"):
+        neuron_config = config.neuron_config
+    else:
+        neuron_config = config
     max_context_length = neuron_config.max_context_length
     max_len = neuron_config.max_length
     # edge case where seq len == context_len
@@ -198,11 +216,31 @@ def get_sample_inputs(model_type, neuron_config: NeuronConfig, sampling_params, 
     if model_type == END_TO_END_MODEL:
         input_ids = torch.randint(0, 100, (batch_size, input_length))
         attention_mask = torch.ones((batch_size, input_length), dtype=torch.int32)
-        assert (
-            image is None
-        ), "image is not supported currently for benchmarking for END_TO_END_MODEL"
-
-        sample_inputs = (input_ids, attention_mask, None, sampling_params)
+        pixel_values, aspect_ratios, vision_mask, num_chunks, has_image = (
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        if image is not None:
+            pixel_values, aspect_ratios, num_chunks, has_image = get_image_tensors(
+                config, [[]] * batch_size
+            )
+            vision_mask = torch.zeros(
+                (neuron_config.batch_size, NUM_IMAGE_PER_PROMPT, 2),
+                dtype=torch.int32,
+            )
+        sample_inputs = (
+            input_ids,
+            attention_mask,
+            sampling_params,
+            pixel_values,
+            aspect_ratios,
+            vision_mask,
+            num_chunks,
+            has_image,
+        )
 
     elif model_type == CONTEXT_ENCODING_MODEL:
         input_ids = torch.zeros((batch_size, input_length), dtype=torch.int32)

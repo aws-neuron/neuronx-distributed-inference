@@ -1,6 +1,8 @@
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMllamaForCausalLM
+from neuronx_distributed_inference.models.mllama.utils import add_instruct
 
 END_TO_END_MODEL = "e2e_model"
 CONTEXT_ENCODING_MODEL = "context_encoding_model"
@@ -15,9 +17,11 @@ TKN_GEN_MODEL_COMPILER_WORK_DIR = BASE_COMPILER_WORK_DIR + TOKEN_GENERATION_MODE
 SPEC_MODEL_COMPILER_WORK_DIR = BASE_COMPILER_WORK_DIR + SPECULATION_MODEL + "/"
 
 TEST_PROMPT = "Hello, I am a language model, and I am here to help,"
+MM_TEST_PROMPT = add_instruct("What is in this image? Tell me a story", has_image=[1])
 
 MODEL_TYPES = {
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
+    "mllama": {"causal-lm": NeuronMllamaForCausalLM},
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
 }

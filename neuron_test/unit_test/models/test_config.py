@@ -1,5 +1,6 @@
 import tempfile
 from pathlib import Path
+from typing import Type
 
 import pytest
 import torch
@@ -10,11 +11,16 @@ from neuronx_distributed_inference.models.config import (
     InferenceConfig,
     NeuronConfig,
 )
+from neuronx_distributed_inference.models.mllama.modeling_mllama import (
+    MllamaInferenceConfig,
+    MultimodalVisionNeuronConfig,
+)
 from neuronx_distributed_inference.models.model_base import NeuronBaseModel
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 
 TEST_CONFIG_PATH = Path(__file__).parent.parent / "resources"
+TEST_MM_CONFIG_PATH = Path(__file__).parent.parent / "resources_multi_modal"
 
 
 def test_validate_config():
@@ -120,15 +126,6 @@ def test_serialize_deserialize_pretrained_config_adapter_where_neuron_config_ove
     assert deserialized_config.neuron_config.overrides_torch_dtype
 
 
-def verify_serialize_deserialize(config: InferenceConfig):
-    """Verify that the config is identical after being serialized and deserialized."""
-    with tempfile.TemporaryDirectory() as model_path:
-        config.save(model_path)
-        deserialized_config = InferenceConfig.load(model_path)
-        assert config.to_json_string() == deserialized_config.to_json_string()
-        return deserialized_config
-
-
 def test_preloaded_pretrained_config():
     hf_config = AutoConfig.from_pretrained(TEST_CONFIG_PATH)
     neuron_config = NeuronConfig()
@@ -144,3 +141,86 @@ def test_preloaded_pretrained_config():
     assert not hasattr(config, "torch_dtype")
     assert neuron_config.torch_dtype == torch.bfloat16
     assert not neuron_config.overrides_torch_dtype
+
+
+def test_multi_modal_preloaded_pretrained_config():
+    hf_config = AutoConfig.from_pretrained(TEST_MM_CONFIG_PATH)
+    neuron_config = NeuronConfig()
+    config = MllamaInferenceConfig(
+        neuron_config=neuron_config,
+        load_config=load_pretrained_config(hf_config=hf_config),
+    )
+
+    # Assert that an attribute from config.json is set on the config.
+    assert config.checkpoint == "META"
+
+    # Asset nested configs are set correctly
+    assert hasattr(config, "text_config")
+    assert hasattr(config, "vision_config")
+    assert isinstance(config.text_config, InferenceConfig)
+    assert isinstance(config.vision_config, InferenceConfig)
+
+    # Assert that torch_dtype is copied to neuron_config correctly.
+    assert not hasattr(config, "torch_dtype")
+    assert not hasattr(config.text_config, "torch_dtype")
+    assert not hasattr(config.vision_config, "torch_dtype")
+    assert neuron_config.torch_dtype == torch.bfloat16
+    assert not neuron_config.overrides_torch_dtype
+
+
+def test_get_text_config_multi_modal():
+    hf_config = AutoConfig.from_pretrained(TEST_MM_CONFIG_PATH)
+    neuron_config = NeuronConfig()
+    config = MllamaInferenceConfig(
+        neuron_config=neuron_config,
+        load_config=load_pretrained_config(hf_config=hf_config),
+    )
+
+    text_config = config.get_text_config()
+
+    assert text_config != config
+    assert text_config.vocab_size == 128256
+
+
+def test_get_text_config_text_model():
+    hf_config = AutoConfig.from_pretrained(TEST_CONFIG_PATH)
+    neuron_config = NeuronConfig()
+    config = InferenceConfig(
+        neuron_config=neuron_config,
+        load_config=load_pretrained_config(hf_config=hf_config),
+    )
+
+    text_config = config.get_text_config()
+
+    assert text_config == config
+    assert text_config.vocab_size == 32000
+
+
+def test_serialize_deserialize_mllama_inference_config():
+    hf_config = AutoConfig.from_pretrained(TEST_MM_CONFIG_PATH)
+    neuron_config = MultimodalVisionNeuronConfig()
+    config = MllamaInferenceConfig(
+        neuron_config=neuron_config,
+        load_config=load_pretrained_config(hf_config=hf_config),
+    )
+
+    assert config.text_config.hidden_size == 4096
+    assert config.vision_config.attention_heads == 16
+    assert config.neuron_config.tp_degree == 1
+
+    deserialized_config = verify_serialize_deserialize(config, MllamaInferenceConfig)
+
+    assert deserialized_config.text_config.hidden_size == 4096
+    assert deserialized_config.vision_config.attention_heads == 16
+    assert deserialized_config.neuron_config.tp_degree == 1
+
+
+def verify_serialize_deserialize(
+    config: InferenceConfig, config_cls: Type[InferenceConfig] = InferenceConfig
+):
+    """Verify that the config is identical after being serialized and deserialized."""
+    with tempfile.TemporaryDirectory() as model_path:
+        config.save(model_path)
+        deserialized_config = config_cls.load(model_path)
+        assert config.to_json_string() == deserialized_config.to_json_string()
+        return deserialized_config

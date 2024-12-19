@@ -1,3 +1,4 @@
+import math
 from typing import Any, Dict, Tuple
 
 import torch
@@ -199,6 +200,40 @@ def _rotate_half(x) -> Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def apply_scaling(freqs: torch.Tensor):
+    # Values obtained from grid search, specifically for Llama3.2 MM PyTorch Implementation
+    scale_factor = 8
+    low_freq_factor = 1
+    high_freq_factor = 4
+    old_context_len = 8192  # original llama3 length
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    new_freqs = []
+    for freq in freqs:
+        wavelen = 2 * math.pi / freq
+        if wavelen < high_freq_wavelen:
+            new_freqs.append(freq)
+        elif wavelen > low_freq_wavelen:
+            new_freqs.append(freq / scale_factor)
+        else:
+            assert low_freq_wavelen != high_freq_wavelen
+            smooth = (old_context_len / wavelen - low_freq_factor) / (
+                high_freq_factor - low_freq_factor
+            )
+            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
+    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
+
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    if use_scaled:
+        freqs = apply_scaling(freqs)
+    freqs = torch.outer(t, freqs)
+    return freqs
+
+
 def apply_rotary_pos_emb(
     q, k, cos, sin, position_ids=None, unsqueeze_dim=1
 ) -> Tuple[Tensor, Tensor]:
@@ -209,6 +244,33 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def apply_rotary_polar_compatible(query, key, freqs_cis):
+    freqs_cis_real = freqs_cis.cos().unsqueeze(2)
+    freqs_cis_imag = freqs_cis.sin().unsqueeze(2)
+
+    def rotate(input):
+        real = input[..., ::2]
+        imag = input[..., 1::2]
+
+        # For complex multiplication
+        # (a + ib) * (c + id) = (ac - bd) + i(ad + bc)
+
+        # ac - bd
+        rot_real = (real * freqs_cis_real) - (imag * freqs_cis_imag)
+
+        # ad + bc
+        rot_imag = (real * freqs_cis_imag) + (freqs_cis_real * imag)
+
+        return torch.cat([rot_real.unsqueeze(-1), rot_imag.unsqueeze(-1)], dim=-1).reshape(
+            input.shape
+        )
+
+    query_rot = rotate(query)
+    key_rot = rotate(key)
+
+    return query_rot.type_as(query), key_rot.type_as(key)
 
 
 def manual_softmax(prior_scores, active_scores, is_speculation) -> Tuple[Tensor, Tensor]:
@@ -327,7 +389,6 @@ def create_block_diagonal_attn_mask(
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
         ]
-
     Args:
         query_lens: a list of query lengths for each sequence
         key_lens: a list of key lengths for each sequence

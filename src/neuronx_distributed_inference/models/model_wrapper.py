@@ -111,9 +111,6 @@ class ModelWrapper(torch.nn.Module):
                 "--vectorize-strided-dma "
             )
 
-            if self.neuron_config.allow_rmsnorm_cascaded_reduce:
-                tensorizer_options += "--allow-rmsnorm-cascaded-reduce "
-
             if self.neuron_config.enable_fused_speculation:
                 tensorizer_options += "--optimize-alias-chain "
 
@@ -122,7 +119,6 @@ class ModelWrapper(torch.nn.Module):
                 f"--tensorizer-options='{tensorizer_options}'"
                 " -O1 "
                 f" --internal-num-neuroncores-per-sengine={self.neuron_config.logical_neuron_cores}"
-                f" --logfile {self.compiler_workdir}/log-neuron-cc.txt"
             )
 
             if self.neuron_config.target:
@@ -498,7 +494,7 @@ class DecoderModelInstance(BaseModelInstance):
                 raise RuntimeError(f"{self.neuron_config.quantization_type} is not supported")
             if self.neuron_config.quantization_dtype == "f8e4m3":
                 q_config["quantized_dtype"] = QuantizedDtype.F8E4M3
-            self.module = convert(float_model, q_config=q_config, inplace=False, mapping=None)
+            self.module = convert(float_model, q_config=q_config, inplace=True, mapping=None)
         else:
             self.module = float_model
 
@@ -513,7 +509,7 @@ class DecoderModelInstance(BaseModelInstance):
         # each buckets, otherwise it will fail the aliasing setup when
         # generating HLO
         self.input_output_aliases = {}
-        num_output_from_trace = 1
+        num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
         if self.neuron_config.enable_fused_speculation:
             if self.module.draft_model.kv_mgr is not None:
                 draft_past_key_values = self.module.draft_model.kv_mgr.past_key_values
@@ -565,7 +561,7 @@ def get_trace_callable(model_cls, config: InferenceConfig, bucket_rank=None):
             q_config = get_default_custom_qconfig_dict()
         else:
             raise RuntimeError(f"{config.neuron_config.quantization_type} is not supported")
-        model = convert(float_model, q_config=q_config, inplace=False, mapping=None)
+        model = convert(float_model, q_config=q_config, inplace=True, mapping=None)
     else:
         model = float_model
 

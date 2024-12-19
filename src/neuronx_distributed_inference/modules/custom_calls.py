@@ -17,6 +17,8 @@ class CustomRMSNorm(nn.Module):
         original_dtype = hidden_states.dtype
 
         hidden_states = hidden_states.to(torch.float32)
-        result = RmsNorm.apply(hidden_states, self.weight, self.variance_epsilon, 2)
+        result = RmsNorm.apply(
+            hidden_states, self.weight, self.variance_epsilon, len(hidden_states.shape) - 1
+        )
 
         return result.to(original_dtype)

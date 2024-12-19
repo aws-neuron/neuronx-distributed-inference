@@ -56,6 +56,7 @@ class NeuronConfig:
         # Need to provide example input shape for tracing
         self.n_positions = kwargs.pop("n_positions", self.seq_len)
         self.on_cpu = kwargs.pop("on_cpu", False)
+        self.output_logits = kwargs.pop("output_logits", False)
 
         # Torch dtype
         if "torch_dtype" in kwargs:
@@ -225,10 +226,6 @@ class NeuronConfig:
         self.cc_pipeline_tiling_factor = kwargs.pop("cc_pipeline_tiling_factor", 2)
         self.target = kwargs.pop("target", None)
 
-        # this compiler flag is an experimental feature made for llama-3.1-405B performance
-        # there are some known accuracy issues with this flag on trn1
-        self.allow_rmsnorm_cascaded_reduce = kwargs.pop("allow_rmsnorm_cascaded_reduce", False)
-
         # weights_to_skip_layout_optimization
         self.weights_to_skip_layout_optimization = []
 
@@ -245,6 +242,15 @@ class NeuronConfig:
         QuantizedDtype.has_dtype(self.quantization_dtype)
         if self.quantized_mlp_kernel_enabled:
             assert self.quantization_dtype == "f8e4m3"
+
+
+class MultimodalVisionNeuronConfig(NeuronConfig):
+    """
+    for multimodal vision config on Neuron
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
 
 
 class MoENeuronConfig(NeuronConfig):
@@ -337,6 +343,16 @@ class InferenceConfig:
     def to_json_string(self) -> str:
         config_dict = to_dict(self)
         return json.dumps(config_dict, indent=2, sort_keys=True)
+
+    def get_text_config(self):
+        """
+        Returns text_config for the text model in multi-modal models.
+        Returns original config for text models
+        """
+        if hasattr(self, "text_config") and self.text_config is not None:
+            return self.text_config
+
+        return self
 
     @classmethod
     def load(cls, model_path: Union[str, os.PathLike], **kwargs) -> "InferenceConfig":

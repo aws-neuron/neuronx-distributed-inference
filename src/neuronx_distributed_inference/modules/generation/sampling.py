@@ -141,52 +141,28 @@ class Sampler(torch.nn.Module):
         counts = torch.sum(greater_than_rand, dim=dim).unsqueeze(dim)
         return counts
 
-    def forward(self, token_logits, sampling_params, return_values=False):
-        """
-        forward to perform topk, topp, temperature and multinomial sampling.
+    def _argmax_sample(self, token_logits, return_values, dim):
+        if self.neuron_config.on_cpu:
+            return torch.argmax(token_logits, dim=dim)
+        else:
+            # distributed argmax
+            tokens = nxd_argmax(
+                tensor=token_logits,
+                dim=dim,
+                gather_dim=dim,
+                keepdim=False,
+                process_group=self.process_group,
+            )
+            values = torch.ones(tokens.shape, dtype=token_logits.dtype, device=tokens.device)
+            if return_values:
+                return tokens, values
+            return tokens
 
-        Inputs:
-            token_logits: tensor whose first dimension is Batch Size
-                and whose final dimension is Vocabulary Size
-            sampling_params: a 2D tensor of size (Batch Size, 3)
-            containing the following sampling params:
-                * top_k: value to use for top_k sampling
-                * top_p: value to use for top_p sampling
-                * temperature: value to use for temperature sampling
-
-        Output:
-            Tensor containing 1 sampled token id per batch size.
-            Output size is (1, Batch Size)
-
-        Note: Using torch.multinomial on device causes trace to hang.
-        This is because torch.multinomial performs a number of distribution
-        validation steps, which is content dependent. Hence we implement multinomial
-        distribution here instead.
-        """
+    def _multinomial_sample(self, token_logits, sampling_params, return_values, dim):
         batch_size = token_logits.shape[0]
         top_k = sampling_params[:, 0].reshape(batch_size, 1)
         top_p = sampling_params[:, 1].reshape(batch_size, 1)
         temperature = sampling_params[:, 2].reshape(batch_size, 1)
-        dim = len(token_logits.shape) - 1  # vocab_size dimension
-
-        if (not self.do_sample) or (
-            not self.dynamic and torch.all(top_k <= 1)
-        ):  # top_k == 1 mean greedy
-            if self.neuron_config.on_cpu:
-                return torch.argmax(token_logits, dim=dim)
-            else:
-                # distributed argmax
-                tokens = nxd_argmax(
-                    tensor=token_logits,
-                    dim=dim,
-                    gather_dim=dim,
-                    keepdim=False,
-                    process_group=self.process_group,
-                )
-                values = torch.ones(tokens.shape, dtype=token_logits.dtype, device=tokens.device)
-                if return_values:
-                    return tokens, values
-                return tokens
 
         top_k_logits_values, top_k_logits_indices = self._top_k_masked(token_logits, top_k, dim)
         if self.is_medusa:
@@ -212,3 +188,36 @@ class Sampler(torch.nn.Module):
 
         counts = self._multinomial(probs_soft_max, dim)
         return torch.gather(input=top_k_logits_indices, dim=dim, index=counts).flatten()
+
+    def forward(self, token_logits, sampling_params, return_values=False):
+        """
+        forward to perform topk, topp, temperature and multinomial sampling.
+
+        Inputs:
+            token_logits: tensor whose first dimension is Batch Size
+                and whose final dimension is Vocabulary Size
+            sampling_params: a 2D tensor of size (Batch Size, 3)
+            containing the following sampling params:
+                * top_k: value to use for top_k sampling
+                * top_p: value to use for top_p sampling
+                * temperature: value to use for temperature sampling
+
+        Output:
+            Tensor containing 1 sampled token id per batch size.
+            Output size is (1, Batch Size)
+
+        Note: Using torch.multinomial on device causes trace to hang.
+        This is because torch.multinomial performs a number of distribution
+        validation steps, which is content dependent. Hence we implement multinomial
+        distribution here instead.
+        """
+        batch_size = token_logits.shape[0]
+        dim = len(token_logits.shape) - 1  # vocab_size dimension
+        top_k = sampling_params[:, 0].reshape(batch_size, 1)
+
+        if self.is_medusa:
+            return self._multinomial_sample(token_logits, sampling_params, return_values, dim)
+        elif self.do_sample and (self.dynamic or torch.any(top_k > 1)):  # top_k == 1 mean greedy
+            return self._multinomial_sample(token_logits, sampling_params, return_values, dim)
+        else:
+            return self._argmax_sample(token_logits, return_values, dim)

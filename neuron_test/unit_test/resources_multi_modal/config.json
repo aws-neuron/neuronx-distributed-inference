@@ -1,0 +1,57 @@
+{
+    "architectures": [
+        "MllamaForConditionalGeneration"
+    ],
+    "checkpoint": "META",
+    "model_type": "mllama",
+    "text_config": {
+        "bos_token_id": 128000,
+        "cross_attention_layers": [
+            3,
+            8,
+            13,
+            18,
+            23,
+            28,
+            33,
+            38
+        ],
+        "eos_token_id": [
+            128001,
+            128008,
+            128009
+        ],
+        "hidden_act": "silu",
+        "hidden_size": 4096,
+        "intermediate_size": 14336,
+        "max_position_embeddings": 131072,
+        "num_attention_heads": 32,
+        "num_hidden_layers": 32,
+        "num_key_value_heads": 8,
+        "pad_token_id": 128001,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 500000.0,
+        "torch_dtype": "bfloat16",
+        "vision_num_cross_attention_layers": 8,
+        "vocab_size": 128256
+    },
+    "torch_dtype": "bfloat16",
+    "vision_config": {
+        "attention_heads": 16,
+        "hidden_size": 1280,
+        "image_size": 560,
+        "intermediate_layers_indices": [
+            3,
+            7,
+            15,
+            23,
+            30
+        ],
+        "max_num_tiles": 4,
+        "num_channels": 3,
+        "num_global_layers": 8,
+        "num_hidden_layers": 32,
+        "patch_size": 14,
+        "torch_dtype": "bfloat16"
+    }
+}

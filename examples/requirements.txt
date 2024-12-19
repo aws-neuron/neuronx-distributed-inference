@@ -2,3 +2,6 @@ transformers==4.45.*
 sentencepiece
 pillow
 pytest-forked
+tiktoken
+blobfile
+torchvision
