@@ -96,16 +96,16 @@ def register_module(key: str):
     return inner
 
 
-def convert_state_dict_to_non_fused_qkv(phi3_state_dict, cfg: InferenceConfig):
+def convert_state_dict_to_neuron(phi3_state_dict, cfg: InferenceConfig):
     for l in range(cfg.num_hidden_layers):
         # Keep the original fused weight as Wqkv.weight
         phi3_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = phi3_state_dict[
             f"layers.{l}.self_attn.qkv_proj.weight"
-        ]
+        ].clone().detach()
 
         # Get the fused QKV weight
-        fused_weight = phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.weight"]
-        fused_gate_up = phi3_state_dict[f"layers.{l}.mlp.gate_up_proj.weight"]
+        fused_weight = phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.weight"].clone().detach()
+        fused_gate_up = phi3_state_dict[f"layers.{l}.mlp.gate_up_proj.weight"].clone().detach()
 
         # Split the fused weight into Q, K, and V using torch.chunk
         q_weight, k_weight, v_weight = torch.chunk(fused_weight, 3, dim=0)
@@ -450,8 +450,7 @@ class NeuronPhi3ForCausalLM(NeuronBaseForCausalLM):
     ) -> dict:
         """This function should be over-ridden in child classes as needed"""
 
-        state_dict = convert_state_dict_to_non_fused_qkv(state_dict, config)
-        print(state_dict)
+        state_dict = convert_state_dict_to_neuron(state_dict, config)
         return state_dict
 
     @classmethod
