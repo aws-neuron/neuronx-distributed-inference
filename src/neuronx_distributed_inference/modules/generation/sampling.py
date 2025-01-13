@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Any, Dict, Union
 
 import torch
 from neuronx_distributed.operators.argmax import argmax as nxd_argmax
@@ -6,7 +6,7 @@ from neuronx_distributed.operators.topk import topk as nxd_topk
 from neuronx_distributed.parallel_layers import parallel_state
 from torch_neuronx.xla_impl.ops import xla_hlo_call
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 
 
 @xla_hlo_call
@@ -16,6 +16,62 @@ def rand_like(tensor):
     minimum = dtype.Constant(constant_value=0)
     maximum = dtype.Constant(constant_value=1)
     return dtype[shape].Rng(minimum, maximum, distribution=1)  # Uniform distribution
+
+
+def validate_sampling_params(
+    params: torch.Tensor, on_device_sampling_config: Union[Dict[str, Any], OnDeviceSamplingConfig]
+) -> None:
+    """
+    Validates sampling parameters for language models.
+
+    Args:
+    params (torch.Tensor): Tensor of shape (batch_size, 3) containing sampling parameters
+                           in the order: top-k, top-p, temperature.
+    on_device_sampling_config
+
+    Raises:
+    ValueError: If any of the parameters are invalid.
+    """
+    if params.shape[1] != 3:
+        raise ValueError(f"Expected tensor of shape (batch_size, 3), but got {params.shape}")
+
+    # autocast params tensor to float32
+    params = params.to(torch.float32)
+
+    # Unpack parameters
+    top_k, top_p, temperature = params[:, 0], params[:, 1], params[:, 2]
+
+    if isinstance(on_device_sampling_config, OnDeviceSamplingConfig):
+        global_top_k = on_device_sampling_config.global_topk
+    else:
+        global_top_k = on_device_sampling_config["global_topk"]
+
+    # Validate top-k value range
+    valid_top_k = (top_k == -1) | ((top_k > 0) & (top_k <= global_top_k))
+    if not torch.all(valid_top_k):
+        raise ValueError(
+            f"Invalid top-k values found. top-k must be -1 or greater than 0 but less than or equal to {global_top_k=}. Found {top_k=}."
+        )
+
+    # checks if top-k values can be represented as integers
+    if not torch.equal(top_k, top_k.floor()):
+        raise ValueError(
+            f"Invalid top-k values found. top-k values should be able to be represented as integer values, but found decimal parts. Found {top_k=}."
+        )
+
+    # Validate top-p
+    valid_top_p = (top_p > 0.0) & (top_p <= 1.0)
+    if not torch.all(valid_top_p):
+        raise ValueError(
+            f"Invalid top-p values found. top-p must be in the range (0.0, 1.0]. Found {top_p=}."
+        )
+
+    # Validate temperature
+    valid_temp = temperature > 0.0
+    if not torch.all(valid_temp):
+        raise ValueError(
+            f"Invalid temperature values found. Temperature must be strictly greater than 0.0. Found {temperature=}."
+        )
 
 
 def prepare_sampling_params(batch_size, top_k=[1], top_p=[1.0], temperature=[1.0]):

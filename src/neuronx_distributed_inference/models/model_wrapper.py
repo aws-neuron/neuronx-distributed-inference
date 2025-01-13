@@ -300,26 +300,36 @@ class ModelWrapper(torch.nn.Module):
 
     def _forward_with_pad(self, *args):
         seq_ids = args[3]
-        if len(args) > 4:
-            medusa_args = args[4:8]
+        sampling_params = args[4]
+        if len(args) > 5:
+            medusa_args = args[5:8]
         else:
             medusa_args = None
 
         # pad the inputs up to the compiled batch size in the end
-        def pad_helper(tensor):
+        def pad_helper(tensor, pad_type="zeros"):
+            VALID_PAD_TYPES = set(["zeros", "ones", "repeat_first_batchline"])
+            assert (
+                pad_type in VALID_PAD_TYPES
+            ), f"Found {pad_type=}, but valid pad types are {VALID_PAD_TYPES}"
             if tensor is None or tensor.shape[0] == self.neuron_config.batch_size:
                 return tensor
 
             padded_shape = list(tensor.shape)
             padded_shape[0] = self.neuron_config.batch_size
-            padded_tensor = torch.zeros(padded_shape, dtype=tensor.dtype)
+            if pad_type == "repeat_first_batchline":
+                # pad with first batch line values instead of zeros, to reduce chances of NaN
+                padded_tensor = tensor[0].unsqueeze(0).repeat(padded_shape[0], 1).to(tensor.dtype)
+            else:
+                fill_value = 0 if pad_type == "zeros" else 1
+                padded_tensor = torch.full(padded_shape, fill_value=fill_value, dtype=tensor.dtype)
             padded_tensor[: tensor.shape[0]] = tensor
             return padded_tensor
 
         padded_args = []
         # pad input_ids, attn_mask and position_ids
         for arg in args[0:3]:
-            padded_args.append(pad_helper(arg))
+            padded_args.append(pad_helper(arg, pad_type="repeat_first_batchline"))
 
         # need to handle seq_ids separately, when compiled batch is 4, if we pad seq_ids from [0,2,1] to [0,2,1,
         # 0]. then the kv cache of padded input could be written into the first cache line, so we need to pad as [0,
@@ -332,6 +342,10 @@ class ModelWrapper(torch.nn.Module):
             dtype=seq_ids.dtype,
         )
         padded_args.append(padded_seq_ids)
+
+        # pad sampling params by repeating first batchline
+        padded_sampling_params = pad_helper(sampling_params, pad_type="repeat_first_batchline")
+        padded_args.append(padded_sampling_params)
 
         if medusa_args is not None:
             for arg in medusa_args:
