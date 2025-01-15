@@ -38,6 +38,7 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     Sampler,
     prepare_sampling_params,
     rand_like,
+    validate_sampling_params,
 )
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
     KVCacheManager,
@@ -1358,6 +1359,9 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         sampling_params = (
             self.default_sampling_params if sampling_params is None else sampling_params
         )
+        if self.on_device_sampling:
+            validate_sampling_params(sampling_params, self.neuron_config.on_device_sampling_config)
+
         self.sampling_params = sampling_params
 
         output_attentions, output_hidden_states, return_dict = self._setup_func_config(
