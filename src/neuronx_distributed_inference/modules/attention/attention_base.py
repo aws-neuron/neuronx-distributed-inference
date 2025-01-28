@@ -91,12 +91,6 @@ class NeuronAttentionBase(nn.Module):
         self.o_proj_layer_name = "o_proj"
 
     def init_gqa_properties(self):
-        if (self.head_dim * self.num_attention_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_attention_heads})."
-            )
-
         self.qkv_proj = GroupQueryAttention_QKV(
             hidden_size=self.hidden_size,
             head_dim=self.head_dim,
