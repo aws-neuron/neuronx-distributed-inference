@@ -588,7 +588,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim
+        self.head_dim = getattr(config.head_dim, config.hidden_dim // config.num_attention_heads)
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.padding_side = config.neuron_config.padding_side
