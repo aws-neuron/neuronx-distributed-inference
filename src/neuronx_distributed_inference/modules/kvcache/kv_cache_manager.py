@@ -93,6 +93,9 @@ class KVCacheManager(nn.Module):
         return num_kv_heads_per_rank
 
     def _get_hidden_dim_per_head(self, config: InferenceConfig):
+        if hasattr(config, "head_dim"):
+            return config.head_dim
+
         hidden_size = config.hidden_size
         num_atten_head = config.num_attention_heads
         hidden_dim_per_head = hidden_size // num_atten_head
