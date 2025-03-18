@@ -130,11 +130,16 @@ def convert_state_dict_to_neuron(phi3_state_dict, cfg: InferenceConfig):
         ].clone().detach()
 
         # Get the fused QKV weight
-        fused_weight = phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.weight"].clone().detach()
+        fused_attn = phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.weight"].clone().detach()
         fused_gate_up = phi3_state_dict[f"layers.{l}.mlp.gate_up_proj.weight"].clone().detach()
-
+        # Potentially handle GQA
+        if cfg.num_attention_heads > cfg.num_key_value_heads:
+            q_features = cfg.hidden_size
+            q_weight = fused_attn[:q_features]
+            k_weight, v_weight = torch.chunk(fused_attn[q_features:], 2, dim=0)
         # Split the fused weight into Q, K, and V using torch.chunk
-        q_weight, k_weight, v_weight = torch.chunk(fused_weight, 3, dim=0)
+        else:
+            q_weight, k_weight, v_weight = torch.chunk(fused_attn, 3, dim=0)
         gate, up = torch.chunk(fused_gate_up, 2, dim=0)
 
         # Add the split weights to the state dict
