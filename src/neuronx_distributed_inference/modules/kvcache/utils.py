@@ -1,75 +1,105 @@
+from typing import List
+
 import torch
+import torch.nn.functional as F
+from neuronx_distributed.utils import cpu_mode
 from torch import Tensor
 from torch_neuronx.xla_impl.ops import xla_hlo_call
+
+from neuronx_distributed_inference.modules.custom_calls import neuron_cumsum
+
+
+def fill_prefix(cache, prefix_cache):
+    if cpu_mode():
+        cache[[slice(0, s) for s in prefix_cache.shape]] = prefix_cache
+        return cache
+    else:
+
+        @xla_hlo_call
+        def xla_fill_prefix(tensor, update):
+            scribe = tensor.scribe
+            dtype = tensor.dtype
+            shape = tensor.sizes
+            start_indices = [scribe.u32.Constant(constant_value=0)] * len(shape)
+            return dtype[shape].DynamicUpdateSlice(tensor, update, *start_indices)
+
+        return xla_fill_prefix(cache, prefix_cache)
+
+
+def dynamic_update_slice(
+    tensor: torch.Tensor, update: torch.Tensor, start_indices: List[torch.Tensor]
+):
+    """
+    Directly invoke DynamicUpdateSlice XLA op
+    https://openxla.org/xla/operation_semantics#dynamicupdateslice
+    """
+
+    if cpu_mode():
+        raise NotImplementedError("dynamic_update_slice() is not implemented for CPU mode")
+
+    @xla_hlo_call
+    def xla_dynamic_update_slice(tensor, update, *start_indices):
+        dtype = tensor.dtype
+        shape = tensor.sizes
+        return dtype[shape].DynamicUpdateSlice(tensor, update, *start_indices)
+
+    assert len(start_indices) == tensor.dim(), "not enough indices to index into tensor"
+    return xla_dynamic_update_slice(tensor, update, *start_indices)
 
 
 def get_active_block_table(
     block_table: Tensor,
-    seq_lens: Tensor,
-    num_active_blocks: Tensor,
-    block_size: Tensor,
+    context_lens: Tensor,
+    block_size: int,
 ):
     """
-    Get a block table of active KV cache blocks, with padding at the end only.
+    Get a block table of active KV cache blocks, with padding only at the end.
 
     The original block table input param from vLLM is padded for each sequence,
     so it is not only padded at the end, but also in between. This function is
-    to clean those padding, so we don't need to fetch a number of KV cache
+    to clean those padding, and only choose necessary KV cache blocks for
+    current request. So we don't need to fetch a number of KV cache
     blocks that are not needed for attention computation.
+
+    This function is meant to be called outside of NeuronBaseModel, so there
+    is no requirement of fixed shape.
 
     Example:
         Inputs:
-            block_tables: [[149,   0], [148,   0], [147, 146], [145,   0]]
-            seq_lens: [[  6], [ 16], [170], [  6]]
-            num_active_blocks: 6
+            block_tables: [[149, 143], [148,   0], [147, 146], [145,   0]]
+            context_lens: [  6,  16, 170,   6]
+            block_size: 128
 
         Expected Outputs:
             active_table:
-            [149, 148, 147, 146, 145, 0]
+            [149, 148, 147, 146, 145]
 
     Args:
-        block_table: the original input param block_table from vllm, where there
-            could be paddings in between.
-        seq_lens: the length of each sequence in a batch request.
-        num_active_blocks: the max number of blocks to hold the effective KV
-            cache blocks, and usually it is decided by bucket size.
+        block_table: the original input param block_table from vllm.
+        context_lens: the length of KV cache per sequence, excluding the KV
+            states from current request.
         block_size: the size of a KV cache block, to be provided by users of
             vLLM.
 
     Returns:
-        active_block: a block table to hold effective KV cache block id, whose
-            length is the same as num_active_blocks.
+        active_table: a block table to hold effective KV cache block id, whose
+            length is the same as num_active_blocks. The active_table will be
+            an empty tensor([]) if there is no active blocks needed.
     """
 
-    batch_size, max_num_blocks_per_seq = block_table.shape
-    # assert len(seq_lens.shape) == 2, "seq_lens is expected to be a 2D tensor"
-    # assert batch_size == seq_lens.shape[0]
+    assert len(block_table.shape) == 2
+    assert len(context_lens.shape) == 1
+    max_num_seqs, _ = block_table.shape
+    assert max_num_seqs == len(context_lens)
 
-    active_table = torch.zeros(num_active_blocks, dtype=block_table.dtype)
+    active_table = []
+    for seq_id in range(max_num_seqs):
+        context_for_seq = context_lens[seq_id]
+        blocks_for_seq = block_table[seq_id, :]
+        num_active_blocks_for_seq = torch.ceil(context_for_seq / block_size).int()
+        active_table.append(blocks_for_seq[:num_active_blocks_for_seq])
 
-    block_table = block_table.reshape(batch_size * max_num_blocks_per_seq)
-    seq_lens = seq_lens.reshape(batch_size)
-
-    num_blocks_per_seq = torch.ceil(seq_lens / block_size)
-    blocks_cumsum = torch.cumsum(num_blocks_per_seq, dim=0)
-    start_block_id_list = torch.cat([torch.tensor([0]), blocks_cumsum])
-
-    seq_id_list = torch.arange(batch_size)
-
-    for block_id in torch.arange(num_active_blocks):
-        seq_mask = blocks_cumsum <= block_id
-        seq_id = torch.minimum(
-            torch.max(seq_mask * (seq_id_list + 1)), torch.tensor(batch_size - 1)
-        )
-        seq_start_block_id = start_block_id_list[seq_id]
-        offset = block_id - seq_start_block_id
-        block_table_id = torch.minimum(
-            seq_id * max_num_blocks_per_seq + offset, torch.tensor(block_table.numel() - 1)
-        )
-        block_table_id = block_table_id.to(torch.int)
-
-        active_table[block_id] = block_table[block_table_id]
-
+    active_table = torch.cat(active_table)
     return active_table
 
 
@@ -88,26 +118,91 @@ def contexted_kv(
 
     This is needed for chunked prefill: in attention module, Q needs to
     attend to all K for a sequence.
+
+    Args:
+        cache: KV cache in block layout.
+        current: KV computed in current step in BHSD layout.
+        cache_mask: Binary array to indicate needed KV cache.
+        cache_reordered_idx: index array used to retrieve KV from cache.
+        current_reordered_idx: index array used to retrieve KV from current.
+
+    Returns:
+        combined_ctx: KV that will be used later for context encoding.
+
     """
-    max_num_ctx = cache_reordered_idx.shape[0]
+    cache_and_current_len = cache_reordered_idx.shape[0]
     # cache is in block layout
     num_blocks, block_size, num_heads, head_dim = cache.shape
     # current output is in BHSD layout
     batch_size, _, seq_len, _ = current.shape
-    size = [1, max_num_ctx, num_heads, head_dim]
+    size = [1, cache_and_current_len, num_heads, head_dim]
 
     cache = cache.reshape(num_blocks * block_size, num_heads * head_dim)
-    cache = torch.index_select(cache, dim=0, index=cache_reordered_idx)
-    cache = cache.reshape(size)
+    cache = torch.index_select(cache, dim=0, index=cache_reordered_idx.int())
 
     current = current.permute((0, 2, 1, 3))  # BHSD -> BSHD
     current = current.reshape(batch_size * seq_len, num_heads * head_dim)
-    current = torch.index_select(current, dim=0, index=current_reordered_idx)
-    current = current.reshape(size)
+    current = torch.index_select(current, dim=0, index=current_reordered_idx.int())
 
-    cache_mask = cache_mask.reshape(size)
+    cache_mask = cache_mask.reshape(-1, 1)
+    combined_ctx = torch.where(cache_mask, cache, current)
+    combined_ctx = combined_ctx.reshape(size)  # BSHD
+    combined_ctx = combined_ctx.permute((0, 2, 1, 3))  # BSHD -> BHSD
+    return combined_ctx
 
-    combined_ctx = torch.where(cache_mask, cache, current)  # BSHD
+
+def contexted_kv_v2(
+    cache,
+    current,
+    cache_mask,
+    current_reordered_idx,
+):
+    """
+    Combine KV cache and KV output for current posistion into one.
+
+    We need to call contexted_kv_indexing_v2() to get necessary input params (
+    index and mask) for this function.
+
+    This is needed for chunked prefill: in attention module, Q needs to
+    attend to all K for a sequence.
+
+    Args:
+        cache: KV cache in BHSD layout.
+        current: KV computed in current step in shape of (batch_size, num_heads, n_active_tokens, head_dim).
+        cache_mask: boolean array to indicate needed KV cache in shape (batch_size, seq_len).
+        current_reordered_idx: index array used to retrieve KV from current in shape (batch_size, seq_len).
+
+    Returns:
+        combined_ctx: KV that will be used later for context encoding in BHSD layout.
+
+    """
+    batch_size, num_heads, seq_len, head_dim = cache.shape
+    _, _, n_active_tokens, _ = current.shape
+
+    dtype = current_reordered_idx.dtype
+    device = current_reordered_idx.device
+    current_reordered_idx = torch.where(
+        cache_mask,
+        current_reordered_idx,
+        current_reordered_idx
+        + torch.arange(batch_size, dtype=dtype, device=device).unsqueeze(-1) * seq_len,
+    )
+
+    cache = cache.permute(0, 2, 1, 3)  # BHSD -> BSHD
+    cache = cache.reshape(batch_size * seq_len, num_heads * head_dim)
+
+    current = current.permute((0, 2, 1, 3))  # BHSD -> BSHD
+    # For token gen, we will need to pad the current KV to have the same shape as cache
+    current = F.pad(input=current, pad=(0, 0, 0, 0, 0, seq_len - n_active_tokens))
+    current = current.reshape(batch_size * seq_len, num_heads * head_dim)
+    current = torch.index_select(
+        input=current, dim=0, index=current_reordered_idx.reshape(-1).int()
+    )
+
+    cache_mask = cache_mask.reshape(-1, 1)
+    combined_ctx = torch.where(cache_mask, cache, current)
+    combined_ctx = combined_ctx.reshape(batch_size, seq_len, num_heads, head_dim)  # BSHD
+    combined_ctx = combined_ctx.permute((0, 2, 1, 3))  # BSHD -> BHSD
     return combined_ctx
 
 
@@ -127,7 +222,7 @@ def contexted_kv_indexing(
     Example:
         new_lens: [3,2,1,0]
         all_lens: [5,7,5,0]
-        total_key_len: 20
+        max_total_len: 20
         block_size: 4
 
         cache_mask:
@@ -141,8 +236,8 @@ def contexted_kv_indexing(
         new_lens: the length of new KV states (derived from current request)
             for each sequence
         all_lens: the length of KV cache and new KV for each sequence
-        total_len: the max total length of KV which includes KV cache and new
-            KV for current request
+        max_total_len: the max total length of KV which includes KV cache and
+            new KV for current request
         block_size: size of a KV cache block
 
     Returns:
@@ -155,35 +250,39 @@ def contexted_kv_indexing(
             each sequence
     """
     batch_size = new_lens.shape[0]
+    dtype = new_lens.dtype
+    device = new_lens.device
     # num of states from previous cache
     old_lens = all_lens - new_lens
     # start id in the combined KV for each seq (in combined KV, there is
     # padding only at the end)
-    all_cumsum = torch.cat([torch.tensor([0]), torch.cumsum(all_lens, dim=0)])
+    all_cumsum = neuron_cumsum(all_lens.reshape(1, -1).float()).flatten().int()
+    all_cumsum = F.pad(all_cumsum, pad=[1, 0])
     # start id in the query for each seq
-    new_cumsum = torch.cat([torch.tensor([0]), torch.cumsum(new_lens, dim=0)])
+    new_cumsum = neuron_cumsum(new_lens.reshape(1, -1).float()).flatten().int()
+    new_cumsum = F.pad(new_cumsum, pad=[1, 0])
 
     # start id in the combined KV for each seq
     all_cumsum = all_cumsum[:batch_size]
     new_steps = all_cumsum + old_lens
 
-    num_block_per_seq = torch.ceil(old_lens / block_size)
-    num_block_per_seq = torch.cat([torch.tensor([0]), num_block_per_seq])
+    num_block_per_seq = torch.ceil(old_lens / block_size).int()
+    num_block_per_seq = F.pad(num_block_per_seq, pad=[1, 0])
     # block start id for each seq
-    block_start_idx = torch.cumsum(num_block_per_seq, dim=0)
+    block_start_idx = neuron_cumsum(num_block_per_seq.reshape(1, -1).float()).flatten().int()
     # cache start id for each seq
     old_start = block_start_idx * block_size
 
-    cache_mask = torch.zeros(max_total_len, dtype=torch.bool)
-    cache_reordered_idx = torch.zeros(max_total_len, dtype=torch.int)
-    current_reordered_idx = torch.zeros(max_total_len, dtype=torch.int)
+    cache_mask = torch.zeros(max_total_len, dtype=torch.bool, device=device)
+    cache_reordered_idx = torch.zeros(max_total_len, dtype=dtype, device=device)
+    current_reordered_idx = torch.zeros(max_total_len, dtype=dtype, device=device)
 
-    idx = torch.arange(max_total_len)
+    idx = torch.arange(max_total_len, dtype=dtype, device=device)
     for seq_id in range(batch_size):
-        cache_reordered_idx, mask, *_ = _selective_masking(
+        cache_reordered_idx, mask = _selective_masking(
             all_cumsum[seq_id], old_start[seq_id], old_lens[seq_id], idx, cache_reordered_idx
         )
-        current_reordered_idx, *_ = _selective_masking(
+        current_reordered_idx, _ = _selective_masking(
             new_steps[seq_id], new_cumsum[seq_id], new_lens[seq_id], idx, current_reordered_idx
         )
         cache_mask = torch.logical_or(mask, cache_mask)
@@ -204,10 +303,99 @@ def _selective_masking(loc, start, length, idx, x_to_ctx):
     return x_to_ctx, mask
 
 
-@xla_hlo_call
-def fill_prefix(tensor, update):
-    scribe = tensor.scribe
-    dtype = tensor.dtype
-    shape = tensor.sizes
-    start_indices = [scribe.u32.Constant(constant_value=0)] * len(shape)
-    return dtype[shape].DynamicUpdateSlice(tensor, update, *start_indices)
+def contexted_kv_indexing_v2(q_lens, k_lens, max_seq_len) -> torch.Tensor:
+    """
+    Generate the precomputed cache mask.
+
+    Example:
+        q_lens: [3,2,0]
+        k_lens: [5,7,0]
+        max_seq_len: 10
+
+        cache_mask:
+            [[1, 1, x, x, x, x, x, x, x, x],
+             [1, 1, 1, 1, 1, x, x, x, x, x],
+             [x, x, x, x, x, x, x, x, x, x]]
+        current_reordered_idx:
+            [[x, x, 0, 1, 2, x, x, x, x, x],
+             [x, x, x, x, x, 0, 1, x, x, x],
+             [x, x, x, x, x, x, x, x, x, x]]
+
+    Args:
+        q_lens: the length of the queries in shape (batch_size, )
+        k_lens: the length of the keys in shape (batch_size, )
+        max_seq_len: the maximum length of the sequence
+
+    Returns:
+        cache_mask: the precomputed cache mask in shape (batch_size, max_seq_len)
+        current_reordered_idx: the scatter indices mapping the newly computed KV
+            to full-length KV in shape (batch_size, max_seq_len)
+    """
+    batch_size = q_lens.shape[0]
+    dtype = q_lens.dtype
+    device = q_lens.device
+
+    cache_lens = k_lens - q_lens
+    mask = torch.arange(max_seq_len, dtype=dtype, device=device).unsqueeze(0).repeat(batch_size, 1)
+    cache_mask = mask.lt(cache_lens.unsqueeze(-1))
+    current_reordered_idx = torch.where(cache_mask, 0, mask - cache_lens.unsqueeze(-1))
+    current_reordered_idx = torch.where(mask.lt(k_lens.unsqueeze(-1)), current_reordered_idx, 0)
+
+    return cache_mask, current_reordered_idx
+
+
+def contexted_kv_indexing_dynamic(
+    q_lens,
+    k_lens,
+    block_size,
+):
+    """
+    Another impl of contexted_kv_indexing with dynamic shape.
+
+    The length of the output indices are the sum of k_lens.
+    """
+    num_seqs = q_lens.shape[0]
+    dtype = q_lens.dtype
+    device = q_lens.device
+
+    cache_mask = []
+    for seq_id in range(num_seqs):
+        num_q = q_lens[seq_id]
+        num_k = k_lens[seq_id]
+        num_cache = num_k - num_q
+
+        cache_per_seq = torch.ones(num_cache, dtype=dtype, device=device)
+        active_per_seq = torch.zeros(num_q, dtype=dtype, device=device)
+        cache_mask_per_seq = torch.cat([cache_per_seq, active_per_seq], dim=0)
+        cache_mask.append(cache_mask_per_seq)
+    cache_mask = torch.cat(cache_mask, dim=0).bool()
+
+    actual_len = cache_mask.shape[0]
+    active_to_ctx = torch.zeros(actual_len, dtype=dtype, device=device)
+    cnt = 0
+    for i in range(actual_len):
+        if not cache_mask[i]:
+            active_to_ctx[i] += cnt
+            cnt += 1
+
+    cached_to_ctx = []
+    cache = k_lens - q_lens
+    num_blocks_per_seq = torch.ceil(cache / block_size)
+    num_blocks_per_seq = F.pad(num_blocks_per_seq, [1, 0])
+    num_blocks_per_seq = torch.cumsum(num_blocks_per_seq, dim=0)
+    for seq_id in range(num_seqs):
+        num_q = q_lens[seq_id]
+        num_k = k_lens[seq_id]
+        num_cache = num_k - num_q
+
+        if num_cache != 0:
+            # fill for cache id
+            start_block_id = num_blocks_per_seq[seq_id]
+            start_slot_id = start_block_id * block_size
+            cache_per_seq = torch.arange(
+                start_slot_id, start_slot_id + num_cache, dtype=dtype, device=device
+            )
+            cached_to_ctx.append(cache_per_seq)
+        cached_to_ctx.append(torch.zeros(num_q, dtype=dtype, device=device))
+    cached_to_ctx = torch.cat(cached_to_ctx, dim=0)
+    return cache_mask, cached_to_ctx, active_to_ctx

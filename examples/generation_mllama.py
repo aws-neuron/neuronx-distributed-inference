@@ -44,15 +44,16 @@ def run_llama_generate():
         seq_len=seq_len,
         on_device_sampling_config=on_device_sampling_config,
         enable_bucketing=True,
-        sequence_parallel_enabled=False,
-        fused_qkv=False,
+        sequence_parallel_enabled=True,
+        fused_qkv=True,
         async_mode=False,
     )
     config = MllamaInferenceConfig(
         neuron_config,
         load_config=load_pretrained_config(model_path),
     )
-    
+    config.neuron_config.skip_vision = False
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
     tokenizer.pad_token = tokenizer.eos_token
 

@@ -30,6 +30,7 @@ except ImportError:
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
+from neuronx_distributed.utils import cpu_mode
 from torch import nn
 from torch_neuronx.xla_impl.ops import nki_jit
 from transformers import MixtralForCausalLM
@@ -53,6 +54,9 @@ def convert_mixtral_to_neuron_state_dict(neuron_state_dict, config):
     Helper function which returns the model weights from the mixtral model in a state dictionary compatible with the stucture of the neuron MoE model.
     """
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported for Mixtral Top-K model"
+
+    # to facilitate rank usage in base model
+    neuron_state_dict["rank_util.rank"] = torch.arange(0, config.neuron_config.tp_degree, dtype=torch.int32)
 
     for l in range(config.num_hidden_layers):  # noqa: E741
         # Copy router weights
@@ -124,11 +128,11 @@ def convert_mixtral_to_neuron_state_dict(neuron_state_dict, config):
     return neuron_state_dict
 
 
-def get_rmsnorm_cls(config):
+def get_rmsnorm_cls():
     # Initialize to the appropriate implementation of RMSNorm
     # If infer on NXD -> CustomRMSNorm
     # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
-    return MixtralRMSNorm if config.neuron_config.on_cpu else CustomRMSNorm
+    return MixtralRMSNorm if cpu_mode() else CustomRMSNorm
 
 
 class MixtralInferenceConfig(InferenceConfig):
@@ -207,11 +211,11 @@ class NeuronMixtralDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
         )
 
-        self.input_layernorm = get_rmsnorm_cls(config)(
+        self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm = get_rmsnorm_cls(config)(
+        self.post_attention_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
@@ -296,7 +300,7 @@ class NeuronMixtralModel(NeuronBaseModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = get_rmsnorm_cls(config)(self.hidden_size, eps=config.rms_norm_eps)
+        self.norm = get_rmsnorm_cls()(self.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
@@ -330,9 +334,7 @@ class NeuronMixtralForCausalLM(NeuronBaseForCausalLM):
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
-        # Prevent auto-down casting when running with fp32
-        if self.config.neuron_config.torch_dtype == torch.float32:
-            compiler_args += " --auto-cast=none"
+        compiler_args += " --auto-cast=none"
         # Enable vector-offset DGE
         compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         return compiler_args

@@ -14,13 +14,13 @@ from PIL import Image
 
 from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.models.mllama.image_transform import custom_image_preprocessing
-from neuronx_distributed_inference.models.mllama.model_wrapper_mllama import NUM_IMAGE_PER_PROMPT
 
 logger = logging.getLogger(__name__)
 
 
 HF_CHECKPOINT = "HF"
 META_CHECKPOINT = "META"
+NUM_IMAGE_PER_PROMPT = 1
 
 
 def get_input_shape(input_ids):
@@ -69,21 +69,32 @@ def get_image(image_path):
         return img
 
 
-def get_image_tensors(config: InferenceConfig, batch_images: List[List]):
+def get_image_tensors(
+    config: InferenceConfig, batch_images: List[List], is_for_context_encoding=True
+):
     bsz = len(batch_images)
-    if len(batch_images[0]) == 0:
+
+    if len(batch_images[0]) == 0 or config.neuron_config.skip_vision:
         logger.info("Setting empty vision inputs...")
-        empty_pixel_values = torch.zeros(
-            [
-                bsz,
-                NUM_IMAGE_PER_PROMPT,
-                config.vision_config.max_num_tiles,
-                config.vision_config.num_channels,
-                config.vision_config.image_size,
-                config.vision_config.image_size,
-            ],
-            dtype=config.neuron_config.torch_dtype,
-        )
+        if config.neuron_config.skip_vision or (not is_for_context_encoding):
+            # We use dummy pixel_values for:
+            # context-encoding when skip_vision==True, as we don't execute xatten layers
+            # token-generation, actual pixel_values are aliased
+            empty_pixel_values = torch.tensor(
+                [0] * config.neuron_config.batch_size, dtype=torch.int32
+            )
+        else:
+            empty_pixel_values = torch.zeros(
+                [
+                    bsz,
+                    NUM_IMAGE_PER_PROMPT,
+                    config.vision_config.max_num_tiles,
+                    config.vision_config.num_channels,
+                    config.vision_config.image_size,
+                    config.vision_config.image_size,
+                ],
+                dtype=config.neuron_config.torch_dtype,
+            )
         empty_aspect_ratios = torch.ones(
             (bsz, NUM_IMAGE_PER_PROMPT, 2),
             dtype=torch.int32,

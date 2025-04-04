@@ -9,7 +9,7 @@ from neuronx_distributed.parallel_layers.mappings import gather_from_sequence_pa
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
 from neuronx_distributed.quantization.quantization_layers import BaseQuantizeParallelLinear
 from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_kernel
-from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
+from neuronxcc.nki.language import nc
 from torch import nn
 from torch.distributed import ProcessGroup
 from torch.nn import functional as F
@@ -328,7 +328,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         rms_norm_eps: float = None,
         qkv_kernel_enabled: bool = False,
-        logical_neuron_cores: int = 1,
+        logical_nc_config: int = 1,
+        qkv_kernel_nbsd_layout: bool = False,
+        on_cpu: bool = False,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -354,7 +356,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         self.sequence_dimension = sequence_dimension
         self.rms_norm_eps = rms_norm_eps
         self.qkv_kernel_enabled = qkv_kernel_enabled
-        self.logical_neuron_cores = logical_neuron_cores
+        self.logical_nc_config = logical_nc_config
+        self.qkv_kernel_nbsd_layout = qkv_kernel_nbsd_layout
 
         if self.tensor_model_parallel_group is not None:
             if self.fused_qkv:
@@ -490,7 +493,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             QKV,
             (
                 q_end_index,
-                k_end_index
+                k_end_index,
                 # rest of the QKV will go to V output
             ),
             dim=2,
@@ -503,7 +506,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
     def _kernel_qkv_forward(self, hidden_states, fused_rmsnorm, rmsnorm):
         logger.debug(
-            f"QKV kernel: fused_rmsnorm={fused_rmsnorm} logical_neuron_cores={self.logical_neuron_cores}"
+            f"QKV kernel: fused_rmsnorm={fused_rmsnorm} logical_nc_config={self.logical_nc_config}"
         )
         bs, seqlen, h = hidden_states.shape
 
@@ -513,39 +516,87 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         )
 
         # shape checks
-        assert (
-            fused_qkv_size
-            == (self.num_attention_heads + 2 * self.num_key_value_heads)
-            * self.head_dim
-            // self.tp_degree
-        )
+        n = (self.num_attention_heads + 2 * self.num_key_value_heads) // self.tp_degree
+        assert fused_qkv_size == n * self.head_dim
         assert h == h2
 
-        QKV = torch.zeros(
-            bs,
-            seqlen,
-            fused_qkv_size,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        fused_rmsnorm = fused_rmsnorm and rmsnorm is not None
 
-        grid = (vnc(self.logical_neuron_cores),)
-
-        # the QKV kernel will automatically switch to the TKG QKV if seqlen==1
-        _traced_qkv_kernel[grid](
-            hidden_states,
-            self.Wqkv.weight,
+        norm_weights = None
+        if fused_rmsnorm:
             # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
-            # should be fine to pass this is as a dummy even if not using fused rmsnorm
-            rmsnorm.weight.unsqueeze(0)
-            if rmsnorm
-            else torch.ones((1, h), device=hidden_states.device),
-            QKV,
-            eps=self.rms_norm_eps,
-            kernel_name="QKV",
-            # Run RMSNorm inside the kernel if NOT using SP norm
-            fused_rmsnorm=(fused_rmsnorm and rmsnorm is not None),
-        )
+            norm_weights = rmsnorm.weight.unsqueeze(0)
+            assert norm_weights.shape == (1, h)
+
+        grid = (nc(self.logical_nc_config),)
+
+        if self.qkv_kernel_nbsd_layout:
+            QKV = torch.zeros(
+                n,
+                bs,
+                seqlen,
+                self.head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+            _traced_qkv_kernel[grid](
+                hidden_states,
+                self.Wqkv.weight,
+                (
+                    norm_weights
+                    if norm_weights is not None
+                    # cannot pass None to this kernel API
+                    else torch.ones((1, h), device=hidden_states.device)
+                ),
+                QKV,
+                eps=self.rms_norm_eps,
+                kernel_name="QKV",
+                # Run RMSNorm inside the kernel if NOT using SP norm
+                fused_rmsnorm=fused_rmsnorm,
+            )
+
+            assert QKV.shape == (n, bs, seqlen, self.head_dim)
+
+            # switch from:
+            #   output layout: [n, b, s, d]
+            #             dim:  0  1  2  3
+            # back to original layout:
+            #   output layout: [b, s, n*d]
+            QKV = (
+                QKV.permute(1, 2, 0, 3)  # after permute: batch, seqlen, num_heads, d_head
+                .reshape(bs, seqlen, fused_qkv_size)
+                .to(hidden_states.dtype)
+            )
+
+        else:
+            QKV = torch.zeros(
+                bs,
+                seqlen,
+                fused_qkv_size,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+            # the QKV kernel will automatically switch to the TKG QKV if seqlen==1
+            _traced_qkv_kernel[grid](
+                hidden_states,
+                self.Wqkv.weight,
+                (
+                    norm_weights
+                    if norm_weights is not None
+                    # cannot pass None to this kernel API
+                    else torch.ones((1, h), device=hidden_states.device)
+                ),
+                QKV,
+                eps=self.rms_norm_eps,
+                kernel_name="QKV",
+                # Run RMSNorm inside the kernel if NOT using SP norm
+                fused_rmsnorm=fused_rmsnorm,
+            )
+
+        assert QKV.shape == (bs, seqlen, fused_qkv_size)
+
         return self._split_fused_qkv(QKV)
 
     def get_weight(
@@ -620,7 +671,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 new_prefix=f"{prefix}.Wqkv",
                 model_state_dict=model_state_dict,
             )
-            qkv_weight, _ = self.get_weight(
+            qkv_weight, qkv_scale = self.get_weight(
                 prefix=prefix, layer=self.Wqkv, layer_name="Wqkv", model_state_dict=model_state_dict
             )
             q_proj_weight, k_proj_weight, v_proj_weight = qkv_weight.split(
@@ -631,7 +682,19 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 ],
                 dim=0,
             )
-            q_proj_scale, k_proj_scale, v_proj_scale = None, None, None
+
+            if qkv_scale is not None:
+                q_proj_scale, k_proj_scale, v_proj_scale = qkv_scale.split(
+                    [
+                        self._src_num_attention_heads * self.head_dim,
+                        self._src_num_key_value_heads * self.head_dim,
+                        self._src_num_key_value_heads * self.head_dim,
+                    ],
+                    dim=0,
+                )
+            else:
+                q_proj_scale, k_proj_scale, v_proj_scale = None, None, None
+
             qkv_bias = self.get_bias(
                 prefix=prefix, layer=self.Wqkv, layer_name="Wqkv", model_state_dict=model_state_dict
             )
@@ -787,12 +850,27 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
         if self.fused_qkv:
             qkv_weight = torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)
+            qkv_scale = None
+            if all(scale is not None for scale in (q_proj_scale, k_proj_scale, v_proj_scale)):
+                qkv_scale = torch.cat([q_proj_scale, k_proj_scale, v_proj_scale], dim=0)
+
+            # Set heads info as weight parameter attributes to be used in weights sharding
+            fused_qkv_params = (
+                [self.Wqkv.weight, self.Wqkv.scale] if qkv_scale is not None else [self.Wqkv.weight]
+            )
+            for param in fused_qkv_params:
+                setattr(param, "fused_qkv", True)
+                setattr(param, "num_attention_heads", self.num_attention_heads)
+                setattr(param, "num_key_value_heads", self.num_key_value_heads)
+                setattr(param, "head_dim", self.head_dim)
+
             self.set_weight(
                 tensor=qkv_weight,
                 prefix=prefix,
                 layer=self.Wqkv,
                 layer_name="Wqkv",
                 model_state_dict=model_state_dict,
+                scale=qkv_scale,
             )
             if self.bias:
                 qkv_bias = torch.cat([q_proj_bias, k_proj_bias, v_proj_bias], dim=0)

@@ -4,11 +4,13 @@ import copy
 import json
 import os
 import time
+import warnings
 from enum import Enum
+from functools import partial
 from typing import Type
 
 import torch
-from neuronx_distributed.quantization.quantization_config import QuantizationType
+from neuronx_distributed.quantization.quantization_config import QuantizationType, ActivationQuantizationType
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
@@ -27,6 +29,7 @@ from neuronx_distributed_inference.utils.accuracy import (
     get_generate_outputs,
 )
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
+from neuronx_distributed_inference.utils.debug_utils import capture_model_inputs
 from neuronx_distributed_inference.utils.distributed import get_init_rank, get_init_world_size
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 from neuronx_distributed_inference.utils.random import set_random_seed
@@ -56,7 +59,21 @@ def parse_args():
     run_parser = subparsers.add_parser("run")
     setup_run_parser(run_parser)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Handle deprecated "--logical-neuron-cores" argument.
+    if args.logical_neuron_cores is not None:
+        warning_message = (
+            "'--logical-neuron-cores' is deprecated and no longer needed. "
+            "By default, NxD Inference now chooses the correct LNC based on instance type. "
+            "To set LNC manually, use the '--logical-nc-config' argument. "
+            "In a future release, the '--logical-neuron-cores' argument will be removed."
+        )
+        warnings.warn(warning_message, category=UserWarning)
+        args.logical_nc_config = args.logical_neuron_cores
+        del args.logical_neuron_cores
+
+    return args
 
 
 def setup_run_parser(run_parser: argparse.ArgumentParser):
@@ -90,6 +107,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--torch-dtype", type=to_torch_dtype)
     run_parser.add_argument("--batch-size", type=int)
     run_parser.add_argument("--padding-side", type=str)
+    run_parser.add_argument("--allow-input-truncation", action="store_true")
     run_parser.add_argument("--seq-len", type=int)
     run_parser.add_argument("--n-active-tokens", type=int)
     run_parser.add_argument("--n-positions", type=int)
@@ -111,6 +129,10 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--max-batch-size", type=int)
     run_parser.add_argument("--is-continuous-batching", action="store_true")
 
+    # KV cache
+    run_parser.add_argument("--kv-cache-batch-size", type=int)
+    run_parser.add_argument("--kv-cache-padding-size", type=int)
+
     # On device sampling
     run_parser.add_argument("--on-device-sampling", action="store_true")
 
@@ -128,6 +150,11 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     )
     run_parser.add_argument("--kv-cache-quant", action="store_true")
     run_parser.add_argument("--quantization-dtype", type=str)
+    run_parser.add_argument(
+        "--modules-to-not-convert-file",
+        type=get_modules_to_not_convert_json,
+        dest="modules_to_not_convert_lists",
+    )
 
     # MoE
     run_parser.add_argument("--capacity-factor", type=float)
@@ -140,9 +167,6 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--enable-eagle-speculation", action="store_true", default=False)
     run_parser.add_argument("--enable-eagle-draft-input-norm", action="store_true", default=False)
 
-    run_parser.add_argument(
-        "--no-trace-tokengen-model", dest="trace_tokengen_model", action="store_false"
-    )
     run_parser.add_argument("--speculation-length", type=int)
     run_parser.add_argument("--spec-batch-size", type=int)
 
@@ -151,6 +175,9 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--medusa-speculation-length", type=int)
     run_parser.add_argument("--num-medusa-heads", type=int)
     run_parser.add_argument("--medusa-tree-json", type=load_json_file, dest="medusa_tree")
+
+    # Token Tree
+    run_parser.add_argument("--token-tree-json", type=load_json_file, dest="token_tree_config")
 
     # Parallelism
     run_parser.add_argument("--tp-degree", type=int)
@@ -168,31 +195,67 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument(
         "--skip-save-sharded-checkpoint", dest="save_sharded_checkpoint", action="store_false"
     )
+    run_parser.add_argument("--skip-sharding", action="store_true")
 
-    # async
-    run_parser.add_argument("--async", action="store_true")
+    # PA and CF
+    run_parser.add_argument(
+        "--enable-block-kv-layout", dest="is_block_kv_layout", action="store_true"
+    )
+    run_parser.add_argument("--pa-num-blocks", type=int)
+    run_parser.add_argument("--pa-block-size", type=int)
+    run_parser.add_argument(
+        "--enable-chunked-prefill", dest="is_chunked_prefill", action="store_true"
+    )
+    run_parser.add_argument("--cp-max-num-seqs", type=int)
+    run_parser.add_argument("--cp-num-active-blocks", type=int)
 
-    # lora
+    # Async
+    run_parser.add_argument("--async-mode", action="store_true")
+
+    # Lora
     run_parser.add_argument("--enable-lora", action="store_true")
     run_parser.add_argument("--max-loras", type=int)
     run_parser.add_argument("--max-lora-rank", type=int)
     run_parser.add_argument("--target-modules", nargs="+")
     run_parser.add_argument("--max-loras-on-cpu", type=int)
+    run_parser.add_argument("--lora-ckpt-path", dest="lora_ckpt_paths", type=str, action="append")
+    run_parser.add_argument("--adapter-id", dest="adapter_ids", type=str, action="append")
 
     # Kernels
     run_parser.add_argument("--qkv-kernel-enabled", action="store_true")
+    run_parser.add_argument("--qkv-kernel-nbsd-layout", action="store_true")
     run_parser.add_argument("--attn-kernel-enabled", action="store_true")
     run_parser.add_argument("--mlp-kernel-enabled", action="store_true")
     run_parser.add_argument("--quantized-mlp-kernel-enabled", action="store_true")
+    run_parser.add_argument("--activation-quantization-type", type=str, choices=[e.value for e in ActivationQuantizationType])
     run_parser.add_argument("--rmsnorm-quantize-kernel-enabled", action="store_true")
-    run_parser.add_argument("--quantized-kernel-lower-bound", type=float, default=1200.0)
+    run_parser.add_argument("--quantize-clamp-bound", type=float, default=float('inf'))
     run_parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
 
+    # Logical NeuronCore Configuration (LNC)
+    lnc_group = run_parser.add_mutually_exclusive_group()
+    lnc_group.add_argument(
+        "--logical-neuron-cores", type=int
+    )  # Deprecated. Use --logical-nc-config.
+    lnc_group.add_argument("--logical-nc-config", type=int)
+
     # Compiler Args
-    run_parser.add_argument("--logical-neuron-cores", type=int, default=1)
     run_parser.add_argument("--cc-pipeline-tiling-factor", type=int, default=2)
 
-    # optional demo arguments
+    # CPU
+    run_parser.add_argument("--on-cpu", action="store_true")
+
+    # Debugging
+    run_parser.add_argument("--capture-indices", nargs="+", type=int, default=None)
+    run_parser.add_argument("--input-capture-save-dir", type=str, default=None)
+
+    # Optional demo arguments
+    run_parser.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="skip model warmup.",
+    )
+
     run_parser.add_argument(
         "--skip-compile",
         action="store_true",
@@ -223,6 +286,20 @@ def load_json_file(json_path):
         return json.load(f)
 
 
+def get_modules_to_not_convert_json(json_path):
+    modules_to_not_convert, draft_model_modules_to_not_convert = None, None
+    assert os.path.exists(json_path), f"File not found: {json_path}"
+    data = load_json_file(json_path)
+    if "model" in data:
+        modules_to_not_convert = data["model"]["modules_to_not_convert"]
+    elif "modules_to_not_convert" in data:
+        modules_to_not_convert = data["modules_to_not_convert"]
+    # Handle draft model modules if they exist
+    if "draft_model" in data:
+        draft_model_modules_to_not_convert = data["draft_model"]["modules_to_not_convert"]
+    return modules_to_not_convert, draft_model_modules_to_not_convert
+
+
 def run_inference(model_cls: Type[NeuronApplicationBase], args):
     # Initialize configs.
     print("Loading configs...")
@@ -235,6 +312,14 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
 
     if (args.quantized and args.quantization_dtype == "f8e4m3") or args.kv_cache_quant:
         os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
+        os.environ["UNSAFE_FP8FNCAST"] = "1"
+
+    if args.modules_to_not_convert_lists:
+        modules_to_not_convert, draft_modules = args.modules_to_not_convert_lists
+        if modules_to_not_convert is not None:
+            config_kwargs["modules_to_not_convert"] = modules_to_not_convert
+        if draft_modules is not None:
+            config_kwargs["draft_model_modules_to_not_convert"] = draft_modules
 
     adapter_ids = None
     if args.enable_lora:
@@ -243,8 +328,9 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
             max_lora_rank=args.max_lora_rank,
             target_modules=args.target_modules,
             max_loras_on_cpu=args.max_loras_on_cpu,
+            lora_ckpt_paths=args.lora_ckpt_paths,
         )
-        adapter_ids = torch.tensor([0, 1], dtype=torch.int32)
+        adapter_ids = args.adapter_ids
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
     config = model_cls.get_config_cls()(
@@ -256,10 +342,16 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     if neuron_config.speculation_length > 0 and args.draft_model_path is not None:
         # Reset speculation options to defaults for the draft model.
         draft_neuron_config = copy.deepcopy(config.neuron_config)
+
+        # Set modules_to_not_convert for the draft model configs
+        if getattr(config.neuron_config, "draft_model_modules_to_not_convert", None):
+            draft_neuron_config.modules_to_not_convert = (
+                draft_neuron_config.draft_model_modules_to_not_convert
+            )
+
         # eagle requires the draft model to have speculation enabled for the last draft run
         if not neuron_config.enable_eagle_speculation:
             draft_neuron_config.speculation_length = 0
-        draft_neuron_config.trace_tokengen_model = True
         draft_neuron_config.enable_fused_speculation = False
         # Set eagle specific config changes
         if neuron_config.enable_eagle_speculation:
@@ -291,29 +383,41 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
 
     # Compile and save model.
     compiling_start_time = time.monotonic()
-    if not args.skip_compile:
+    if not args.skip_compile and not args.on_cpu:
         print("\nCompiling and saving model...")
         model.compile(args.compiled_model_path, debug=args.hlo_debug)
         if draft_model is not None and neuron_config.enable_fused_speculation is False:
             print("\nCompiling and saving draft model...")
             draft_model.compile(args.compiled_draft_model_path)
+        compiling_end_time = time.monotonic()
+        total_compiling_time = compiling_end_time - compiling_start_time
+        print(f"Compiling and tracing time: {total_compiling_time} seconds")
+    else:
+        print("\nSkipping model compilation")
 
     if args.enable_torch_dist:
         torch.distributed.barrier()
 
     if args.compile_only:
         return
-    compiling_end_time = time.monotonic()
-    total_compiling_time = compiling_end_time - compiling_start_time
-    print(f"Compiling and tracing time: {total_compiling_time} seconds")
+
     # Load compiled model to Neuron.
-    print("\nLoading model to Neuron...")
-    model.load(args.compiled_model_path)
+    loading_start_time = time.monotonic()
+    if not args.on_cpu:
+        print("\nLoading model to Neuron...")
+        model.load(args.compiled_model_path)
+    else:
+        print("\nLoading model to CPU...")
+        model.to_cpu()
     loading_end_time = time.monotonic()
-    model_loading_time = loading_end_time - compiling_end_time
+    model_loading_time = loading_end_time - loading_start_time
     print(f"Total model loading time: {model_loading_time} seconds")
 
-    if draft_model is not None and neuron_config.enable_fused_speculation is False:
+    if (
+        draft_model is not None
+        and neuron_config.enable_fused_speculation is False
+        and not args.on_cpu
+    ):
         print("\nLoading draft model to Neuron...")
         draft_model.load(args.compiled_draft_model_path)
 
@@ -356,6 +460,14 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         expected_outputs_path=args.expected_outputs_path,
     )
 
+    input_capture_hook = None
+    if args.capture_indices:
+        input_capture_hook = partial(
+            capture_model_inputs,
+            capture_indices=args.capture_indices,
+            input_capture_save_dir=args.input_capture_save_dir,
+        )
+
     # Generate outputs.
     run_generation(
         model,
@@ -364,6 +476,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         generation_config,
         draft_model=draft_model,
         adapter_ids=adapter_ids,
+        input_capture_hook=input_capture_hook,
     )
 
     # Benchmarking.
@@ -385,6 +498,7 @@ def run_generation(
     generation_config,
     draft_model=None,
     adapter_ids=None,
+    input_capture_hook=None,
 ):
     print("\nGenerating outputs...")
     print(f"Prompts: {prompts}")
@@ -398,6 +512,7 @@ def run_generation(
         generation_config=generation_config,
         adapter_ids=adapter_ids,
         max_length=model.neuron_config.max_length,
+        input_capture_hook=input_capture_hook,
     )
 
     print("Generated outputs:")
@@ -440,6 +555,7 @@ def run_accuracy_check(
             prompt=prompt,
             draft_model=draft_model,
             expected_token_ids=expected_outputs,
+            num_tokens_to_check=num_tokens_to_check,
         )
     elif check_accuracy_mode == CheckAccuracyMode.LOGIT_MATCHING:
         assert draft_model is None, "Logit matching not supported for speculation"

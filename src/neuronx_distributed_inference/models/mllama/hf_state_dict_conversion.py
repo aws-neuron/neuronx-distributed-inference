@@ -30,27 +30,31 @@ def convert_hf_state_dict_to_neuron_state_dict(
     state_dict["text_model.norm.weight"] = state_dict.pop("language_model.model.norm.weight")
     state_dict["text_model.lm_head.weight"] = state_dict.pop("language_model.lm_head.weight")
     language_model_embed_tokens = state_dict.pop("language_model.model.embed_tokens.weight")
-    state_dict["text_model.embed_tokens.learnable_embedding.weight"] = language_model_embed_tokens[
-        -8:
-    ]
-    state_dict["text_model.embed_tokens.tok_embeddings.weight"] = language_model_embed_tokens[:-8]
-
+    state_dict["text_model.embed_tokens.learnable_embedding.weight"] = (
+        language_model_embed_tokens[-8:].clone().detach().contiguous()
+    )
+    state_dict["text_model.embed_tokens.tok_embeddings.weight"] = (
+        language_model_embed_tokens[:-8].clone().detach().contiguous()
+    )
+    state_dict["text_model.rank_util.rank"] = torch.arange(
+        0, config.neuron_config.tp_degree, dtype=torch.int32
+    )
     neuron_decoder_layer = 0
     for l in range(config.num_hidden_layers):  # noqa: E741
         if l in cross_attention_layers:
             # cross attention decoder layers
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.gate_attn"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.cross_attn_attn_gate")[0].view(1)
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.gate_ffwd"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.cross_attn_mlp_gate")[0].view(1)
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.attention_norm.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.input_layernorm.weight")
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.ffn_norm.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.post_attention_layernorm.weight")
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.gate_attn"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.cross_attn_attn_gate")[0].view(1)
+            )
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.gate_ffwd"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.cross_attn_mlp_gate")[0].view(1)
+            )
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.attention_norm.weight"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.input_layernorm.weight")
+            )
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.ffn_norm.weight"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.post_attention_layernorm.weight")
+            )
 
             state_dict[
                 f"text_model.layers.{neuron_decoder_layer}.xatten.feed_forward.gate_proj.weight"
@@ -62,26 +66,26 @@ def convert_hf_state_dict_to_neuron_state_dict(
                 f"text_model.layers.{neuron_decoder_layer}.xatten.feed_forward.down_proj.weight"
             ] = state_dict.pop(f"language_model.model.layers.{l}.mlp.down_proj.weight")
             # inner cross attention layers
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.q_norm.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.cross_attn.q_norm.weight")
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.k_norm.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.cross_attn.k_norm.weight")
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.q_norm.weight"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.cross_attn.q_norm.weight")
+            )
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.k_norm.weight"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.cross_attn.k_norm.weight")
+            )
 
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.wq.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.cross_attn.q_proj.weight")
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.wk.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.cross_attn.k_proj.weight")
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.wv.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.cross_attn.v_proj.weight")
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.wq.weight"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.cross_attn.q_proj.weight")
+            )
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.wk.weight"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.cross_attn.k_proj.weight")
+            )
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.wv.weight"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.cross_attn.v_proj.weight")
+            )
 
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.wo.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.cross_attn.o_proj.weight")
+            state_dict[f"text_model.layers.{neuron_decoder_layer}.xatten.xatten.wo.weight"] = (
+                state_dict.pop(f"language_model.model.layers.{l}.cross_attn.o_proj.weight")
+            )
 
         else:
             # self attention decoder layers
@@ -199,9 +203,9 @@ def _convert_gated_pos_emb_state_dict(state_dict, config, vision_config, prefix)
             1, dtype=global_pos_embed.dtype
         )
     else:
-        state_dict[
-            f"{neuron_prefix}.gated_positional_embedding.tile_embedding.weight"
-        ] = state_dict.pop(f"{ckpt_tile_embedding_key}.weight")
+        state_dict[f"{neuron_prefix}.gated_positional_embedding.tile_embedding.weight"] = (
+            state_dict.pop(f"{ckpt_tile_embedding_key}.weight")
+        )
         state_dict[f"{neuron_prefix}.gated_positional_embedding.gate"] = state_dict.pop(
             "vision_model.gated_positional_embedding.gate"
         )

@@ -2,6 +2,7 @@ import math
 from typing import Any, Dict, Tuple
 
 import torch
+import torch.nn.functional as F
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_kv_shared_group,
@@ -9,6 +10,8 @@ from neuronx_distributed.parallel_layers.parallel_state import (
 )
 from neuronx_distributed.parallel_layers.utils import get_padding_length
 from torch import Tensor, nn
+
+from neuronx_distributed_inference.modules.custom_calls import neuron_cumsum
 
 torch.manual_seed(0)
 
@@ -107,7 +110,7 @@ def _get_scale_from_state_dict_quantized(prefix: str, state_dict: Dict[str, Any]
     if prefix in quantized_scale_cache:
         return quantized_scale_cache[prefix]
 
-    if (prefix + "weight_scale") in state_dict:
+    if (prefix + "scale") in state_dict:
         # Transformations for fp8 kernel scale inputs
 
         # Original shape in checkpoint
@@ -122,7 +125,7 @@ def _get_scale_from_state_dict_quantized(prefix: str, state_dict: Dict[str, Any]
         # New shape needed (down)
         # transpose --> [1, H]
         # broadcast --> [128, H]
-        scale = state_dict[prefix + "weight_scale"]
+        scale = state_dict[prefix + "scale"]
         if "down_proj" not in prefix:
             scale = pad_to_128_multiple(scale, 0)
         scale = scale.t()
@@ -150,17 +153,17 @@ def preprocess_quantized_linear_scale(layer):
 
     # Transpose scale
     scale = layer.scale.clone().T
+    del layer.scale
+
     # Broadcast scale
     scale = torch.broadcast_to(scale, (128, scale.shape[1]))
-    # In the checkpoint the attr is weight_scale, so patch here.
-    setattr(layer, "weight_scale", torch.nn.Parameter(scale))
+    # In the checkpoint the attr is scale, so patch here.
+    setattr(layer, "scale", torch.nn.Parameter(scale, requires_grad=False))
 
     # Add methods for loading from checkpoint
-    layer.weight_scale.__dict__.update(orig_scale_attrs)
-    setattr(layer.weight_scale, "partition_dim", 1 - getattr(layer.weight_scale, "partition_dim"))
-    setattr(layer.weight_scale, "get_tensor_from_state_dict", _get_scale_from_state_dict_quantized)
-
-    del layer.scale
+    layer.scale.__dict__.update(orig_scale_attrs)
+    setattr(layer.scale, "partition_dim", 1 - getattr(layer.scale, "partition_dim"))
+    setattr(layer.scale, "get_tensor_from_state_dict", _get_scale_from_state_dict_quantized)
     # setattr(layer.weight, "set_tensor_to_state_dict", _set_weight_to_state_dict) # TODO: Is this needed?
 
 
@@ -365,6 +368,7 @@ def create_block_diagonal_attn_mask(
     key_lens: torch.Tensor,
     max_query_len: torch.Tensor,
     max_key_len: torch.Tensor,
+    is_prior: bool = False,
 ):
     """
     Return a block diagonal atttention mask which can be used by chunked
@@ -399,16 +403,18 @@ def create_block_diagonal_attn_mask(
         mask: the causal attention mask for chunked prefill
     """
     batch_size = query_lens.shape[0]
+    dtype = query_lens.dtype
+    device = query_lens.device
 
-    row_idx = torch.arange(max_query_len, dtype=torch.int).reshape(-1, 1)
-    col_idx = torch.arange(max_key_len, dtype=torch.int).reshape(1, -1)
+    row_idx = torch.arange(max_query_len, dtype=dtype, device=device).reshape(-1, 1)
+    col_idx = torch.arange(max_key_len, dtype=dtype, device=device).reshape(1, -1)
 
-    q_cumsum = torch.cumsum(query_lens, dim=0)
-    q_cumsum = torch.cat([torch.tensor(0).reshape(1), q_cumsum])
-    k_cumsum = torch.cumsum(key_lens, dim=0)
-    k_cumsum = torch.cat([torch.tensor(0).reshape(1), k_cumsum])
+    q_cumsum = neuron_cumsum(query_lens.reshape(1, -1).float()).reshape(-1).int()
+    q_cumsum = F.pad(q_cumsum, pad=[1, 0])
+    k_cumsum = neuron_cumsum(key_lens.reshape(1, -1).float()).reshape(-1).int()
+    k_cumsum = F.pad(k_cumsum, pad=[1, 0])
 
-    mask = torch.zeros(max_query_len, max_key_len, dtype=torch.bool)
+    mask = torch.zeros(max_query_len, max_key_len, dtype=torch.bool, device=device)
     for seq_id in range(batch_size):
         ri = q_cumsum[seq_id]  # row index
         ci = k_cumsum[seq_id]  # column index
@@ -423,7 +429,12 @@ def create_block_diagonal_attn_mask(
         top_mask = row_idx >= ri
         bottom_mask = row_idx < ri + nr
 
-        mask_per_seq = diagonal_mask & left_mask & top_mask & bottom_mask
+        if is_prior:
+            right_mask = col_idx < ci + nc - nr
+            mask_per_seq = diagonal_mask & left_mask & top_mask & bottom_mask & right_mask
+        else:
+            mask_per_seq = diagonal_mask & left_mask & top_mask & bottom_mask
+
         mask = mask | mask_per_seq
 
     return mask

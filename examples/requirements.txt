@@ -1,4 +1,6 @@
-transformers==4.45.*
+transformers==4.48.*
+huggingface-hub
+diffusers==0.32.0
 sentencepiece
 pillow
 pytest-forked

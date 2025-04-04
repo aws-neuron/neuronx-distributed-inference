@@ -61,7 +61,7 @@ NEURON_CPP_LOG_LEVEL=1 NEURON_RT_ROOT_COMM_ID=10.1.201.64:63423 inference_demo \
               --model-type llama \
               --task-type causal-lm \
               run \
-                --model-path /shared_3/bowencc/nxd-ws-09-03/TinyLLama-v0 \
+                --model-path TinyLLama-v0 \
                 --compiled-model-path  traced_models/TinyLLama-v0-multi-node_0/ \
                 --torch-dtype bfloat16 \
                 --start_rank_id 0 \
@@ -84,7 +84,7 @@ NEURON_CPP_LOG_LEVEL=1 NEURON_RT_ROOT_COMM_ID=10.1.201.64:63423 inference_demo \
               --model-type llama \
               --task-type causal-lm \
               run \
-                --model-path /shared_3/bowencc/nxd-ws-09-03/TinyLLama-v0 \
+                --model-path TinyLLama-v0 \
                 --compiled-model-path  traced_models/TinyLLama-v0-multi-node_1/ \
                 --torch-dtype bfloat16 \
                 --start_rank_id 32 \

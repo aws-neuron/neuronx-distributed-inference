@@ -1,9 +1,11 @@
 import torch
 
+from neuronx_distributed_inference.models.mllama.utils import (
+    NUM_IMAGE_PER_PROMPT,
+    get_image_tensors,
+)
 from neuronx_distributed_inference.models.model_wrapper import DecoderModelInstance, ModelWrapper
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
-
-NUM_IMAGE_PER_PROMPT = 1  # TODO: generalize to max 4
 
 
 class ModelWrapperMllama(ModelWrapper):
@@ -40,34 +42,14 @@ class ModelWrapperMllama(ModelWrapper):
             )
 
             # Default to 1x1 aspect ratios (because the aspect ratio values are used in computations)
-            aspect_ratios = torch.ones(
-                (self.neuron_config.batch_size, NUM_IMAGE_PER_PROMPT, 2),
-                dtype=torch.int32,
+            pixel_values, aspect_ratios, num_chunks, has_image = get_image_tensors(
+                self.config, [[]] * self.neuron_config.batch_size, (n_active_tokens > 1)
             )
 
             vision_mask = torch.zeros(
                 (self.neuron_config.batch_size, NUM_IMAGE_PER_PROMPT, 2),
                 dtype=torch.int32,
             )
-
-            num_chunks = torch.zeros((self.neuron_config.batch_size, 1), dtype=torch.int32)
-            has_image = torch.zeros(self.neuron_config.batch_size, dtype=torch.int32)
-            pixel_values = torch.zeros(
-                (
-                    self.neuron_config.batch_size,
-                    NUM_IMAGE_PER_PROMPT,
-                    self.config.vision_config.max_num_tiles,
-                    self.config.vision_config.num_channels,
-                    self.config.vision_config.image_size,
-                    self.config.vision_config.image_size,
-                ),
-                dtype=self.config.neuron_config.torch_dtype,
-            )
-
-            if (
-                n_active_tokens <= 1
-            ):  # dummy pixel_values for token-generation, actual pixel_values are aliased
-                pixel_values = torch.tensor([0] * self.neuron_config.batch_size, dtype=torch.int32)
 
             inputs.append(
                 (
@@ -170,7 +152,9 @@ class MMDecoderModelInstance(DecoderModelInstance):
 
         if self.module.kv_mgr is not None:
             past_key_values = self.module.kv_mgr.past_key_values
-            vision_key_values = self.module.kv_mgr.vision_key_values
+            vision_key_values = (
+                self.module.kv_mgr.vision_key_values if not self.neuron_config.skip_vision else []
+            )
         else:
             past_key_values = self.module.past_key_values
             vision_key_values = []

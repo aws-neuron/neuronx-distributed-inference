@@ -27,7 +27,6 @@ inference_demo \
     --on-device-sampling \
     --enable-bucketing \
     --top-k 1 \
-    --do-sample \
     --pad-token-id 2 \
     --prompt "I believe the meaning of life is" \
     --prompt "The color of the sky is" \
@@ -51,7 +50,6 @@ inference_demo \
     --seq-len 1152 \
     --enable-bucketing \
     --top-k 1 \
-    --do-sample \
     --pad-token-id 0 \
     --prompt "I believe the meaning of life is" \
     --prompt "The color of the sky is" \
@@ -76,9 +74,7 @@ inference_demo \
     --seq-len 64 \
     --enable-bucketing \
     --speculation-length 5 \
-    --no-trace-tokengen-model \
     --top-k 1 \
-    --do-sample \
     --pad-token-id 2 \
     --prompt "I believe the meaning of life is" \
     --check-accuracy-mode token-matching \
@@ -105,7 +101,6 @@ inference_demo \
     --quantized-checkpoints-path /home/ubuntu/model_hf/Llama-2-7b/model_quant.pt \
     --quantization-type per_channel_symmetric \
     --top-k 1 \
-    --do-sample \
     --pad-token-id 2 \
     --prompt "I believe the meaning of life is" \
     --prompt "The color of the sky is"
@@ -130,7 +125,6 @@ inference_demo \
     --tol-map "{5: (1e-5, 0.02)}" \
     --enable-bucketing \
     --top-k 1 \
-    --do-sample \
     --pad-token-id 2 \
     --prompt "I believe the meaning of life is" \
     --prompt "The color of the sky is"
