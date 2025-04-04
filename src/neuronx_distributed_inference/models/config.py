@@ -1,10 +1,11 @@
 import json
 import logging
 import os
+import warnings
 from typing import Dict, List, Type, Union
-
 import torch
-from neuronx_distributed.quantization.quantization_config import QuantizedDtype
+from neuronx_distributed.quantization.quantization_config import QuantizedDtype, ActivationQuantizationType
+from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 
@@ -19,6 +20,10 @@ def to_torch_dtype(dtype_str: str) -> torch.dtype:
     }
     assert dtype_str in dtype_mapping, f"Unsupported dtype: {dtype_str}"
     return dtype_mapping[dtype_str]
+
+
+def validate_activation_quantization_type(type: str):
+    assert type in ActivationQuantizationType, f"Unsupported activation quantization type: {type}"
 
 
 def to_dict(obj):
@@ -50,6 +55,7 @@ class NeuronConfig:
         # Basic config for inference in NxD
         self.batch_size = kwargs.pop("batch_size", 1)
         self.padding_side = kwargs.pop("padding_side", "right")
+        self.allow_input_truncation: bool = kwargs.pop("allow_input_truncation", False)
         # TODO: see if we can consolidate n_active_tokens and n_positions into one
         self.seq_len = kwargs.pop("seq_len", 128)
         self.n_active_tokens = kwargs.pop("n_active_tokens", self.seq_len)
@@ -57,6 +63,7 @@ class NeuronConfig:
         self.n_positions = kwargs.pop("n_positions", self.seq_len)
         self.on_cpu = kwargs.pop("on_cpu", False)
         self.output_logits = kwargs.pop("output_logits", False)
+        self.is_prefill_stage = None  # set only in enable_<>() in NeuronBaseForCausalLM
 
         # Torch dtype
         if "torch_dtype" in kwargs:
@@ -96,6 +103,12 @@ class NeuronConfig:
         self.max_batch_size = kwargs.pop("max_batch_size", self.batch_size)
         self.is_continuous_batching = kwargs.pop("is_continuous_batching", False)
 
+        # KV cache
+        self.kv_cache_batch_size = kwargs.pop("kv_cache_batch_size", self.batch_size)
+        # padding size for kv cache in batch-dimension (used in Data Parallel tokengen)
+        # (this is useful when kv update needs to be discarded, but need to do write op to maintain SPMD)
+        self.kv_cache_padding_size = kwargs.pop("kv_cache_padding_size", 0)
+
         # On-device sampling
         self.on_device_sampling_config = kwargs.pop("on_device_sampling_config", None)
         if type(self.on_device_sampling_config) is dict:
@@ -104,7 +117,7 @@ class NeuronConfig:
             )
 
         # async
-        self.async_mode = kwargs.pop("async", False)
+        self.async_mode = kwargs.pop("async_mode", False)
 
         # Bucketing
         self.enable_bucketing = kwargs.pop("enable_bucketing", False)
@@ -133,11 +146,14 @@ class NeuronConfig:
         self.quantization_type: str = kwargs.pop("quantization_type", "per_tensor_symmetric")
         self.quantization_dtype: str = kwargs.pop("quantization_dtype", "int8")
 
+        self.modules_to_not_convert = kwargs.pop("modules_to_not_convert", None)
+        self.draft_model_modules_to_not_convert = kwargs.pop(
+            "draft_model_modules_to_not_convert", None
+        )
         # TODO: Add validation for quantized_checkpoints_path after the design discussions
         self.kv_cache_quant = kwargs.pop("kv_cache_quant", False)
 
         # Speculative decoding
-        self.trace_tokengen_model = kwargs.pop("trace_tokengen_model", True)
         self.speculation_length = kwargs.pop("speculation_length", 0)
         self.spec_batch_size = kwargs.pop("spec_batch_size", self.batch_size)
         self.enable_fused_speculation = kwargs.pop("enable_fused_speculation", False)
@@ -148,8 +164,14 @@ class NeuronConfig:
         if self.enable_eagle_speculation:
             self.enable_fused_speculation = True
 
-        if self.speculation_length > 0 and self.async_mode:
-            raise IncompatibleConfigError("Speculative Decoding is not yet supported with async.")
+        if self.speculation_length > 0 and self.async_mode and not self.enable_fused_speculation:
+            raise IncompatibleConfigError(
+                "Unfused Speculative Decoding is not yet supported with async."
+            )
+
+        # Added Token Tree config
+        self.token_tree_config = kwargs.pop("token_tree_config", None)
+        self.enable_token_tree = self.token_tree_config is not None
 
         # Medusa decoding
         self.is_medusa = kwargs.pop("is_medusa", False)
@@ -157,16 +179,32 @@ class NeuronConfig:
         self.num_medusa_heads = kwargs.pop("num_medusa_heads", 0)
         self.medusa_tree = kwargs.pop("medusa_tree", None)
 
-        if self.speculation_length > 0 and self.async_mode:
+        if self.is_medusa and self.async_mode:
             raise IncompatibleConfigError("Medusa Decoding is not yet supported with async.")
 
         # Paged attention
-        self.is_paged_attention = kwargs.pop("is_paged_attention", False)
+        self.is_block_kv_layout = kwargs.pop("is_block_kv_layout", False)
         self.pa_num_blocks = kwargs.pop("pa_num_blocks", self.batch_size)
         self.pa_block_size = kwargs.pop("pa_block_size", self.seq_len)
-
-        # Chunked prefilled
+        # # Prefix caching
+        self.is_prefix_caching = kwargs.pop("is_prefix_caching", False)
+        # # Chunked prefill
+        # When chunked prefill is enabled, max_context_length will be
+        # used as chunk size. Batch size will be 1 because it concatenates
+        # all requests along seq dim. cp_max_num_seqs is used to denote how
+        # many sequences are there in one concatenated request.
         self.is_chunked_prefill = kwargs.pop("is_chunked_prefill", False)
+        self.cp_max_num_seqs = kwargs.pop("cp_max_num_seqs", 0)
+        self.cp_num_active_blocks = kwargs.pop("cp_num_active_blocks", 0)
+        if self.is_chunked_prefill:
+            assert (
+                self.is_block_kv_layout
+            ), "is_block_kv_layout has to be true for chunked prefill \
+                because it depends on block KV"
+            assert (
+                self.batch_size == 1
+            ), "batch_size has to be 1 for chunked prefill \
+                because it concatenates all requests into one long request"
 
         # Lora
         self.lora_config = kwargs.pop("lora_config", None)
@@ -178,6 +216,7 @@ class NeuronConfig:
         self.pp_degree = kwargs.pop("pp_degree", 1)
         self.ep_degree = kwargs.pop("ep_degree", 1)
         self.save_sharded_checkpoint = kwargs.pop("save_sharded_checkpoint", True)
+        self.skip_sharding = kwargs.pop("skip_sharding", False)
 
         # QK layer normalization
         self.qk_layernorm = kwargs.pop("qk_layernorm", False)
@@ -211,16 +250,53 @@ class NeuronConfig:
         # Kernels
         self.attn_kernel_enabled = kwargs.pop("attn_kernel_enabled", False)
         self.qkv_kernel_enabled = kwargs.pop("qkv_kernel_enabled", False)
+        self.qkv_kernel_nbsd_layout = kwargs.pop("qkv_kernel_nbsd_layout", False)
         self.mlp_kernel_enabled = kwargs.pop("mlp_kernel_enabled", False)
         self.mlp_kernel_fuse_residual_add = kwargs.pop("mlp_kernel_fuse_residual_add", False)
         self.quantized_mlp_kernel_enabled = kwargs.pop("quantized_mlp_kernel_enabled", False)
+        self.activation_quantization_type = kwargs.pop("activation_quantization_type", None)
+        if self.activation_quantization_type is not None:
+            validate_activation_quantization_type(self.activation_quantization_type)
+
+        if self.quantized_mlp_kernel_enabled or self.mlp_kernel_enabled:
+            assert not (
+                self.activation_quantization_type
+            ), "native quantization does not work with quantized kernels"
         self.rmsnorm_quantize_kernel_enabled = kwargs.pop("rmsnorm_quantize_kernel_enabled", False)
         if self.rmsnorm_quantize_kernel_enabled:
             assert (
                 self.quantized_mlp_kernel_enabled
             ), "quantized_mlp_kernel must be enabled to use rmsomrm_quantize_kernel!"
-        self.quantized_kernel_lower_bound = kwargs.pop("quantized_kernel_lower_bound", 1200.0)
-        self.logical_neuron_cores = kwargs.pop("logical_neuron_cores", 1)
+        self.quantize_clamp_bound = kwargs.pop("quantize_clamp_bound", float('inf'))
+
+        if self.quantized or self.is_mlp_quantized():
+            if self.qkv_kernel_enabled:
+                assert (
+                    self.modules_to_not_convert
+                ), "Could not find modules_to_not_convert for quantized model."
+            elif not self.modules_to_not_convert:
+                warnings.warn(
+                    "modules_to_not_convert is not provided. Assuming all modules will be quantized.",
+                    UserWarning
+                )
+
+        # Logical NeuronCore Configuration (LNC)
+        lnc = get_platform_lnc()
+        if "logical_neuron_cores" in kwargs:
+            # For backward compatibility, default to the deprecated logical_neuron_cores attribute if set.
+            warning_message = (
+                "'logical_neuron_cores' is deprecated and replaced by 'logical_nc_config'. "
+                "In a future release, this attribute will be removed."
+            )
+            warnings.warn(warning_message, category=DeprecationWarning)
+            lnc = kwargs.pop("logical_neuron_cores")
+        self.logical_nc_config = int(
+            os.environ.get("NEURON_LOGICAL_NC_CONFIG", kwargs.pop("logical_nc_config", lnc))
+        )
+
+        if self.is_mlp_quantized():
+            self.quantization_type = "per_channel_symmetric"
+            self.quantization_dtype = "f8e4m3"
 
         # compiler flags
         self.cc_pipeline_tiling_factor = kwargs.pop("cc_pipeline_tiling_factor", 2)
@@ -234,14 +310,45 @@ class NeuronConfig:
 
         self._verify_quantized_config()
 
+        # warmup flag
+        self.skip_warmup = kwargs.pop("skip_warmup", False)
+
     def _verify_quantized_config(self):
         if not self.quantized:
             return
         assert self.quantized_checkpoints_path is not None, "quantized_checkpoints_path is required"
         # Verification for quantized dtype
         QuantizedDtype.has_dtype(self.quantization_dtype)
-        if self.quantized_mlp_kernel_enabled:
+        if self.is_mlp_quantized():
             assert self.quantization_dtype == "f8e4m3"
+
+    def __getattribute__(self, name):
+        # Maintain backward compatibility without serializing deprecated 'logical_neuron_cores' attr.
+        if name == "logical_neuron_cores":
+            warning_message = (
+                "'logical_neuron_cores' is deprecated and will be removed in a future release. "
+                "Use the 'logical_nc_config' attribute instead."
+            )
+            warnings.warn(warning_message, category=DeprecationWarning)
+            return self.logical_nc_config
+
+        # Maintain backward compatibility without serializing deprecated 'logical_neuron_cores' attr.
+
+        if name == "trace_tokengen_model":
+            warning_message = (
+                "'trace_tokengen_model' is deprecated and will be removed in a future release. "
+                + "Returning the expected value based on current configuration"
+            )
+            warnings.warn(warning_message, category=DeprecationWarning)
+            return (
+                not self.enable_fused_speculation
+                or not self.speculation_length > 0
+                or not self.medusa_speculation_length > 0
+            )  # return true if speculation isn't enabled
+        return super().__getattribute__(name)
+
+    def is_mlp_quantized(self):
+        return self.quantized_mlp_kernel_enabled or self.activation_quantization_type
 
 
 class MultimodalVisionNeuronConfig(NeuronConfig):
@@ -250,6 +357,7 @@ class MultimodalVisionNeuronConfig(NeuronConfig):
     """
 
     def __init__(self, **kwargs) -> None:
+        self.skip_vision = kwargs.pop("skip_vision", False)
         super().__init__(**kwargs)
 
 
@@ -432,7 +540,7 @@ class FusedSpecNeuronConfig:
 
 class OnDeviceSamplingConfig:
     def __init__(self, **kwargs):
-        self.do_sample = kwargs.pop("do_sample", True)
+        self.do_sample = kwargs.pop("do_sample", False)
         self.top_k = kwargs.pop("top_k", 1)
         self.top_p = kwargs.pop("top_p", 1.0)
         self.temperature = kwargs.pop("temperature", 1.0)
@@ -440,3 +548,14 @@ class OnDeviceSamplingConfig:
         self.deterministic = kwargs.pop("deterministic", False)
         self.global_topk = kwargs.pop("global_topk", 256)
         self.on_device_sampling_config = kwargs.pop("on_device_sampling_config", True)
+
+
+def get_platform_lnc():
+    """
+    Get the Logical NeuronCore Configuration (LNC) for the current platform.
+    """
+    target = get_platform_target()
+    if target == "trn2":
+        return 2
+    else:
+        return 1

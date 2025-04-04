@@ -117,25 +117,36 @@ class ImageFeedForward(torch.nn.Module):
         dropout: float,
         sequence_parallel_enabled: bool,
         act_layer: Callable = nn.GELU,
+        ffn_in_sp: bool = False,
     ):
         super().__init__()
-        # layers
-        self.c_fc = ColumnParallelLinear(
-            dim,
-            hidden_dim,
-            bias=True,
-            gather_output=False,
-            sequence_parallel_enabled=sequence_parallel_enabled,
-            sequence_dimension=1 if sequence_parallel_enabled else None,
-        )
-        self.c_proj = RowParallelLinear(
-            hidden_dim,
-            dim,
-            bias=True,
-            input_is_parallel=True,
-            sequence_parallel_enabled=sequence_parallel_enabled,
-            sequence_dimension=1 if sequence_parallel_enabled else None,
-        )
+        if ffn_in_sp:
+            # Layers (no weight sharding)
+            # TODO: Test and enable ffn_in_sp for 11B model
+            #       This reduces VE latency by ~25ms, but consumes ~1GB of extra HBM
+            assert (
+                sequence_parallel_enabled
+            ), "sequence_parallel_enabled must be True if ffn_in_sp=True"
+            self.c_fc = nn.Linear(dim, hidden_dim, bias=True)
+            self.c_proj = nn.Linear(hidden_dim, dim, bias=True)
+        else:
+            # Parallel Layers (weights in TP)
+            self.c_fc = ColumnParallelLinear(
+                dim,
+                hidden_dim,
+                bias=True,
+                gather_output=False,
+                sequence_parallel_enabled=sequence_parallel_enabled,
+                sequence_dimension=1 if sequence_parallel_enabled else None,
+            )
+            self.c_proj = RowParallelLinear(
+                hidden_dim,
+                dim,
+                bias=True,
+                input_is_parallel=True,
+                sequence_parallel_enabled=sequence_parallel_enabled,
+                sequence_dimension=1 if sequence_parallel_enabled else None,
+            )
         self.non_linearity = act_layer()
         self.dropout = dropout
 
@@ -248,7 +259,7 @@ class NeuronImageAttention(NeuronAttentionBase):
             and (Q.shape == K_active.shape == V_active.shape)
             and (self.padding_side == "right" or bsz == 1)
         )
-        assert int(self.logical_neuron_cores) == 1
+        assert int(self.logical_nc_config) == 1
         attn_output = self.perform_maskless_sdpa(
             Q=Q,
             K=K_active,
@@ -405,6 +416,14 @@ class VisionEncoder(nn.Module):
         self.max_num_tiles = max_num_tiles
         self.image_size = to_2tuple(image_size)
         self.patch_size = to_2tuple(patch_size)
+
+        if parallel_state.model_parallel_is_initialized():
+            self.tp_degree = parallel_state.get_tensor_model_parallel_size()
+        else:
+            self.tp_degree = 1
+        # round up local_heads to account for heads replication
+        self.local_heads = math.ceil(heads / self.tp_degree)
+
         self.grid_size = (
             self.image_size[0] // self.patch_size[0],
             self.image_size[1] // self.patch_size[1],
@@ -520,7 +539,8 @@ class VisionEncoder(nn.Module):
         npad, attn_mask = 0, None
         x, npad = expand_num_tokens_to_mult8(x)
         # Pass in the attention_mask_gen_vectors as the attn_mask
-        attn_mask = build_attention_mask_gen_vectors(x, ar, ntok, num_chunks, 1)
+        attn_mask = build_attention_mask_gen_vectors(x, ar, ntok, num_chunks, self.local_heads)
+
         x = x.view(bsz * num_concurrent_media, -1, dim)
         x, int_x = self.transformer(x, return_intermediate=self.return_intermediate, mask=attn_mask)
 

@@ -3,6 +3,7 @@ This is a temporary file to get the testing running for new package.
 
 Some of the utitlies functions need to be redo or removed.
 """
+
 # flake8: noqa
 
 import warnings
@@ -11,7 +12,7 @@ from functools import partial
 from typing import List, Optional, Union
 
 import torch
-from torch_neuronx.testing.validation import logit_validation
+from torch_neuronx.testing.validation import custom_allclose, logit_validation
 from transformers import GenerationConfig, PreTrainedModel, PreTrainedTokenizer
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 
@@ -19,6 +20,7 @@ from neuronx_distributed_inference.models.application_base import NeuronApplicat
 from neuronx_distributed_inference.models.mllama.utils import create_vision_mask, get_image_tensors
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 from neuronx_distributed_inference.utils.constants import *
+from neuronx_distributed_inference.utils.exceptions import LogitMatchingValidationError
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
 try:
@@ -30,7 +32,70 @@ except ImportError:
     )
     ipex = None
 
+try:
+    import matplotlib
+    import matplotlib.pyplot as plt
+except ImportError:
+    warnings.warn(
+        "matplotlib not found. Install via `pip install matplotlib`.",
+        category=UserWarning,
+    )
+    matplotlib = None
+    plt = None
+
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
+
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+def check_accuracy_embeddings(
+    actual_output: torch.Tensor,
+    expected_output: torch.Tensor,
+    plot_outputs: bool = False,
+    rtol: float = 0.0,
+    atol: float = 0.0,
+):
+    assert (
+        expected_output.dtype == actual_output.dtype
+    ), f"dtypes {expected_output.dtype} and {actual_output.dtype} does not match!"
+    dtype = expected_output.dtype
+
+    # Set default rtol, atol based on dtype if not provided
+    if not rtol:
+        if dtype == torch.bfloat16:
+            rtol = 0.05
+        elif dtype == torch.float32:
+            rtol = 0.01
+        else:
+            NotImplementedError(f"Specify rtol for dtype {dtype}")
+    logger.info(f"Using rtol = {rtol} for dtype {dtype}")
+    if not atol:
+        atol = 1e-5
+    logger.info(f"Using atol = {atol}")
+
+    if plot_outputs and matplotlib and plt:
+        # Save plot, expecting a y=x straight line
+        matplotlib.rcParams["agg.path.chunksize"] = 10000
+        matplotlib.rcParams["path.simplify_threshold"] = 1.0
+        plt.plot(
+            actual_output.float().detach().numpy().reshape(-1),
+            expected_output.float().detach().numpy().reshape(-1),
+        )
+        plt.xlabel("Actual Output")
+        plt.ylabel("Expected Output")
+        plot_path = "plot.png"
+        plt.savefig(plot_path, format="png")
+        logger.info(f"Saved outputs plot to {plot_path}.")
+
+    # NxD logit validation tests uses this method
+    # equivalent to torch.allclose except rtol is multiplied by absolute max, not abs
+    # this matches the behavior of the compiler's birsim-to-xla_infergoldens verification
+    passed, max_err = custom_allclose(expected_output, actual_output, atol=atol, rtol=rtol)
+    logger.info(f"Embeddings passed accuracy validation: {passed}, max_err: {max_err}")
+    return passed, max_err
 
 
 def get_generate_outputs_from_token_ids(
@@ -40,6 +105,7 @@ def get_generate_outputs_from_token_ids(
     attention_mask=None,
     is_hf=False,
     draft_model=None,
+    input_capture_hook=None,
     **generate_kwargs,
 ):
     if not is_hf:
@@ -89,7 +155,12 @@ def get_generate_outputs_from_token_ids(
         attention_mask[token_ids == tokenizer.pad_token_id] = 0
 
     generation_model = model if is_hf else HuggingFaceGenerationAdapter(model)
-    outputs = generation_model.generate(token_ids, attention_mask=attention_mask, **generate_kwargs)
+    outputs = generation_model.generate(
+        token_ids,
+        attention_mask=attention_mask,
+        input_capture_hook=input_capture_hook,
+        **generate_kwargs,
+    )
 
     if not is_hf:
         model.reset()
@@ -109,7 +180,14 @@ def get_generate_outputs_from_token_ids(
 
 
 def get_generate_outputs(
-    model, prompts, tokenizer, is_hf=False, draft_model=None, device="neuron", **generate_kwargs
+    model,
+    prompts,
+    tokenizer,
+    is_hf=False,
+    draft_model=None,
+    device="neuron",
+    input_capture_hook=None,
+    **generate_kwargs,
 ):
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -141,6 +219,7 @@ def get_generate_outputs(
             attention_mask=inputs.attention_mask,
             is_hf=is_hf,
             draft_model=draft_model,
+            input_capture_hook=input_capture_hook,
             **generate_kwargs,
         )
 
@@ -196,7 +275,8 @@ def check_accuracy(
         prompts = [prompt] * neuron_config.batch_size
 
     # FIXME: add image support
-
+    if hasattr(expected_token_ids, "sequences"):
+        expected_token_ids = expected_token_ids.sequences
     if expected_token_ids is not None:
         outputs_expected = tokenizer.batch_decode(
             expected_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
@@ -215,9 +295,10 @@ def check_accuracy(
 
     print(f"Expected output: {outputs_expected}")
 
+    original_async_mode = neuron_model.neuron_config.async_mode
     async_modes_to_test = get_async_modes_to_test(execution_mode, neuron_model)
     for async_mode in async_modes_to_test:
-        neuron_model.neuron_config.async_mode = async_mode
+        neuron_model.set_async_mode(async_mode)
         mode_being_tested = "async mode" if async_mode else "sync mode"
 
         output_token_ids, outputs_actual = get_generate_outputs(
@@ -254,6 +335,7 @@ def check_accuracy(
             output_token_ids, expected_token_ids
         ), f"\nActual: ({device}) {output_token_ids} \nExpected (hf-cpu): {expected_token_ids}"
         print(f"The output from Neuronx NxD on {device} using {mode_being_tested} is accurate!")
+        neuron_model.set_async_mode(original_async_mode)
 
 
 def check_accuracy_logits(
@@ -330,17 +412,16 @@ def check_accuracy_logits(
     def generate_fn(input_ids):
         input_length = input_ids.shape[1]
         attention_mask = extrapolated_attention_mask[:, :input_length]
-        with torch.inference_mode():
-            model_outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=seq_len - input_length,
-                min_new_tokens=seq_len - input_length,
-                do_sample=False,
-                return_dict_in_generate=True,
-                output_scores=True,
-                generation_config=generation_config,
-            )
+        model_outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=seq_len - input_length,
+            min_new_tokens=seq_len - input_length,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+            generation_config=generation_config,
+        )
 
         actual_logits = torch.stack(model_outputs.scores)
         actual_token_ids = actual_logits.argmax(dim=2).T
@@ -399,13 +480,17 @@ def check_accuracy_logits(
 
     passed, results, status_msg = logit_validation(
         input_ids=initial_input_ids,
-        generate_fn=generate_fn
-        if image is None
-        else generate_mm_fn,  # use different generation functions
+        generate_fn=(
+            generate_fn if image is None else generate_mm_fn
+        ),  # use different generation functions
         expected_logits=expected_logits,
         tol_map=tol_map,
         divergence_difference_tol=divergence_difference_tol,
     )
-    assert passed, status_msg
 
-    print("Passed logits validation")
+    if not passed:
+        raise LogitMatchingValidationError(status_msg, results)
+
+    print("Passed logits validation!")
+
+    return results

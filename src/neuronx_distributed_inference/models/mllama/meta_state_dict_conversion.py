@@ -34,7 +34,9 @@ def convert_meta_state_dict_to_neuron_state_dict(state_dict: dict, config: Infer
     state_dict["text_model.embed_tokens.tok_embeddings.weight"] = state_dict.pop(
         "text_model.tok_embeddings.weight"
     )
-
+    state_dict["text_model.rank_util.rank"] = torch.arange(
+        0, config.neuron_config.tp_degree, dtype=torch.int32
+    )
     xl = 0
     for l in range(text_config.num_hidden_layers):  # noqa: E741
         # attention mapping
@@ -43,42 +45,42 @@ def convert_meta_state_dict_to_neuron_state_dict(state_dict: dict, config: Infer
         )
 
         if config.neuron_config.fused_qkv:
-            state_dict[
-                f"text_model.layers.{l}.self_attn.self_attn.qkv_proj.Wqkv.weight"
-            ] = torch.cat(
-                [
-                    state_dict.pop(f"text_model.layers.{l}.attention.wq.weight"),
-                    state_dict.pop(f"text_model.layers.{l}.attention.wk.weight"),
-                    state_dict.pop(f"text_model.layers.{l}.attention.wv.weight"),
-                ]
+            state_dict[f"text_model.layers.{l}.self_attn.self_attn.qkv_proj.Wqkv.weight"] = (
+                torch.cat(
+                    [
+                        state_dict.pop(f"text_model.layers.{l}.attention.wq.weight"),
+                        state_dict.pop(f"text_model.layers.{l}.attention.wk.weight"),
+                        state_dict.pop(f"text_model.layers.{l}.attention.wv.weight"),
+                    ]
+                )
             )
         else:
-            state_dict[
-                f"text_model.layers.{l}.self_attn.self_attn.qkv_proj.q_proj.weight"
-            ] = state_dict.pop(f"text_model.layers.{l}.attention.wq.weight")
-            state_dict[
-                f"text_model.layers.{l}.self_attn.self_attn.qkv_proj.k_proj.weight"
-            ] = state_dict.pop(f"text_model.layers.{l}.attention.wk.weight")
-            state_dict[
-                f"text_model.layers.{l}.self_attn.self_attn.qkv_proj.v_proj.weight"
-            ] = state_dict.pop(f"text_model.layers.{l}.attention.wv.weight")
+            state_dict[f"text_model.layers.{l}.self_attn.self_attn.qkv_proj.q_proj.weight"] = (
+                state_dict.pop(f"text_model.layers.{l}.attention.wq.weight")
+            )
+            state_dict[f"text_model.layers.{l}.self_attn.self_attn.qkv_proj.k_proj.weight"] = (
+                state_dict.pop(f"text_model.layers.{l}.attention.wk.weight")
+            )
+            state_dict[f"text_model.layers.{l}.self_attn.self_attn.qkv_proj.v_proj.weight"] = (
+                state_dict.pop(f"text_model.layers.{l}.attention.wv.weight")
+            )
         state_dict[f"text_model.layers.{l}.self_attn.self_attn.o_proj.weight"] = state_dict.pop(
             f"text_model.layers.{l}.attention.wo.weight"
         )
 
         # feed forward mapping
-        state_dict[
-            f"text_model.layers.{l}.self_attn.post_attention_layernorm.weight"
-        ] = state_dict.pop(f"text_model.layers.{l}.ffn_norm.weight")
-        state_dict[
-            f"text_model.layers.{l}.self_attn.feed_forward.gate_proj.weight"
-        ] = state_dict.pop(f"text_model.layers.{l}.feed_forward.w1.weight")
+        state_dict[f"text_model.layers.{l}.self_attn.post_attention_layernorm.weight"] = (
+            state_dict.pop(f"text_model.layers.{l}.ffn_norm.weight")
+        )
+        state_dict[f"text_model.layers.{l}.self_attn.feed_forward.gate_proj.weight"] = (
+            state_dict.pop(f"text_model.layers.{l}.feed_forward.w1.weight")
+        )
         state_dict[f"text_model.layers.{l}.self_attn.feed_forward.up_proj.weight"] = state_dict.pop(
             f"text_model.layers.{l}.feed_forward.w3.weight"
         )
-        state_dict[
-            f"text_model.layers.{l}.self_attn.feed_forward.down_proj.weight"
-        ] = state_dict.pop(f"text_model.layers.{l}.feed_forward.w2.weight")
+        state_dict[f"text_model.layers.{l}.self_attn.feed_forward.down_proj.weight"] = (
+            state_dict.pop(f"text_model.layers.{l}.feed_forward.w2.weight")
+        )
 
         if l in fusion_schedule:
             state_dict[f"text_model.layers.{l}.xatten.gate_attn"] = state_dict.pop(
@@ -94,15 +96,15 @@ def convert_meta_state_dict_to_neuron_state_dict(state_dict: dict, config: Infer
                 f"text_model.cross_attention_layers.{xl}.ffn_norm.weight"
             )
 
-            state_dict[
-                f"text_model.layers.{l}.xatten.feed_forward.gate_proj.weight"
-            ] = state_dict.pop(f"text_model.cross_attention_layers.{xl}.feed_forward.w1.weight")
-            state_dict[
-                f"text_model.layers.{l}.xatten.feed_forward.up_proj.weight"
-            ] = state_dict.pop(f"text_model.cross_attention_layers.{xl}.feed_forward.w3.weight")
-            state_dict[
-                f"text_model.layers.{l}.xatten.feed_forward.down_proj.weight"
-            ] = state_dict.pop(f"text_model.cross_attention_layers.{xl}.feed_forward.w2.weight")
+            state_dict[f"text_model.layers.{l}.xatten.feed_forward.gate_proj.weight"] = (
+                state_dict.pop(f"text_model.cross_attention_layers.{xl}.feed_forward.w1.weight")
+            )
+            state_dict[f"text_model.layers.{l}.xatten.feed_forward.up_proj.weight"] = (
+                state_dict.pop(f"text_model.cross_attention_layers.{xl}.feed_forward.w3.weight")
+            )
+            state_dict[f"text_model.layers.{l}.xatten.feed_forward.down_proj.weight"] = (
+                state_dict.pop(f"text_model.cross_attention_layers.{xl}.feed_forward.w2.weight")
+            )
             # inner cross attention layers
             state_dict[f"text_model.layers.{l}.xatten.xatten.q_norm.weight"] = state_dict.pop(
                 f"text_model.cross_attention_layers.{xl}.attention.q_norm.weight"

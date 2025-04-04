@@ -28,6 +28,7 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     Sampler,
     prepare_sampling_params,
 )
+from neuronx_distributed_inference.modules.lora_serving import LoraCheckpoint
 
 
 def load_pretrained_config(
@@ -101,6 +102,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         self.padding_side = self.neuron_config.padding_side
         self.sampler = None
         self.prev_kv_cache_populated = False
+        self.lora_checkpoint = LoraCheckpoint(self.neuron_config.lora_config)
 
         # WARNING: Neuron Forward is needed by any models with additional input args
         self.forward = self.neuron_model.forward
@@ -151,7 +153,10 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         unfinished_sequences = torch.ones(
             input_ids.shape[0], dtype=torch.long, device=input_ids.device
         )
-
+        # convert adapter_ids from strings to indices
+        model_kwargs["adapter_ids"] = self.lora_checkpoint.convert_adapter_ids_to_indices(
+            model_kwargs.get("adapter_ids"), unfinished_sequences.numel()
+        )
         this_peer_finished = False
         # auto-regressive generation
         while not this_peer_finished:
@@ -187,7 +192,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                     sampler_config = NeuronConfig(**neuron_kwargs)
 
                     sampler_config.on_cpu = True
-                    self.sampler = Sampler(sampler_config)
+                    self.sampler = Sampler(sampler_config, do_sample=do_sample)
 
                 next_tokens = self.sampler(next_token_scores, sampling_params)
             else:
@@ -227,6 +232,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         attention_mask=None,
         inputs_embeds=None,
         sampling_params=None,
+        adapter_ids=None,
         **kwargs,
     ):
         # Store KV cache flag before forward pass.
@@ -239,6 +245,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         medusa_mask = kwargs.get("medusa_mask", None)
         scatter_index = kwargs.get("scatter_index", None)
         position_ids = kwargs.get("position_ids", None)
+        input_capture_hook = kwargs.get("input_capture_hook", None)
+
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
@@ -259,9 +267,10 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache", False),
                 "attention_mask": attention_mask,
-                "adapter_ids": kwargs.get("adapter_ids", None),
                 "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
                 "sampling_params": sampling_params,
+                "input_capture_hook": input_capture_hook,
+                "adapter_ids": adapter_ids,
             }
         )
 
@@ -461,20 +470,29 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
 
         # Prompt encoding
         outputs = self(**model_inputs)
-        new_token = outputs.fused_outputs[1].view(
-            bs, -1
-        )  # The target generated token after ctx encoding
+        new_token = outputs.fused_outputs[0][:, 0].view(
+            bs, 1
+        )  # The target generate token after ctx encoding
 
         returned_ids = new_token
         incremental_len = 0
         end_for_all = False
 
+        # NOTE: fused_outputs looks like the following:
+        # [
+        #     padded_accepted_tokens,
+        #     next_input_ids,
+        #     next_attn_mask,
+        #     next_pos_ids,
+        #     <draft_logits>,
+        #     <target_logits>
+        # ] <> means that it may or may not be there.
         if return_dict_in_generate:
             if output_scores:
                 # TODO: Process raw logits with logits processor when needed
-                scores += (outputs.fused_outputs[3][:, -1, :],)
+                scores += (outputs.fused_outputs[-1][:, -1, :],)
             if output_logits:
-                raw_logits += (outputs.fused_outputs[3],)
+                raw_logits += (outputs.fused_outputs[-1],)
 
         while True:
             # 1. update the kwargs for fused generation
@@ -487,34 +505,19 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             # 2. get the generated draft tokens and target tokens
             outputs = self(**model_inputs)
 
-            draft_new_tokens = outputs.fused_outputs[0]
-            target_tokens = outputs.fused_outputs[1]
+            accepted_tokens_with_padding = outputs.fused_outputs[0]
+            next_pos_ids = outputs.fused_outputs[3]
+            n_matches = next_pos_ids - model_inputs["position_ids"]
+            n_matches = torch.ops.aten.Int(n_matches)
+            incremental_len = n_matches
 
-            if self.neuron_config.enable_eagle_speculation:
-                candidate_new_tokens = draft_new_tokens[:, 1:]
-            else:
-                candidate_new_tokens = draft_new_tokens[:, :-1]
+            # 3. retrieve accepted tokens using n_matches
+            if len(accepted_tokens_with_padding.shape) == 1:
+                accepted_tokens_with_padding.reshape(
+                    self.neuron_config.batch_size, self.neuron_config.speculation_length
+                )
+            accepted_tokens = accepted_tokens_with_padding[:, :n_matches]
 
-            # 3. EOS checking
-            eos_pos = draft_new_tokens.shape[1]
-            for eos_token_id in eos_token_id_list:
-                if eos_token_id in draft_new_tokens:
-                    # get column indices
-                    eos_pos_cur = (draft_new_tokens == eos_token_id).nonzero(as_tuple=True)[1]
-                    eos_pos = min(torch.min(eos_pos_cur), eos_pos)
-            if eos_pos < draft_new_tokens.shape[1]:
-                candidate_new_tokens = candidate_new_tokens[:, : eos_pos + 1]
-                target_tokens = target_tokens[:, : eos_pos + 2]
-
-            selected_tokens = target_tokens[:, :-1]
-
-            # 4. Checking which draft tokens match for acceptance (we use greedy here)
-            n_matches = ((~(candidate_new_tokens == selected_tokens)).cumsum(dim=-1) < 1).sum()
-
-            n_matches = min(n_matches, max_len - cur_len - 1)
-            incremental_len = n_matches + 1
-
-            accepted_tokens = target_tokens[:, : n_matches + 1]  # Accept bonus token from target
             eos_pos = accepted_tokens.shape[1]
             for eos_token_id in eos_token_id_list:
                 if eos_token_id in accepted_tokens:
@@ -530,16 +533,16 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             if return_dict_in_generate:
                 if output_scores:
                     # TODO: Process raw logits with logits processor when needed
-                    scores += tuple(outputs.fused_outputs[3][:, i, :] for i in range(n_matches + 1))
+                    scores += tuple(outputs.fused_outputs[-1][:, i, :] for i in range(n_matches))
                 if output_logits:
-                    raw_logits += (outputs.fused_outputs[3],)
+                    raw_logits += (outputs.fused_outputs[-1],)
 
             # 5. Update with the generated token length and check for stopping condition.
             if end_for_all:
                 break
             if returned_ids[:, -1:][0] in torch.tensor(eos_token_id_list):
                 break
-            cur_len = cur_len + n_matches + 1
+            cur_len = cur_len + n_matches
             if cur_len >= max_len:
                 break
             if max_len - cur_len <= spec_len:
@@ -694,7 +697,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             # 6. Update the args for the next iteration.
             #    Feed the last correct token to the next loop
             new_token = valid_tokens[:, -1:]
-            if new_token[0] == torch.tensor(eos_token_id):
+            if new_token[0].item() in torch.tensor(eos_token_id):
                 break
             input_ids = valid_tokens[:, -1:]
             candidate_input_ids = valid_tokens[:, -1:]

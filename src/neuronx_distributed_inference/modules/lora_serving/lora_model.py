@@ -9,6 +9,8 @@ from neuronx_distributed.parallel_layers import (
     RowParallelLinear,
 )
 
+from neuronx_distributed_inference.modules.attention.gqa import GQA, GroupQueryAttention_QKV
+
 from .config import LoraServingConfig
 from .lora_module import (
     MultiLoraModuleColumnParallelLinear,
@@ -37,7 +39,7 @@ class LoraModel(torch.nn.Module):
     def inject_adapter(self):
         r"""
         Creates adapter layers and replaces the target modules with the adapter layers.
-        It involves the following four steps:
+        It involves the following steps:
             Step 1: set the list of target modules rules in wildcard for LoRA injection
             Step 2: For each module in the base model, check if it matches any target module rules. If so
             Step 3: Create a LoraLayer for this module and replace it with the LoraLayer
@@ -47,7 +49,7 @@ class LoraModel(torch.nn.Module):
             raise ValueError("Target modules are not set for the base model.")
 
         is_target_modules_in_base_model = False
-        key_list = self.get_leave_module_names()
+        key_list = self.get_leaf_module_names()
 
         for key in key_list:
             if not self._check_target_module_exists(key):
@@ -62,11 +64,11 @@ class LoraModel(torch.nn.Module):
                 f"Please check the target modules and try again."
             )
 
-    def get_leave_module_names(self):
+    def get_leaf_module_names(self):
         r"""
-        Return the leave module names.
-        The keys of module.named_modules() may include non-leave module names.
-        For example, both "self_attn.o_proj" and "self_attn.o_proj.o_proj" are included for Llama2, but only the leave module "self_attn.o_proj.o_proj" needs LoRA.
+        Return the leaf module names.
+        The keys of module.named_modules() may include non-leaf module names.
+        For example, both "self_attn.o_proj" and "self_attn.o_proj.o_proj" are included for Llama2, but only the leaf module "self_attn.o_proj.o_proj" needs LoRA.
         """
         key_list = [key for key, _ in self.module.named_modules()]
         key_list = sorted(key_list, key=len, reverse=True)
@@ -116,7 +118,7 @@ class LoraModel(torch.nn.Module):
         if current_key is None:
             raise ValueError("Current Key shouldn't be `None`")
 
-        new_module = self._create_new_module(target)
+        new_module = self._create_new_module(parent, target, current_key)
         self._replace_module(parent, target_name, new_module, target)
 
     def _replace_module(self, parent, child_name, new_module, child):
@@ -136,7 +138,7 @@ class LoraModel(torch.nn.Module):
             else:
                 new_module.state = child.state
 
-    def _create_new_module(self, target):
+    def _create_new_module(self, parent, target, current_key):
         r"""
         Create the corresponding LoraLayer according to its module type, such as torch.nn.Linear and torch.nn.Embedding.
         """
@@ -150,7 +152,22 @@ class LoraModel(torch.nn.Module):
         elif isinstance(target, torch.nn.Conv2d):
             lora_adapters = MultiLoraModuleConv2d(target, lora_config)
         elif isinstance(target, ColumnParallelLinear):
-            lora_adapters = MultiLoraModuleColumnParallelLinear(target, lora_config)
+            keywords = [".k_proj", ".v_proj"]
+            # pass the kv replication information to LoRA module and LoRA layer
+            if isinstance(parent, GroupQueryAttention_QKV) and any(
+                key in current_key for key in keywords
+            ):
+                # the calculation of repeats is based on gqa.py
+                source_heads = parent._src_num_key_value_heads
+                if parent.sharding_strategy == GQA.REPLICATE_TO_TP_DEGREE:
+                    repeats = parent.tp_degree // source_heads
+                elif parent.sharding_strategy == GQA.CONVERT_TO_MHA:
+                    repeats = parent._src_num_attention_heads // source_heads
+                lora_adapters = MultiLoraModuleColumnParallelLinear(
+                    target, lora_config, (source_heads, repeats)
+                )
+            else:
+                lora_adapters = MultiLoraModuleColumnParallelLinear(target, lora_config)
         elif isinstance(target, RowParallelLinear):
             lora_adapters = MultiLoraModuleRowParallelLinear(target, lora_config)
 

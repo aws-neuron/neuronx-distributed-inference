@@ -27,8 +27,10 @@ import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import utils  # noqa: E402
 from neuronx_distributed.parallel_layers.layers import SPMDRank
 from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group
-from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
+from neuronxcc.nki.language import nc
 from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
+
+from neuronx_distributed_inference.modules.kvcache.utils import contexted_kv, contexted_kv_v2
 
 from .gqa import GQA, GroupQueryAttention_O, GroupQueryAttention_QKV  # noqa: E402
 
@@ -91,12 +93,6 @@ class NeuronAttentionBase(nn.Module):
         self.o_proj_layer_name = "o_proj"
 
     def init_gqa_properties(self):
-        if (self.head_dim * self.num_attention_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_attention_heads})."
-            )
-
         self.qkv_proj = GroupQueryAttention_QKV(
             hidden_size=self.hidden_size,
             head_dim=self.head_dim,
@@ -113,7 +109,9 @@ class NeuronAttentionBase(nn.Module):
             tensor_model_parallel_group=self.tensor_model_parallel_group,
             rms_norm_eps=self.rms_norm_eps,
             qkv_kernel_enabled=self.neuron_config.qkv_kernel_enabled,
-            logical_neuron_cores=self.neuron_config.logical_neuron_cores,
+            logical_nc_config=self.neuron_config.logical_nc_config,
+            qkv_kernel_nbsd_layout=self.neuron_config.qkv_kernel_nbsd_layout,
+            on_cpu=self.neuron_config.on_cpu,
         )
         self.o_proj = GroupQueryAttention_O(
             hidden_size=self.hidden_size,
@@ -139,11 +137,12 @@ class NeuronAttentionBase(nn.Module):
             self.q_layernorm = nn.LayerNorm(self.head_dim)
             self.k_layernorm = nn.LayerNorm(self.head_dim)
         self.attn_kernel_enabled = self.neuron_config.attn_kernel_enabled
-        self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
+        self.logical_nc_config = self.neuron_config.logical_nc_config
 
     def scaled_qk(self, Q, K, attention_mask):
         QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
-        QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
+        if attention_mask is not None:
+            QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
         return QK
 
     def prep_qkv_tensors(
@@ -193,7 +192,7 @@ class NeuronAttentionBase(nn.Module):
         logger.debug(f"Flash attention strategy: {flash_attn_strategy}")
 
         if flash_attn_strategy != FlashAttentionStrategy.NONE:
-            logger.debug(f"ATTN kernel: logical_neuron_cores={self.logical_neuron_cores}")
+            logger.debug(f"ATTN kernel: logical_nc_config={self.logical_nc_config}")
             # if we are using left padding, then the bzs needs be 1 (otherwise we get wrong result
             # because flash attention does not use attention_mask). In practice, we use right
             # padding so this is unlikely to cause issues
@@ -231,7 +230,7 @@ class NeuronAttentionBase(nn.Module):
             logger.debug(f"Attn output shape {attn_output.shape}")
 
             if flash_attn_strategy == FlashAttentionStrategy.SHARDED_KERNEL:
-                grid = (vnc(self.logical_neuron_cores),)
+                grid = (nc(self.logical_nc_config),)
 
                 _flash_fwd_call[grid](
                     Q,
@@ -273,24 +272,24 @@ class NeuronAttentionBase(nn.Module):
         For LNC1, use the unsharded kernel if sequence length is at least 4096 to get the best performance.
         The unsharded kernel requires a sequence length of at least 512.
 
-        For LNC2, use the sharded kernel if sequence length is divisible by 1024. Otherwise, use no
+        For LNC2, use the sharded kernel if sequence length is divisible by 256. Otherwise, use no
         kernel, because the unsharded kernel has worse performance than no kernel.
-        The sharded kernel requires a sequence length of at least 1024.
+        The sharded kernel requires a sequence length of at least 256.
 
         These constraints may change later.
 
         TODO: Throw an exception instead of disabling flash attention if explicitly enabled but not eligible.
               This must consider bucketing to avoid throwing an exception for smaller buckets.
         """
-        if int(self.logical_neuron_cores) > 1:
-            if q_len < 1024:
+        if int(self.logical_nc_config) > 1:
+            if q_len < 256:
                 return FlashAttentionStrategy.NONE
 
-            if q_len % 1024 == 0:
+            if q_len % 256 == 0:
                 return FlashAttentionStrategy.SHARDED_KERNEL
             else:
                 warnings.warn(
-                    "Flash attention disabled. LNC2 requires seq_len % 1024 for flash attn to be performant"
+                    "Flash attention disabled. LNC2 requires seq_len % 256 for flash attn to be performant"
                 )
                 return FlashAttentionStrategy.NONE
 
@@ -338,7 +337,7 @@ class NeuronAttentionBase(nn.Module):
         return attn_output
 
     def compute_for_token_gen(
-        self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+        self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask, is_block_kv=False
     ) -> Tensor:
         """attention computation at token generation phase"""
         is_speculation = position_ids.shape[-1] > 1
@@ -359,19 +358,97 @@ class NeuronAttentionBase(nn.Module):
         K_active = repeat_kv(K, self.num_key_value_groups)
         V_active = repeat_kv(V, self.num_key_value_groups)
         active_scores = torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if is_speculation:
+        if is_speculation or is_block_kv:
             active_scores = torch.where(
                 active_mask, active_scores, torch.finfo(active_scores.dtype).min
             )
         active_scores = active_scores.to(torch.float32)
 
         # iii. attention scores
-        softmax_prior, softmax_active = manual_softmax(prior_scores, active_scores, is_speculation)
+        softmax_prior, softmax_active = manual_softmax(
+            prior_scores, active_scores, is_speculation or is_block_kv
+        )
         softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
         attn_prior = torch.matmul(softmax_prior, V_prior)
         attn_active = torch.matmul(softmax_active, V_active)
         attn_output = attn_prior + attn_active
 
+        return attn_output
+
+    def compute_for_block_kv(self, Q, K, V, past_key_value, attention_mask, **kwargs):
+        """
+        Attention computation for block kv layout for prefix caching
+
+        The first step is to combine the KV from current requset with the KV cache
+        using the cache_mask and current_reordered_idx.
+        The second step is to do the attention calculation.
+
+        Args:
+            Q: hidden state of current queries in shape of (batch_size, num_heads, n_active_tokens, head_dim)
+            K: hidden state of current keys in shape of (batch_size, num_heads, n_active_tokens, head_dim)
+            V: hidden state of current values in shape of (batch_size, num_heads, n_active_tokens, head_dim)
+            past_key_value: tuple of KV caches with each in shape of (batch_size, num_heads, max_seq_len, head_dim)
+            cache_mask: the precomputed cache mask in shape of (batch_size, max_seq_len)
+            current_reordered_idx: the scatter indices mapping the newly computed KV
+                to full-length KV in shape of (batch_size, max_seq_len)
+
+        Returns:
+            attn_output: output hidden state in shape of (batch_size, num_heads, n_active_tokens, head_dim)
+        """
+        K_active = K
+        V_active = V
+
+        K_prior = past_key_value[0]
+        V_prior = past_key_value[1]
+
+        args = (
+            kwargs.get("cache_mask"),
+            kwargs.get("current_reordered_idx"),
+        )
+        K_combined = contexted_kv_v2(K_prior, K_active, *args)
+        V_combined = contexted_kv_v2(V_prior, V_active, *args)
+
+        K_combined = repeat_kv(K_combined, self.num_key_value_groups)
+        V_combined = repeat_kv(V_combined, self.num_key_value_groups)
+
+        active_scores = self.scaled_qk(Q, K_combined, attention_mask)
+        active_scores = nn.functional.softmax(active_scores, dim=-1, dtype=torch.float32).to(
+            Q.dtype
+        )
+        attn_output = torch.matmul(active_scores, V_combined)
+        return attn_output
+
+    def perform_contexted_prefill(self, Q, K, V, past_key_value, attention_mask, **kwargs):
+        """
+        Attention computation for chunked prefill
+
+        The Q here contains only logits from current request, but the K and V
+        will contain logits from previous and current. This is similar to
+        compute_for_token_gen, but the Q here is from concatenated prompt, so
+        the num of queries for each seq can be a value that is not one.
+        """
+        K_active = K
+        V_active = V
+
+        K_prior = past_key_value[0]
+        V_prior = past_key_value[1]
+
+        args = (
+            kwargs.get("cache_mask"),
+            kwargs.get("cache_reordered_idx"),
+            kwargs.get("current_reordered_idx"),
+        )
+        K_combined = contexted_kv(K_prior, K_active, *args)
+        V_combined = contexted_kv(V_prior, V_active, *args)
+
+        K_combined = repeat_kv(K_combined, self.num_key_value_groups)
+        V_combined = repeat_kv(V_combined, self.num_key_value_groups)
+
+        active_scores = self.scaled_qk(Q, K_combined, attention_mask)
+        active_scores = nn.functional.softmax(active_scores, dim=-1, dtype=torch.float32).to(
+            Q.dtype
+        )
+        attn_output = torch.matmul(active_scores, V_combined)
         return attn_output
 
     def forward(
@@ -385,24 +462,46 @@ class NeuronAttentionBase(nn.Module):
         cos_cache: Optional[torch.Tensor] = None,
         sin_cache: Optional[torch.Tensor] = None,
         rmsnorm=None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
+        **kwargs,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """Implements each layer's forward pass for the attention block."""
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
             q_len *= self.tensor_model_parallel_group.size()
 
-        Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
-            position_ids,
-            hidden_states,
-            past_key_value,
-            adapter_ids=adapter_ids,
-            cos_cache=cos_cache,
-            sin_cache=sin_cache,
-            rmsnorm=rmsnorm,
-        )
+        if rotary_position_ids is not None:
+            Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
+                rotary_position_ids,
+                hidden_states,
+                past_key_value,
+                adapter_ids=adapter_ids,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                rmsnorm=rmsnorm,
+            )
+        else:
+            Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
+                position_ids,
+                hidden_states,
+                past_key_value,
+                adapter_ids=adapter_ids,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                rmsnorm=rmsnorm,
+            )
 
         flash_attn_strategy = FlashAttentionStrategy.NONE
-        if past_key_value is None:
+        if self.neuron_config.is_prefix_caching:
+            attn_output = self.compute_for_token_gen(
+                Q, K, V, position_ids, past_key_value, attention_mask, active_mask, is_block_kv=True
+            )
+        elif self.neuron_config.is_chunked_prefill:
+            # Leverage contexted prefill to do attention for block kV layout.
+            attn_output = self.perform_contexted_prefill(
+                Q, K, V, past_key_value, attention_mask, **kwargs
+            )
+        elif past_key_value is None:
             attn_output, flash_attn_strategy = self.perform_prefill(
                 Q, K, V, q_len, bsz, attention_mask
             )

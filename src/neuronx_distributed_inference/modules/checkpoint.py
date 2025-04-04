@@ -3,8 +3,8 @@ import os
 from typing import Callable, Dict, List
 
 import torch
-from safetensors.torch import load_file, save_file
-from transformers.modeling_utils import shard_checkpoint
+from huggingface_hub import save_torch_state_dict
+from safetensors.torch import load_file
 
 _SAFETENSORS_MODEL_INDEX_FILENAME_JSON = "model.safetensors.index.json"
 _SAFETENSORS_MODEL_FILENAME = "model.safetensors"
@@ -142,19 +142,13 @@ def save_state_dict_safetensors(
     """
     Shard and save state dict in safetensors format following HF convention.
     """
-    sharded_state_dict, index = shard_checkpoint(
-        state_dict, max_shard_size=max_shard_size, weights_name="model.safetensors"
+
+    save_torch_state_dict(
+        state_dict,
+        save_directory=state_dict_dir,
+        filename_pattern="model{suffix}.safetensors",
+        max_shard_size=max_shard_size,
     )
-
-    os.makedirs(state_dict_dir, exist_ok=True)
-    if index is not None:
-        index_path = os.path.join(state_dict_dir, _SAFETENSORS_MODEL_INDEX_FILENAME_JSON)
-        with open(index_path, "w") as fin:
-            json.dump(index, fin, indent=4)
-
-    for filename, shard in sharded_state_dict.items():
-        file_path = os.path.join(state_dict_dir, filename)
-        save_file(shard, file_path)
 
 
 def prune_state_dict(state_dict):

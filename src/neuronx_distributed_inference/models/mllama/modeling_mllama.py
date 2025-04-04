@@ -7,11 +7,12 @@
 
 """PyTorch LLaMA Multimodal model for NXD inference."""
 import copy
+import inspect
 import json
 import logging
 import math
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn.functional as F
@@ -164,8 +165,8 @@ class MllamaInferenceConfig(InferenceConfig):
                 is_medusa was set to {self.neuron_config.is_medusa}. \
                 speculation_length was set to {self.neuron_config.speculation_length}"
         assert (
-            int(self.neuron_config.logical_neuron_cores) == 1
-        ), "This model currently only support logical_neuron_cores=1"
+            int(self.neuron_config.logical_nc_config) == 1
+        ), "This model currently only support logical_nc_config=1"
 
     def to_json_string(self):
         config_copy = copy.deepcopy(self)
@@ -224,11 +225,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         if not hasattr(self.config, "rope_scaling") or self.config.rope_scaling is None:
             # TODO(yihsian): Check if we can just use our own implementation
             if self.is_medusa:
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                )
+                self.rotary_emb = LlamaRotaryEmbedding(self.config)
             else:
                 self.rotary_emb = RotaryEmbedding(
                     self.head_dim,
@@ -774,7 +771,7 @@ class NeuronMllamaDecoderLayer(nn.Module):
         self.vision_config = vision_config
         self.xatten = (
             NeuronLlamaCrossAttentionBlock(config, self.vision_config)
-            if is_xatten_layer
+            if (is_xatten_layer and not config.neuron_config.skip_vision)
             else DummyCrossAttention()
         )
         self.self_attn = NeuronLlamaAttentionBlock(config)
@@ -973,19 +970,6 @@ class NeuronMllamaTextModel(NeuronBaseModel):
             else self.n_positions
         )
 
-        orig_seq_ids = seq_ids
-
-        if self._is_reorder_needed(is_for_context_encoding, is_for_speculation):
-            seq_ids = torch.argsort(seq_ids)
-            input_ids = self._reorder_helper(input_ids, seq_ids)
-            attention_mask = self._reorder_helper(attention_mask, seq_ids)
-            position_ids = self._reorder_helper(position_ids, seq_ids)
-            sampling_params = self._reorder_helper(sampling_params, seq_ids)
-            # vision_tokens is a dummy tensor of 0's, no need to re-order
-            vision_mask = self._reorder_helper(vision_mask, seq_ids)
-            num_chunks = self._reorder_helper(num_chunks, seq_ids)
-            has_image = self._reorder_helper(has_image, seq_ids)
-
         # It is either for context encoding or for token generation
         if is_for_context_encoding:
             past_key_values, vision_key_values = None, None
@@ -1057,12 +1041,9 @@ class NeuronMllamaTextModel(NeuronBaseModel):
         res = logits
         if self.on_device_sampling:
             # perform sampling on Neuron to get tokens
-            res = self.sampler(logits[:, -1, :], sampling_params)
+            res = self.sampler(logits[:, -1, :], sampling_params, rank_id=self.rank_util.get_rank())
 
             res = res.to(torch.int32)
-
-        if self._is_reorder_needed(is_for_context_encoding, is_for_speculation):
-            res = self._reorder_helper(res, orig_seq_ids)
 
         return [res] + updated_kv_cache + updated_vision_cache
 
@@ -1140,9 +1121,9 @@ class NeuronMllamaTextModel(NeuronBaseModel):
                 has_image=has_image,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
-                rotary_freqs=self.rotary_freqs[position_ids]
-                if self.rotary_freqs is not None
-                else None,
+                rotary_freqs=(
+                    self.rotary_freqs[position_ids] if self.rotary_freqs is not None else None
+                ),
             )
 
             hidden_states = layer_outputs[0]
@@ -1204,9 +1185,14 @@ class NeuronMllamaModel(NeuronBaseModel):
         if is_for_context_encoding:
             # We mask the output with `has_image`
             # So vision_tokens becomes all zeros if input has no image,
-            vision_tokens = self.vision_model(pixel_values, aspect_ratios) * has_image.view(
-                -1, 1, 1, 1, 1
-            )
+            if self.neuron_config.skip_vision:
+                vision_tokens = pixel_values
+            else:
+                # We mask the output with `has_image`
+                # So vision_tokens becomes all zeros if input has no image,
+                vision_tokens = self.vision_model(pixel_values, aspect_ratios) * has_image.view(
+                    -1, 1, 1, 1, 1
+                )
         else:
             vision_tokens = torch.tensor([0] * self.neuron_config.batch_size)
 
@@ -1252,7 +1238,7 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
     def get_compiler_args(self) -> str:
         return "--enable-saturate-infinity --auto-cast=none --model-type=transformer \
                 --tensorizer-options='--enable-ccop-compute-overlap \
-                --cc-pipeline-tiling-factor=2 --vectorize-dge-dma --vectorize-strided-dma' -O1 \
+                --cc-pipeline-tiling-factor=2 --vectorize-strided-dma' -O1 \
                 --hbm-scratchpad-page-size=1024"
 
     @staticmethod
@@ -1270,6 +1256,25 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
 
     def get_model_wrapper_cls(self):
         return ModelWrapperMllama
+
+    def _convert_input_dict_to_ordered_tuple(self, input_dict: Dict[str, Any]):
+        """
+        Utility function to convert input dictionary to ordered tuple
+        based on input signature of _get_model_outputs
+        """
+        args = []
+        ordered_keys = inspect.getfullargspec(self._get_model_outputs).args
+
+        for key in ordered_keys:
+            if key == "self":
+                continue
+            elif (key == "medusa_args" or key == "llava_args") and input_dict[key]:
+                for custom_arg in input_dict[key]:
+                    args.append(custom_arg)
+            else:
+                args.append(input_dict[key])
+
+        return tuple(args)
 
     def forward(
         self,
@@ -1294,6 +1299,7 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
         has_image: Optional[torch.Tensor] = None,
         vision_key_values: Optional[List[torch.FloatTensor]] = None,
         llava_args: Optional[List] = [],
+        input_capture_hook: Optional[Callable] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
         Args:
@@ -1335,20 +1341,40 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
         if seq_ids is None:
             seq_ids = torch.arange(input_ids.shape[0])
 
-        outputs, is_run_on_neuron = self._get_model_outputs(
-            input_ids,
-            attention_mask,
-            position_ids,
-            seq_ids,
-            sampling_params,
-            pixel_values,
-            aspect_ratios,
-            vision_mask,
-            num_chunks,
-            has_image,
-        )
+        if self.async_mode:
+            bs, _ = input_ids.shape
+            outputs, is_run_on_neuron = self._get_model_outputs_async(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                seq_ids=seq_ids,
+                sampling_params=sampling_params,
+                adapter_ids=adapter_ids,
+                medusa_args=medusa_args,
+                llava_args=llava_args,
+                pixel_values=pixel_values if input_ids.shape[-1] > 1 else torch.tensor([0] * bs),
+                aspect_ratios=aspect_ratios,
+                vision_mask=vision_mask,
+                num_chunks=num_chunks,
+                has_image=has_image,
+                prev_hidden=None,
+            )
+        else:
+            outputs, is_run_on_neuron = self._get_model_outputs(
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                pixel_values,
+                aspect_ratios,
+                vision_mask,
+                num_chunks,
+                has_image,
+            )
 
-        if self.neuron_config.trace_tokengen_model and not self.token_generation_model.is_neuron():
+        generation_model = self.get_generation_model()
+        if not generation_model.is_neuron():
             self._copy_past_key_values(outputs)
 
         if is_run_on_neuron:
@@ -1395,31 +1421,7 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
             )
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
-            if self.async_mode:
-                if not self.unequal_batching:
-                    # for now only cte + tkg flow is supported with async (this will be enforced at config level)
-                    next_outputs = self.token_generation_model(
-                        outputs,
-                        self.next_cpu_inputs["attention_mask"],
-                        self.next_cpu_inputs["position_ids"],
-                        seq_ids,
-                        sampling_params,
-                        # Llama-MM specific
-                        torch.tensor([0] * bs),  # dummy pixel_values
-                        aspect_ratios,
-                        vision_mask,
-                        num_chunks,
-                        has_image,
-                    )
-                    outputs = self._get_async_output(outputs)  # block on cte call
-                    self.prior_outputs = next_outputs
-                else:
-                    if isinstance(
-                        outputs, list
-                    ):  # in case the outputs weren't passed through `torch.cat` in model_wrapper.py
-                        outputs = self._get_async_output(outputs)  # block on cte call
 
-                    self.prior_outputs = None
         else:  # token generation
             if (
                 self.next_cpu_inputs is not None and self.prior_outputs is not None
@@ -1432,7 +1434,7 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
                 _attention_mask = attention_mask
                 _position_ids = position_ids
 
-            next_outputs = self.token_generation_model(
+            outputs = self.token_generation_model(
                 _input_ids,
                 _attention_mask,
                 _position_ids,
@@ -1445,34 +1447,6 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
                 num_chunks,
                 has_image,
             )
-
-            if self.async_mode:
-                if (
-                    self.prior_outputs is None
-                ):  # this means that next_outputs is processing token to be returned
-                    self.prior_outputs = next_outputs
-                    next_outputs = self.token_generation_model(  # submit future token request
-                        next_outputs,
-                        self.next_cpu_inputs["attention_mask"],
-                        self.next_cpu_inputs["position_ids"],
-                        seq_ids,
-                        sampling_params,
-                        # Llama-MM specific
-                        torch.tensor([0] * bs),  # dummy pixel_values
-                        aspect_ratios,
-                        vision_mask,
-                        num_chunks,
-                        has_image,
-                    )
-                outputs = self.prior_outputs
-                if isinstance(outputs, list):
-                    outputs = self._get_async_output(
-                        self.prior_outputs
-                    )  # block on prior (sometimes current) token gen request
-
-                self.prior_outputs = next_outputs
-            else:
-                outputs = next_outputs
 
             is_run_on_neuron = self.token_generation_model.is_neuron()
 

@@ -14,21 +14,15 @@ class BaseMultiLora(nn.Module):
         return self.dtype
 
     def get_weight(self, adapter_ids) -> torch.Tensor:
-        if adapter_ids is None:
-            adapter_ids = 0
-        return self.weight[adapter_ids].squeeze()
-
-    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        return self.weight[adapter_ids]
 
     def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor) -> torch.Tensor:
-        ret = []
-        weights = self.get_weight(adapter_ids)
+        raise NotImplementedError
 
-        for i in range(adapter_ids.numel()):
-            output = self._forward(x[i], weights[i])
-            ret.append(output)
-        return torch.stack(ret)
+    def _enisum_forward(self, x: torch.Tensor, weights: torch.Tensor, memory_transpose):
+        if not memory_transpose:
+            return torch.einsum("bij,bkj->bik", x, weights)
+        return torch.einsum("bij,bjk->bik", x, weights)
 
 
 class MultiLoraLinear(BaseMultiLora):
@@ -38,13 +32,16 @@ class MultiLoraLinear(BaseMultiLora):
         input_size: int,
         output_size: int,
         dtype: torch.dtype = torch.float32,
+        memory_transpose: bool = True,
     ) -> None:
         self.max_loras = max_loras
         self.dtype = dtype
-        self.input_size = input_size
-        self.output_size = output_size
+        self.memory_transpose = memory_transpose
         super().__init__()
-        self.weight_shape = (self.max_loras, self.output_size, self.input_size)
+        if not self.memory_transpose:
+            self.weight_shape = (self.max_loras, output_size, input_size)
+        else:
+            self.weight_shape = (self.max_loras, input_size, output_size)
         self.weight = nn.Parameter(
             torch.empty(*self.weight_shape, dtype=self.dtype), requires_grad=False
         )
@@ -52,8 +49,9 @@ class MultiLoraLinear(BaseMultiLora):
     def get_checkpoint_shape(self):
         return self.weight_shape
 
-    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, weight)
+    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor) -> torch.Tensor:
+        weights = self.get_weight(adapter_ids)
+        return self._enisum_forward(x, weights, self.memory_transpose)
 
 
 class MultiLoraConv2d(BaseMultiLora, nn.Conv2d):
@@ -98,6 +96,15 @@ class MultiLoraConv2d(BaseMultiLora, nn.Conv2d):
     def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return self._conv_forward(x, weight, None)
 
+    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor) -> torch.Tensor:
+        ret = []
+        weights = self.get_weight(adapter_ids)
+
+        for i in range(adapter_ids.numel()):
+            output = self._forward(x[i], weights[i])
+            ret.append(output)
+        return torch.stack(ret)
+
 
 class MultiLoraEmbedding(BaseMultiLora):
     def __init__(
@@ -111,9 +118,11 @@ class MultiLoraEmbedding(BaseMultiLora):
         scale_grad_by_freq: bool,
         sparse: bool,
         dtype: torch.dtype = torch.float32,
+        memory_transpose: bool = True,
     ) -> None:
         self.max_loras = max_loras
         self.dtype = dtype
+        self.memory_transpose = memory_transpose
         self.input_size = input_size
         self.output_size = output_size
         self.padding_idx = padding_idx
@@ -122,7 +131,10 @@ class MultiLoraEmbedding(BaseMultiLora):
         self.scale_grad_by_freq = scale_grad_by_freq
         self.sparse = sparse
         super().__init__()
-        self.weight_shape = (self.max_loras, self.output_size, self.input_size)
+        if not self.memory_transpose:
+            self.weight_shape = (self.max_loras, output_size, input_size)
+        else:
+            self.weight_shape = (self.max_loras, input_size, output_size)
         self.weight = nn.Parameter(
             torch.empty(*self.weight_shape, dtype=self.dtype), requires_grad=False
         )
@@ -131,15 +143,26 @@ class MultiLoraEmbedding(BaseMultiLora):
         return self.weight_shape
 
     def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        if not self.memory_transpose:
+            weight = weight.T
         return F.embedding(
             x,
-            weight.T,
+            weight,
             padding_idx=self.padding_idx,
             max_norm=self.max_norm,
             norm_type=self.norm_type,
             scale_grad_by_freq=self.scale_grad_by_freq,
             sparse=self.sparse,
         )
+
+    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor) -> torch.Tensor:
+        ret = []
+        weights = self.get_weight(adapter_ids)
+
+        for i in range(adapter_ids.numel()):
+            output = self._forward(x[i], weights[i])
+            ret.append(output)
+        return torch.stack(ret)
 
 
 class MultiLoraColumnParallelLinear(BaseMultiLora, ColumnParallelLinear):
@@ -149,10 +172,14 @@ class MultiLoraColumnParallelLinear(BaseMultiLora, ColumnParallelLinear):
         input_size: int,
         output_size: int,
         dtype: torch.dtype = torch.float32,
+        memory_transpose: bool = True,
+        kv_replicate=None,
         **kwargs,
     ) -> None:
         self.max_loras = max_loras
         self.dtype = dtype
+        self.memory_transpose = memory_transpose
+        self.kv_replicate = kv_replicate
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -163,26 +190,31 @@ class MultiLoraColumnParallelLinear(BaseMultiLora, ColumnParallelLinear):
         )
 
     def set_weight_and_bias_config(self) -> None:
-        self.weight_shape = (
-            self.max_loras,
-            self.output_size_per_partition,
-            self.input_size,
-        )
-        self.weight_partition_dim = 1
+        if not self.memory_transpose:
+            self.weight_shape = (
+                self.max_loras,
+                self.output_size_per_partition,
+                self.input_size,
+            )
+            self.weight_partition_dim = 1
+        else:
+            self.weight_shape = (
+                self.max_loras,
+                self.input_size,
+                self.output_size_per_partition,
+            )
+            self.weight_partition_dim = 2
         self.bias_shape = None
 
     def get_checkpoint_shape(self):
-        return (self.max_loras, self.output_size, self.input_size)
+        if not self.memory_transpose:
+            return (self.max_loras, self.output_size, self.input_size)
+        else:
+            return (self.max_loras, self.input_size, self.output_size)
 
-    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        return self._forward_impl(
-            input=x,
-            weight=weight,
-            bias=None,
-            async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
-            autograd_func_class=self.autograd_func_class,
-        )
+    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor) -> torch.Tensor:
+        weights = self.get_weight(adapter_ids)
+        return self._enisum_forward(x, weights, self.memory_transpose)
 
 
 class MultiLoraRowParallelLinear(BaseMultiLora, RowParallelLinear):
@@ -192,33 +224,54 @@ class MultiLoraRowParallelLinear(BaseMultiLora, RowParallelLinear):
         input_size: int,
         output_size: int,
         dtype: torch.dtype = torch.float32,
+        memory_transpose: bool = True,
         **kwargs,
     ) -> None:
         self.max_loras = max_loras
         self.dtype = dtype
+        self.memory_transpose = memory_transpose
         super().__init__(
             input_size=input_size, output_size=output_size, dtype=dtype, bias=False, **kwargs
         )
 
     def set_weight_and_bias_config(self) -> None:
-        self.weight_shape = (
-            self.max_loras,
-            self.output_size,
-            self.input_size_per_partition,
-        )
-        self.weight_partition_dim = 2
+        if not self.memory_transpose:
+            self.weight_shape = (
+                self.max_loras,
+                self.output_size,
+                self.input_size_per_partition,
+            )
+            self.weight_partition_dim = 2
+        else:
+            self.weight_shape = (
+                self.max_loras,
+                self.input_size_per_partition,
+                self.output_size,
+            )
+            self.weight_partition_dim = 1
         self.bias_shape = None
 
     def get_checkpoint_shape(self):
-        return (self.max_loras, self.output_size, self.input_size)
+        if not self.memory_transpose:
+            return (self.max_loras, self.output_size, self.input_size)
+        else:
+            return (self.max_loras, self.input_size, self.output_size)
 
-    def _forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        output_parallel = self._forward_impl(
-            input=x,
-            weight=weight,
-            bias=None,
-            async_grad_allreduce=False,
-            sequence_parallel_enabled=False,
-            autograd_func_class=self.autograd_func_class,
-        )
+    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor) -> torch.Tensor:
+        weights = self.get_weight(adapter_ids)
+        output_parallel = self._enisum_forward(x, weights, self.memory_transpose)
         return mappings.reduce_from_tensor_model_parallel_region(output_parallel)
+
+
+class MultiLoraColumnShardedLinear(MultiLoraColumnParallelLinear):
+    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor) -> torch.Tensor:
+        weights = self.get_weight(adapter_ids)
+        weights = mappings._gather_along_dim(weights, self.weight_partition_dim)
+        return self._enisum_forward(x, weights, self.memory_transpose)
+
+
+class MultiLoraRowShardedLinear(MultiLoraRowParallelLinear):
+    def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor) -> torch.Tensor:
+        weights = self.get_weight(adapter_ids)
+        weights = mappings._gather_along_dim(weights, self.weight_partition_dim)
+        return self._enisum_forward(x, weights, self.memory_transpose)

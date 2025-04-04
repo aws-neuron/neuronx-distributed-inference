@@ -37,11 +37,7 @@ from neuronx_distributed.parallel_layers.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from neuronx_distributed.parallel_layers.utils import get_padding_length
-from neuronx_distributed.quantization.quantization_config import QuantizationType, QuantizedDtype
-from neuronx_distributed.quantization.quantization_layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
-    QuantizedColumnParallel,
-    QuantizedRowParallel,
-)
+from neuronx_distributed.utils import cpu_mode
 from neuronxcc.nki._private_kernels.mlp import (
     mlp_fused_add_isa_kernel,
     mlp_isa_kernel,
@@ -49,7 +45,7 @@ from neuronxcc.nki._private_kernels.mlp import (
     quant_mlp_isa_kernel,
 )
 from neuronxcc.nki._private_kernels.rmsnorm import rmsnorm_quant_isa_kernel
-from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
+from neuronxcc.nki.language import nc
 from torch import nn
 from torch_neuronx.xla_impl.ops import nki_jit
 from transformers import LlamaForCausalLM
@@ -84,7 +80,7 @@ def get_rmsnorm_cls():
     # Initialize to the appropriate implementation of RMSNorm
     # If infer on NXD -> CustomRMSNorm
     # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
-    return CustomRMSNorm if parallel_state.model_parallel_is_initialized() else LlamaRMSNorm
+    return LlamaRMSNorm if cpu_mode() else CustomRMSNorm
 
 
 def preshard_hook_fn(module: torch.nn.Module, model_state_dict: dict, prefix: str) -> bool:
@@ -92,6 +88,47 @@ def preshard_hook_fn(module: torch.nn.Module, model_state_dict: dict, prefix: st
         return module.preshard_hook(model_state_dict, prefix)
 
     return False
+
+
+# Get the modules_to_not_convert from the neuron configs
+def get_modules_to_not_convert(neuron_config: NeuronConfig):
+    return getattr(neuron_config, "modules_to_not_convert", None)
+
+
+def get_updated_configs(config: InferenceConfig):
+    """
+    Generate a list of configurations for each hidden layer in a Llama model.
+
+    This function creates a list of InferenceConfig objects, one for each layer. It
+    modifies the configurations for certain layers based on which modules should not
+    be converted to quantized format. The function uses get_modules_to_not_convert()
+    to determine which modules should not be converted.
+
+    Args:
+    config (InferenceConfig): The inference configuration for the model.
+
+    Returns:
+    list[InferenceConfig]: A list of InferenceConfig objects, one for each layer in the model.
+                           Each config may be either the original config or a modified version
+                           with "quantized_mlp_kernel_enabled" as False for that specific layer.
+    """
+    updated_configs = []
+    modules_to_not_convert = get_modules_to_not_convert(config.neuron_config)
+    if modules_to_not_convert is None:
+        modules_to_not_convert = []
+
+    for i in range(config.num_hidden_layers):
+        # If any of the MLP modules for this layer are in modules_to_not_convert
+        module_pattern = f"layers.{i}.mlp"
+        if any(module_pattern in module for module in modules_to_not_convert):
+            non_quant_config = copy.deepcopy(config)
+            non_quant_config.neuron_config.quantized_mlp_kernel_enabled = False
+            non_quant_config.neuron_config.activation_quantization_type = None
+            non_quant_config.neuron_config.quantize_clamp_bound = float('inf')
+            updated_configs.append(non_quant_config)
+        else:
+            updated_configs.append(config)
+    return updated_configs
 
 
 def _register_module(key: str, cls: Type[nn.Module]):
@@ -118,21 +155,41 @@ def register_module(key: str):
     return inner
 
 
+def _helper_concat_and_delete_qkv(llama_state_dict, layer_num, attr):
+    """
+    Helper function to concatenate and delete QKV attributes for fusedqkv (weight or scale).
+    Args:
+        llama_state_dict: The state dictionary containing model weights
+        layer_num: The index of the layer to process
+        attr: The attribute to process ('weight' or 'scale')
+    """
+    llama_state_dict[f"layers.{layer_num}.self_attn.Wqkv.{attr}"] = torch.cat(
+        [
+            llama_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"],
+            llama_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"],
+            llama_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"],
+        ],
+    )
+
+    del llama_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"]
+    del llama_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"]
+    del llama_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"]
+
+
 def convert_state_dict_to_fused_qkv(llama_state_dict, cfg: InferenceConfig):
     """
-    This function concats the qkv weights to a Wqkv weight for fusedqkv, and deletes the qkv weights.
+    This function concats the qkv weights and scales to a Wqkv weight and scale for fusedqkv, and deletes the qkv weights.
     """
+    mods_to_not_conv = get_modules_to_not_convert(cfg.neuron_config)
+    if mods_to_not_conv is None:
+        mods_to_not_conv = []
+
     for l in range(cfg.num_hidden_layers):  # noqa: E741
-        llama_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = torch.cat(
-            [
-                llama_state_dict[f"layers.{l}.self_attn.q_proj.weight"],
-                llama_state_dict[f"layers.{l}.self_attn.k_proj.weight"],
-                llama_state_dict[f"layers.{l}.self_attn.v_proj.weight"],
-            ],
-        )
-        del llama_state_dict[f"layers.{l}.self_attn.q_proj.weight"]
-        del llama_state_dict[f"layers.{l}.self_attn.k_proj.weight"]
-        del llama_state_dict[f"layers.{l}.self_attn.v_proj.weight"]
+        _helper_concat_and_delete_qkv(llama_state_dict, l, "weight")
+        if (
+            cfg.neuron_config.quantized_mlp_kernel_enabled or cfg.neuron_config.quantized
+        ) and f"layers.{l}.self_attn" not in mods_to_not_conv:
+            _helper_concat_and_delete_qkv(llama_state_dict, l, "scale")
 
     gc.collect()
 
@@ -189,97 +246,73 @@ class NeuronLlamaMLP(nn.Module):
         self.mlp_kernel_enabled = self.neuron_config.mlp_kernel_enabled
         self.quantized_mlp_kernel_enabled = self.neuron_config.quantized_mlp_kernel_enabled
         self.rmsnorm_quantize_kernel_enabled = self.neuron_config.rmsnorm_quantize_kernel_enabled
-        self.quantized_kernel_lower_bound = self.neuron_config.quantized_kernel_lower_bound
-        self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
+        self.quantize_clamp_bound = self.neuron_config.quantize_clamp_bound
+        self.logical_nc_config = self.neuron_config.logical_nc_config
+        self.activation_quantization_type = self.neuron_config.activation_quantization_type
         mlp_bias = getattr(config, "mlp_bias", False)
+
+        if self.neuron_config.quantized_mlp_kernel_enabled and self.quantize_clamp_bound == float('inf'):
+            logging.warning("quantize_clamp_bound is not specified in NeuronConfig. We will use the default value of 1200 for llama models in quantized kernels.")
+            self.quantize_clamp_bound = 1200.0
         if parallel_state.model_parallel_is_initialized():
-            if self.quantized_mlp_kernel_enabled:
-                # Quantized MLP kernels expect intermediate size to be multiple of 128, so we need to pad
+            if self.neuron_config.quantized_mlp_kernel_enabled:
+                # # Quantized MLP kernels expect intermediate size to be multiple of 128, so we need to pad
                 tp_degree = self.neuron_config.tp_degree
                 self.intermediate_size += (
                     get_padding_length(self.intermediate_size // tp_degree, 128) * tp_degree
                 )
                 logger.debug(f"Quantized intermediate_size: {self.intermediate_size}")
-
-                quantization_type = QuantizationType(self.neuron_config.quantization_type)
-                quantized_dtype = QuantizedDtype.F8E4M3
-                self.gate_proj = QuantizedColumnParallel(
-                    input_size=self.hidden_size,
-                    output_size=self.intermediate_size,
-                    bias=mlp_bias,
-                    gather_output=False,
-                    sequence_parallel_enabled=False,
-                    dtype=config.neuron_config.torch_dtype,
-                    quantized_dtype=quantized_dtype,
-                    quantization_type=quantization_type,
-                    tensor_model_parallel_group=get_tp_group(config),
-                )
-                self.up_proj = QuantizedColumnParallel(
-                    input_size=self.hidden_size,
-                    output_size=self.intermediate_size,
-                    bias=mlp_bias,
-                    gather_output=False,
-                    sequence_parallel_enabled=False,
-                    dtype=config.neuron_config.torch_dtype,
-                    quantized_dtype=quantized_dtype,
-                    quantization_type=quantization_type,
-                    tensor_model_parallel_group=get_tp_group(config),
-                )
-                self.down_proj = QuantizedRowParallel(
-                    input_size=self.intermediate_size,
-                    output_size=self.hidden_size,
-                    bias=mlp_bias,
-                    quantization_type=quantization_type,
-                    input_is_parallel=True,
-                    dtype=config.neuron_config.torch_dtype,
-                    quantized_dtype=quantized_dtype,
-                    sequence_parallel_enabled=False,
-                    quantization_per_channel_axis=0,
-                    tensor_model_parallel_group=get_tp_group(config),
-                )
-
-            else:
-                self.gate_proj = ColumnParallelLinear(
-                    self.hidden_size,
-                    self.intermediate_size,
-                    bias=mlp_bias,
-                    gather_output=False,
-                    dtype=config.neuron_config.torch_dtype,
-                    pad=True,
-                    sequence_parallel_enabled=False,
-                    sequence_dimension=None,
-                    tensor_model_parallel_group=get_tp_group(config),
-                )
-                self.up_proj = ColumnParallelLinear(
-                    self.hidden_size,
-                    self.intermediate_size,
-                    bias=mlp_bias,
-                    gather_output=False,
-                    dtype=config.neuron_config.torch_dtype,
-                    pad=True,
-                    sequence_parallel_enabled=False,
-                    sequence_dimension=None,
-                    tensor_model_parallel_group=get_tp_group(config),
-                )
-                self.down_proj = RowParallelLinear(
-                    self.intermediate_size,
-                    self.hidden_size,
-                    bias=mlp_bias,
-                    input_is_parallel=True,
-                    dtype=config.neuron_config.torch_dtype,
-                    pad=True,
-                    sequence_parallel_enabled=self.sequence_parallel_enabled,
-                    sequence_dimension=self.sequence_dimension,
-                    tensor_model_parallel_group=get_tp_group(config),
-                    reduce_dtype=config.neuron_config.rpl_reduce_dtype,
-                )
-
+            self.gate_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=mlp_bias,
+                gather_output=False,
+                dtype=config.neuron_config.torch_dtype,
+                pad=True,
+                sequence_parallel_enabled=False,
+                sequence_dimension=None,
+                tensor_model_parallel_group=get_tp_group(config),
+            )
+            self.up_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=mlp_bias,
+                gather_output=False,
+                dtype=config.neuron_config.torch_dtype,
+                pad=True,
+                sequence_parallel_enabled=False,
+                sequence_dimension=None,
+                tensor_model_parallel_group=get_tp_group(config),
+            )
+            self.down_proj = RowParallelLinear(
+                self.intermediate_size,
+                self.hidden_size,
+                bias=mlp_bias,
+                input_is_parallel=True,
+                dtype=config.neuron_config.torch_dtype,
+                pad=True,
+                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                sequence_dimension=self.sequence_dimension,
+                tensor_model_parallel_group=get_tp_group(config),
+                reduce_dtype=config.neuron_config.rpl_reduce_dtype,
+            )
             if self.mlp_kernel_enabled:
-                if self.quantized_mlp_kernel_enabled:
-                    preprocess_quantized_linear_layer(self.gate_proj)
-                    preprocess_quantized_linear_layer(self.up_proj)
-                    preprocess_quantized_linear_layer(self.down_proj)
-
+                if self.neuron_config.quantized_mlp_kernel_enabled:
+                    setattr(
+                        self.gate_proj,
+                        "post_create_quantized_module_hook",
+                        preprocess_quantized_linear_layer,
+                    )
+                    setattr(
+                        self.up_proj,
+                        "post_create_quantized_module_hook",
+                        preprocess_quantized_linear_layer,
+                    )
+                    setattr(
+                        self.down_proj,
+                        "post_create_quantized_module_hook",
+                        preprocess_quantized_linear_layer,
+                    )
                 else:
                     # Transpose the weights to the layout expected by kernels
                     self.gate_proj.weight = transpose_parallel_linear_layer(self.gate_proj.weight)
@@ -291,11 +324,12 @@ class NeuronLlamaMLP(nn.Module):
             self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
             self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
 
-    def _kernel_enabled_quantized_mlp(self, x, fused_rmsnorm, rmsnorm, residual, adapter_ids):
-        grid = (vnc(self.logical_neuron_cores),)
+    def _kernel_enabled_quantized_mlp(self, x, rmsnorm, residual, adapter_ids):
+        grid = (nc(self.logical_nc_config),)
         fused_residual = residual is not None
+        fused_rmsnorm = rmsnorm is not None
         logger.debug(
-            f"MLP: quantized kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_neuron_cores={self.logical_neuron_cores}"
+            f"MLP: quantized kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_nc_config={self.logical_nc_config}"
         )
 
         # Can't do residual add in the kernel if SP is enabled
@@ -308,13 +342,17 @@ class NeuronLlamaMLP(nn.Module):
         else:
             _mlp_fwd_call = nki_jit()(quant_mlp_isa_kernel)
 
+        if fused_rmsnorm:
+            ln_w = rmsnorm.weight.unsqueeze(0)
+        else:
+            ln_w = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
         # Handle SP RMSnorm
         x_orig_dtype = x.dtype
         if self.sequence_parallel_enabled:
             # This RMSNormQuant kernel will do quantization inside, so we pass the
-            # lower_bound for clipping.
+            # clamp_bound for clipping.
             # If we don't use this kernel, the MLP kernel below will do the
-            # quantization, so we also pass lower_bound to that kernel.
+            # quantization, so we also pass clamp_bound to that kernel.
             if self.rmsnorm_quantize_kernel_enabled:
                 logger.debug(
                     "Running Quantized MLP kernel with sequence-parallel RMSnorm-Quantize kernel!"
@@ -329,10 +367,9 @@ class NeuronLlamaMLP(nn.Module):
                     dtype=torch.int8,
                     device=x.device,
                 )
-                ln_w = rmsnorm.weight.unsqueeze(0)
-                lower_bound = self.quantized_kernel_lower_bound
+                clamp_bound = self.quantize_clamp_bound
                 _rmsnorm_quant_fwd_call[grid](
-                    x, ln_w, lower_bound, quant_rmsnorm_out, kernel_name="QuantOnly"
+                    x, ln_w, clamp_bound, quant_rmsnorm_out, kernel_name="QuantOnly"
                 )
                 x = gather_from_sequence_parallel_region(
                     quant_rmsnorm_out,
@@ -367,14 +404,13 @@ class NeuronLlamaMLP(nn.Module):
         # Grab weights
         # all weights of the layers are stored in (out, in) shape
         # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
-        ln_w = rmsnorm.weight.unsqueeze(0)
         gate_w = self.gate_proj.weight.data
-        gate_w_scale = self.gate_proj.weight_scale
+        gate_w_scale = self.gate_proj.scale
         up_w = self.up_proj.weight.data
-        up_w_scale = self.up_proj.weight_scale
+        up_w_scale = self.up_proj.scale
         down_w = self.down_proj.weight.data
-        down_w_scale = self.down_proj.weight_scale
-        lower_bound = self.quantized_kernel_lower_bound
+        down_w_scale = self.down_proj.scale
+        clamp_bound = self.quantize_clamp_bound
 
         if fused_residual:
             _mlp_fwd_call[grid](
@@ -387,7 +423,7 @@ class NeuronLlamaMLP(nn.Module):
                 up_w_scale,
                 down_w,  # down_w
                 down_w_scale,
-                lower_bound,
+                clamp_bound,
                 output_tensor,  # out
                 fused_rmsnorm=fused_rmsnorm,
                 eps=self.rms_norm_eps,
@@ -408,7 +444,7 @@ class NeuronLlamaMLP(nn.Module):
                 up_w_scale,
                 down_w,  # down_w
                 down_w_scale,
-                lower_bound,
+                clamp_bound,
                 output_tensor,  # out
                 # Run RMSNorm inside the kernel if NOT using SP rmsnorm
                 fused_rmsnorm=fused_rmsnorm,
@@ -428,10 +464,11 @@ class NeuronLlamaMLP(nn.Module):
         logger.debug(f"Quantized MLP output shape {output_tensor.shape}")
         return (output_tensor, residual)
 
-    def _kernel_enabled_mlp(self, x, fused_rmsnorm, rmsnorm, residual, adapter_ids):
+    def _kernel_enabled_mlp(self, x, rmsnorm, residual, adapter_ids):
         fused_residual = residual is not None
+        fused_rmsnorm = rmsnorm is not None
         logger.debug(
-            f"MLP: kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_neuron_cores={self.logical_neuron_cores}"
+            f"MLP: kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_nc_config={self.logical_nc_config}"
         )
 
         # Choose which kernel to call
@@ -468,12 +505,15 @@ class NeuronLlamaMLP(nn.Module):
         # Grab weights
         # all weights of the layers are stored in (out, in) shape
         # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
-        ln_w = rmsnorm.weight.unsqueeze(0)
+        if fused_rmsnorm:
+            ln_w = rmsnorm.weight.unsqueeze(0)
+        else:
+            ln_w = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
         gate_w = self.gate_proj.weight.data
         up_w = self.up_proj.weight.data
         down_w = self.down_proj.weight.data
 
-        grid = (vnc(self.logical_neuron_cores),)
+        grid = (nc(self.logical_nc_config),)
 
         if fused_residual:
             _mlp_fwd_call[grid](
@@ -521,7 +561,7 @@ class NeuronLlamaMLP(nn.Module):
         logger.debug(f"MLP output shape {output_tensor.shape}")
         return (output_tensor, residual)
 
-    def _native_mlp(self, x, rmsnorm, adapter_ids=None):
+    def _native_mlp(self, x, adapter_ids=None):
         logger.debug("MLP: native compiler")
         # all-gather is done here instead of CPL layers to
         # avoid 2 all-gathers from up and gate projections
@@ -529,19 +569,20 @@ class NeuronLlamaMLP(nn.Module):
             x = gather_from_sequence_parallel_region(
                 x, self.sequence_dimension, process_group=get_tp_group(self.config)
             )
-
         gate_proj_output = (
             self.gate_proj(x)
             if not is_lora_module(self.gate_proj)
             else self.gate_proj(x, adapter_ids)
         )
+
         up_proj_output = (
             self.up_proj(x) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
         )
+
         down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
         output = (
             self.down_proj(down_proj_input)
-            if not is_lora_module(self.up_proj)
+            if not is_lora_module(self.down_proj)
             else self.down_proj(down_proj_input, adapter_ids)
         )
         logger.debug(f"MLP output shape {output.shape}")
@@ -550,23 +591,22 @@ class NeuronLlamaMLP(nn.Module):
     def forward(self, x, rmsnorm=None, residual=None, adapter_ids=None):
         """
         If residual is passed in, will fuse its add into the MLP kernel
+        If rmsnorm is passed in, will fuse the rmsnorm into the MLP kernel
 
         Returns a tuple of (output, residual), where residual is the output of the residual add
         """
         if self.mlp_kernel_enabled:
-            fused_rmsnorm = not self.sequence_parallel_enabled
             # Quantized MLP kernel
             if self.quantized_mlp_kernel_enabled:
                 return self._kernel_enabled_quantized_mlp(
-                    x, fused_rmsnorm, rmsnorm, residual, adapter_ids=adapter_ids
+                    x, rmsnorm, residual, adapter_ids=adapter_ids
                 )
             # MLP kernel
-            return self._kernel_enabled_mlp(
-                x, fused_rmsnorm, rmsnorm, residual, adapter_ids=adapter_ids
-            )
+            return self._kernel_enabled_mlp(x, rmsnorm, residual, adapter_ids=adapter_ids)
         else:
             # No kernel
-            return (self._native_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
+            assert rmsnorm is None and residual is None
+            return (self._native_mlp(x, adapter_ids=adapter_ids), None)
 
 
 @register_module("NeuronLlamaAttention")
@@ -588,7 +628,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_attention_heads)
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.padding_side = config.neuron_config.padding_side
@@ -623,11 +663,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         if not hasattr(self.config, "rope_scaling") or self.config.rope_scaling is None:
             # TODO(yihsian): Check if we can just use our own implementation
             if self.is_medusa:
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                )
+                self.rotary_emb = LlamaRotaryEmbedding(self.config)
             else:
                 self.rotary_emb = RotaryEmbedding(
                     self.head_dim,
@@ -755,10 +791,18 @@ class NeuronLlamaDecoderLayer(nn.Module):
         )
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
+        self.quantized_mlp_kernel_enabled = config.neuron_config.quantized_mlp_kernel_enabled
         self.rmsnorm_quantize_kernel_enabled = config.neuron_config.rmsnorm_quantize_kernel_enabled
         self.mlp_kernel_fuse_residual_add = config.neuron_config.mlp_kernel_fuse_residual_add
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+        self.is_prefill_stage = config.neuron_config.is_prefill_stage
         self.config = config
+
+        if self.is_prefill_stage and self.config.neuron_config.is_mlp_quantized():
+            # for CTE, quantized MLP kernel does not support fused rmsnorm
+            self.mlp_kernel_fused_rmsnorm = False
+        else:
+            self.mlp_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
 
     def forward(
         self,
@@ -767,6 +811,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         adapter_ids=None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -783,6 +828,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
             past_key_value=past_key_value,
             adapter_ids=adapter_ids,
             rmsnorm=self.input_layernorm,
+            rotary_position_ids=rotary_position_ids,
             **kwargs,
         )
 
@@ -801,11 +847,14 @@ class NeuronLlamaDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
             residual = hidden_states
             # RMSNorm (fused with QKV kernel when SP is disabled)
-            if not self.mlp_kernel_enabled or self.sequence_parallel_enabled:
+            if self.mlp_kernel_enabled and self.mlp_kernel_fused_rmsnorm:
+                rmsnorm = self.post_attention_layernorm
+            else:
                 hidden_states = self.post_attention_layernorm(hidden_states)
+                rmsnorm = None
             hidden_states, _ = self.mlp(
                 hidden_states,
-                rmsnorm=self.post_attention_layernorm,
+                rmsnorm=rmsnorm,
                 adapter_ids=adapter_ids,
             )
 
@@ -899,18 +948,9 @@ class NeuronLlamaModel(NeuronBaseModel):
                 bias=False,
             )
 
-        # In the target fp8 checkpoint, the 1st and last
-        # layers are not using fp8.
-        updated_configs = []
-        for i in range(config.num_hidden_layers):
-            # TODO: Remove hardcoded code to have non-quantized MLPs for first and last decoder block
-            if i == 0 or i == config.num_hidden_layers - 1:
-                non_quant_config = copy.deepcopy(config)
-                non_quant_config.neuron_config.quantized_mlp_kernel_enabled = False
-                updated_configs.append(non_quant_config)
-            else:
-                updated_configs.append(config)
+        updated_configs = get_updated_configs(config)
         self.layers = nn.ModuleList([NeuronLlamaDecoderLayer(conf) for conf in updated_configs])
+
         if not config.neuron_config.is_eagle_draft:
             self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
 

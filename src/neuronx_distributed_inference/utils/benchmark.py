@@ -30,15 +30,21 @@ def benchmark_sampling(
 
     sampling_params = prepare_sampling_params(
         batch_size=neuron_config.batch_size,
-        top_k=generation_config.top_k
-        if isinstance(generation_config.top_k, list)
-        else [generation_config.top_k],
-        top_p=generation_config.top_p
-        if isinstance(generation_config.top_p, list)
-        else [generation_config.top_p],
-        temperature=generation_config.temperature
-        if isinstance(generation_config.temperature, list)
-        else [generation_config.temperature],
+        top_k=(
+            generation_config.top_k
+            if isinstance(generation_config.top_k, list)
+            else [generation_config.top_k]
+        ),
+        top_p=(
+            generation_config.top_p
+            if isinstance(generation_config.top_p, list)
+            else [generation_config.top_p]
+        ),
+        temperature=(
+            generation_config.temperature
+            if isinstance(generation_config.temperature, list)
+            else [generation_config.temperature]
+        ),
     )
 
     target = target if target is not None else "all"
@@ -70,12 +76,10 @@ def benchmark_sampling(
             "generation_config": modified_generation_config,
             "attention_mask": attention_mask,
             "max_new_tokens": neuron_config.max_new_tokens,
-            "top_k": 1,
-            "do_sample": draft_model is None and not neuron_config.enable_fused_speculation,
             "sampling_params": sampling_params,
-            "max_length": neuron_config.max_length
-            if neuron_config.max_new_tokens is None
-            else None,
+            "max_length": (
+                neuron_config.max_length if neuron_config.max_new_tokens is None else None
+            ),
         }
 
         if draft_model is not None:

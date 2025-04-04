@@ -23,18 +23,23 @@ setup(
     package_data={"": []},
     install_requires=[
         "neuronx_distributed",
-        "transformers==4.45.*",
+        "transformers==4.48.*",
+        "huggingface-hub",
         "sentencepiece",
         "torchvision",
         "pillow",
         "blobfile",
     ],
-    tests_require=["pytest", "pytest-forked"],
+    extras_require={
+        "test": ["pytest", "pytest-forked", "pytest-cov", "pytest-xdist", "accelerate", "diffusers==0.32.0"],
+        "flux": ["diffusers==0.32.0"],
+    },
     python_requires=">=3.7",
     package_dir={"": "src"},
     entry_points={
         "console_scripts": [
             "inference_demo=neuronx_distributed_inference.inference_demo:main",
+            "nxdi_distributed_launcher=neuronx_distributed_inference.scripts.nxdi_distributed_launcher:main",
         ],
     },
 )

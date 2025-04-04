@@ -8,8 +8,10 @@ from neuronx_distributed.parallel_layers.utils import divide
 EXTRA_RESERVED_SPACE = 128
 
 
-def get_cache_size(seq_len, num_cores_per_group):
-    return divide(seq_len, num_cores_per_group) + EXTRA_RESERVED_SPACE
+def get_cache_size(seq_len, num_cores_per_group, is_ctx=False):
+    """extra reserved space is only needed in decoding phase"""
+    per_core_sz = divide(seq_len, num_cores_per_group)
+    return per_core_sz if is_ctx else per_core_sz + EXTRA_RESERVED_SPACE
 
 
 def turn_2d_mask_to_4d(attention_mask, n_positions, batch_size):
