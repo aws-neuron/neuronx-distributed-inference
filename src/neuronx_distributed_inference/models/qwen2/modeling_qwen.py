@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch Phi model for NXD inference."""
+"""PyTorch Qwen2 model for NXD inference."""
 import copy
 import gc
 import logging
@@ -42,6 +42,7 @@ from neuronx_distributed.quantization.quantization_layers import (  # noqa: E402
     QuantizedColumnParallel,
     QuantizedRowParallel,
 )
+from neuronx_distributed_inference.modules.attention.gqa import GroupQueryAttention_O
 from neuronxcc.nki._private_kernels.mlp import (
     mlp_fused_add_isa_kernel,
     mlp_isa_kernel,
@@ -52,13 +53,9 @@ from neuronxcc.nki._private_kernels.rmsnorm import rmsnorm_quant_isa_kernel
 from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
 from torch import nn
 from torch_neuronx.xla_impl.ops import nki_jit
-from transformers import Phi3ForCausalLM
+from transformers import Qwen2ForCausalLM
 from transformers.activations import ACT2FN
-from transformers.models.phi3.modeling_phi3 import (
-    Phi3RotaryEmbedding,
-    Phi3RMSNorm,
-    Phi3LongRoPEScaledRotaryEmbedding,
-)
+from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig  # noqa: E402
 from neuronx_distributed_inference.models.model_base import (  # noqa: E402
@@ -79,7 +76,7 @@ from neuronx_distributed_inference.modules.flashdecode.utils import calculate_nu
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
 
-_PHI3_MODULE_MAP = {}
+_Qwen2_MODULE_MAP = {}
 
 logger = logging.getLogger("Neuron")
 
@@ -88,7 +85,7 @@ def get_rmsnorm_cls():
     # Initialize to the appropriate implementation of RMSNorm
     # If infer on NXD -> CustomRMSNorm
     # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
-    return CustomRMSNorm if parallel_state.model_parallel_is_initialized() else Phi3RMSNorm
+    return CustomRMSNorm if parallel_state.model_parallel_is_initialized() else LlamaRMSNorm
 
 
 def preshard_hook_fn(module: torch.nn.Module, model_state_dict: dict, prefix: str) -> bool:
@@ -99,19 +96,19 @@ def preshard_hook_fn(module: torch.nn.Module, model_state_dict: dict, prefix: st
 
 
 def _register_module(key: str, cls: Type[nn.Module]):
-    _PHI3_MODULE_MAP[key] = cls
+    _Qwen2_MODULE_MAP[key] = cls
 
 
 def register_module(key: str):
     """
-    Register a module for use in NeuronPhi3.
+    Register a module for use in NeuronQwen2.
 
     Arguments:
         key: String used to identify the module
 
     Example:
-        @register_module("NeuronPhi3Attention")
-        class NeuronPhi3Attention(nn.Module):
+        @register_module("NeuronQwen2Attention")
+        class NeuronQwen2Attention(nn.Module):
             ...
     """
 
@@ -122,43 +119,28 @@ def register_module(key: str):
     return inner
 
 
-def convert_state_dict_to_neuron(phi3_state_dict, cfg: InferenceConfig):
-    for l in range(cfg.num_hidden_layers):
-        # Keep the original fused weight as Wqkv.weight
-        phi3_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = phi3_state_dict[
-            f"layers.{l}.self_attn.qkv_proj.weight"
-        ].clone().detach()
-
-        # Get the fused QKV weight
-        fused_attn = phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.weight"].clone().detach()
-        fused_gate_up = phi3_state_dict[f"layers.{l}.mlp.gate_up_proj.weight"].clone().detach()
-        # Potentially handle GQA
-        if cfg.num_attention_heads > cfg.num_key_value_heads:
-            q_features = cfg.hidden_size
-            q_weight = fused_attn[:q_features]
-            k_weight, v_weight = torch.chunk(fused_attn[q_features:], 2, dim=0)
-        # Split the fused weight into Q, K, and V using torch.chunk
-        else:
-            q_weight, k_weight, v_weight = torch.chunk(fused_attn, 3, dim=0)
-        gate, up = torch.chunk(fused_gate_up, 2, dim=0)
-
-        # Add the split weights to the state dict
-        phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.q_proj.weight"] = q_weight
-        phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.k_proj.weight"] = k_weight
-        phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.v_proj.weight"] = v_weight
-        phi3_state_dict[f"layers.{l}.mlp.gate_proj.weight"] = gate
-        phi3_state_dict[f"layers.{l}.mlp.up_proj.weight"] = up
-
-        # Remove the original qkv_proj weight
-        del phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.weight"]
-        del phi3_state_dict[f"layers.{l}.mlp.gate_up_proj.weight"]
+def convert_state_dict_to_fused_qkv(Qwen2_state_dict, cfg: InferenceConfig):
+    """
+    This function concats the qkv weights to a Wqkv weight for fusedqkv, and deletes the qkv weights.
+    """
+    for l in range(cfg.num_hidden_layers):  # noqa: E741
+        Qwen2_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = torch.cat(
+            [
+                Qwen2_state_dict[f"layers.{l}.self_attn.q_proj.weight"],
+                Qwen2_state_dict[f"layers.{l}.self_attn.k_proj.weight"],
+                Qwen2_state_dict[f"layers.{l}.self_attn.v_proj.weight"],
+            ],
+        )
+        del Qwen2_state_dict[f"layers.{l}.self_attn.q_proj.weight"]
+        del Qwen2_state_dict[f"layers.{l}.self_attn.k_proj.weight"]
+        del Qwen2_state_dict[f"layers.{l}.self_attn.v_proj.weight"]
 
     gc.collect()
 
-    return phi3_state_dict
+    return Qwen2_state_dict
 
 
-class NeuronPhi3InferenceConfig(InferenceConfig):
+class Qwen2InferenceConfig(InferenceConfig):
     def add_derived_config(self):
         self.num_cores_per_group = 1
         if self.neuron_config.flash_decoding_enabled:
@@ -173,11 +155,11 @@ class NeuronPhi3InferenceConfig(InferenceConfig):
             "num_attention_heads",
             "num_hidden_layers",
             "num_key_value_heads",
+            "pad_token_id",
             "vocab_size",
             "max_position_embeddings",
             "rope_theta",
             "rms_norm_eps",
-            "pad_token_id",
             "hidden_act",
         ]
 
@@ -186,7 +168,7 @@ class NeuronPhi3InferenceConfig(InferenceConfig):
         return NeuronConfig
 
 
-class NeuronPhi3MLP(nn.Module):
+class NeuronQwen2MLP(nn.Module):
     """
     This class just replace the linear layers (gate_proj, up_proj and down_proj) with column and row parallel layers
     """
@@ -588,10 +570,10 @@ class NeuronPhi3MLP(nn.Module):
             return (self._native_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
 
 
-@register_module("NeuronPhi3Attention")
-class NeuronPhi3Attention(NeuronAttentionBase):
+@register_module("NeuronQwen2Attention")
+class NeuronQwen2Attention(NeuronAttentionBase):
     """
-    Compared with Phi3Attention, this class just
+    Compared with Qwen2Attention, this class just
     1. replaces the q_proj, k_proj, v_proj with column parallel layer
     2. replaces the o_proj with row parallel layer
     3. update self.num_head to be self.num_head / tp_degree
@@ -615,7 +597,7 @@ class NeuronPhi3Attention(NeuronAttentionBase):
         self.is_medusa = config.neuron_config.is_medusa
         self.flash_decoding_enabled = config.neuron_config.flash_decoding_enabled
         self.num_cores_per_group = config.num_cores_per_group
-        self.bias = getattr(config, "attention_bias", False)
+        self.bias = getattr(config, "attention_bias", True)
         self.rpl_reduce_dtype = config.neuron_config.rpl_reduce_dtype
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
         self.rms_norm_eps = config.rms_norm_eps
@@ -631,18 +613,34 @@ class NeuronPhi3Attention(NeuronAttentionBase):
         self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
         logger.debug(
-            f"Hello from NeuronPhi3Attention init! Is SP enabled? {self.sequence_parallel_enabled}. Dim? {self.sequence_dimension}"
+            f"Hello from NeuronQwen2Attention init! Is SP enabled? {self.sequence_parallel_enabled}. Dim? {self.sequence_dimension}"
         )
 
         self.init_gqa_properties()
 
         self.init_rope()
+        
+        self.o_proj = GroupQueryAttention_O(
+            hidden_size=self.hidden_size,
+            head_dim=self.head_dim,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            tp_degree=self.tp_degree,
+            dtype=self.torch_dtype,
+            bias=False,
+            input_is_parallel=True,
+            layer_name=self.o_proj_layer_name,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_dimension=self.sequence_dimension,
+            tensor_model_parallel_group=self.tensor_model_parallel_group,
+            rpl_reduce_dtype=self.rpl_reduce_dtype,
+        )
 
     def init_rope(self):
         if not hasattr(self.config, "rope_scaling") or self.config.rope_scaling is None:
             # TODO(yihsian): Check if we can just use our own implementation
             if self.is_medusa:
-                self.rotary_emb = Phi3RotaryEmbedding(
+                self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     base=self.rope_theta,
@@ -657,86 +655,94 @@ class NeuronPhi3Attention(NeuronAttentionBase):
             rope_type = self.config.rope_scaling.get(
                 "rope_type", self.config.rope_scaling.get("type", None)
             )
-            if rope_type == "longrope":
-                self.rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(
-                    self.head_dim, self.config
+            if rope_type == "Qwen2":
+                self.rotary_emb = Qwen2RotaryEmbedding(
+                    dim=self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=self.rope_theta,
+                    factor=self.config.rope_scaling["factor"],
+                    low_freq_factor=self.config.rope_scaling["low_freq_factor"],
+                    high_freq_factor=self.config.rope_scaling["high_freq_factor"],
+                    original_max_position_embeddings=self.config.rope_scaling[
+                        "original_max_position_embeddings"
+                    ],
                 )
             else:
-                # Phi3RotaryEmbedding automatically chooses the correct scaling type from config.
+                # Qwen2RotaryEmbedding automatically chooses the correct scaling type from config.
                 # Warning: The HF implementation may have precision issues when run on Neuron.
                 # We include it here for compatibility with other scaling types.
-                self.rotary_emb = Phi3RotaryEmbedding(self.config)
+                self.rotary_emb = LlamaRotaryEmbedding(self.config)
 
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
-# class Phi33RotaryEmbedding(nn.Module):
-#     """
-#     Adapted from Phi3 4.43 impl
-#     * https://github.com/huggingface/transformers/blob/v4.43.4/src/transformers/models/Phi3/modeling_Phi3.py#L78
-#     * https://github.com/huggingface/transformers/blob/v4.43.4/src/transformers/modeling_rope_utils.py#L345
+class Qwen2RotaryEmbedding(nn.Module):
+    """
+    Adapted from Qwen2 4.43 impl
+    * https://github.com/huggingface/transformers/blob/v4.43.4/src/transformers/models/Qwen2/modeling_Qwen2.py#L78
+    * https://github.com/huggingface/transformers/blob/v4.43.4/src/transformers/modeling_rope_utils.py#L345
 
-#     This implementation ensures inv_freq is calculated and stored in fp32.
-#     """
+    This implementation ensures inv_freq is calculated and stored in fp32.
+    """
 
-#     def __init__(
-#         self,
-#         dim,
-#         max_position_embeddings=131072,
-#         base=500000.0,
-#         factor=8.0,
-#         low_freq_factor=1.0,
-#         high_freq_factor=4.0,
-#         original_max_position_embeddings=8192,
-#     ):
-#         super().__init__()
-#         self.dim = dim
-#         self.max_position_embeddings = max_position_embeddings
-#         self.base = base
-#         self.factor = factor
-#         self.low_freq_factor = low_freq_factor
-#         self.high_freq_factor = high_freq_factor
-#         self.old_context_len = original_max_position_embeddings
-#         self.register_buffer("inv_freq", None, persistent=False)
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=131072,
+        base=500000.0,
+        factor=8.0,
+        low_freq_factor=1.0,
+        high_freq_factor=4.0,
+        original_max_position_embeddings=8192,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.factor = factor
+        self.low_freq_factor = low_freq_factor
+        self.high_freq_factor = high_freq_factor
+        self.old_context_len = original_max_position_embeddings
+        self.register_buffer("inv_freq", None, persistent=False)
 
-#     @torch.no_grad()
-#     def forward(self, x, position_ids):
-#         # x: [bs, num_attention_heads, seq_len, head_size]
-#         if self.inv_freq is None:
-#             inv_freq = 1.0 / (
-#                 self.base
-#                 ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
-#             )
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if self.inv_freq is None:
+            inv_freq = 1.0 / (
+                self.base
+                ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
+            )
 
-#             low_freq_wavelen = self.old_context_len / self.low_freq_factor
-#             high_freq_wavelen = self.old_context_len / self.high_freq_factor
-#             new_freqs = []
-#             for freq in inv_freq:
-#                 wavelen = 2 * math.pi / freq
-#                 if wavelen < high_freq_wavelen:
-#                     new_freqs.append(freq)
-#                 elif wavelen > low_freq_wavelen:
-#                     new_freqs.append(freq / self.factor)
-#                 else:
-#                     assert low_freq_wavelen != high_freq_wavelen
-#                     smooth = (self.old_context_len / wavelen - self.low_freq_factor) / (
-#                         self.high_freq_factor - self.low_freq_factor
-#                     )
-#                     new_freqs.append((1 - smooth) * freq / self.factor + smooth * freq)
-#             self.inv_freq = torch.tensor(new_freqs, dtype=inv_freq.dtype, device=inv_freq.device)
+            low_freq_wavelen = self.old_context_len / self.low_freq_factor
+            high_freq_wavelen = self.old_context_len / self.high_freq_factor
+            new_freqs = []
+            for freq in inv_freq:
+                wavelen = 2 * math.pi / freq
+                if wavelen < high_freq_wavelen:
+                    new_freqs.append(freq)
+                elif wavelen > low_freq_wavelen:
+                    new_freqs.append(freq / self.factor)
+                else:
+                    assert low_freq_wavelen != high_freq_wavelen
+                    smooth = (self.old_context_len / wavelen - self.low_freq_factor) / (
+                        self.high_freq_factor - self.low_freq_factor
+                    )
+                    new_freqs.append((1 - smooth) * freq / self.factor + smooth * freq)
+            self.inv_freq = torch.tensor(new_freqs, dtype=inv_freq.dtype, device=inv_freq.device)
 
-#         inv_freq_expanded = (
-#             self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-#         )
-#         position_ids_expanded = position_ids[:, None, :].float()
-#         with torch.autocast(device_type=x.device.type, enabled=False):
-#             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-#             emb = torch.cat((freqs, freqs), dim=-1)
-#             cos = emb.cos()
-#             sin = emb.sin()
-#         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class NeuronPhi3DecoderLayer(nn.Module):
+class NeuronQwen2DecoderLayer(nn.Module):
     """
     Just replace the attention with the NXD version, and MLP with the NXD version
     """
@@ -744,10 +750,10 @@ class NeuronPhi3DecoderLayer(nn.Module):
     def __init__(self, config: InferenceConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = NeuronPhi3Attention(
+        self.self_attn = _Qwen2_MODULE_MAP[config.neuron_config.attn_cls](
             config=config, tensor_model_parallel_group=get_tp_group(config)
         )
-        self.mlp = NeuronPhi3MLP(config)
+        self.mlp = NeuronQwen2MLP(config)
         logger.debug(
             f"Instantiating RMSNorm modules with hidden size {config.hidden_size} and EPS {config.rms_norm_eps}"
         )
@@ -842,7 +848,7 @@ class ResBlock(nn.Module):
         self.linear = nn.Linear(hidden_size, hidden_size)
         # Initialize as an identity mapping
         torch.nn.init.zeros_(self.linear.weight)
-        # Use SiLU activation to keep consistent with the Phi3 model
+        # Use SiLU activation to keep consistent with the Qwen2 model
         self.act = nn.SiLU()
 
     def forward(self, x):
@@ -858,9 +864,9 @@ class ResBlock(nn.Module):
         return x + self.act(self.linear(x))
 
 
-class NeuronPhi3Model(NeuronBaseModel):
+class NeuronQwen2Model(NeuronBaseModel):
     """
-    The neuron version of the Phi3Model
+    The neuron version of the Qwen2Model
     """
 
     def setup_attr_for_model(self, config: InferenceConfig):
@@ -921,7 +927,7 @@ class NeuronPhi3Model(NeuronBaseModel):
                 updated_configs.append(non_quant_config)
             else:
                 updated_configs.append(config)
-        self.layers = nn.ModuleList([NeuronPhi3DecoderLayer(conf) for conf in updated_configs])
+        self.layers = nn.ModuleList([NeuronQwen2DecoderLayer(conf) for conf in updated_configs])
         if not config.neuron_config.is_eagle_draft:
             self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -952,27 +958,27 @@ class NeuronPhi3Model(NeuronBaseModel):
                 setattr(self, f"medusa_head_{i}", medusa_head)
 
 
-class NeuronPhi3ForCausalLM(NeuronBaseForCausalLM):
+class NeuronQwen2ForCausalLM(NeuronBaseForCausalLM):
     """
-    This class extends Phi3ForCausalLM create traceable
+    This class extends Qwen2ForCausalLM create traceable
     blocks for Neuron.
 
     Args:
-        Phi3ForCausalLM (_type_): _description_
+        Qwen2ForCausalLM (_type_): _description_
     """
 
-    _model_cls = NeuronPhi3Model
+    _model_cls = NeuronQwen2Model
 
     @staticmethod
     def load_hf_model(model_path):
-        return Phi3ForCausalLM.from_pretrained(model_path)
+        return Qwen2ForCausalLM.from_pretrained(model_path)
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
         """This function should be over-ridden in child classes as needed"""
         neuron_config = config.neuron_config
-        # if neuron_config.fused_qkv:
-        state_dict = convert_state_dict_to_neuron(state_dict, config)
+        if neuron_config.fused_qkv:
+            state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
 
         if neuron_config.vocab_parallel:
             # TODO: this hack can be removed after replication_id is ready to use
@@ -997,4 +1003,4 @@ class NeuronPhi3ForCausalLM(NeuronBaseForCausalLM):
 
     @classmethod
     def get_config_cls(cls):
-        return NeuronPhi3InferenceConfig
+        return Qwen2InferenceConfig
