@@ -1,4 +1,4 @@
-# coding=utf-8
+s # coding=utf-8
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
@@ -164,14 +164,14 @@ def convert_state_dict_to_fused_qkv(phi3_state_dict, cfg: InferenceConfig):
         if cfg.neuron_config.fused_qkv:
             phi3_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = phi3_state_dict[
                 f"layers.{l}.self_attn.qkv_proj.weight"
-            ].clone().detach()
+            ].clone().detach().contiguous()
         else:
             q_features = cfg.hidden_size
-            q_weight = fused_attn[:q_features].clone()
-            k_v = fused_attn[q_features:].clone()
+            q_weight = fused_attn[:q_features].clone().detach().contiguous()
+            k_v = fused_attn[q_features:].clone().detach().contiguous()
             k_weight, v_weight = torch.chunk(k_v, 2, dim=0)
-            k_weight = k_weight.clone()  # Ensure separate memory
-            v_weight = v_weight.clone()  # Ensure separate memory
+            k_weight = k_weight.clone().detach().contiguous() #Ensure separate memory
+            v_weight = v_weight.clone().detach().contiguous() #Ensure separate memory
 
             # Store split weights with correct naming structure
             phi3_state_dict[f"layers.{l}.self_attn.q_proj.weight"] = q_weight
@@ -181,8 +181,8 @@ def convert_state_dict_to_fused_qkv(phi3_state_dict, cfg: InferenceConfig):
         del phi3_state_dict[f"layers.{l}.self_attn.qkv_proj.weight"]
 
         gate_up_split = torch.chunk(fused_gate_up, 2, dim=0)
-        gate = gate_up_split[0].clone()  # Ensure separate memory
-        up = gate_up_split[1].clone()
+        gate = gate_up_split[0].clone().detach().contiguous() #Ensure separate memory
+        up = gate_up_split[1].clone().detach().contiguous()
 
         phi3_state_dict[f"layers.{l}.mlp.gate_proj.weight"] = gate
         phi3_state_dict[f"layers.{l}.mlp.up_proj.weight"] = up
