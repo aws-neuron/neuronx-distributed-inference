@@ -23,6 +23,12 @@ import gc
 import logging
 import math
 from typing import List, Optional, Tuple, Type
+from neuronx_distributed_inference.modules.attention.gqa import GroupQueryAttention_O
+
+from neuronx_distributed_inference.modules.attention.utils import (
+    apply_rotary_pos_emb,
+    move_heads_front,
+)
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
@@ -42,7 +48,7 @@ from neuronx_distributed.quantization.quantization_layers import (  # noqa: E402
     QuantizedColumnParallel,
     QuantizedRowParallel,
 )
-from neuronx_distributed_inference.modules.attention.gqa import GroupQueryAttention_O
+
 from neuronxcc.nki._private_kernels.mlp import (
     mlp_fused_add_isa_kernel,
     mlp_isa_kernel,
@@ -50,13 +56,13 @@ from neuronxcc.nki._private_kernels.mlp import (
     quant_mlp_isa_kernel,
 )
 from neuronxcc.nki._private_kernels.rmsnorm import rmsnorm_quant_isa_kernel
-from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
+from neuronxcc.nki.language import nc
 from torch import nn
 from torch_neuronx.xla_impl.ops import nki_jit
 from transformers import Qwen2ForCausalLM
 from transformers.activations import ACT2FN
-from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
-
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm, Qwen2RotaryEmbedding
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaRMSNorm
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig  # noqa: E402
 from neuronx_distributed_inference.models.model_base import (  # noqa: E402
     NeuronBaseForCausalLM,
@@ -85,7 +91,7 @@ def get_rmsnorm_cls():
     # Initialize to the appropriate implementation of RMSNorm
     # If infer on NXD -> CustomRMSNorm
     # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
-    return CustomRMSNorm if parallel_state.model_parallel_is_initialized() else LlamaRMSNorm
+    return CustomRMSNorm if parallel_state.model_parallel_is_initialized() else Qwen2RMSNorm
 
 
 def preshard_hook_fn(module: torch.nn.Module, model_state_dict: dict, prefix: str) -> bool:
@@ -102,10 +108,8 @@ def _register_module(key: str, cls: Type[nn.Module]):
 def register_module(key: str):
     """
     Register a module for use in NeuronQwen2.
-
     Arguments:
         key: String used to identify the module
-
     Example:
         @register_module("NeuronQwen2Attention")
         class NeuronQwen2Attention(nn.Module):
@@ -190,7 +194,6 @@ class NeuronQwen2MLP(nn.Module):
         self.mlp_kernel_enabled = self.neuron_config.mlp_kernel_enabled
         self.quantized_mlp_kernel_enabled = self.neuron_config.quantized_mlp_kernel_enabled
         self.rmsnorm_quantize_kernel_enabled = self.neuron_config.rmsnorm_quantize_kernel_enabled
-        self.quantized_kernel_lower_bound = self.neuron_config.quantized_kernel_lower_bound
         self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
         mlp_bias = getattr(config, "mlp_bias", False)
         if parallel_state.model_parallel_is_initialized():
@@ -293,7 +296,7 @@ class NeuronQwen2MLP(nn.Module):
             self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
 
     def _kernel_enabled_quantized_mlp(self, x, fused_rmsnorm, rmsnorm, residual, adapter_ids):
-        grid = (vnc(self.logical_neuron_cores),)
+        grid = (nc(self.logical_neuron_cores),)
         fused_residual = residual is not None
         logger.debug(
             f"MLP: quantized kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_neuron_cores={self.logical_neuron_cores}"
@@ -474,7 +477,7 @@ class NeuronQwen2MLP(nn.Module):
         up_w = self.up_proj.weight.data
         down_w = self.down_proj.weight.data
 
-        grid = (vnc(self.logical_neuron_cores),)
+        grid = (nc(self.logical_neuron_cores),)
 
         if fused_residual:
             _mlp_fwd_call[grid](
@@ -551,7 +554,6 @@ class NeuronQwen2MLP(nn.Module):
     def forward(self, x, rmsnorm=None, residual=None, adapter_ids=None):
         """
         If residual is passed in, will fuse its add into the MLP kernel
-
         Returns a tuple of (output, residual), where residual is the output of the residual add
         """
         if self.mlp_kernel_enabled:
@@ -619,7 +621,7 @@ class NeuronQwen2Attention(NeuronAttentionBase):
         self.init_gqa_properties()
 
         self.init_rope()
-        
+
         self.o_proj = GroupQueryAttention_O(
             hidden_size=self.hidden_size,
             head_dim=self.head_dim,
@@ -637,109 +639,7 @@ class NeuronQwen2Attention(NeuronAttentionBase):
         )
 
     def init_rope(self):
-        if not hasattr(self.config, "rope_scaling") or self.config.rope_scaling is None:
-            # TODO(yihsian): Check if we can just use our own implementation
-            if self.is_medusa:
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                )
-            else:
-                self.rotary_emb = RotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                )
-        else:
-            rope_type = self.config.rope_scaling.get(
-                "rope_type", self.config.rope_scaling.get("type", None)
-            )
-            if rope_type == "Qwen2":
-                self.rotary_emb = Qwen2RotaryEmbedding(
-                    dim=self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                    factor=self.config.rope_scaling["factor"],
-                    low_freq_factor=self.config.rope_scaling["low_freq_factor"],
-                    high_freq_factor=self.config.rope_scaling["high_freq_factor"],
-                    original_max_position_embeddings=self.config.rope_scaling[
-                        "original_max_position_embeddings"
-                    ],
-                )
-            else:
-                # Qwen2RotaryEmbedding automatically chooses the correct scaling type from config.
-                # Warning: The HF implementation may have precision issues when run on Neuron.
-                # We include it here for compatibility with other scaling types.
-                self.rotary_emb = LlamaRotaryEmbedding(self.config)
-
-
-# TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
-class Qwen2RotaryEmbedding(nn.Module):
-    """
-    Adapted from Qwen2 4.43 impl
-    * https://github.com/huggingface/transformers/blob/v4.43.4/src/transformers/models/Qwen2/modeling_Qwen2.py#L78
-    * https://github.com/huggingface/transformers/blob/v4.43.4/src/transformers/modeling_rope_utils.py#L345
-
-    This implementation ensures inv_freq is calculated and stored in fp32.
-    """
-
-    def __init__(
-        self,
-        dim,
-        max_position_embeddings=131072,
-        base=500000.0,
-        factor=8.0,
-        low_freq_factor=1.0,
-        high_freq_factor=4.0,
-        original_max_position_embeddings=8192,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        self.factor = factor
-        self.low_freq_factor = low_freq_factor
-        self.high_freq_factor = high_freq_factor
-        self.old_context_len = original_max_position_embeddings
-        self.register_buffer("inv_freq", None, persistent=False)
-
-    @torch.no_grad()
-    def forward(self, x, position_ids):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        if self.inv_freq is None:
-            inv_freq = 1.0 / (
-                self.base
-                ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
-            )
-
-            low_freq_wavelen = self.old_context_len / self.low_freq_factor
-            high_freq_wavelen = self.old_context_len / self.high_freq_factor
-            new_freqs = []
-            for freq in inv_freq:
-                wavelen = 2 * math.pi / freq
-                if wavelen < high_freq_wavelen:
-                    new_freqs.append(freq)
-                elif wavelen > low_freq_wavelen:
-                    new_freqs.append(freq / self.factor)
-                else:
-                    assert low_freq_wavelen != high_freq_wavelen
-                    smooth = (self.old_context_len / wavelen - self.low_freq_factor) / (
-                        self.high_freq_factor - self.low_freq_factor
-                    )
-                    new_freqs.append((1 - smooth) * freq / self.factor + smooth * freq)
-            self.inv_freq = torch.tensor(new_freqs, dtype=inv_freq.dtype, device=inv_freq.device)
-
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        )
-        position_ids_expanded = position_ids[:, None, :].float()
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        self.rotary_emb = Qwen2RotaryEmbedding(self.config)
 
 
 class NeuronQwen2DecoderLayer(nn.Module):
@@ -750,7 +650,8 @@ class NeuronQwen2DecoderLayer(nn.Module):
     def __init__(self, config: InferenceConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = _Qwen2_MODULE_MAP[config.neuron_config.attn_cls](
+        # self.self_attn = _Qwen2_MODULE_MAP[config.neuron_config.attn_cls](
+        self.self_attn = NeuronQwen2Attention(
             config=config, tensor_model_parallel_group=get_tp_group(config)
         )
         self.mlp = NeuronQwen2MLP(config)
@@ -835,10 +736,8 @@ class NeuronQwen2DecoderLayer(nn.Module):
 class ResBlock(nn.Module):
     """
     A Residual Block module.
-
     This module performs a linear transformation followed by a SiLU activation,
     and then adds the result to the original input, creating a residual connection.
-
     Args:
         hidden_size (int): The size of the hidden layers in the block.
     """
@@ -854,10 +753,8 @@ class ResBlock(nn.Module):
     def forward(self, x):
         """
         Forward pass of the ResBlock.
-
         Args:
             x (torch.Tensor): Input tensor.
-
         Returns:
             torch.Tensor: Output after the residual connection and activation.
         """
@@ -962,7 +859,6 @@ class NeuronQwen2ForCausalLM(NeuronBaseForCausalLM):
     """
     This class extends Qwen2ForCausalLM create traceable
     blocks for Neuron.
-
     Args:
         Qwen2ForCausalLM (_type_): _description_
     """
