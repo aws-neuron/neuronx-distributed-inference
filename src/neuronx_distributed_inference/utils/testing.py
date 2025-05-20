@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+import torch_neuronx
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.trace import ModelBuilder
 from neuronx_distributed.trace.model_builder import BaseModelInstance
@@ -37,7 +38,7 @@ def validate_accuracy(
     """
     Validates the accuracy of a Neuron model. This function tests that the model produces expected
     outputs, which you can provide and/or produce on CPU. To compare outputs, this function uses
-    torch.testing.assert_close. If the output isn't similar, this function raises an
+    torch_neuronx.testing.assert_close. If the output isn't similar, this function raises an
     AssertionError.
 
     Args:
@@ -47,7 +48,7 @@ def validate_accuracy(
         expected_outputs: The list of expected outputs for each input. If not provided, this
             function compares against the CPU output for each input.
         cpu_callable: The callable to use to produce output on CPU.
-        assert_close_kwargs: The kwargs to pass to torch.testing.assert_close.
+        assert_close_kwargs: The kwargs to pass to torch_neuronx.testing.assert_close.
     """
     if expected_outputs is None and cpu_callable is None:
         raise ValueError("Provide expected_outputs or a cpu_callable to produce expected outputs")
@@ -70,14 +71,14 @@ def validate_accuracy(
             cpu_output = cpu_callable(*input)
             logger.info(f"CPU output: {cpu_output}")
             if expected_output is not None:
-                torch.testing.assert_close(expected_output, cpu_output, **assert_close_kwargs)
+                torch_neuronx.testing.assert_close(expected_output, cpu_output, **assert_close_kwargs)
             else:
                 expected_output = cpu_output
 
         neuron_output = neuron_model(*input)
         logger.info(f"Expected output: {expected_output}")
         logger.info(f"Neuron output: {neuron_output}")
-        torch.testing.assert_close(expected_output, neuron_output, **assert_close_kwargs)
+        torch_neuronx.testing.assert_close(expected_output, neuron_output, **assert_close_kwargs)
         logger.info(f"Model is accurate for input: {input}")
 
 

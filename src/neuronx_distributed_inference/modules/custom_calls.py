@@ -9,19 +9,28 @@ except ImportError:
 
 
 class CustomRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size=None, eps=1e-6):
         """
         Use this RMSNorm to perform customized rmsnorm on Neuron
         Note: CustomRMSNorm forward method calls target="AwsNeuronRmsNorm"
         """
         super().__init__()
-        self.weight = nn.Parameter(ones(hidden_size))
+        self.weight = None
+        if hidden_size is not None:
+            self.weight = nn.Parameter(ones(hidden_size))  # specify hidden size
+        self.hidden_size = hidden_size
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
         original_dtype = hidden_states.dtype
 
         hidden_states = hidden_states.to(torch.float32)
+        if self.hidden_size is None and self.weight is None:
+            self.weight = nn.Parameter(
+                ones(
+                    hidden_states.shape[-1], device=hidden_states.device, dtype=hidden_states.dtype
+                )
+            )
         result = RmsNorm.apply(
             hidden_states, self.weight, self.variance_epsilon, len(hidden_states.shape) - 1
         )

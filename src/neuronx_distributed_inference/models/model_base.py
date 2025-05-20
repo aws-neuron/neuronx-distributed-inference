@@ -21,6 +21,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.config import InferenceConfig
+from neuronx_distributed_inference.models.layer_boundary_marker import (
+    ModuleMarkerEndWrapper,
+    ModuleMarkerStartWrapper,
+)
 from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     CONTEXT_ENCODING_MODEL_TAG,
     FUSED_SPECULATION_MODEL_TAG,
@@ -31,7 +35,10 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402; 
 )
 from neuronx_distributed_inference.modules.async_execution import causal_lm_async_execution
 from neuronx_distributed_inference.modules.attention import utils as attn_utils
-from neuronx_distributed_inference.modules.autobucketing import generate_buckets
+from neuronx_distributed_inference.modules.autobucketing import (
+    generate_2d_buckets_for_prefix_cahcing,
+    generate_buckets,
+)
 from neuronx_distributed_inference.modules.custom_calls import neuron_cumsum
 from neuronx_distributed_inference.modules.eagle.hidden_state import HiddenStateRollingBuffer
 from neuronx_distributed_inference.modules.eagle.token_tree import TokenTree
@@ -47,12 +54,12 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     rand_like,
     validate_sampling_params,
 )
+from neuronx_distributed_inference.modules.generation.seq_parallel_logits_slice import (
+    seq_parallel_slice_last_token,
+)
 from neuronx_distributed_inference.modules.kvcache import utils as kvcache_utils
 from neuronx_distributed_inference.modules.kvcache.block_kv_cache_manager import BlockKVCacheManager
-from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
-    KVCacheManager,
-    _slice_kv_cacheline,
-)
+from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
 from neuronx_distributed_inference.modules.lora_serving import LoraCheckpoint, wrap_model_with_lora
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
@@ -75,12 +82,14 @@ class NeuronBaseModel(nn.Module):
         self.neuron_config = config.neuron_config
         self.batch_size = config.neuron_config.batch_size
         self.n_positions = config.neuron_config.n_positions
+        self.prefix_size = 0
+        self.n_active_tokens = config.neuron_config.n_active_tokens
         self.vocab_size = config.vocab_size
         self.speculation_length = config.neuron_config.speculation_length
         self.padding_side = config.neuron_config.padding_side
         self.max_length = config.neuron_config.max_length
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
-        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
+        self.sequence_dimension = 1
         self.rank_util = SPMDRank(world_size=self.config.neuron_config.tp_degree)
         self.num_cores_per_group = config.num_cores_per_group
         self.is_block_kv_layout = config.neuron_config.is_block_kv_layout
@@ -96,6 +105,7 @@ class NeuronBaseModel(nn.Module):
         if lora_config is not None:
             wrap_model_with_lora(self, lora_config)
             self.lora_checkpoint = LoraCheckpoint(lora_config)
+        self.sliced_hidden = False
 
     def setup_attr_for_model(self, config: InferenceConfig):
         """
@@ -266,17 +276,10 @@ class NeuronBaseModel(nn.Module):
         )
         is_for_medusa_speculation = input_ids.shape[-1] == self.medusa_speculation_length
 
-        # It is either for context encoding or for token generation
-        if is_for_context_encoding:
-            past_key_values = None
-        else:
-            medusa_metadata = {
-                "current_length": current_length,
-                "accepted_indices": accepted_indices,
-            }
-            past_key_values = self.kv_mgr.get_cache(
-                self.n_positions, medusa_metadata=medusa_metadata
-            )
+        medusa_metadata = {
+            "current_length": current_length,
+            "accepted_indices": accepted_indices,
+        }
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
@@ -291,22 +294,17 @@ class NeuronBaseModel(nn.Module):
                 self.batch_size, 1, self.medusa_speculation_length, self.medusa_speculation_length
             )
 
-        hidden_states, past_key_values = self.get_model_output(
+        hidden_states, updated_kv_cache = self.get_model_output(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
             active_mask=active_mask,
             adapter_ids=adapter_ids,
-        )
-
-        updated_kv_cache = self.kv_mgr.update_cache(
-            is_for_context_encoding,
-            seq_ids,
-            position_ids,
-            past_key_values,
-            self.n_positions,
-            scatter_index,
+            update_cache=True,
+            is_for_context_encoding=is_for_context_encoding,
+            medusa_metadata=medusa_metadata,
+            seq_ids=seq_ids,
+            scatter_index=scatter_index,
         )
 
         if self.padding_side == "left":
@@ -407,21 +405,6 @@ class NeuronBaseModel(nn.Module):
             is_for_context_encoding = False
             token_tree_input_len = input_ids.shape[-1]
 
-        cache_size = (
-            get_cache_size(self.n_positions, self.num_cores_per_group, is_for_context_encoding)
-            if self.neuron_config.flash_decoding_enabled
-            else self.n_positions
-        )
-
-        # It is either for context encoding or for token generation
-        if is_for_context_encoding:
-            past_key_values = None
-        else:
-            if kv_cache is None:
-                past_key_values = self.kv_mgr.get_cache(cache_size)
-            else:
-                past_key_values = self._slice_kv_cache(kv_cache, cache_size)
-
         # Prepare attention mask(s)
         attention_mask = self._create_token_tree_attn_mask(
             attention_mask, is_for_context_encoding, is_for_token
@@ -454,39 +437,24 @@ class NeuronBaseModel(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
             active_mask=active_mask,
             inputs_embeds=inputs_embeds,
             adapter_ids=adapter_ids,
             prev_hidden=prev_hidden,
             rotary_position_ids=rotary_position_ids,
+            is_for_context_encoding=is_for_context_encoding,
+            seq_ids=seq_ids,
+            scatter_index=scatter_index,
+            kv_active_mask=active_mask_2d,
+            kvcache_buffer=kv_cache,
+            # KV cache is update here only when it is drafting stage
+            update_cache=self.neuron_config.is_eagle_draft,
         )
 
         full_hidden_states = hidden_states
 
-        # KV cache is update here only when it is drafting stage
         if self.neuron_config.is_eagle_draft:
-            if kv_cache is None:
-                updated_kv_cache = self.kv_mgr.update_cache(
-                    is_for_context_encoding=is_for_context_encoding,
-                    seq_ids=seq_ids,
-                    position_ids=position_ids,
-                    new_key_values=past_key_values,
-                    seq_len=cache_size,
-                    scatter_index=scatter_index,
-                    active_mask=active_mask_2d,
-                )
-            else:
-                updated_kv_cache = self.kv_mgr.update_cache(
-                    is_for_context_encoding=is_for_context_encoding,
-                    seq_ids=seq_ids,
-                    position_ids=position_ids,
-                    new_key_values=past_key_values,
-                    seq_len=cache_size,
-                    scatter_index=scatter_index,
-                    active_mask=active_mask_2d,
-                    kvcache_buffer=kv_cache,
-                )
+            updated_kv_cache = past_key_values
         else:
             updated_kv_cache = None
 
@@ -540,18 +508,6 @@ class NeuronBaseModel(nn.Module):
         outputs = outputs + [full_hidden_states] + [past_key_values]
 
         return outputs
-
-    def _slice_kv_cache(self, kv_cache, n_positions):
-        past_key_values = []
-        for idx in range(len(kv_cache)):
-            k_cache = _slice_kv_cacheline(
-                self.config.neuron_config.padding_side, n_positions, kv_cache[idx][0]
-            )
-            v_cache = _slice_kv_cacheline(
-                self.config.neuron_config.padding_side, n_positions, kv_cache[idx][1]
-            )
-            past_key_values.append([k_cache, v_cache])
-        return past_key_values
 
     def forward(
         self,
@@ -626,17 +582,6 @@ class NeuronBaseModel(nn.Module):
             else self.n_positions
         )
 
-        # It is either for context encoding or for token generation
-        if self.is_block_kv_layout:
-            past_key_values = self.kv_mgr.get_cache(active_block_table=active_block_table)
-        elif is_for_context_encoding:
-            past_key_values = None
-        else:
-            if kv_cache is None:
-                past_key_values = self.kv_mgr.get_cache(seq_len=cache_size)
-            else:
-                past_key_values = self._slice_kv_cache(kv_cache, cache_size)
-
         # Prepare attention mask(s)
         if self.is_prefix_caching:
             attention_mask = self.create_attn_mask(
@@ -645,8 +590,8 @@ class NeuronBaseModel(nn.Module):
                 is_for_speculation,
                 query_lens=num_queries,
                 key_lens=num_queries + computed_context_lens,
-                max_query_len=self.neuron_config.n_active_tokens,
-                max_key_len=self.neuron_config.max_context_length,
+                max_query_len=self.n_active_tokens,
+                max_key_len=self.prefix_size,
                 is_prior=True,
             )
         elif self.is_chunked_prefill:
@@ -675,8 +620,8 @@ class NeuronBaseModel(nn.Module):
             active_mask = self._create_block_kv_attn_mask(
                 query_lens=num_queries,
                 key_lens=num_queries,
-                max_query_len=self.neuron_config.n_active_tokens,
-                max_key_len=self.neuron_config.n_active_tokens,
+                max_query_len=self.n_active_tokens,
+                max_key_len=self.n_active_tokens,
                 is_prior=False,
             )
         if is_for_speculation:
@@ -706,11 +651,11 @@ class NeuronBaseModel(nn.Module):
                 attention_mask_2d, n_positions=cache_size, batch_size=self.batch_size
             )
 
-        hidden_states, past_key_values = self.get_model_output(
+        hidden_states, updated_kv_cache = self.get_model_output(
             input_ids=input_ids,
+            seq_ids=seq_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
             active_mask=active_mask,
             inputs_embeds=inputs_embeds,
             adapter_ids=adapter_ids,
@@ -718,41 +663,36 @@ class NeuronBaseModel(nn.Module):
             cache_mask=cache_mask,
             current_reordered_idx=current_reordered_idx,
             cache_reordered_idx=cache_reordered_idx,
-        )
-
-        if self.neuron_config.enable_eagle_speculation:
-            full_hidden_states = hidden_states
-
-        updated_kv_cache = self.kv_mgr.update_cache(
+            num_queries=num_queries,
             is_for_context_encoding=is_for_context_encoding,
-            seq_ids=seq_ids,
-            position_ids=position_ids,
-            new_key_values=past_key_values,
-            seq_len=cache_size,
             scatter_index=slot_mapping if self.is_block_kv_layout else scatter_index,
-            active_mask=active_mask_2d,
             kvcache_buffer=kv_cache,
+            is_for_speculation=is_for_speculation,
+            active_block_table=active_block_table,
+            kv_active_mask=active_mask_2d,
+            update_cache=True,
         )
 
         batch_size = input_ids.shape[0]
-        if self.padding_side == "left":
-            index = torch.tensor([hidden_states.shape[1] - 1], device=hidden_states.device)
-            index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
-            hidden_states = torch.gather(hidden_states, dim=1, index=index)
-        elif self.is_chunked_prefill:
-            # chunked prefill will return cp_max_num_seqs, not just the last one
-            index = neuron_cumsum(num_queries.reshape(1, -1).float()).int() - 1
-            index = index.reshape(1, -1, 1)
-            index = index.expand(batch_size, -1, self.hidden_size)
-            hidden_states = torch.gather(hidden_states, dim=1, index=index)
-        else:
-            if not (
-                position_ids.shape[-1] == self.speculation_length or position_ids.shape[-1] == 1
-            ):
-                # context encoding
-                index = torch.max(position_ids, dim=1, keepdim=True).indices
+        if not self.sliced_hidden:
+            if self.padding_side == "left":
+                index = torch.tensor([hidden_states.shape[1] - 1], device=hidden_states.device)
                 index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
                 hidden_states = torch.gather(hidden_states, dim=1, index=index)
+            elif self.is_chunked_prefill:
+                # chunked prefill will return cp_max_num_seqs, not just the last one
+                index = neuron_cumsum(num_queries.reshape(1, -1).float()).int() - 1
+                index = index.reshape(1, -1, 1)
+                index = index.expand(batch_size, -1, self.hidden_size)
+                hidden_states = torch.gather(hidden_states, dim=1, index=index)
+            else:
+                if not (
+                    position_ids.shape[-1] == self.speculation_length or position_ids.shape[-1] == 1
+                ):
+                    # context encoding
+                    index = torch.max(position_ids, dim=1, keepdim=True).indices
+                    index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
+                    hidden_states = torch.gather(hidden_states, dim=1, index=index)
 
         logits = self.lm_head(hidden_states)
         logits = logits.float()
@@ -797,7 +737,10 @@ class NeuronBaseModel(nn.Module):
         outputs += updated_kv_cache
 
         if self.neuron_config.enable_eagle_speculation:
-            outputs = outputs + [full_hidden_states]
+            if is_for_context_encoding:
+                outputs = outputs + [hidden_states] + [self.full_hidden_states]
+            else:
+                outputs = outputs + [self.full_hidden_states]
 
         return outputs
 
@@ -810,6 +753,7 @@ class NeuronBaseModel(nn.Module):
     def get_model_output(
         self,
         input_ids: torch.LongTensor = None,
+        seq_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -819,13 +763,18 @@ class NeuronBaseModel(nn.Module):
         prev_hidden: Optional[torch.FloatTensor] = None,
         adapter_ids: Optional[torch.LongTensor] = None,
         rotary_position_ids: Optional[torch.LongTensor] = None,
+        update_cache: bool = False,
+        is_for_context_encoding: bool = False,
         **kwargs,
     ):
         batch_size, seq_length = input_ids.shape[:2]
+        if self.config.neuron_config.layer_boundary_markers:
+            input_ids = ModuleMarkerStartWrapper()(input_ids)
 
         past_key_values_length = 0
         if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
+            # Check V cache's seqlen because K cache may be transposed.
+            past_key_values_length = past_key_values[0][1].shape[2]
 
         if inputs_embeds is None:
             inputs_embeds = (
@@ -856,31 +805,78 @@ class NeuronBaseModel(nn.Module):
         #     attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
         # )
 
-        # embed positions
-        if self.sequence_parallel_enabled:
-            # TODO: Replace this with rankid + scatter call once supported
-            hidden_states = _reduce_scatter_along_dim(
-                inputs_embeds,
-                self.sequence_dimension,
-                xm.REDUCE_MAX,
-                process_group=get_tp_group(self.config),
-            )
+        if self.neuron_config.target_sequence_parallel_enabled and is_for_context_encoding:
+            if (
+                self.neuron_config.is_eagle_draft
+                and seq_length < self.neuron_config.weight_gather_seq_len_threshold
+            ):
+                hidden_states = inputs_embeds
+            else:
+                # TODO: Replace this with rankid + scatter call once supported
+                hidden_states = _reduce_scatter_along_dim(
+                    inputs_embeds,
+                    self.sequence_dimension,
+                    xm.REDUCE_SUM if self.neuron_config.vocab_parallel else xm.REDUCE_MAX,
+                    process_group=get_tp_group(self.config),
+                )
         else:
             hidden_states = inputs_embeds
 
         if self.neuron_config.is_eagle_draft:
+            weight_gather = False
+            if self.neuron_config.target_sequence_parallel_enabled and is_for_context_encoding:
+                if seq_length >= self.neuron_config.weight_gather_seq_len_threshold:
+                    weight_gather = True
+                else:
+                    prev_hidden = gather_from_sequence_parallel_region(
+                        prev_hidden,
+                        self.sequence_dimension,
+                        process_group=get_tp_group(self.config),
+                    )
             concat_states = torch.cat((hidden_states, prev_hidden), dim=2)
-            hidden_states = self.fc(concat_states)
+            hidden_states = self.fc.forward_wg(concat_states, weight_gather)
+
+        if self.config.neuron_config.layer_boundary_markers:
+            hidden_states, position_ids = ModuleMarkerEndWrapper()(hidden_states, position_ids)
+
+        update_kv_per_layer = update_cache and (
+            self.neuron_config.layer_boundary_markers
+            or (
+                self.neuron_config.attn_block_tkg_nki_kernel_cache_update
+                and not is_for_context_encoding
+            )
+        )
 
         # decoder layers
-        next_decoder_cache = ()
+        next_decoder_cache = [] if update_kv_per_layer else ()
         cos_cache = None
         sin_cache = None
-        for idx, decoder_layer in enumerate(self.layers):
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
 
+        cache_size = (
+            get_cache_size(self.n_positions, self.num_cores_per_group, is_for_context_encoding)
+            if self.neuron_config.flash_decoding_enabled
+            else self.n_positions
+        )
+
+        get_kv_per_layer = False
+        if self.is_block_kv_layout or not is_for_context_encoding:
+            if not self.config.neuron_config.layer_boundary_markers:
+                past_key_values = self.kv_mgr.get_cache(
+                    seq_ids=seq_ids,
+                    seq_len=cache_size,
+                    **kwargs,
+                )
+            else:
+                get_kv_per_layer = True
+
+        residual = None
+        for idx, decoder_layer in enumerate(self.layers):
+            if self.config.neuron_config.layer_boundary_markers:
+                hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
             layer_outputs = decoder_layer(
                 hidden_states,
+                seq_ids=seq_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_value,
@@ -889,20 +885,70 @@ class NeuronBaseModel(nn.Module):
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
                 rotary_position_ids=rotary_position_ids,
+                kv_mgr=self.kv_mgr,
+                get_kv_per_layer=get_kv_per_layer,
+                update_kv_per_layer=update_kv_per_layer,
+                idx=idx,
+                is_for_context_encoding=is_for_context_encoding,
+                seq_len=cache_size,
+                residual=residual,
                 **kwargs,
             )
 
             hidden_states = layer_outputs[0]
-            next_decoder_cache += (layer_outputs[1],)
-            cos_cache, sin_cache = layer_outputs[2:]
+            kv = layer_outputs[1]
+            if update_kv_per_layer:
+                next_decoder_cache += kv
+            else:
+                next_decoder_cache += (kv,)
+            cos_cache, sin_cache = layer_outputs[2:4]
+            residual = layer_outputs[4]
+            if self.config.neuron_config.layer_boundary_markers:
+                k, v = kv
+                hidden_states, k, v = ModuleMarkerEndWrapper()(hidden_states, k, v)
+                kv = (k, v)
+                cos_cache, sin_cache = None, None
+
+        if update_cache and not update_kv_per_layer:
+            next_decoder_cache = self.kv_mgr.update_cache(
+                is_for_context_encoding=is_for_context_encoding,
+                seq_ids=seq_ids,
+                position_ids=position_ids,
+                new_key_values=next_decoder_cache,
+                seq_len=cache_size,
+                **kwargs,
+            )
+
+        if self.config.neuron_config.layer_boundary_markers:
+            hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+
+        if self.neuron_config.qkv_kernel_fuse_residual_add:
+            # residual add for the last layer which cannot be fused with qkv
+            hidden_states = residual + hidden_states
 
         if not self.neuron_config.is_eagle_draft:
             hidden_states = self.norm(hidden_states)
 
-        if self.sequence_parallel_enabled:
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, self.sequence_dimension, process_group=get_tp_group(self.config)
-            )
+        self.full_hidden_states = None
+        if self.neuron_config.enable_eagle_speculation:
+            self.full_hidden_states = hidden_states  # (B, S/TP, H)
+
+        if self.neuron_config.sequence_parallel_enabled:
+            hidden_states = seq_parallel_slice_last_token(
+                hidden_states,
+                position_ids,
+                self.sequence_dimension,
+                self.batch_size,
+                self.hidden_size,
+                kwargs["num_queries"],
+                self.neuron_config,
+                self.config,
+            )  # (B, 1, H)
+            self.sliced_hidden = True
+
+        if self.config.neuron_config.layer_boundary_markers:
+            hidden_states = ModuleMarkerEndWrapper()(hidden_states)
+            return (hidden_states, next_decoder_cache)
 
         return (hidden_states, next_decoder_cache)
 
@@ -1088,19 +1134,6 @@ class NeuronFusedSpecModel(nn.Module):
             target_position_id = draft_position_ids[:, i : i + 1] + i + 1
             target_position_ids = torch.cat([target_position_ids, target_position_id], dim=1)
 
-            if draft_cache is None:
-                draft_cache = self.draft_model.kv_mgr.get_cache(self.n_positions, skip_slice=True)
-            else:
-                # draft cache returned from the model is flattened. We reshape it to match the expected input schema.
-                # kvcache_buffer is 2D list where, 1st dim for layer and the second denotes K and V.
-                # For example,
-                #     kvcache_buffer[1][0] is the K cache of the 1st layer
-                #     kvcache_buffer[4][1] is the V cache of the 4th layer
-                reshaped_cache = []
-                for i in range(0, len(draft_cache), 2):
-                    reshaped_cache.append([draft_cache[i], draft_cache[i + 1]])
-                draft_cache = reshaped_cache
-
             model_output = self.draft_model(
                 draft_input_ids,
                 draft_attention_mask,
@@ -1164,8 +1197,8 @@ class NeuronFusedSpecModel(nn.Module):
         target_outputs = self.target_model(
             input_ids, attention_mask, position_ids, seq_ids, sampling_params
         )
+        last_hidden_state = target_outputs[-2]
         hidden_state = target_outputs[-1]
-
         # Create draft args from target args
         # Draft is always running 1 position behind the target
         # So if target input is ABCDE, draft input will be BCDE
@@ -1182,7 +1215,6 @@ class NeuronFusedSpecModel(nn.Module):
             scatter_index.shape, dtype=attention_mask.dtype, device=attention_mask.device
         )
         draft_position_ids = torch.scatter(draft_position_ids, 1, scatter_index, zeros)
-
         draft_outputs = self.draft_model(
             draft_input_ids,
             attention_mask,
@@ -1192,11 +1224,8 @@ class NeuronFusedSpecModel(nn.Module):
             hidden_state,
         )
         num_outputs = 1 if not self.neuron_config.output_logits else 2
-        draft_cache = draft_outputs[num_outputs:-1]
-        target_cache = target_outputs[num_outputs:-1]
-        index = torch.max(position_ids, dim=1, keepdim=True).indices
-        index = index.unsqueeze(1).expand(self.batch_size, 1, self.hidden_size)
-        hidden_state = torch.gather(hidden_state, dim=1, index=index)
+        draft_cache = draft_outputs[num_outputs:-2]
+        target_cache = target_outputs[num_outputs:-2]
 
         if self.neuron_config.output_logits:
             return (
@@ -1206,10 +1235,14 @@ class NeuronFusedSpecModel(nn.Module):
                 + [target_outputs[1]]
                 + draft_cache
                 + target_cache
-                + [hidden_state]
+                + [last_hidden_state]
             )
         return (
-            [draft_outputs[0]] + [target_outputs[0]] + draft_cache + target_cache + [hidden_state]
+            [draft_outputs[0]]
+            + [target_outputs[0]]
+            + draft_cache
+            + target_cache
+            + [last_hidden_state]
         )
 
     def _eagle_tree_token_gen_forward(
@@ -1325,16 +1358,6 @@ class NeuronFusedSpecModel(nn.Module):
 
             draft_position_id = draft_position_ids[:, i, : level_node_count[i]]
             draft_input_ids = candidate_input_ids[:, drafted_num:]
-
-            if draft_cache is None:
-                draft_cache = self.draft_model.kv_mgr.get_cache(self.n_positions, skip_slice=True)
-            else:
-                # draft cache returned from the model is flattened. We reshape it to match the expected input schema.
-                # kvcache_buffer is 2D list where, 1st dim for layer and the second denotes K and V.
-                reshaped_cache = []
-                for j in range(0, len(draft_cache), 2):
-                    reshaped_cache.append([draft_cache[j], draft_cache[j + 1]])
-                draft_cache = reshaped_cache
 
             draft_attention_mask = copy.deepcopy(attention_mask)
             draft_attention_mask = (
@@ -1670,19 +1693,6 @@ class NeuronFusedSpecModel(nn.Module):
             target_position_id = draft_position_ids[:, i : i + 1] + i + 2
             target_position_ids = torch.cat([target_position_ids, target_position_id], dim=1)
 
-            if draft_cache is None:
-                draft_cache = self.draft_model.kv_mgr.get_cache(self.n_positions, skip_slice=True)
-            else:
-                # draft cache returned from the model is flattened. We reshape it to match the expected input schema.
-                # kvcache_buffer is 2D list where, 1st dim for layer and the second denotes K and V.
-                # For example,
-                #     kvcache_buffer[1][0] is the K cache of the 1st layer
-                #     kvcache_buffer[4][1] is the V cache of the 4th layer
-                reshaped_cache = []
-                for i in range(0, len(draft_cache), 2):
-                    reshaped_cache.append([draft_cache[i], draft_cache[i + 1]])
-                draft_cache = reshaped_cache
-
             model_output = self.draft_model(
                 draft_input_ids,
                 draft_attention_mask,
@@ -1694,7 +1704,9 @@ class NeuronFusedSpecModel(nn.Module):
             )
             if not self.greedy:
                 draft_outputs, single_draft_probs = self.draft_sampler(
-                    model_output[0], sampling_params, return_values=True,
+                    model_output[0],
+                    sampling_params,
+                    return_values=True,
                 )
                 draft_probs.append(single_draft_probs)
             else:
@@ -2038,11 +2050,14 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         self.async_mode = self.neuron_config.async_mode
         self.next_cpu_inputs = None
         self.prior_outputs = None
+        self.async_should_stop = False
+        self.prior_seq_ids = None
         self.unequal_batching = (
             self.neuron_config.ctx_batch_size != self.neuron_config.tkg_batch_size
         )
         if self.async_mode:
             os.environ["NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS"] = "2"
+            os.environ["NEURON_RT_IO_RING_CACHE_SIZE"] = "2"
 
         self.sampler = None
         self.default_sampling_params = prepare_sampling_params(
@@ -2069,8 +2084,6 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             assert (
                 model.neuron_config.is_prefill_stage is not None
             ), f"{model.tag} doesn't indicate whether it is part of the prefill or generation step."
-
-        self.set_async_mode(self.neuron_config.async_mode)
 
     def get_model_wrapper_cls(self):
         return ModelWrapper
@@ -2124,17 +2137,33 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         new_config.neuron_config.is_prefill_stage = True
 
         if not new_config.neuron_config.enable_bucketing:
-            new_config.neuron_config.buckets = generate_buckets(
-                new_config.neuron_config.max_context_length,
-                new_config.neuron_config.max_context_length,
-            )
+            if new_config.neuron_config.is_prefix_caching:
+                new_config.neuron_config.buckets = generate_2d_buckets_for_prefix_cahcing(
+                    new_config.neuron_config.max_context_length,
+                    new_config.neuron_config.max_context_length,
+                    new_config.neuron_config.max_context_length,
+                    new_config.neuron_config.max_context_length,
+                )
+            else:
+                new_config.neuron_config.buckets = generate_buckets(
+                    new_config.neuron_config.max_context_length,
+                    new_config.neuron_config.max_context_length,
+                )
         else:
             if new_config.neuron_config.context_encoding_buckets is not None:
                 new_config.neuron_config.buckets = new_config.neuron_config.context_encoding_buckets
             else:
-                new_config.neuron_config.buckets = generate_buckets(
-                    128, new_config.neuron_config.max_context_length
-                )
+                if new_config.neuron_config.is_prefix_caching:
+                    new_config.neuron_config.buckets = generate_2d_buckets_for_prefix_cahcing(
+                        128,
+                        new_config.neuron_config.max_context_length,
+                        128,
+                        new_config.neuron_config.max_context_length,
+                    )
+                else:
+                    new_config.neuron_config.buckets = generate_buckets(
+                        128, new_config.neuron_config.max_context_length
+                    )
 
         self.context_encoding_model = self.model_wrapper(
             config=new_config,
@@ -2156,16 +2185,26 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         new_config.neuron_config.is_prefill_stage = False
 
         if not new_config.neuron_config.enable_bucketing:
-            new_config.neuron_config.buckets = generate_buckets(
-                self.neuron_config.max_length, self.neuron_config.max_length
-            )
+            if new_config.neuron_config.is_prefix_caching:
+                new_config.neuron_config.buckets = generate_2d_buckets_for_prefix_cahcing(
+                    1, 1, self.neuron_config.max_length, self.neuron_config.max_length
+                )
+            else:
+                new_config.neuron_config.buckets = generate_buckets(
+                    self.neuron_config.max_length, self.neuron_config.max_length
+                )
         else:
             if new_config.neuron_config.token_generation_buckets is not None:
                 new_config.neuron_config.buckets = new_config.neuron_config.token_generation_buckets
             else:
-                new_config.neuron_config.buckets = generate_buckets(
-                    128, self.neuron_config.max_length
-                )
+                if new_config.neuron_config.is_prefix_caching:
+                    new_config.neuron_config.buckets = generate_2d_buckets_for_prefix_cahcing(
+                        1, 1, 128, self.neuron_config.max_length
+                    )
+                else:
+                    new_config.neuron_config.buckets = generate_buckets(
+                        128, self.neuron_config.max_length
+                    )
 
         # shouldn't be used in token gen models
         new_config.neuron_config.sequence_parallel_enabled = False
@@ -2182,7 +2221,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         )
         self.models.append(self.token_generation_model)
 
-    def enable_speculation(self):
+    def enable_speculation(self, enable_wlt_optimization: bool = True, **model_init_kwargs):
         new_config = copy.deepcopy(self.config)
         new_config.neuron_config.batch_size = self.neuron_config.spec_batch_size
         new_config.neuron_config.n_active_tokens = self.neuron_config.speculation_length
@@ -2207,7 +2246,11 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             config=new_config,
             model_cls=self._model_cls,
             tag=SPECULATION_MODEL_TAG,
-            priority_model_idx=0,  # to turn on weight layout optimization
+            model_init_kwargs=model_init_kwargs,
+            compiler_args=self.get_compiler_args(),
+            priority_model_idx=(
+                0 if enable_wlt_optimization else None
+            ),  # to turn on weight layout optimization
         )
 
         self.models.append(self.speculation_model)
@@ -2222,36 +2265,6 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         new_config.neuron_config.is_prefill_stage = False
 
         self.models.append(self.medusa_speculation_model)
-
-    def set_async_mode(self, async_mode: bool):
-        if async_mode and not self.on_device_sampling:
-            raise ValueError("Cannot set async mode when on device sampling is not enabled.")
-
-        # reset async mode state
-        self.async_mode = async_mode
-        self.next_cpu_inputs = None
-        self.prior_outputs = None
-        self.async_should_stop = False
-        self.prior_seq_ids = None
-
-        # set/unset nrt env vars for async mode
-        NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS = "NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS"
-        NEURON_RT_IO_RING_CACHE_SIZE = "NEURON_RT_IO_RING_CACHE_SIZE"
-        if self.async_mode:
-            os.environ[NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS] = "2"
-            os.environ[NEURON_RT_IO_RING_CACHE_SIZE] = "2"
-        elif NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS in os.environ:
-            os.unsetenv(NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS)
-            os.unsetenv(NEURON_RT_IO_RING_CACHE_SIZE)
-
-        # set async mode in model wrapper models
-        for model in self.models:
-            model.async_mode = async_mode
-
-            # refresh internal async state
-            if self.is_loaded_to_neuron:
-                for spmd_model in self._get_spmd_model_objects(model.tag):
-                    spmd_model.refresh_async_state()
 
     @classmethod
     def prepare_quantized_state_dict(cls, hf_model_quant):

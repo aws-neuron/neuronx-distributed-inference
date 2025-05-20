@@ -3,6 +3,7 @@ from functools import partial
 
 import pytest
 import torch
+import torch_neuronx
 import torch.distributed
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
@@ -102,7 +103,7 @@ def test_logits_masking(batch_size, vocab_size, pad_size, tp_degree, logical_nc_
 
     traced_output = traced_model(logits)
 
-    torch.testing.assert_close(
+    torch_neuronx.testing.assert_close(
         cpu_output,
         traced_output.to("cpu"),
         atol=1e-3,

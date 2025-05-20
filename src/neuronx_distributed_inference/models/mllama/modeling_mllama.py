@@ -15,7 +15,6 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
-import torch.nn.functional as F
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers.mappings import (
     _reduce_scatter_along_dim,
@@ -35,6 +34,7 @@ from neuronx_distributed_inference.modules.attention.utils import (
     RotaryEmbedding,
     apply_rotary_polar_compatible,
     move_heads_front,
+    neuron_scaled_dot_product_attention,
     precompute_freqs_cis,
 )
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm  # noqa: F401
@@ -201,6 +201,8 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
+        self.use_qk_norm = config.use_qk_norm if hasattr(config, "use_qk_norm") else False
+
         self.padding_side = self.neuron_config.padding_side
         self.torch_dtype = self.neuron_config.torch_dtype
         self.is_medusa = self.neuron_config.is_medusa
@@ -220,6 +222,8 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.init_gqa_properties()
 
         self.init_rope()
+
+        self.init_qk_norm()
 
     def init_rope(self):
         if not hasattr(self.config, "rope_scaling") or self.config.rope_scaling is None:
@@ -281,9 +285,12 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 rmsnorm=rmsnorm,
             )
 
-        Q, K, V = self.qkv_proj(
+        Q, K, V, _ = self.qkv_proj(
             hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids
         )
+        if self.use_qk_norm:
+            Q = self.qk_norm(Q)
+            K = self.qk_norm(K)
 
         # Divide hidden_dim across heads for MHA
         # Change layout: BSHD -> BHSD
@@ -304,7 +311,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             assert rotary_freqs is not None, "rotary_emb is initilazed but rotary_freqs is None"
             Q, K = apply_rotary_polar_compatible(Q.transpose(1, 2), K.transpose(1, 2), rotary_freqs)
             Q, K = Q.transpose(1, 2), K.transpose(1, 2)
-        return Q, K, V, cos_cache, sin_cache
+        return Q, K, V, cos_cache, sin_cache, None
 
     def forward(
         self,
@@ -327,7 +334,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         if self.sequence_parallel_enabled:
             q_len *= self.tensor_model_parallel_group.size()
 
-        Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
+        Q, K, V, cos_cache, sin_cache, _ = self.prep_qkv_tensors(
             position_ids,
             hidden_states,
             past_key_value,
@@ -625,9 +632,11 @@ class NeuronLlamaCrossAttention(torch.nn.Module):
             xattn_mask, full_text_row_masked_out_mask = self._get_xattn_mask(
                 seqlen, vision_tokens, vision_mask, num_chunks, has_image.view(-1, 1, 1, 1)
             )
-            output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=xattn_mask, dropout_p=0.0)
+            output = neuron_scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=xattn_mask, dropout_p=0.0
+            )
         else:
-            output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=0.0)
+            output = neuron_scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=0.0)
             full_text_row_masked_out_mask = has_image.view(-1, 1, 1, 1)
         output = output * full_text_row_masked_out_mask
         output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1)
@@ -1232,7 +1241,7 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
         return MultimodalVisionNeuronConfig
 
     @staticmethod
-    def load_hf_model(model_path):
+    def load_hf_model(model_path, **kwargs):
         raise Exception("HuggingFace checkpoint is not supported yet")
 
     def get_compiler_args(self) -> str:

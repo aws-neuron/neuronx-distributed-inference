@@ -28,9 +28,12 @@ class MultimodalKVCacheManager(KVCacheManager):
 
         # override past_key_values from base class with correct num_hidden_layers passed as arg
         # as num_hidden_layers are interpreted differently in the various config's
+        assert (
+            self.k_shape == self.v_shape
+        ), 'K and V cache shapes must match in MultimodalKVCacheManager'
         self.past_key_values = nn.ParameterList(
             [
-                nn.Parameter(torch.zeros(self.kv_shape, dtype=dtype), requires_grad=False)
+                nn.Parameter(torch.zeros(self.k_shape, dtype=dtype), requires_grad=False)
                 for _ in range(num_self_attention_layers * 2)
             ]
         )

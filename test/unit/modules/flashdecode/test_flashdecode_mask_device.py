@@ -2,6 +2,7 @@ import unittest
 
 import pytest
 import torch
+import torch_neuronx
 from neuronx_distributed.trace.model_builder import BaseModelInstance, ModelBuilder
 
 from neuronx_distributed_inference.modules.flashdecode.utils import mask_util
@@ -54,8 +55,8 @@ class TestFlashDecodingMasks(unittest.TestCase):
         traced_model.nxd_model.initialize_with_saved_weights(start_rank_tensor=torch.tensor([0]))
         output = traced_model(cache_ids, core_id)
 
-        torch.testing.assert_close(expected_active_mask, output[0])
-        torch.testing.assert_close(expected_prior_mask, output[1])
+        torch_neuronx.testing.assert_close(expected_active_mask, output[0])
+        torch_neuronx.testing.assert_close(expected_prior_mask, output[1])
 
         assert torch.equal(expected_active_mask, active)
         assert torch.equal(expected_prior_mask, prior)
@@ -72,8 +73,8 @@ class TestFlashDecodingMasks(unittest.TestCase):
             pos_ids=cache_ids, rank_id=core_id, num_cores_per_group=2, cache_size=8
         )
         output = traced_model(cache_ids, core_id)
-        torch.testing.assert_close(expected_active_mask, output[0])
-        torch.testing.assert_close(expected_prior_mask, output[1])
+        torch_neuronx.testing.assert_close(expected_active_mask, output[0])
+        torch_neuronx.testing.assert_close(expected_prior_mask, output[1])
         torch.testing.assert_close(expected_active_mask, active)
         torch.testing.assert_close(expected_prior_mask, prior)
 
@@ -117,10 +118,10 @@ class TestFlashDecodingMasks(unittest.TestCase):
         torch.testing.assert_close(expected_prior_masks_0, prior_core_0)
         torch.testing.assert_close(expected_active_masks_1, active_core_1)
         torch.testing.assert_close(expected_prior_masks_1, prior_core_1)
-        torch.testing.assert_close(expected_active_masks_0, output_0[0])
-        torch.testing.assert_close(expected_prior_masks_0, output_0[1])
-        torch.testing.assert_close(expected_active_masks_1, output_1[0])
-        torch.testing.assert_close(expected_prior_masks_1, output_1[1])
+        torch_neuronx.testing.assert_close(expected_active_masks_0, output_0[0])
+        torch_neuronx.testing.assert_close(expected_prior_masks_0, output_0[1])
+        torch_neuronx.testing.assert_close(expected_active_masks_1, output_1[0])
+        torch_neuronx.testing.assert_close(expected_prior_masks_1, output_1[1])
 
     def test_speculation(self):
         cache_ids = torch.tensor([[5, 6, 7, 8], [4, 5, 6, 7], [10, 11, 12, 13]], dtype=torch.int32)
@@ -177,10 +178,10 @@ class TestFlashDecodingMasks(unittest.TestCase):
         torch.testing.assert_close(expected_prior_masks_0, prior_core_0)
         torch.testing.assert_close(expected_active_masks_1, active_core_1)
         torch.testing.assert_close(expected_prior_masks_1, prior_core_1)
-        torch.testing.assert_close(expected_active_masks_0, output_0[0])
-        torch.testing.assert_close(expected_prior_masks_0, output_0[1])
-        torch.testing.assert_close(expected_active_masks_1, output_1[0])
-        torch.testing.assert_close(expected_prior_masks_1, output_1[1])
+        torch_neuronx.testing.assert_close(expected_active_masks_0, output_0[0])
+        torch_neuronx.testing.assert_close(expected_prior_masks_0, output_0[1])
+        torch_neuronx.testing.assert_close(expected_active_masks_1, output_1[0])
+        torch_neuronx.testing.assert_close(expected_prior_masks_1, output_1[1])
 
 
 if __name__ == "__main__":

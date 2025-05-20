@@ -121,7 +121,7 @@ class LoraCheckpoint:
                                 scaling = (
                                     lora_alpha / lora_rank
                                     if not use_rslora
-                                    else lora_alpha / lora_rank ** 0.5
+                                    else lora_alpha / lora_rank**0.5
                                 )
                         except (ValueError, TypeError) as e:
                             logging.warning(f"Error processing lora_scaling: {e}")

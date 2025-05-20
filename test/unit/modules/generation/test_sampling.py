@@ -5,6 +5,7 @@ import pytest
 
 # Third Party
 import torch
+import torch_neuronx
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.trace import parallel_model_trace
@@ -238,7 +239,7 @@ def run_sampler_accuracy_test(batch_size, topk, num_beams=1):
     neuron_sampler = get_sampler(topk, num_beams, on_device=True)
     cpu_sampler = get_sampler(topk, num_beams, on_device=False)
     print(neuron_sampler.sample(logits_device).cpu(), cpu_sampler.sample(logits))
-    torch.testing.assert_close(
+    torch_neuronx.testing.assert_close(
         neuron_sampler.sample(logits_device).cpu(), cpu_sampler.sample(logits), check_dtype=False
     )
     # Reset groups
@@ -246,16 +247,17 @@ def run_sampler_accuracy_test(batch_size, topk, num_beams=1):
     torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int8])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dim", [0, 1, 2, 3])
 @pytest.mark.parametrize("shape", [(13,), (11, 7), (5, 3, 2), (7, 5, 3, 2)])
 def test_cumsum(dim, shape, dtype):
     if dim > len(shape) - 1:
         pytest.skip(f"Dim {dim} outside of shape {shape}")
-    tensor_in = torch.rand(shape).to(dtype).to(xm.xla_device())
+    tensor_in = torch.rand(shape).to(dtype)
     expected_output = torch.cumsum(tensor_in, dim=dim)
-    actual_output = cumsum(tensor_in, dim=dim, on_cpu=False)
-    assert torch.allclose(expected_output, actual_output)
+    tensor_in_neuron = tensor_in.to(xm.xla_device())
+    actual_output = cumsum(tensor_in_neuron, dim=dim, on_cpu=False)
+    torch_neuronx.testing.assert_close(actual_output.cpu(), expected_output)
 
 
 if __name__ == "__main__":

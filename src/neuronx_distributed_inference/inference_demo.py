@@ -10,7 +10,10 @@ from functools import partial
 from typing import Type
 
 import torch
-from neuronx_distributed.quantization.quantization_config import QuantizationType, ActivationQuantizationType
+from neuronx_distributed.quantization.quantization_config import (
+    ActivationQuantizationType,
+    QuantizationType,
+)
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
@@ -28,9 +31,11 @@ from neuronx_distributed_inference.utils.accuracy import (
     check_accuracy_logits,
     get_generate_outputs,
 )
+from neuronx_distributed_inference.utils import argparse_utils
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 from neuronx_distributed_inference.utils.debug_utils import capture_model_inputs
 from neuronx_distributed_inference.utils.distributed import get_init_rank, get_init_world_size
+from neuronx_distributed_inference.utils.exceptions import LogitMatchingValidationError
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 from neuronx_distributed_inference.utils.random import set_random_seed
 
@@ -117,10 +122,12 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--rpl-reduce-dtype", type=to_torch_dtype)
     run_parser.add_argument("--output-logits", action="store_true")
     run_parser.add_argument("--vocab-parallel", action="store_true")
+    run_parser.add_argument("--layer-boundary-markers", action="store_true", default=False)
 
     # Attention
     run_parser.add_argument("--fused-qkv", action="store_true")
     run_parser.add_argument("--sequence-parallel-enabled", action="store_true")
+    run_parser.add_argument("--weight-gather-seq-len-threshold", type=int)
     run_parser.add_argument("--flash-decoding-enabled", action="store_true")
 
     # Continuous batching
@@ -132,6 +139,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # KV cache
     run_parser.add_argument("--kv-cache-batch-size", type=int)
     run_parser.add_argument("--kv-cache-padding-size", type=int)
+    run_parser.add_argument("--disable-kv-cache-tiling", action="store_true")
 
     # On device sampling
     run_parser.add_argument("--on-device-sampling", action="store_true")
@@ -193,9 +201,16 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         "This is useful for ensuring processes on different nodes are in sync",
     )
     run_parser.add_argument(
-        "--skip-save-sharded-checkpoint", dest="save_sharded_checkpoint", action="store_false"
+        "--save-sharded-checkpoint",
+        action="store_true",
+        help="Save sharded checkpoints to disk when compiling NxDI model. "
+        "When loading NxDI model, sharded checkpoints will be loaded from the compiled model path.",
     )
-    run_parser.add_argument("--skip-sharding", action="store_true")
+    run_parser.add_argument(
+        "--skip-sharding",
+        action="store_true",
+        help="Skip sharding checkpoints when compiling NxDI model. "
+    )
 
     # PA and CF
     run_parser.add_argument(
@@ -206,6 +221,9 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument(
         "--enable-chunked-prefill", dest="is_chunked_prefill", action="store_true"
     )
+    run_parser.add_argument(
+        "--enable-prefix-caching", dest="is_prefix_caching", action="store_true"
+    )
     run_parser.add_argument("--cp-max-num-seqs", type=int)
     run_parser.add_argument("--cp-num-active-blocks", type=int)
 
@@ -214,8 +232,8 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 
     # Lora
     run_parser.add_argument("--enable-lora", action="store_true")
-    run_parser.add_argument("--max-loras", type=int)
-    run_parser.add_argument("--max-lora-rank", type=int)
+    run_parser.add_argument("--max-loras", type=int, default=1)
+    run_parser.add_argument("--max-lora-rank", type=int, default=16)
     run_parser.add_argument("--target-modules", nargs="+")
     run_parser.add_argument("--max-loras-on-cpu", type=int)
     run_parser.add_argument("--lora-ckpt-path", dest="lora_ckpt_paths", type=str, action="append")
@@ -227,10 +245,21 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--attn-kernel-enabled", action="store_true")
     run_parser.add_argument("--mlp-kernel-enabled", action="store_true")
     run_parser.add_argument("--quantized-mlp-kernel-enabled", action="store_true")
-    run_parser.add_argument("--activation-quantization-type", type=str, choices=[e.value for e in ActivationQuantizationType])
+    run_parser.add_argument("--fused-rmsnorm-skip-gamma", action="store_true")
+    run_parser.add_argument(
+        "--activation-quantization-type",
+        type=str,
+        choices=[e.value for e in ActivationQuantizationType],
+    )
     run_parser.add_argument("--rmsnorm-quantize-kernel-enabled", action="store_true")
-    run_parser.add_argument("--quantize-clamp-bound", type=float, default=float('inf'))
+    run_parser.add_argument("--quantize-clamp-bound", type=float, default=float("inf"))
     run_parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
+    run_parser.add_argument("--qkv-kernel-fuse-residual-add", action="store_true")
+    run_parser.add_argument("--attn-tkg-nki-kernel-enabled", action="store_true")
+    run_parser.add_argument("--attn-tkg-builtin-kernel-enabled", action="store_true")
+    run_parser.add_argument("--attn-block-tkg-nki-kernel-enabled", action="store_true")
+    run_parser.add_argument("--attn-block-tkg-nki-kernel-cache-update", action="store_true")
+    run_parser.add_argument("--k-cache-transposed", action="store_true")
 
     # Logical NeuronCore Configuration (LNC)
     lnc_group = run_parser.add_mutually_exclusive_group()
@@ -246,7 +275,12 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--on-cpu", action="store_true")
 
     # Debugging
-    run_parser.add_argument("--capture-indices", nargs="+", type=int, default=None)
+    run_parser.add_argument(
+        "--capture-indices",
+        nargs="+",
+        action=argparse_utils.StringOrIntegers,
+        default=None,
+        help=f"Specify '{argparse_utils.AUTO}' when using check accuracy mode with {CheckAccuracyMode.LOGIT_MATCHING} for inferrring capture indices when the test fails and use the indices to capture inputs. Otherwise, provide any number of integer values for capturing inputs at those indices.")
     run_parser.add_argument("--input-capture-save-dir", type=str, default=None)
 
     # Optional demo arguments
@@ -266,6 +300,11 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         "--compile-only",
         action="store_true",
         help="Only perform model compilation.",
+    )
+    run_parser.add_argument(
+        "--compile-dry-run",
+        action="store_true",
+        help="Perform a compilation dry run (minimal model trace)",
     )
     run_parser.add_argument(
         "--hlo-debug",
@@ -385,10 +424,12 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     compiling_start_time = time.monotonic()
     if not args.skip_compile and not args.on_cpu:
         print("\nCompiling and saving model...")
-        model.compile(args.compiled_model_path, debug=args.hlo_debug)
+        model.compile(args.compiled_model_path, debug=args.hlo_debug, dry_run=args.compile_dry_run)
         if draft_model is not None and neuron_config.enable_fused_speculation is False:
             print("\nCompiling and saving draft model...")
-            draft_model.compile(args.compiled_draft_model_path)
+            draft_model.compile(
+                args.compiled_draft_model_path, debug=args.hlo_debug, dry_run=args.compile_dry_run
+            )
         compiling_end_time = time.monotonic()
         total_compiling_time = compiling_end_time - compiling_start_time
         print(f"Compiling and tracing time: {total_compiling_time} seconds")
@@ -398,7 +439,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     if args.enable_torch_dist:
         torch.distributed.barrier()
 
-    if args.compile_only:
+    if args.compile_only or args.compile_dry_run:
         return
 
     # Load compiled model to Neuron.
@@ -446,25 +487,37 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     if neuron_config.is_medusa:
         draft_model = model
 
-    # Check accuracy.
-    run_accuracy_check(
-        model,
-        tokenizer,
-        generation_config,
-        args.prompts[0],
-        args.check_accuracy_mode,
-        args.divergence_difference_tol,
-        args.tol_map,
-        num_tokens_to_check=args.num_tokens_to_check,
-        draft_model=draft_model,
-        expected_outputs_path=args.expected_outputs_path,
-    )
-
     input_capture_hook = None
-    if args.capture_indices:
+    capture_indices = args.capture_indices
+
+    # Check accuracy.
+    logit_error = None
+    try:
+        run_accuracy_check(
+            model,
+            tokenizer,
+            generation_config,
+            args.prompts[0],
+            args.check_accuracy_mode,
+            args.divergence_difference_tol,
+            args.tol_map,
+            num_tokens_to_check=args.num_tokens_to_check,
+            draft_model=draft_model,
+            expected_outputs_path=args.expected_outputs_path,
+        )
+    except LogitMatchingValidationError as e:
+        logit_error = e
+        if args.capture_indices == argparse_utils.AUTO:
+            capture_indices = logit_error.get_divergence_index()
+            print(f"\nAuto capture after a failed logits test. Setting capture indices to {capture_indices}")
+
+    if args.capture_indices == argparse_utils.AUTO and logit_error is None:
+        capture_indices = None
+
+    if capture_indices is not None:
         input_capture_hook = partial(
             capture_model_inputs,
-            capture_indices=args.capture_indices,
+            capture_indices=capture_indices,
             input_capture_save_dir=args.input_capture_save_dir,
         )
 
@@ -478,6 +531,9 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         adapter_ids=adapter_ids,
         input_capture_hook=input_capture_hook,
     )
+
+    if logit_error is not None:
+        raise logit_error
 
     # Benchmarking.
     if args.benchmark:

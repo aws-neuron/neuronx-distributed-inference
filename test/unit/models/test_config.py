@@ -90,6 +90,7 @@ def test_serialize_deserialize_inference_config_with_fused_spec_config():
     assert deserialized_config.neuron_config.tp_degree == 1
     assert deserialized_config.fused_spec_config.draft_config.hidden_size == 1024
     assert deserialized_config.fused_spec_config.draft_config.neuron_config.tp_degree == 1
+    assert type(deserialized_config.fused_spec_config.worker_cls) is type(NeuronBaseModel)
 
 
 def test_neuron_config_logical_neuron_cores_backward_compatible():
@@ -280,3 +281,33 @@ class TestGetPlatformLNC(unittest.TestCase):
         assert get_platform_lnc() == 2
 
         assert get_platform_target_mock.call_count == 3
+
+
+def test_kv_cache_tiling_disabling():
+    hf_config = AutoConfig.from_pretrained(TEST_CONFIG_PATH)
+    neuron_config = NeuronConfig(max_length = 2048, enable_fused_speculation=True, disable_kv_cache_tiling=True)
+    config = InferenceConfig(
+        neuron_config=neuron_config,
+        load_config=load_pretrained_config(hf_config=hf_config),
+    )
+
+    # Assert that kv cache tiling has been turned off by the user.
+    assert not config.neuron_config.kv_cache_tiling
+
+
+def test_inference_config_from_json_string_invalid_fused_spec_worker_cls():
+    worker_cls_name = "NotReal"
+    worker_cls_module = "not.real"
+    config = {
+        "fused_spec_config": {
+            "worker_cls": {
+                "__name__": worker_cls_name,
+                "__module__": worker_cls_module,
+            },
+        },
+    }
+    config_json = json.dumps(config)
+    with pytest.raises(ModuleNotFoundError) as e_info:
+        config = InferenceConfig.from_json_string(config_json)
+        message = str(e_info)
+        assert worker_cls_name in message and worker_cls_module in message

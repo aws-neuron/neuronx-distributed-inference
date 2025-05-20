@@ -234,7 +234,7 @@ class NeuronDbrxBlock(nn.Module):
         hidden_states = self.ffn(hidden_states)[0]
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, present_key_value, cos_cache, sin_cache)
+        outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
 
         return outputs
 
@@ -293,8 +293,8 @@ class NeuronDbrxForCausalLM(NeuronBaseForCausalLM):
     _model_cls = NeuronDbrxModel
 
     @staticmethod
-    def load_hf_model(model_path):
-        return DbrxForCausalLM.from_pretrained(model_path)
+    def load_hf_model(model_path, **kwargs):
+        return DbrxForCausalLM.from_pretrained(model_path, **kwargs)
 
     @classmethod
     def get_config_cls(cls):

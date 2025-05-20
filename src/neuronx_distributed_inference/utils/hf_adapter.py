@@ -144,6 +144,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             top_p=generation_config.top_p,
             temperature=generation_config.temperature,
         )
+        model_kwargs["sampling_params"] = sampling_params
 
         # init scores / logits tuples
         scores = () if (return_dict_in_generate and output_scores) else None
