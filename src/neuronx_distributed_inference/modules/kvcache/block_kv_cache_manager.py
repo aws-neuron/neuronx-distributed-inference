@@ -41,7 +41,7 @@ class BlockKVCacheManager(KVCacheManager):
             # 128 / max_num_blocks_per_seq, so that the block_size dimension can be
             # correctly tiled (assuming the block_size is always a power of 2).
             tiling_factor = BlockKVCacheManager._find_next_power_2(128 / max_num_blocks_per_seq)
-            self.kv_shape = (
+            self.k_shape = self.v_shape = (
                 config.neuron_config.pa_num_blocks + self._NUM_EXTRA_RESERVED_BLOCK,
                 tiling_factor,
                 config.neuron_config.pa_block_size // tiling_factor,
@@ -51,7 +51,7 @@ class BlockKVCacheManager(KVCacheManager):
             self.block_tiling = True
             self.block_tiling_factor = tiling_factor
         else:
-            self.kv_shape = (
+            self.k_shape = self.v_shape = (
                 config.neuron_config.pa_num_blocks + self._NUM_EXTRA_RESERVED_BLOCK,
                 config.neuron_config.pa_block_size,
                 num_kv_heads_per_rank,
@@ -64,36 +64,34 @@ class BlockKVCacheManager(KVCacheManager):
     def _find_next_power_2(x):
         return 2 ** ceil(log2(x))
 
-    def get_cache(self, **kwargs):
+    def get_cache(self, active_block_table, **kwargs):
         """
         Get cache for paged attention using an active block table.
 
         An active block table will only have padding block at the end, not
         between blocks.
         """
-        active_block_table = kwargs.get("active_block_table")
         past_key_values = []
-        for key_layer_idx in range(0, len(self.past_key_values), 2):
-            k_cache, v_cache = self.get_kv_by_layer_id(key_layer_idx)
-
-            if self.is_prefix_caching:
-                key_state = self._get_cache_from_block_table_pc(k_cache, active_block_table)
-                value_state = self._get_cache_from_block_table_pc(v_cache, active_block_table)
-            elif self.is_chunked_prefill:
-                key_state = self._get_cache_from_block_table_cp(k_cache, active_block_table)
-                value_state = self._get_cache_from_block_table_cp(v_cache, active_block_table)
-            else:
-                raise ValueError("Can't find a proper way to read block KV cache.")
-
-            past_key_values.append([key_state, value_state])
+        for idx in range(len(self.past_key_values) // 2):
+            k_cache, v_cache = self.get_kv_by_layer_id(idx, active_block_table=active_block_table)
+            past_key_values.append([k_cache, v_cache])
 
         return past_key_values
 
-    def get_kv_by_layer_id(self, key_layer_idx, gather_index=None, slice_index=None):
+    def get_kv_by_layer_id(self, idx, active_block_table, **kwargs):
         # Hide the extra blocks from being accessed during cache read
-        k_cache = self.past_key_values[key_layer_idx][: self.pa_num_blocks]
-        v_cache = self.past_key_values[key_layer_idx + 1][: self.pa_num_blocks]
-        return k_cache, v_cache
+        k_cache = self.past_key_values[2 * idx][: self.pa_num_blocks]
+        v_cache = self.past_key_values[2 * idx + 1][: self.pa_num_blocks]
+        if self.is_prefix_caching:
+            key_state = self._get_cache_from_block_table_pc(k_cache, active_block_table)
+            value_state = self._get_cache_from_block_table_pc(v_cache, active_block_table)
+        elif self.is_chunked_prefill:
+            key_state = self._get_cache_from_block_table_cp(k_cache, active_block_table)
+            value_state = self._get_cache_from_block_table_cp(v_cache, active_block_table)
+        else:
+            raise ValueError("Can't find a proper way to read block KV cache.")
+
+        return key_state, value_state
 
     def _get_cache_from_block_table_pc(self, cache: Tensor, active_block_table: Tensor):
         """
@@ -139,11 +137,7 @@ class BlockKVCacheManager(KVCacheManager):
 
     def update_cache(
         self,
-        is_for_context_encoding: bool,
-        seq_ids: Tensor,
-        position_ids: Tensor,
         new_key_values: List[Tensor],
-        seq_len: int,
         scatter_index=None,
         **kwargs,
     ):
@@ -152,24 +146,35 @@ class BlockKVCacheManager(KVCacheManager):
 
         The slot_mapping will be passed as scatter_index
         """
-        slot_mapping = scatter_index
         updated_kv_cache = []
         for idx, kv_per_layer in enumerate(new_key_values):
-            k_cache = self._update_cache_into_block_layout(
-                latest=kv_per_layer[0],
-                cache=self.past_key_values[idx * 2],
-                slot_mapping=slot_mapping,
+            k_cache, v_cache = self.update_kv_by_layer_id(
+                idx=idx, kv_per_layer=kv_per_layer, scatter_index=scatter_index
             )
-            v_cache = self._update_cache_into_block_layout(
-                latest=kv_per_layer[1],
-                cache=self.past_key_values[idx * 2 + 1],
-                slot_mapping=slot_mapping,
-            )
-
             updated_kv_cache.append(k_cache)
             updated_kv_cache.append(v_cache)
 
         return updated_kv_cache
+
+    def update_kv_by_layer_id(
+        self,
+        idx,
+        kv_per_layer: List[Tensor],
+        scatter_index=None,
+        **kwargs,
+    ):
+        slot_mapping = scatter_index
+        k_cache = self._update_cache_into_block_layout(
+            latest=kv_per_layer[0],
+            cache=self.past_key_values[idx * 2],
+            slot_mapping=slot_mapping,
+        )
+        v_cache = self._update_cache_into_block_layout(
+            latest=kv_per_layer[1],
+            cache=self.past_key_values[idx * 2 + 1],
+            slot_mapping=slot_mapping,
+        )
+        return k_cache, v_cache
 
     def _update_cache_into_block_layout(self, latest, cache, slot_mapping, padding_id=-1):
         """

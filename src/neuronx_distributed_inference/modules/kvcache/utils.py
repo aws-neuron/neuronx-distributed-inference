@@ -47,6 +47,23 @@ def dynamic_update_slice(
     return xla_dynamic_update_slice(tensor, update, *start_indices)
 
 
+def update_cache_const_indices(cache: torch.Tensor, updates: torch.Tensor, sequence_ids: Tensor):
+    """
+    Use constants for head and position indices, so that compiler just needs to compute the offset for batch dimension.
+    This is needed to avoid inefficient DMAs, since compiler is not able to const-prop a constant address offset and treats it a dynamic offset.
+    NCC-6227
+    """
+    max_batch_size, kv_heads, max_sequence_length, d_head = cache.shape
+    batch_size, _, bucket_length, _ = updates.shape
+
+    batch_indices = sequence_ids.view(-1, 1, 1).expand(-1, kv_heads, bucket_length).to(torch.int32)
+    head_indices = torch.arange(kv_heads).view(1, -1, 1).expand(batch_size, -1, bucket_length).to(torch.int32)
+    pos_indices = torch.arange(bucket_length).view(1, 1, -1).expand(batch_size, kv_heads, -1).to(torch.int32)
+
+    indices = batch_indices, head_indices, pos_indices
+    return torch.index_put(cache, indices, updates)
+
+
 def get_active_block_table(
     block_table: Tensor,
     context_lens: Tensor,

@@ -61,16 +61,26 @@ def test_slice_kv_cacheline():
     seq_len = 1
 
     # 1. right padding
-    actual = _slice_kv_cacheline("right", seq_len, cache)
+    actual = _slice_kv_cacheline("right", seq_len, cache, transposed=False)
     expected = torch.tensor([[[[1, 2]], [[5, 6]]]])
     assert torch.equal(actual, expected)
     assert torch.equal(_deprecated_slice_kv_cacheline("right", seq_len, cache), expected)
 
     # 2. left padding
-    actual = _slice_kv_cacheline("left", seq_len, cache)
+    actual = _slice_kv_cacheline("left", seq_len, cache, transposed=False)
     expected = torch.tensor([[[[3, 4]], [[7, 8]]]])
     assert torch.equal(actual, expected)
     assert torch.equal(_deprecated_slice_kv_cacheline("left", seq_len, cache), expected)
+
+    # 3. right padding, transposed cache
+    actual = _slice_kv_cacheline("right", seq_len, cache, transposed=True)
+    expected = torch.tensor([[[[1], [3]], [[5], [7]]]])
+    assert torch.equal(actual, expected)
+
+    # 4. left padding, transposed cache
+    actual = _slice_kv_cacheline("left", seq_len, cache, transposed=True)
+    expected = torch.tensor([[[[2], [4]], [[6], [8]]]])
+    assert torch.equal(actual, expected)
 
 
 def test_gather_slice_into_kv_cacheline():
@@ -79,7 +89,7 @@ def test_gather_slice_into_kv_cacheline():
     seq_len = 1
 
     # 1. right padding
-    actual = _gather_slice_into_kv_cacheline(cache, "right", seq_len, bucket_slice)
+    actual = _gather_slice_into_kv_cacheline(cache, "right", seq_len, bucket_slice, transposed=False)
     expected = torch.tensor([[[[100], [100], [50], [50], [50]]]])
     assert torch.equal(actual, expected)
     assert torch.equal(
@@ -87,7 +97,7 @@ def test_gather_slice_into_kv_cacheline():
     )
 
     # 2. left padding
-    actual = _gather_slice_into_kv_cacheline(cache, "left", seq_len, bucket_slice)
+    actual = _gather_slice_into_kv_cacheline(cache, "left", seq_len, bucket_slice, transposed=False)
     expected = torch.tensor([[[[50], [50], [50], [100], [100]]]])
     assert torch.equal(actual, expected)
     assert torch.equal(
@@ -97,8 +107,13 @@ def test_gather_slice_into_kv_cacheline():
 
 def test_reshape_tiled_kv():
     tiled_cache = torch.rand(1, 2, 2, 128, 2)
-    actual = _reshape_tiled_cache(tiled_cache)
+    actual = _reshape_tiled_cache(tiled_cache, transposed=False)
     assert actual.shape == torch.Size([1, 2, 256, 2])
+    assert torch.equal(actual.flatten(), tiled_cache.flatten())
+
+    tiled_cache = torch.rand(1, 2, 2, 128, 2)
+    actual = _reshape_tiled_cache(tiled_cache, transposed=True)
+    assert actual.shape == torch.Size([1, 2, 2, 256])
     assert torch.equal(actual.flatten(), tiled_cache.flatten())
 
 
@@ -504,4 +519,4 @@ class TestDynamicUpdateSlice(unittest.TestCase):
 
         cache = cache_tensor.clone().detach()
         neuron_output = neuron_module(cache, cache_update, seq_ids)
-        torch.testing.assert_close(cpu_cache, neuron_output)
+        torch_neuronx.testing.assert_close(cpu_cache, neuron_output)

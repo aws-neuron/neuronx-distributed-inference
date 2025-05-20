@@ -25,6 +25,7 @@ def benchmark_sampling(
     generation_config: GenerationConfig = None,
     target: str = None,
     image=None,
+    num_runs=20,
 ):
     neuron_config = model.neuron_config
 
@@ -116,11 +117,13 @@ def benchmark_sampling(
 
         # Register latency collectors after warm-up to avoid recording warm-up metrics.
         generation_model = HuggingFaceGenerationAdapter(model)
+        print(f"Starting end-to-end benchmark with {num_runs}")
         e2e_benchmark = Benchmark(
             generation_model.generate,
             input_param,
             preprocess_func=model.reset,
             post_warmup_func=post_warmup_func,
+            num_runs=num_runs
         )
         e2e_benchmark.run()
         report[END_TO_END_MODEL] = generate_report(
@@ -140,7 +143,7 @@ def benchmark_sampling(
     # Benchmark context encoding model only
     if target == "context_encode":
         input_param = get_sample_inputs(CONTEXT_ENCODING_MODEL, model.config, sampling_params)
-        ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, model.config)
+        ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, model.config, num_runs=num_runs)
         ctx_enc_benchmark.run()
         report[CONTEXT_ENCODING_MODEL] = generate_report(
             ctx_enc_benchmark.latency_list,
@@ -152,7 +155,7 @@ def benchmark_sampling(
     # Benchmark token generation model only
     if hasattr(model, "token_generation_model") and target == "token_gen":
         input_param = get_sample_inputs(TOKEN_GENERATION_MODEL, model.config, sampling_params)
-        tkn_gen_benchmark = Benchmark(model.token_generation_model, input_param)
+        tkn_gen_benchmark = Benchmark(model.token_generation_model, input_param, num_runs=num_runs)
         tkn_gen_benchmark.run()
         report[TOKEN_GENERATION_MODEL] = generate_report(
             tkn_gen_benchmark.latency_list,
@@ -164,7 +167,7 @@ def benchmark_sampling(
     # Benchmark speculation model only
     if hasattr(model, "speculation_model") and target == "speculation":
         input_param = get_sample_inputs(SPECULATION_MODEL, model.config, sampling_params)
-        spec_benchmark = Benchmark(model.speculation_model, input_param)
+        spec_benchmark = Benchmark(model.speculation_model, input_param, num_runs=num_runs)
         spec_benchmark.run()
         report[SPECULATION_MODEL] = generate_report(
             spec_benchmark.latency_list,
@@ -176,7 +179,7 @@ def benchmark_sampling(
     # Benchmark Medusa speculation model
     if hasattr(model, "medusa_speculation_model") and target == "speculation":
         input_param = get_sample_inputs(MEDUSA_MODEL, model.config)
-        spec_benchmark = Benchmark(model.medusa_speculation_model, input_param)
+        spec_benchmark = Benchmark(model.medusa_speculation_model, input_param, num_runs=num_runs)
         spec_benchmark.run()
         report[MEDUSA_MODEL] = generate_report(
             spec_benchmark.latency_list,

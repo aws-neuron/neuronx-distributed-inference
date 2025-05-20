@@ -5,10 +5,14 @@ from typing import Optional, Tuple
 import torch
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
-from neuronx_distributed.parallel_layers.mappings import gather_from_sequence_parallel_region
+from neuronx_distributed.parallel_layers.mappings import (
+    gather_from_sequence_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
 from neuronx_distributed.quantization.quantization_layers import BaseQuantizeParallelLinear
-from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_kernel
+from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_kernel, rmsnorm_qkv_isa_fused_add_kernel
 from neuronxcc.nki.language import nc
 from torch import nn
 from torch.distributed import ProcessGroup
@@ -21,6 +25,16 @@ from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lo
 logger = logging.getLogger("Neuron")
 
 _traced_qkv_kernel = nki_jit()(rmsnorm_qkv_isa_kernel)
+_traced_qkv_kernel_fused_add = nki_jit()(rmsnorm_qkv_isa_fused_add_kernel)
+
+try:
+    from neuronxcc.nki._pre_prod_kernels.output_proj import output_proj_kernel
+    _traced_o_proj_kernel = nki_jit()(output_proj_kernel)
+except ImportError:
+    logger.warning(
+        "Use a more recent neuron compiler version to enable output projection kernel"
+    )
+    _traced_o_proj_kernel = None
 
 
 class GQA(enum.Enum):
@@ -328,6 +342,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         rms_norm_eps: float = None,
         qkv_kernel_enabled: bool = False,
+        fused_rmsnorm_skip_gamma: bool = False,
         logical_nc_config: int = 1,
         qkv_kernel_nbsd_layout: bool = False,
         on_cpu: bool = False,
@@ -356,6 +371,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         self.sequence_dimension = sequence_dimension
         self.rms_norm_eps = rms_norm_eps
         self.qkv_kernel_enabled = qkv_kernel_enabled
+        self.fused_rmsnorm = not self.sequence_parallel_enabled
+        self.fused_rmsnorm_skip_gamma = fused_rmsnorm_skip_gamma and self.fused_rmsnorm
         self.logical_nc_config = logical_nc_config
         self.qkv_kernel_nbsd_layout = qkv_kernel_nbsd_layout
 
@@ -426,7 +443,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.bias
                 )
 
-    def forward(self, hidden_states: torch.Tensor, rmsnorm=None, adapter_ids=None):
+    def forward(self, hidden_states: torch.Tensor, rmsnorm=None, adapter_ids=None, residual=None):
         if self.sequence_parallel_enabled and self.tensor_model_parallel_group is not None:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states,
@@ -436,10 +453,10 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
         if self.qkv_kernel_enabled:
             assert self.fused_qkv, "QKV kernel only supported when fused_qkv is TRUE"
-            fused_rmsnorm = not self.sequence_parallel_enabled
-            return self._kernel_qkv_forward(hidden_states, fused_rmsnorm, rmsnorm)
+            return self._kernel_qkv_forward(hidden_states, rmsnorm, residual)
         else:
-            return self._native_qkv_forward(hidden_states, adapter_ids)
+            Q, K, V = self._native_qkv_forward(hidden_states, adapter_ids)
+        return Q, K, V, residual
 
     def _native_qkv_forward(self, hidden_states: torch.Tensor, adapter_ids=None):
         if self.fused_qkv:
@@ -504,9 +521,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         logger.debug(f"V shape after tensor_split: {V.shape}")
         return Q, K, V
 
-    def _kernel_qkv_forward(self, hidden_states, fused_rmsnorm, rmsnorm):
+    def _kernel_qkv_forward(self, hidden_states, rmsnorm, residual):
         logger.debug(
-            f"QKV kernel: fused_rmsnorm={fused_rmsnorm} logical_nc_config={self.logical_nc_config}"
+            f"QKV kernel: fused_rmsnorm={self.fused_rmsnorm}, skip_gamma={self.fused_rmsnorm_skip_gamma} logical_nc_config={self.logical_nc_config}"
         )
         bs, seqlen, h = hidden_states.shape
 
@@ -520,7 +537,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         assert fused_qkv_size == n * self.head_dim
         assert h == h2
 
-        fused_rmsnorm = fused_rmsnorm and rmsnorm is not None
+        fused_rmsnorm = self.fused_rmsnorm and rmsnorm is not None
 
         norm_weights = None
         if fused_rmsnorm:
@@ -540,21 +557,53 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 device=hidden_states.device,
             )
 
-            _traced_qkv_kernel[grid](
-                hidden_states,
-                self.Wqkv.weight,
-                (
-                    norm_weights
-                    if norm_weights is not None
-                    # cannot pass None to this kernel API
-                    else torch.ones((1, h), device=hidden_states.device)
-                ),
-                QKV,
-                eps=self.rms_norm_eps,
-                kernel_name="QKV",
-                # Run RMSNorm inside the kernel if NOT using SP norm
-                fused_rmsnorm=fused_rmsnorm,
-            )
+            if residual is not None:
+                # attn_out is set to zeros becauses we getting the residual from fused-add-MLP directly
+                # TODO: remove this useless field from qkv kenrel
+                zeros = torch.zeros(
+                    residual.shape,
+                    dtype=residual.dtype,
+                    device=residual.device,
+                )
+                # the residual result before QKV is stored back to hidden_states (input0) such that it
+                # can be used by fused-add-MLP later
+                _traced_qkv_kernel_fused_add[grid](
+                    hidden_states,
+                    residual,
+                    zeros,
+                    self.Wqkv.weight,
+                    (
+                        norm_weights
+                        if norm_weights is not None
+                        # cannot pass None to this kernel API
+                        else torch.ones((1, h), device=hidden_states.device)
+                    ),
+                    QKV,
+                    eps=self.rms_norm_eps,
+                    kernel_name="QKV",
+                    # Run RMSNorm inside the kernel if NOT using SP norm
+                    fused_rmsnorm=fused_rmsnorm,
+                    skip_gamma=self.fused_rmsnorm_skip_gamma,
+                )
+                residual = hidden_states  # store residual for MLP
+            else:
+                _traced_qkv_kernel[grid](
+                    hidden_states,
+                    self.Wqkv.weight,
+                    (
+                        norm_weights
+                        if norm_weights is not None
+                        # cannot pass None to this kernel API
+                        else torch.ones((1, h), device=hidden_states.device)
+                    ),
+                    QKV,
+                    kernel_name="QKV",
+                    eps=self.rms_norm_eps,
+                    # Run RMSNorm inside the kernel if NOT using SP norm
+                    fused_rmsnorm=fused_rmsnorm,
+                    skip_gamma=self.fused_rmsnorm_skip_gamma,
+                    use_dma_transpose=True,
+                )
 
             assert QKV.shape == (n, bs, seqlen, self.head_dim)
 
@@ -570,6 +619,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             )
 
         else:
+            assert residual is None, "fused_add_qkv only support for nbsd layout"
             QKV = torch.zeros(
                 bs,
                 seqlen,
@@ -589,15 +639,16 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     else torch.ones((1, h), device=hidden_states.device)
                 ),
                 QKV,
-                eps=self.rms_norm_eps,
                 kernel_name="QKV",
+                eps=self.rms_norm_eps,
                 # Run RMSNorm inside the kernel if NOT using SP norm
                 fused_rmsnorm=fused_rmsnorm,
+                skip_gamma=self.fused_rmsnorm_skip_gamma,
             )
 
         assert QKV.shape == (bs, seqlen, fused_qkv_size)
 
-        return self._split_fused_qkv(QKV)
+        return (*self._split_fused_qkv(QKV), residual)
 
     def get_weight(
         self, prefix: str, layer: torch.nn.Module, layer_name, model_state_dict: dict
@@ -950,6 +1001,8 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         sequence_dimension: Optional[int] = None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         rpl_reduce_dtype: torch.dtype = None,
+        out_proj_kernel_enabled: bool = False,
+        logical_nc_config: int = 1,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -964,6 +1017,10 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         )
 
         self.input_is_parallel = input_is_parallel
+        self.out_proj_kernel_enabled = out_proj_kernel_enabled
+        self.logical_nc_config = logical_nc_config
+        self.rpl_reduce_dtype = rpl_reduce_dtype
+        self.sequence_parallel_enabled = sequence_parallel_enabled
 
         if self.tensor_model_parallel_group is not None:
             self.o_proj = RowParallelLinear(
@@ -977,6 +1034,10 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
                 tensor_model_parallel_group=self.tensor_model_parallel_group,
                 reduce_dtype=rpl_reduce_dtype,
             )
+            if self.out_proj_kernel_enabled:
+                # we need to transpose the weights on the CPU side to avoid
+                # needing to transpose on the device when using out proj kernel
+                self.o_proj.weight = transpose_parallel_linear_layer(self.o_proj.weight)
         else:
             self.o_proj = nn.Linear(
                 self.num_attention_heads * self.head_dim, self.hidden_size, bias=self.bias
@@ -986,7 +1047,52 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         # For example, in CLIP vision model, we use "out_proj"
         self.layer_name = layer_name
 
+    def _kernel_o_proj(self, attention_output):
+        logger.debug(f"Output projection kernel: logical_nc_config={self.logical_nc_config}")
+        logger.debug(
+            f"attention_output.shape: {attention_output.shape}"
+            f"Output projection weight - shape: {self.o_proj.weight.shape}, dtype: {self.o_proj.weight.dtype}"
+        )
+        # The compute is: out(B, S, H) = attention_output(B, S, n, d) @ out_proj_weight(n * d, H)
+        nd, H = self.o_proj.weight.shape
+        B, S, nd = attention_output.shape
+        heads_per_core = self.num_attention_heads // self.tp_degree
+        assert (
+            nd == heads_per_core * self.head_dim
+        ), f"attention_output.shape = {attention_output.shape}, heads_per_core = {heads_per_core}, head_dim = {self.head_dim}"
+
+        # Kernel wants BndS layout for input.
+        attention_output = attention_output.reshape(B, S, heads_per_core, self.head_dim)
+        kernel_attn_in = attention_output.permute(0, 2, 3, 1)
+
+        out = torch.zeros(B, S, H, dtype=attention_output.dtype, device=attention_output.device)
+        _traced_o_proj_kernel[(nc(self.logical_nc_config),)](
+            active=kernel_attn_in,
+            weight=self.o_proj.weight,
+            out=out,
+        )
+
+        # All-reduce or reduce-scatter, depending on whether SP is enabled
+        original_dtype = out.dtype
+        out = out.to(self.rpl_reduce_dtype)
+
+        if self.sequence_parallel_enabled:
+            out = reduce_scatter_to_sequence_parallel_region(
+                out, 1, process_group=self.tensor_model_parallel_group
+            )
+        else:
+            out = reduce_from_tensor_model_parallel_region(
+                out, process_group=self.tensor_model_parallel_group
+            )
+
+        out = out.to(original_dtype)
+
+        return out
+
     def forward(self, attention_output: torch.Tensor, adapter_ids=None):
+        if self.out_proj_kernel_enabled:
+            return self._kernel_o_proj(attention_output)
+
         return (
             self.o_proj(attention_output)
             if not is_lora_module(self.o_proj)

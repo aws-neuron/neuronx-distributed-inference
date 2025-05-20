@@ -56,7 +56,9 @@ def convert_mixtral_to_neuron_state_dict(neuron_state_dict, config):
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported for Mixtral Top-K model"
 
     # to facilitate rank usage in base model
-    neuron_state_dict["rank_util.rank"] = torch.arange(0, config.neuron_config.tp_degree, dtype=torch.int32)
+    neuron_state_dict["rank_util.rank"] = torch.arange(
+        0, config.neuron_config.tp_degree, dtype=torch.int32
+    )
 
     for l in range(config.num_hidden_layers):  # noqa: E741
         # Copy router weights
@@ -263,7 +265,7 @@ class NeuronMixtralDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)[0]
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, present_key_value, cos_cache, sin_cache)
+        outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
 
         return outputs
 
@@ -317,8 +319,8 @@ class NeuronMixtralForCausalLM(NeuronBaseForCausalLM):
     _model_cls = NeuronMixtralModel
 
     @staticmethod
-    def load_hf_model(model_path):
-        return MixtralForCausalLM.from_pretrained(model_path)
+    def load_hf_model(model_path, **kwargs):
+        return MixtralForCausalLM.from_pretrained(model_path, **kwargs)
 
     @classmethod
     def get_config_cls(cls):

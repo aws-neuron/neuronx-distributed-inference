@@ -35,6 +35,7 @@ from neuronx_distributed.parallel_layers.mappings import (
     gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
+    _gather_along_first_dim,
 )
 from neuronx_distributed.parallel_layers.utils import get_padding_length
 from neuronx_distributed.utils import cpu_mode
@@ -124,7 +125,7 @@ def get_updated_configs(config: InferenceConfig):
             non_quant_config = copy.deepcopy(config)
             non_quant_config.neuron_config.quantized_mlp_kernel_enabled = False
             non_quant_config.neuron_config.activation_quantization_type = None
-            non_quant_config.neuron_config.quantize_clamp_bound = float('inf')
+            non_quant_config.neuron_config.quantize_clamp_bound = float("inf")
             updated_configs.append(non_quant_config)
         else:
             updated_configs.append(config)
@@ -170,7 +171,6 @@ def _helper_concat_and_delete_qkv(llama_state_dict, layer_num, attr):
             llama_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"],
         ],
     )
-
     del llama_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"]
     del llama_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"]
     del llama_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"]
@@ -194,6 +194,56 @@ def convert_state_dict_to_fused_qkv(llama_state_dict, cfg: InferenceConfig):
     gc.collect()
 
     return llama_state_dict
+
+
+class WeightGatheredColumnParallel(ColumnParallelLinear):
+    """
+    A specialized column-parallel linear layer that implements weight gathering optimization
+    for efficient processing of long sequences in transformer models during eagle speculation.
+
+    This layer provides two forward paths:
+    1. Standard column-parallel forward (inherited from parent)
+    2. Weight-gathered forward for long sequences
+    """
+    def forward_wg(self, input: torch, weight_gather: bool = False):
+        """
+        Performs the forward pass with optional weight gathering optimization.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape (batch_size, seq_len/TP, 2*hidden_size)
+            weight_gather (bool): Whether to use weight gathering optimization.
+                                Typically True for sequences >= 32K
+
+        Returns:
+            torch.Tensor or Tuple[torch.Tensor, torch.Tensor]:
+                - If skip_bias_add is False: Output tensor of shape (batch_size, seq_len, hidden_size)
+                - If skip_bias_add is True: Tuple of (output tensor, bias)
+        """
+        if weight_gather:
+            weight = _gather_along_first_dim(self.weight, process_group=self.tensor_parallel_group)
+            output = self._forward_impl(
+                input=input,
+                weight=weight,
+                bias=None,
+                async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
+                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                sequence_dimension=self.sequence_dimension,
+                autograd_func_class=self.autograd_func_class,
+                process_group=self.tensor_parallel_group
+            )
+
+            output = gather_from_sequence_parallel_region(
+                output,
+                self.sequence_dimension,
+                process_group=self.tensor_parallel_group,
+            )
+            if self.skip_bias_add:
+                return output, self.bias
+
+            output = (output + self.bias) if self.bias is not None else output
+            return output
+        else:
+            return self.forward(input)
 
 
 class LlamaInferenceConfig(InferenceConfig):
@@ -244,6 +294,7 @@ class NeuronLlamaMLP(nn.Module):
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
         self.rms_norm_eps = config.rms_norm_eps
         self.mlp_kernel_enabled = self.neuron_config.mlp_kernel_enabled
+        self.fused_rmsnorm_skip_gamma = self.config.neuron_config.fused_rmsnorm_skip_gamma
         self.quantized_mlp_kernel_enabled = self.neuron_config.quantized_mlp_kernel_enabled
         self.rmsnorm_quantize_kernel_enabled = self.neuron_config.rmsnorm_quantize_kernel_enabled
         self.quantize_clamp_bound = self.neuron_config.quantize_clamp_bound
@@ -251,8 +302,12 @@ class NeuronLlamaMLP(nn.Module):
         self.activation_quantization_type = self.neuron_config.activation_quantization_type
         mlp_bias = getattr(config, "mlp_bias", False)
 
-        if self.neuron_config.quantized_mlp_kernel_enabled and self.quantize_clamp_bound == float('inf'):
-            logging.warning("quantize_clamp_bound is not specified in NeuronConfig. We will use the default value of 1200 for llama models in quantized kernels.")
+        if self.neuron_config.quantized_mlp_kernel_enabled and self.quantize_clamp_bound == float(
+            "inf"
+        ):
+            logging.warning(
+                "quantize_clamp_bound is not specified in NeuronConfig. We will use the default value of 1200 for llama models in quantized kernels."
+            )
             self.quantize_clamp_bound = 1200.0
         if parallel_state.model_parallel_is_initialized():
             if self.neuron_config.quantized_mlp_kernel_enabled:
@@ -346,6 +401,7 @@ class NeuronLlamaMLP(nn.Module):
             ln_w = rmsnorm.weight.unsqueeze(0)
         else:
             ln_w = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
+
         # Handle SP RMSnorm
         x_orig_dtype = x.dtype
         if self.sequence_parallel_enabled:
@@ -468,7 +524,7 @@ class NeuronLlamaMLP(nn.Module):
         fused_residual = residual is not None
         fused_rmsnorm = rmsnorm is not None
         logger.debug(
-            f"MLP: kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_nc_config={self.logical_nc_config}"
+            f"MLP: kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, skip_gamma={self.fused_rmsnorm_skip_gamma}, logical_nc_config={self.logical_nc_config}"
         )
 
         # Choose which kernel to call
@@ -524,9 +580,10 @@ class NeuronLlamaMLP(nn.Module):
                 up_w,  # up_w
                 down_w,  # down_w
                 output_tensor,  # out
-                fused_rmsnorm=fused_rmsnorm,
-                eps=self.rms_norm_eps,
                 kernel_name="MLP",
+                fused_rmsnorm=fused_rmsnorm,
+                skip_gamma=self.fused_rmsnorm_skip_gamma,
+                eps=self.rms_norm_eps,
                 store_add=True,
             )
             original_seqlen = x.shape[1]
@@ -541,10 +598,11 @@ class NeuronLlamaMLP(nn.Module):
                 up_w,
                 down_w,
                 output_tensor,  # out
+                kernel_name="MLP",
                 # Run RMSNorm inside the kernel if NOT using SP rmsnorm
                 fused_rmsnorm=fused_rmsnorm,
+                skip_gamma=self.fused_rmsnorm_skip_gamma,
                 eps=self.rms_norm_eps,
-                kernel_name="MLP",
             )
             residual = None
 
@@ -595,6 +653,7 @@ class NeuronLlamaMLP(nn.Module):
 
         Returns a tuple of (output, residual), where residual is the output of the residual add
         """
+
         if self.mlp_kernel_enabled:
             # Quantized MLP kernel
             if self.quantized_mlp_kernel_enabled:
@@ -640,6 +699,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.rpl_reduce_dtype = config.neuron_config.rpl_reduce_dtype
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
         self.rms_norm_eps = config.rms_norm_eps
+        self.attn_tkg_builtin_kernel_enabled = self.neuron_config.attn_tkg_builtin_kernel_enabled
 
         if parallel_state.model_parallel_is_initialized():
             self.tp_degree = self.config.neuron_config.tp_degree
@@ -692,6 +752,9 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 # We include it here for compatibility with other scaling types.
                 self.rotary_emb = LlamaRotaryEmbedding(self.config)
 
+        if self.attn_tkg_builtin_kernel_enabled:
+            self.inv_freqs = self.rotary_emb.get_inv_freqs().unsqueeze(1)
+
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
 class Llama3RotaryEmbedding(nn.Module):
@@ -723,31 +786,32 @@ class Llama3RotaryEmbedding(nn.Module):
         self.old_context_len = original_max_position_embeddings
         self.register_buffer("inv_freq", None, persistent=False)
 
+    def get_inv_freqs(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        freq_indices = torch.arange(0, self.dim, 2, dtype=torch.float, device=device)
+        inv_freq = 1.0 / (self.base ** (freq_indices / self.dim))
+
+        low_freq_wavelen = self.old_context_len / self.low_freq_factor
+        high_freq_wavelen = self.old_context_len / self.high_freq_factor
+        new_freqs = []
+        for freq in inv_freq:
+            wavelen = 2 * math.pi / freq
+            if wavelen < high_freq_wavelen:
+                new_freqs.append(freq)
+            elif wavelen > low_freq_wavelen:
+                new_freqs.append(freq / self.factor)
+            else:
+                assert low_freq_wavelen != high_freq_wavelen
+                smooth = (self.old_context_len / wavelen - self.low_freq_factor) / (
+                    self.high_freq_factor - self.low_freq_factor
+                )
+                new_freqs.append((1 - smooth) * freq / self.factor + smooth * freq)
+        return torch.tensor(new_freqs, dtype=inv_freq.dtype, device=inv_freq.device)
+
     @torch.no_grad()
     def forward(self, x, position_ids):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if self.inv_freq is None:
-            inv_freq = 1.0 / (
-                self.base
-                ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
-            )
-
-            low_freq_wavelen = self.old_context_len / self.low_freq_factor
-            high_freq_wavelen = self.old_context_len / self.high_freq_factor
-            new_freqs = []
-            for freq in inv_freq:
-                wavelen = 2 * math.pi / freq
-                if wavelen < high_freq_wavelen:
-                    new_freqs.append(freq)
-                elif wavelen > low_freq_wavelen:
-                    new_freqs.append(freq / self.factor)
-                else:
-                    assert low_freq_wavelen != high_freq_wavelen
-                    smooth = (self.old_context_len / wavelen - self.low_freq_factor) / (
-                        self.high_freq_factor - self.low_freq_factor
-                    )
-                    new_freqs.append((1 - smooth) * freq / self.factor + smooth * freq)
-            self.inv_freq = torch.tensor(new_freqs, dtype=inv_freq.dtype, device=inv_freq.device)
+            self.inv_freq = self.get_inv_freqs(x.device)
 
         inv_freq_expanded = (
             self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
@@ -769,9 +833,11 @@ class NeuronLlamaDecoderLayer(nn.Module):
     def __init__(self, config: InferenceConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
+
         self.self_attn = _LLAMA_MODULE_MAP[config.neuron_config.attn_cls](
             config=config, tensor_model_parallel_group=get_tp_group(config)
         )
+
         self.mlp = NeuronLlamaMLP(config)
         logger.debug(
             f"Instantiating RMSNorm modules with hidden size {config.hidden_size} and EPS {config.rms_norm_eps}"
@@ -794,6 +860,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         self.quantized_mlp_kernel_enabled = config.neuron_config.quantized_mlp_kernel_enabled
         self.rmsnorm_quantize_kernel_enabled = config.neuron_config.rmsnorm_quantize_kernel_enabled
         self.mlp_kernel_fuse_residual_add = config.neuron_config.mlp_kernel_fuse_residual_add
+        self.qkv_kernel_fuse_residual_add = config.neuron_config.qkv_kernel_fuse_residual_add
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
         self.is_prefill_stage = config.neuron_config.is_prefill_stage
         self.config = config
@@ -812,16 +879,17 @@ class NeuronLlamaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         adapter_ids=None,
         rotary_position_ids: Optional[torch.LongTensor] = None,
+        residual: Optional[torch.Tensor] = None,  # residual from previous layer used by QKV
         **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        residual = hidden_states
-
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]], Optional[torch.FloatTensor], Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
+        entry_hidden_states = hidden_states
         # RMSNorm (fused with QKV kernel when SP is disabled)
         if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm:
             hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+        # produced another residual used by MLP
+        attn_output = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -829,9 +897,26 @@ class NeuronLlamaDecoderLayer(nn.Module):
             adapter_ids=adapter_ids,
             rmsnorm=self.input_layernorm,
             rotary_position_ids=rotary_position_ids,
+            residual=residual,
             **kwargs,
         )
 
+        if attn_output.residual is None:
+            residual = entry_hidden_states  # input to attention
+        else:
+            # residual will only be returned by attn/qkv if fuse add qkv kernel is enabled
+            assert self.qkv_kernel_fuse_residual_add, \
+                "residual add before qkv should be computed in the previous layer, \
+                 unless qkv_kernel_fuse_residual_add is specified"
+            assert (
+                not self.sequence_parallel_enabled
+            ), "qkv_kernel_fuse_residual_add should be off when sequence parallelism is enabled"
+            assert (
+                self.qkv_kernel_enabled
+            ), "qkv_kernel_fuse_residual_add should be used with qkv_kernel_enabled"
+            residual = attn_output.residual
+
+        hidden_states = attn_output.hidden_states
         if self.mlp_kernel_enabled and self.mlp_kernel_fuse_residual_add:
             assert (
                 not self.sequence_parallel_enabled
@@ -858,9 +943,14 @@ class NeuronLlamaDecoderLayer(nn.Module):
                 adapter_ids=adapter_ids,
             )
 
-        hidden_states = residual + hidden_states
+        # if fuse residual add with qkv, we leave this add to the next layer's QKV
+        # unless it is the last layer in which case we add it here
+        if not self.qkv_kernel_fuse_residual_add:
+            hidden_states = residual + hidden_states
+            residual = None  # set to None to prevent it from being used again
 
-        outputs = (hidden_states, present_key_value, cos_cache, sin_cache)
+        # also return residual for QKV in the next layer
+        outputs = (hidden_states, attn_output.present_key_value, attn_output.cos_cache, attn_output.sin_cache, residual)
         return outputs
 
 
@@ -922,7 +1012,8 @@ class NeuronLlamaModel(NeuronBaseModel):
                 self.padding_idx,
                 dtype=config.neuron_config.torch_dtype,
                 shard_across_embedding=not config.neuron_config.vocab_parallel,
-                sequence_parallel_enabled=False,
+                sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+                sequence_dimension=1,
                 pad=True,
                 tensor_model_parallel_group=get_tp_group(config),
                 use_spmd_rank=config.neuron_config.vocab_parallel,
@@ -949,6 +1040,7 @@ class NeuronLlamaModel(NeuronBaseModel):
             )
 
         updated_configs = get_updated_configs(config)
+
         self.layers = nn.ModuleList([NeuronLlamaDecoderLayer(conf) for conf in updated_configs])
 
         if not config.neuron_config.is_eagle_draft:
@@ -956,8 +1048,9 @@ class NeuronLlamaModel(NeuronBaseModel):
 
         if config.neuron_config.is_eagle_draft:
             fc_bias = getattr(config, "fc_bias", False)
-            self.fc = ColumnParallelLinear(
-                config.hidden_size * 2, config.hidden_size, bias=fc_bias, gather_output=True
+            # replicate fc weights since activations are sequence sharded
+            self.fc = WeightGatheredColumnParallel(
+                config.hidden_size * 2, config.hidden_size, bias=fc_bias, gather_output=True, sequence_dimension=1
             )
         self.is_medusa = config.neuron_config.is_medusa
         self.num_medusa_heads = config.neuron_config.num_medusa_heads
@@ -993,22 +1086,14 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
     _model_cls = NeuronLlamaModel
 
     @staticmethod
-    def load_hf_model(model_path):
-        return LlamaForCausalLM.from_pretrained(model_path)
+    def load_hf_model(model_path, **kwargs):
+        return LlamaForCausalLM.from_pretrained(model_path, **kwargs)
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
         """This function should be over-ridden in child classes as needed"""
+
         neuron_config = config.neuron_config
-        if neuron_config.fused_qkv:
-            state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
-
-        if neuron_config.vocab_parallel:
-            # TODO: this hack can be removed after replication_id is ready to use
-            state_dict["embed_tokens.rank_util.rank"] = torch.arange(
-                0, neuron_config.local_ranks_size
-            )
-
         # to facilitate rank usage in attention
         num_layers = config.num_hidden_layers
         tp_degree = neuron_config.tp_degree
@@ -1016,6 +1101,46 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
             state_dict[f"layers.{i}.self_attn.rank_util.rank"] = torch.arange(
                 0, tp_degree, dtype=torch.int32
             )
+
+            """
+            for every layer do the following transformations
+            gate_w_prime = (gate_w.T * gamma).T
+            up_w_prime = (up_w.T * gamma).T
+            """
+            if (
+                neuron_config.fused_rmsnorm_skip_gamma
+                and not neuron_config.sequence_parallel_enabled
+            ):
+                if neuron_config.mlp_kernel_enabled:
+                    # MLP
+                    state_dict[f"layers.{i}.mlp.gate_proj.weight"] = state_dict[
+                        f"layers.{i}.mlp.gate_proj.weight"
+                    ] * state_dict[f"layers.{i}.input_layernorm.weight"].unsqueeze(0)
+                    state_dict[f"layers.{i}.mlp.up_proj.weight"] = state_dict[
+                        f"layers.{i}.mlp.up_proj.weight"
+                    ] * state_dict[f"layers.{i}.input_layernorm.weight"].unsqueeze(0)
+
+                if neuron_config.qkv_kernel_enabled:
+                    # QKV
+                    state_dict[f"layers.{i}.self_attn.q_proj.weight"] = state_dict[
+                        f"layers.{i}.self_attn.q_proj.weight"
+                    ] * state_dict[f"layers.{i}.input_layernorm.weight"].unsqueeze(0)
+                    state_dict[f"layers.{i}.self_attn.k_proj.weight"] = state_dict[
+                        f"layers.{i}.self_attn.k_proj.weight"
+                    ] * state_dict[f"layers.{i}.input_layernorm.weight"].unsqueeze(0)
+                    state_dict[f"layers.{i}.self_attn.v_proj.weight"] = state_dict[
+                        f"layers.{i}.self_attn.v_proj.weight"
+                    ] * state_dict[f"layers.{i}.input_layernorm.weight"].unsqueeze(0)
+
+        if neuron_config.fused_qkv:
+            state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
+
+        if neuron_config.vocab_parallel:
+            # TODO: this hack can be removed after replication_id is ready to use
+            state_dict["embed_tokens.rank_util.rank"] = torch.arange(
+                0, neuron_config.local_ranks_size, dtype=torch.int32
+            )
+
         # to facilitate rank usage in base model
         state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
         return state_dict

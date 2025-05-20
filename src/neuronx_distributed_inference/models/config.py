@@ -1,10 +1,16 @@
+import inspect
 import json
 import logging
+import importlib
 import os
 import warnings
 from typing import Dict, List, Type, Union
+
 import torch
-from neuronx_distributed.quantization.quantization_config import QuantizedDtype, ActivationQuantizationType
+from neuronx_distributed.quantization.quantization_config import (
+    ActivationQuantizationType,
+    QuantizedDtype,
+)
 from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
@@ -31,6 +37,11 @@ def to_dict(obj):
         return {k: to_dict(v) for k, v in obj.items()}
     elif type(obj) is list:
         return [to_dict(v) for v in obj]
+    elif inspect.isclass(obj):
+        return {
+            "__module__": obj.__module__,
+            "__name__": obj.__name__,
+        }
     elif hasattr(obj, "__dict__"):
         return {k: to_dict(v) for k, v in obj.__dict__.items()}
     elif type(obj) is torch.dtype:
@@ -89,9 +100,14 @@ class NeuronConfig:
         # Embedding Config
         self.vocab_parallel = kwargs.pop("vocab_parallel", False)
 
+        # Layer boundary markers
+        self.layer_boundary_markers = kwargs.pop("layer_boundary_markers", False)
+
         # Attention
         self.fused_qkv = kwargs.pop("fused_qkv", False)
         self.sequence_parallel_enabled = kwargs.pop("sequence_parallel_enabled", False)
+        self.target_sequence_parallel_enabled = self.sequence_parallel_enabled
+        self.weight_gather_seq_len_threshold = kwargs.pop("weight_gather_seq_len_threshold", 32768)
         # TODO: Remove Llama attn_cls and multiple attention feature.
         self.attn_cls = kwargs.pop("attn_cls", "NeuronLlamaAttention")
 
@@ -165,8 +181,8 @@ class NeuronConfig:
             self.enable_fused_speculation = True
 
         if self.speculation_length > 0 and self.async_mode and not self.enable_fused_speculation:
-            raise IncompatibleConfigError(
-                "Unfused Speculative Decoding is not yet supported with async."
+            warnings.warn(
+                "Unfused Speculative Decoding + async mode may not result in performance improvements due to high likelihood of data dependent compute causing blocking calls."
             )
 
         # Added Token Tree config
@@ -215,7 +231,7 @@ class NeuronConfig:
         self.tp_degree = kwargs.pop("tp_degree", 1)
         self.pp_degree = kwargs.pop("pp_degree", 1)
         self.ep_degree = kwargs.pop("ep_degree", 1)
-        self.save_sharded_checkpoint = kwargs.pop("save_sharded_checkpoint", True)
+        self.save_sharded_checkpoint = kwargs.pop("save_sharded_checkpoint", False)
         self.skip_sharding = kwargs.pop("skip_sharding", False)
 
         # QK layer normalization
@@ -237,26 +253,74 @@ class NeuronConfig:
         # KV Cache tiling optimizations
         #   Tiling the sequence dimension of the KV cache enables specific
         #   compiler optimizations like cascaded reductions
-        self.kv_cache_tiling = False
-        if self.enable_eagle_speculation or self.enable_fused_speculation:
-            # TODO once compiler fixes CR 158191111 we can turn back output tiling on
-            # For all models. For now only use it for fused speculation that needs
-            # chaining of aliased tensors.
-            if self.max_length > 128 and self.max_length % 128 == 0:
-                # Our tile size is 128. We can tile only if sequence length is
-                # divisible by 128.
-                self.kv_cache_tiling = True
+
+        # Flag to allow users to disable kv cache tiling. If it exists, it'll be true.
+        self.disable_kv_cache_tiling = kwargs.pop("disable_kv_cache_tiling", False)
+        # If no user input has been taken in for kv cache tiling
+        if not self.disable_kv_cache_tiling:
+            self.kv_cache_tiling = False
+            if self.enable_eagle_speculation or self.enable_fused_speculation:
+                # TODO once compiler fixes CR 158191111 we can turn back output tiling on
+                # For all models. For now only use it for fused speculation that needs
+                # chaining of aliased tensors.
+                if self.max_length > 128 and self.max_length % 128 == 0:
+                    # Our tile size is 128. We can tile only if sequence length is
+                    # divisible by 128.
+                    self.kv_cache_tiling = True
+        else:  # User requested disabling of kv cache tiling
+            self.kv_cache_tiling = False
+
+        self.k_cache_transposed = kwargs.pop("k_cache_transposed", False)
 
         # Kernels
-        self.attn_kernel_enabled = kwargs.pop("attn_kernel_enabled", False)
+        self.attn_kernel_enabled = kwargs.pop("attn_kernel_enabled", False)  # CTE attention kernel.
         self.qkv_kernel_enabled = kwargs.pop("qkv_kernel_enabled", False)
         self.qkv_kernel_nbsd_layout = kwargs.pop("qkv_kernel_nbsd_layout", False)
         self.mlp_kernel_enabled = kwargs.pop("mlp_kernel_enabled", False)
+        self.fused_rmsnorm_skip_gamma = kwargs.pop("fused_rmsnorm_skip_gamma", False)
         self.mlp_kernel_fuse_residual_add = kwargs.pop("mlp_kernel_fuse_residual_add", False)
+        self.qkv_kernel_fuse_residual_add = kwargs.pop("qkv_kernel_fuse_residual_add", False)
         self.quantized_mlp_kernel_enabled = kwargs.pop("quantized_mlp_kernel_enabled", False)
         self.activation_quantization_type = kwargs.pop("activation_quantization_type", None)
         if self.activation_quantization_type is not None:
             validate_activation_quantization_type(self.activation_quantization_type)
+
+        # Token-gen attention kernels
+        self.attn_tkg_nki_kernel_enabled = kwargs.pop("attn_tkg_nki_kernel_enabled", False)
+        self.attn_tkg_builtin_kernel_enabled = kwargs.pop("attn_tkg_builtin_kernel_enabled", False)
+        self.attn_block_tkg_nki_kernel_enabled = kwargs.pop("attn_block_tkg_nki_kernel_enabled", False)
+        attn_tkg_kernel_enablement = [
+            self.attn_tkg_nki_kernel_enabled,
+            self.attn_tkg_builtin_kernel_enabled,
+            self.attn_block_tkg_nki_kernel_enabled,
+        ]
+        assert sum(attn_tkg_kernel_enablement) <= 1, (
+            "Multiple token-generation attention kernels enabled. Please enable no more than one of: "
+            "[attn-tkg-nki-kernel-enabled, attn-tkg-builtin-kernel-enabled, attn-block-tkg-nki-kernel-enabled]"
+        )
+
+        # Enable in-kernel KV cache update by default if attn_block_tkg_nki_kernel_enabled.
+        self.attn_block_tkg_nki_kernel_cache_update = kwargs.pop(
+            "attn_block_tkg_nki_kernel_cache_update", self.attn_block_tkg_nki_kernel_enabled
+        )
+        if not self.attn_block_tkg_nki_kernel_enabled:
+            assert not self.attn_block_tkg_nki_kernel_cache_update, \
+                'attn-block-tkg-nki-kernel-cache-update can only be enabled with attn-block-tkg-nki-kernel-enabled'
+        if self.attn_block_tkg_nki_kernel_cache_update:
+            self.kv_cache_tiling = False  # Don't do kv cache tiling when kernel does cache update.
+
+        # Check attention features incompatible with attention block kernel or transposed K cache.
+        attn_tkg_or_k_cache_tp__incompatible_features = [
+            (self.flash_decoding_enabled, 'flash decoding'),
+            (self.is_chunked_prefill, 'contexted prefill'),
+            (self.is_block_kv_layout, 'block KV cache'),
+        ]
+        if sum(attn_tkg_kernel_enablement) > 0:
+            for flag, feature in attn_tkg_or_k_cache_tp__incompatible_features:
+                assert not flag, f'Attention TKG kernels do not yet support {feature} feature.'
+        if self.k_cache_transposed:
+            for flag, feature in attn_tkg_or_k_cache_tp__incompatible_features:
+                assert not flag, f'Transposed K cache is not yet supported by {feature} feature.'
 
         if self.quantized_mlp_kernel_enabled or self.mlp_kernel_enabled:
             assert not (
@@ -267,7 +331,7 @@ class NeuronConfig:
             assert (
                 self.quantized_mlp_kernel_enabled
             ), "quantized_mlp_kernel must be enabled to use rmsomrm_quantize_kernel!"
-        self.quantize_clamp_bound = kwargs.pop("quantize_clamp_bound", float('inf'))
+        self.quantize_clamp_bound = kwargs.pop("quantize_clamp_bound", float("inf"))
 
         if self.quantized or self.is_mlp_quantized():
             if self.qkv_kernel_enabled:
@@ -277,7 +341,7 @@ class NeuronConfig:
             elif not self.modules_to_not_convert:
                 warnings.warn(
                     "modules_to_not_convert is not provided. Assuming all modules will be quantized.",
-                    UserWarning
+                    UserWarning,
                 )
 
         # Logical NeuronCore Configuration (LNC)
@@ -311,7 +375,7 @@ class NeuronConfig:
         self._verify_quantized_config()
 
         # warmup flag
-        self.skip_warmup = kwargs.pop("skip_warmup", False)
+        self.skip_warmup = kwargs.pop("skip_warmup", True if get_platform_target() == "trn2" else False)
 
     def _verify_quantized_config(self):
         if not self.quantized:
@@ -331,8 +395,6 @@ class NeuronConfig:
             )
             warnings.warn(warning_message, category=DeprecationWarning)
             return self.logical_nc_config
-
-        # Maintain backward compatibility without serializing deprecated 'logical_neuron_cores' attr.
 
         if name == "trace_tokengen_model":
             warning_message = (
@@ -510,9 +572,22 @@ class InferenceConfig:
                 merged_kwargs["fused_spec_config"]["draft_config"] = cls(
                     **merged_kwargs["fused_spec_config"]["draft_config"]
                 )
-            merged_kwargs["fused_spec_config"] = FusedSpecNeuronConfig(
+            fused_spec_config = FusedSpecNeuronConfig(
                 **merged_kwargs["fused_spec_config"]
             )
+
+            model_cls_name = fused_spec_config.worker_cls["__name__"]
+            neuron_module_path = fused_spec_config.worker_cls["__module__"]
+            try:
+                neuron_module = importlib.import_module(neuron_module_path)
+                fused_spec_config.worker_cls = getattr(neuron_module, model_cls_name)
+            except Exception as e:
+                raise ModuleNotFoundError(
+                    f"Failed to load class {model_cls_name} from module {neuron_module_path}. "
+                    f"Make sure the module exists in NxDI and model class is supported. "
+                    f"If the compiled model is from NxDI v0.2 or earlier, try recompiling the model."
+                ) from e
+            merged_kwargs["fused_spec_config"] = fused_spec_config
 
         return cls(**merged_kwargs)
 

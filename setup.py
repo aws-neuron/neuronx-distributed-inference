@@ -1,9 +1,25 @@
 from setuptools import PEP420PackageFinder, setup
+import os
+import subprocess
+from subprocess import CalledProcessError
+
+
+def get_version(version_str):
+    major, minor, patch = version_str.split(".")
+    patch = os.getenv('VERSION_PATCH', patch)
+    suffix = os.getenv('SUFFIX')
+    if not suffix:
+        try:
+            suffix = f'{subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()[0:8]}.dev'
+        except CalledProcessError:
+            suffix = 'dev'
+    return f"{major}.{minor}.{patch}+{suffix}"
+
 
 exec(open("src/neuronx_distributed_inference/_version.py").read())
 setup(
     name="neuronx-distributed-inference",
-    version=__version__,  # noqa F821
+    version=get_version(__version__),  # noqa F821
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",

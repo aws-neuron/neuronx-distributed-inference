@@ -1,5 +1,6 @@
 import os
 
+import torch
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
 
 
@@ -26,3 +27,12 @@ def get_tp_group(config):
     if config.neuron_config.use_draft_group:
         return parallel_state.get_speculative_draft_group(as_list=False)
     return parallel_state.get_tensor_model_parallel_group(as_list=False)
+
+
+def get_dp_rank_spmd(global_rank: torch.tensor, tp_degree: int):
+    dp_rank = torch.div(
+        global_rank,
+        tp_degree,
+        rounding_mode="floor",
+    ).to(torch.int32)
+    return dp_rank

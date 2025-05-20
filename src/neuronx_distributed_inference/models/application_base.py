@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 import warnings
 from functools import partial
@@ -135,9 +136,6 @@ class NeuronApplicationBase(torch.nn.Module):
         # TODO: improve the config access
         return cls.get_config_cls().get_neuron_config_cls()
 
-    def set_async_mode(self, async_mode: bool):
-        pass
-
     def _get_spmd_model_objects(self, key):
         key = key.lower()
         if self.is_loaded_to_neuron:
@@ -156,11 +154,13 @@ class NeuronApplicationBase(torch.nn.Module):
         if pre_shard_weights_hook:
             pre_shard_weights_hook(self)
 
-        if self.neuron_config.skip_sharding or not self.neuron_config.save_sharded_checkpoint:
+        if self.neuron_config.skip_sharding:
             logger.info(
-                f"SKIPPING sharding the checkpoint at {sharded_checkpoint_dir}, assuming it's already sharded; "
-                f"However, if you switch to enable or disable kernels that modifies model weights such as MLP, "
-                f"fused QKV kernels, please re-shard it!"
+                "Pre-sharding the checkpoints is forced to be SKIPPED with skip_sharding."
+            )
+        elif not self.neuron_config.save_sharded_checkpoint:
+            logger.info(
+                "SKIPPING pre-sharding the checkpoints. The checkpoints will be sharded during load time."
             )
         else:
             self.get_builder(debug).shard_checkpoint(serialize_path=sharded_checkpoint_dir)
@@ -170,13 +170,18 @@ class NeuronApplicationBase(torch.nn.Module):
                     sharded_checkpoint_dir=sharded_checkpoint_dir
                 )
 
-    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None):
+    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None, dry_run=False):
+        """Compiles this model and saves it to the given path."""
         compiled_model_path = normalize_path(compiled_model_path)
 
-        """Compiles this model and saves it to the given path."""
         self.config.save(compiled_model_path)
 
-        traced_model = self.get_builder(debug).trace(initialize_model_weights=False)
+        traced_model = self.get_builder(debug).trace(
+            initialize_model_weights=False, dry_run=dry_run
+        )
+        if dry_run:
+            return
+
         torch.jit.save(traced_model, compiled_model_path + COMPILED_MODEL_FILE_NAME)
         del traced_model
 
@@ -210,26 +215,32 @@ class NeuronApplicationBase(torch.nn.Module):
     def warmup(self):
         """Invoke each model once to trigger any lazy initializations."""
         logger.info("Warming up the model.")
-        # async mode should be false for warmup
-        if self.neuron_config.async_mode:
-            self.set_async_mode(False)
         start_time = time.time()
         for model in self.models:
             example_inputs = model.input_generator()
             for example in example_inputs:
                 try:
-                    model.model.nxd_model.forward(example)
-                except Exception as e:
-                    tag = model.tag
-                    example_shapes = [x.shape for x in example]
-                    logger.warn(
-                        f"Ignored an exception during warmup of model tagged as '{tag}' using inputs with shapes '{example_shapes}'",
-                        exc_info=e,
-                    )
+                    if self.neuron_config.async_mode:
+                        ranked_input = [
+                            example
+                            for _ in range(self.neuron_config.tp_degree)
+                        ]
+                        ranked_output = model.model.nxd_model.forward_async(
+                            ranked_input
+                        )
+                        # block immediately
+                        [[out_tensor.cpu() for out_tensor in output] for output in ranked_output]
+                    else:
+                        model.model.nxd_model.forward(example)
+                except RuntimeError as e:
+                    error_name = e.__class__.__name__
+                    errors = re.findall("RuntimeError:.*Error", str(e))
+                    if len(errors) > 0:
+                        error_name = errors[-1]
+                    logger.warning(
+                        f"Received a {error_name} during warmup of a model tagged as {model.tag}. This is safe to ignore."
+                    )  # this wont lead to cold starts since NRT is still executing the neffs
 
-        # re-enable async mode once warmup is complete if async mode is enabled
-        if self.neuron_config.async_mode:
-            self.set_async_mode(True)
         logger.info(f"Warmup completed in {time.time() - start_time} seconds.")
 
     def load_weights(self, compiled_model_path, start_rank_id=None, local_ranks_size=None):
@@ -244,26 +255,26 @@ class NeuronApplicationBase(torch.nn.Module):
         if local_ranks_size is None:
             local_ranks_size = self.neuron_config.local_ranks_size
 
-        logging.info(
-            f"loading models for ranks {start_rank_id}...{start_rank_id + local_ranks_size - 1}"
-        )
         weights = []
-        for rank in range(start_rank_id, start_rank_id + local_ranks_size):
-            if self.neuron_config.save_sharded_checkpoint or self.neuron_config.skip_sharding:
+        start_time = time.monotonic()
+        if self.neuron_config.save_sharded_checkpoint:
+            logging.info(
+                f"Loading presharded checkpoints for {start_rank_id}...{start_rank_id + local_ranks_size - 1}"
+            )
+            for rank in range(start_rank_id, start_rank_id + local_ranks_size):
                 ckpt = load_file(
                     os.path.join(
                         compiled_model_path, f"weights/tp{rank}_sharded_checkpoint.safetensors"
                     )
                 )
-            else:
-                print(f"There are no saved sharded checkpoints. Sharding and loading rank {rank}")
-                source_model_key = list(self.get_builder().model_collection.keys())[0]
-                ckpt = self.get_builder().shard_weights(
-                    rank, self.get_builder().model_collection[source_model_key]
-                )
-            weights.append(ckpt)
+                weights.append(ckpt)
+        else:
+            logger.info("Sharding weights on load...")
+            weights = self.get_builder().shard_checkpoint()
+
         start_rank_tensor = torch.tensor([start_rank_id], dtype=torch.int32, device="cpu")
         self.traced_model.nxd_model.initialize(weights, start_rank_tensor)
+        logger.info(f"Finished weights loading in {time.monotonic() - start_time} seconds")
 
     def to_cpu(self):
         """
@@ -326,7 +337,7 @@ class NeuronApplicationBase(torch.nn.Module):
     def checkpoint_loader_fn(self, mmap: bool = False):
         """This function loads the model's state dictionary and weights from the hf model"""
 
-        model_path = self.model_path
+        model_path = getattr(self.config, "_name_or_path", self.model_path)
 
         if self.config.neuron_config.quantized:
             existing_checkpoint_path = self.config.neuron_config.quantized_checkpoints_path
@@ -342,10 +353,10 @@ class NeuronApplicationBase(torch.nn.Module):
                     current_dtype = self.neuron_config.torch_dtype
                     # only cast floating types
                     if name.endswith("scale"):
-                        warnings.warn(f"Found float32 scales, skip converting to {current_dtype}")
-                    else:
+                        warnings.warn(f"Found {param.dtype} scales, skip converting to {current_dtype}")
+                    elif param.dtype != current_dtype:
                         warnings.warn(
-                            f"Found float32 weights in checkpoint: {name}. Will convert to {current_dtype}"
+                            f"Found {param.dtype} weights in checkpoint: {name}. Will convert to {current_dtype}"
                         )
                         _model_sd[name] = param.to(current_dtype)
 
@@ -367,13 +378,17 @@ class NeuronApplicationBase(torch.nn.Module):
         return model_sd
 
     @classmethod
-    def get_state_dict(cls, model_path: str, config: InferenceConfig) -> dict:
+    def get_state_dict(cls, model_name_or_path: str, config: InferenceConfig) -> dict:
         """Gets the state dict for this model."""
 
-        if os.path.isdir(model_path):
-            model_sd = load_state_dict(model_path)
+        if os.path.isdir(model_name_or_path):
+            model_sd = load_state_dict(model_name_or_path)
+        elif os.path.isfile(model_name_or_path):
+            model_sd = torch.load(model_name_or_path)
         else:
-            model_sd = torch.load(model_path)
+            # model_name_or_path is a model name
+            model = cls.load_hf_model(model_name_or_path, device_map="cpu")
+            model_sd = model.state_dict()
 
         param_name_list = list(model_sd.keys())
         for param_name in param_name_list:
@@ -388,9 +403,16 @@ class NeuronApplicationBase(torch.nn.Module):
                 model_sd[updated_param_name] = model_sd[param_name]
                 del model_sd[param_name]
 
-        if os.path.exists(model_path + "/medusa_heads.pt"):
-            medusa_head = torch.load(model_path + "/medusa_heads.pt", map_location="cpu")
-            model_sd.update(medusa_head)
+        if config.neuron_config.is_medusa:
+            if os.path.exists(model_name_or_path + "/medusa_heads.pt"):
+                medusa_head = torch.load(model_name_or_path + "/medusa_heads.pt", map_location="cpu")
+                model_sd.update(medusa_head)
+            else:
+                raise FileNotFoundError(
+                    f"Medusa head is not found in {model_name_or_path}/medusa_heads.pt."
+                    "Recompile the model with save_sharded_checkpoint=True."
+                )
+
         model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
         if getattr(config, "tie_word_embeddings", False):
             cls.update_state_dict_for_tied_weights(model_sd)

@@ -103,7 +103,11 @@ def within_bounds(inputs: Dict[str, Any], max_length: int, generation_length: in
 def will_hit_bucket_boundary(known_length: int, buckets: List[int], max_num_tokens_generated=1):
     hits_bucket_boundary = False
     for bucket in buckets:
-        if known_length < bucket and (known_length + max_num_tokens_generated) >= bucket:
+        # we do max_num_tokens_generated * 2 because we speculatively execute one step
+        # ahead, before knowing the results of the current neff execution. In the worst case
+        # both neffs will have full matching tokens, which is problematic near the bucket boundary
+        # therefore, we will execute at a higher bucket in such cases.
+        if known_length < bucket and (known_length + max_num_tokens_generated * 2) >= bucket:
             hits_bucket_boundary = True
             return hits_bucket_boundary
 
@@ -150,61 +154,75 @@ def causal_lm_async_execution(
     )
     known_seqlen = inputs["attention_mask"].shape[1]
     hits_bucket_boundary = will_hit_bucket_boundary(
-        known_seqlen, buckets=generation_model.neuron_config.buckets, max_num_tokens_generated=generation_length
+        known_seqlen,
+        buckets=generation_model.neuron_config.buckets,
+        max_num_tokens_generated=generation_length,
     )
 
-    if neuron_base_instance.prior_outputs is not None and (
+    stay_in_sync_mode = (
         not torch.equal(neuron_base_instance.prior_seq_ids, inputs["seq_ids"])
         or hits_bucket_boundary
-    ):
+    )
+    start_async = not stay_in_sync_mode and neuron_base_instance.prior_outputs is None
+    continue_async = not stay_in_sync_mode and not start_async
+
+    if stay_in_sync_mode:
         # reset async state
         neuron_base_instance.prior_outputs = None
         neuron_base_instance.prior_seq_ids = None
 
-    if neuron_base_instance.prior_outputs is None:
+    if stay_in_sync_mode or start_async:
         next_outputs, is_run_on_neuron = execute_model(
             neuron_base_instance,
             generation_model,
             inputs,
             hits_bucket_boundary=hits_bucket_boundary,
         )
-        neuron_base_instance.prior_outputs = next_outputs
-        neuron_base_instance.prior_seq_ids = inputs["seq_ids"]
+        if start_async:
+            neuron_base_instance.prior_outputs = next_outputs
+            neuron_base_instance.prior_seq_ids = inputs["seq_ids"]
 
-    if within_bounds(inputs, neuron_base_instance.neuron_config.seq_len, generation_length):
-        next_outputs = neuron_base_instance.prior_outputs
-        inputs["input_ids"] = next_outputs.get_ranked_tensor()
-        if neuron_base_instance.next_cpu_inputs is not None:
-            inputs["attention_mask"] = neuron_base_instance.next_cpu_inputs["attention_mask"]
-            inputs["position_ids"] = neuron_base_instance.next_cpu_inputs["position_ids"]
-        elif not is_fused_speculation:
-            raise RuntimeError(
-                "Expected next_cpu_inputs to be generated for a non fused_spec model."
-            )
+    if start_async or continue_async:
+        if within_bounds(inputs, neuron_base_instance.neuron_config.seq_len, generation_length):
+            next_outputs = neuron_base_instance.prior_outputs
+            inputs["input_ids"] = next_outputs.get_ranked_tensor()
+            if neuron_base_instance.next_cpu_inputs is not None:
+                inputs["attention_mask"] = neuron_base_instance.next_cpu_inputs["attention_mask"]
+                inputs["position_ids"] = neuron_base_instance.next_cpu_inputs["position_ids"]
+            elif not is_fused_speculation:
+                raise RuntimeError(
+                    "Expected next_cpu_inputs to be generated for a non fused_spec model."
+                )
 
-        next_outputs, is_run_on_neuron = execute_model(
-            neuron_base_instance, generation_model, inputs
-        )
-    else:
-        if neuron_base_instance.prior_outputs is not None:
-            outputs = neuron_base_instance.prior_outputs.sync_async_result_to_cpu(
-                inputs["seq_ids"], is_fused_speculation=is_fused_speculation
+            next_outputs, is_run_on_neuron = execute_model(
+                neuron_base_instance, generation_model, inputs
             )
-            neuron_base_instance.prior_outputs = None
-            neuron_base_instance.prior_seq_ids = None
-            neuron_base_instance.async_should_stop = True
         else:
-            raise RuntimeError(
-                "The stopping criteria for fused async should have been triggered, but it wasn't."
-            )
+            if neuron_base_instance.prior_outputs is not None:
+                outputs = neuron_base_instance.prior_outputs.sync_async_result_to_cpu(
+                    inputs["seq_ids"], is_fused_speculation=is_fused_speculation
+                )
+                neuron_base_instance.prior_outputs = None
+                neuron_base_instance.prior_seq_ids = None
+                neuron_base_instance.async_should_stop = True
+            else:
+                raise RuntimeError(
+                    "The stopping criteria for fused async should have been triggered, but it wasn't."
+                )
 
-        return outputs, True  # assume async mode only runs on neuron
+            return outputs, True  # assume async mode only runs on neuron
 
     # output to be returned
-    outputs: AsyncTensorWrapper = neuron_base_instance.prior_outputs
+    outputs: AsyncTensorWrapper = neuron_base_instance.prior_outputs if not stay_in_sync_mode else next_outputs
     outputs = outputs.sync_async_result_to_cpu(
         inputs["seq_ids"], is_fused_speculation=is_fused_speculation
     )
+
+    if stay_in_sync_mode:
+        # make sure prior outputs is not set
+        neuron_base_instance.prior_outputs = None
+        neuron_base_instance.prior_seq_ids = None
+        return outputs, is_run_on_neuron
 
     # next step
     neuron_base_instance.prior_outputs = next_outputs

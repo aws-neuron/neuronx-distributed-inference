@@ -3,6 +3,7 @@ from functools import partial
 
 import pytest
 import torch
+import torch_neuronx
 from neuronx_distributed.operators.topk import topk as nxd_topk
 from neuronx_distributed.parallel_layers.layers import ParallelEmbedding, SPMDRank
 from neuronx_distributed.trace.model_builder import BaseModelInstance, ModelBuilder
@@ -132,7 +133,7 @@ def test_vocab_parallel_embedding(batch_size, sequence_length, tp_degree, dtype,
 
     model.eval()
     cpu_output = model.cpu_forward(input_ids)
-    torch.testing.assert_close(
+    torch_neuronx.testing.assert_close(
         cpu_output,
         tuple([x.to("cpu") for x in traced_output]),
         atol=1e-3,

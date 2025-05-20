@@ -25,7 +25,10 @@ from neuronx_distributed_inference.modules.attention.attention_base import (
     FlashAttentionStrategy,
     NeuronAttentionBase,
 )
-from neuronx_distributed_inference.modules.attention.utils import repeat_kv
+from neuronx_distributed_inference.modules.attention.utils import (
+    neuron_scaled_dot_product_attention,
+    repeat_kv,
+)
 
 from .aspect_ratio_utils import convert_aspect_ratios_to_ids
 from .encoder_utils import (
@@ -246,7 +249,7 @@ class NeuronImageAttention(NeuronAttentionBase):
             logger.debug(f"Attn output after reshape {attn_output.shape}")
         else:
             # shape: BHSD
-            attn_output = F.scaled_dot_product_attention(
+            attn_output = neuron_scaled_dot_product_attention(
                 Q_cat, K_cat, V, attn_mask=None, scale=scale
             )
         return attn_output

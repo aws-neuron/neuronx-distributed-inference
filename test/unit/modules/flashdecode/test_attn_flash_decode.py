@@ -3,6 +3,7 @@ from functools import partial
 
 import pytest
 import torch
+import torch_neuronx
 import torch.distributed
 from neuronx_distributed.parallel_layers import ColumnParallelLinear
 from neuronx_distributed.trace.model_builder import BaseModelInstance, ModelBuilder
@@ -100,11 +101,11 @@ def test_shard_over_sequence(num_heads, past_sequence_length, tp_degree, dtype):
     model.eval()
     cpu_output = model.cpu_forward(active_scores)
     print(f" cpu_output shape {cpu_output[0].shape} {cpu_output[1].shape}")
-    torch.testing.assert_close(
+    torch_neuronx.testing.assert_close(
         cpu_output[0][..., : (past_sequence_length // tp_degree)],
         traced_output[0].to("cpu"),
-        atol=1e-3,
-        rtol=1e-3,
+        atol=2.5e-4,
+        rtol=1e-5,
     )
 
 

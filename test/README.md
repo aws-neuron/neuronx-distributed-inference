@@ -88,7 +88,7 @@ neuronx_distributed_inference.utils.testing.validate_accuracy(neuron_model, inpu
 
 Validates the accuracy of a Neuron model. This function tests that the model produces expected
 outputs, which you can provide and/or produce on CPU. To compare outputs, this function uses
-`torch.testing.assert_close`. If the output isn't similar, this function raises an
+`torch_neuronx.testing.assert_close`. If the output isn't similar, this function raises an
 AssertionError.
 
 Arguments:
@@ -98,7 +98,7 @@ Arguments:
 * `expected_outputs`: The list of expected outputs for each input. If not provided, this
   function compares against the CPU output for each input.
 * `cpu_callable`: The callable to use to produce output on CPU.
-* `assert_close_kwargs`: The kwargs to pass to `torch.testing.assert_close`.
+* `assert_close_kwargs`: The kwargs to pass to `torch_neuronx.testing.assert_close`.
 
 #### Examples
 

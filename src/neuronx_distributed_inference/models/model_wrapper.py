@@ -69,6 +69,7 @@ class ModelWrapper(torch.nn.Module):
         base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
         self.compiler_workdir = os.path.join(base_compile_work_dir, self.tag)
 
+        hlo2tensorizer = ""
         if compiler_args is None:
             tensorizer_options = (
                 "--enable-ccop-compute-overlap "
@@ -93,9 +94,16 @@ class ModelWrapper(torch.nn.Module):
                 # force Modular flow for CTE model to save compile time
                 # TKG model can use default (-O2) to avoid function call overheads with Modular flow
                 self.compiler_args += " -O1 "
+                # Set threshold low so that modular flow always kicks in for context encoding graph.
+                # This is needed because lots of mac-ops happen in kernels which are not visible to the graph partitioner at the moment.
+                hlo2tensorizer += " --modular-flow-mac-threshold=10 "
 
             if self.neuron_config.target:
                 self.compiler_args += f" --target {self.neuron_config.target}"
+
+            # disable further partitioning when using markers to avoid compiler errors"
+            if self.neuron_config.layer_boundary_markers:
+                hlo2tensorizer += " --recursive-layer-det=false "
 
         else:
             self.compiler_args = compiler_args
@@ -109,9 +117,10 @@ class ModelWrapper(torch.nn.Module):
             or self.neuron_config.quantized_mlp_kernel_enabled
             or self.neuron_config.activation_quantization_type
         ):
-            self.compiler_args += (
-                " --internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3' "
-            )
+            hlo2tensorizer += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 "
+
+        if hlo2tensorizer:
+            self.compiler_args += f" --internal-hlo2tensorizer-options='{hlo2tensorizer}' "
 
         logging.info(f"neuronx-cc compiler_args are: {self.compiler_args}")
 
@@ -155,18 +164,27 @@ class ModelWrapper(torch.nn.Module):
         """Generate a list of valid sample inputs containing one input list for each bucket."""
         inputs = []
         for bucket in self.neuron_config.buckets:
-            n_active_tokens = (
-                bucket
-                if self.neuron_config.bucket_n_active_tokens
-                else self.neuron_config.n_active_tokens
-            )
             batch_size = self.neuron_config.batch_size
+            if isinstance(bucket, list) and self.neuron_config.is_prefix_caching:
+                n_active_tokens = (
+                    bucket[0]
+                    if self.neuron_config.bucket_n_active_tokens
+                    else self.neuron_config.n_active_tokens
+                )
+                prefix_size = bucket[1]
+                attention_mask = torch.ones((batch_size, bucket[1]), dtype=torch.int32)
+            else:
+                n_active_tokens = (
+                    bucket
+                    if self.neuron_config.bucket_n_active_tokens
+                    else self.neuron_config.n_active_tokens
+                )
+                attention_mask = torch.ones((batch_size, bucket), dtype=torch.int32)
 
             # TODO: Find a better way to ensure warmup invocations work. Some models
             # like 405B with eagle speculation seem to have problems with torch.zeros
             # as warmup input that causes some buckets to not warmup up.
             input_ids = torch.ones((batch_size, n_active_tokens), dtype=torch.int32)
-            attention_mask = torch.ones((batch_size, bucket), dtype=torch.int32)
             if self.tag != CONTEXT_ENCODING_MODEL_TAG and self.tag != MEDUSA_MODEL_TAG:
                 position_ids = torch.ones((batch_size, n_active_tokens), dtype=torch.int32)
             else:
@@ -283,10 +301,8 @@ class ModelWrapper(torch.nn.Module):
             elif self.is_prefix_caching:
                 slot_mapping = torch.zeros((batch_size, n_active_tokens), dtype=torch.int32)
 
-                max_total_len = self.neuron_config.max_length
-                max_blocks_per_seq = max_total_len // self.neuron_config.pa_block_size
                 active_block_table = torch.zeros(
-                    (batch_size, max_blocks_per_seq), dtype=torch.int32
+                    (batch_size, prefix_size // self.neuron_config.pa_block_size), dtype=torch.int32
                 )
 
                 # number of queries in current request only
@@ -294,7 +310,7 @@ class ModelWrapper(torch.nn.Module):
                 num_queries = torch.zeros((batch_size, 1), dtype=torch.int32)
 
                 # length of context excluding the current request
-                computed_context_lens = torch.zeros((batch_size, 1), dtype=torch.int32)
+                computed_context_lens = torch.full((batch_size, 1), prefix_size, dtype=torch.int32)
 
                 inputs.append(
                     (
@@ -495,6 +511,22 @@ class ModelWrapper(torch.nn.Module):
             if self.tag == CONTEXT_ENCODING_MODEL_TAG
             else self.neuron_config.max_length
         )
+        if isinstance(self.neuron_config.buckets[-1], list) and self.neuron_config.is_prefix_caching:
+            # 2D bucketing for prefix caching
+            pad_lengths = self.get_target_2d_bucket_for_prefix_caching(*args, strategy=pad_type)
+            if self.tag == CONTEXT_ENCODING_MODEL_TAG and self.neuron_config.is_prefix_caching:
+                padded_inputs = F.pad(args[0], (0, pad_lengths[0] - args[0].shape[1]), "constant", self.config.pad_token_id)
+                padded_attn_mask = F.pad(args[1], (0, pad_lengths[1] - args[1].shape[1]), "constant", 0)
+                padded_position_id = F.pad(args[2], (0, pad_lengths[0] - args[2].shape[1]), "constant", 1)
+                padded_slot_mapping = F.pad(args[11], (0, pad_lengths[0] - args[11].shape[1]), "constant", -1)
+                padded_block_table = F.pad(args[12], (0, (pad_lengths[1] // self.neuron_config.pa_block_size) - args[12].shape[1]), "constant", 0)
+                args = (padded_inputs, padded_attn_mask, padded_position_id, *args[3:11], padded_slot_mapping, padded_block_table, *args[13:])
+                return tuple(args)
+            else:
+                padded_attn_mask = F.pad(args[1], (0, pad_lengths[1] - args[1].shape[1]), "constant", 0)
+                padded_block_table = F.pad(args[12], (0, (pad_lengths[1] // self.neuron_config.pa_block_size) - args[12].shape[1]), "constant", 0)
+                args = (*args[0:1], padded_attn_mask, *args[2:12], padded_block_table, *args[13:])
+                return tuple(args)
 
         if pad_type == "first_fit" or pad_type == "second_fit":
             pad_length = self.get_target_bucket(*args, strategy=pad_type)
@@ -587,22 +619,23 @@ class ModelWrapper(torch.nn.Module):
     def get_target_bucket(self, *args, strategy="first_fit"):
         # NOTE: strategy must be a subset of pad_type for consistency
 
-        attention_mask = args[1]
-        input_len = attention_mask.shape[1]
+        input_len = args[1].shape[1]
+        buckets = self.neuron_config.buckets
         speculation_length = (
-            self.neuron_config.speculation_length if self.tag == FUSED_SPECULATION_MODEL_TAG else 0
+            self.neuron_config.speculation_length
+            if self.tag == FUSED_SPECULATION_MODEL_TAG or self.tag == SPECULATION_MODEL_TAG
+            else 0
         )
-        for i, bucket in enumerate(self.neuron_config.buckets):
-            if input_len + speculation_length < bucket:
-                if strategy == "first_fit":
+        largest_bucket_idx = len(buckets) - 1
+        for i, bucket in enumerate(buckets):
+            if strategy == "first_fit":
+                if input_len + speculation_length < bucket:
                     return bucket
-                elif strategy == "second_fit" and bucket != self.neuron_config.buckets[-1]:
-                    return self.neuron_config.buckets[i + 1]
-                else:
-                    # next highest bucket doesn't exist, so return current bucket
-                    return bucket
+            elif strategy == "second_fit":
+                if input_len < bucket:
+                    return buckets[min(i + 1, largest_bucket_idx)]
 
-        largest_bucket = self.neuron_config.buckets[-1]
+        largest_bucket = buckets[largest_bucket_idx]
         if input_len + speculation_length == largest_bucket:
             return largest_bucket
         elif self.neuron_config.allow_input_truncation:
@@ -611,6 +644,16 @@ class ModelWrapper(torch.nn.Module):
         raise ValueError(
             f"Input len {input_len} exceeds largest bucket ({largest_bucket}) for {self.tag}"
         )
+
+    def get_target_2d_bucket_for_prefix_caching(self, *args, strategy="first_fit"):
+        buckets = torch.tensor(self.neuron_config.buckets)
+        assert strategy != "second_fit", f"2D bucketing does not support {strategy}"
+        vertical_dim = args[13]
+        horizontal_dim = args[14]
+        mask = (buckets[:, 0] >= vertical_dim) & (buckets[:, 1] >= horizontal_dim)
+        index = torch.nonzero(mask)
+        bucket_idx = index[0][1]
+        return buckets[bucket_idx]
 
     def _process_async_inputs(self, *args):
         """
@@ -673,13 +716,10 @@ class ModelWrapper(torch.nn.Module):
                 ranked_out_replacing.add(2)  # position_ids
                 for i in range(self.neuron_config.local_ranks_size):
                     ranked_args[i].append(
-                        args[0][i][2].reshape(  # attention_mask
-                            batch_size, -1  # B x bucket_dim
-                        )
+                        args[0][i][2].reshape(batch_size, -1)  # attention_mask  # B x bucket_dim
                     )
                     ranked_args[i].append(
-                        args[0][i][3].reshape(  # position_ids
-                            batch_size, 1)  # B x 1
+                        args[0][i][3].reshape(batch_size, 1)  # position_ids  # B x 1
                     )
             else:  # cte + tkg flow
                 n_active_tokens = (
@@ -724,6 +764,24 @@ class ModelWrapper(torch.nn.Module):
             dummy_adapter_ids = torch.zeros((input_batch_size), dtype=torch.int32)
             args = (*args[:6], dummy_adapter_ids, *args[7:])
         return args
+
+    def vllm_cte_repadding(self, batch_args):
+        # This function is used to undo the padding from vllm serving for bs > 1 and
+        # repad to nearest bucket size
+
+        # retrieve the actual_len by using max of position ids (batch_args[2])
+        # assumption here: the padding_id is 0
+        actual_len = torch.max(batch_args[2]) + 1
+
+        # Undo padding from vllm
+        batch_args[0] = batch_args[0][:, :actual_len]
+        batch_args[1] = batch_args[1][:, :actual_len]
+        batch_args[2] = batch_args[2][:, :actual_len]
+
+        # repad to nearest bucket
+        batch_args = self.pad_inputs(*batch_args, pad_type="first_fit")
+
+        return batch_args
 
     def forward(self, *args, pad_type="first_fit"):
         logging.debug(f"calling forward on network {self.tag}")
@@ -770,9 +828,15 @@ class ModelWrapper(torch.nn.Module):
                 logging.debug(
                     f"running foward on batch {cur_batch}:{cur_batch + self.neuron_config.batch_size}"
                 )
-                outputs = self._forward(
-                    *[arg[cur_batch : cur_batch + self.neuron_config.batch_size] for arg in args]
-                )
+
+                # pad to next bucket for context encoding with bs > 1
+                # batch_arg represent single prompt in batch of prompts
+                batch_args = [
+                    arg[cur_batch : cur_batch + self.neuron_config.batch_size] for arg in args
+                ]
+                batch_args = self.vllm_cte_repadding(batch_args)
+
+                outputs = self._forward(*batch_args)
 
                 # sequential execution must be done in sync mode to avoid buffer write race conditions
                 if self.async_mode:
@@ -867,7 +931,9 @@ class DecoderModelInstance(BaseModelInstance):
             if self.neuron_config.quantization_dtype == "f8e4m3":
                 q_config["quantized_dtype"] = QuantizedDtype.F8E4M3
 
-            q_config["activation_quantization_type"] = ActivationQuantizationType(self.neuron_config.activation_quantization_type)
+            q_config["activation_quantization_type"] = ActivationQuantizationType(
+                self.neuron_config.activation_quantization_type
+            )
             q_config["clamp_bound"] = self.neuron_config.quantize_clamp_bound
 
             """
@@ -901,7 +967,12 @@ class DecoderModelInstance(BaseModelInstance):
 
     def get(self, bucket_rank, **kwargs):
         if bucket_rank is not None:
-            self.module.n_positions = self.neuron_config.buckets[bucket_rank]
+            if self.neuron_config.is_prefix_caching:
+                self.module.prefix_size = self.neuron_config.buckets[bucket_rank][1]
+                self.module.n_active_tokens = self.neuron_config.buckets[bucket_rank][0]
+                self.module.n_positions = min(self.module.prefix_size + self.module.n_active_tokens, self.neuron_config.max_context_length)
+            else:
+                self.module.n_positions = self.neuron_config.buckets[bucket_rank]
             if self.neuron_config.enable_fused_speculation:
                 self.module.draft_model.n_positions = self.neuron_config.buckets[bucket_rank]
                 self.module.target_model.n_positions = self.neuron_config.buckets[bucket_rank]
