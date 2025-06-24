@@ -13,6 +13,9 @@ class TestPadding(unittest.TestCase):
             [[1, 4, 128, 128], [1, 4, 256, 256]],  # pad index 3, 2
             [[1, 1, 128, 128], [1, 4, 256, 256]],  # pad index 3, 2, 1
             [[1, 1, 128, 128], [4, 4, 256, 256]],  # pad index 3, 2, 1, 0
+            [[1, 1024], [4, 1024]], # pad index 0
+            [[1, 1024], [4, 2048]], # pad index 0, 1
+            [[1, 1, 2], [4, 1, 2]], # pad index 0
         ]
 
         for original_shape, target_shape in test_inputs:

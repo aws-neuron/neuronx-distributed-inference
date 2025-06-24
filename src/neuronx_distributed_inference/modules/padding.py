@@ -32,7 +32,9 @@ def pad_tensor(
         padding.extend([0, pad_size])  # Pad only at the end of each dimension
 
     # Create the padded tensor
-    padded_tensor = torch.nn.functional.pad(unpadded_tensor, padding, mode="constant", value=0)
+    # we sometimes see numerical errors with different compiler version if we pad with 0, 1, or random value
+    # So here we use the actual max value of unpadded_tensor
+    padded_tensor = torch.nn.functional.pad(unpadded_tensor, padding, mode="constant", value=torch.max(unpadded_tensor))
 
     # Create the mask
     mask = torch.zeros(target_shape, dtype=torch.int, device=unpadded_tensor.device)

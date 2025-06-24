@@ -160,38 +160,26 @@ class MixtralInferenceConfig(InferenceConfig):
 
 class NeuronMixtralAttention(NeuronAttentionBase):
     def __init__(self, config: MixtralInferenceConfig):
-        super().__init__()
-        self.config = config
-        self.neuron_config = config.neuron_config
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.padding_side = config.neuron_config.padding_side
-        self.torch_dtype = config.neuron_config.torch_dtype
-        self.qk_layernorm = config.neuron_config.qk_layernorm
+        rotary_emb = RotaryEmbedding(
+            config.hidden_size // config.num_attention_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.hidden_size // config.num_attention_heads,
+            rotary_emb=rotary_emb,
+        )
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
                 "NeuronMixtralAttention has to be initialized in a distributed env. Please use neuronx_distributed"
                 " module to initialize a distributed env."
             )
-        self.tp_degree = parallel_state.get_tensor_model_parallel_size()
-        self.fused_qkv = False
-        self.clip_qkv = None
-
-        self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
-        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
-
-        self.init_gqa_properties()
-
-        self.rotary_emb = RotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
-        )
 
 
 class NeuronMixtralDecoderLayer(nn.Module):

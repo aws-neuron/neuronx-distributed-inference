@@ -9,8 +9,9 @@ from torch_neuronx.xla_impl.ops import ConcatenateOp
 
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
     _gather_slice_into_kv_cacheline,
-    _reshape_tiled_cache,
     _slice_kv_cacheline,
+    untile_cache,
+    tile_cache,
 )
 from neuronx_distributed_inference.modules.kvcache.utils import (
     contexted_kv,
@@ -105,17 +106,28 @@ def test_gather_slice_into_kv_cacheline():
     )
 
 
-def test_reshape_tiled_kv():
+def test_untile_cache():
     tiled_cache = torch.rand(1, 2, 2, 128, 2)
-    actual = _reshape_tiled_cache(tiled_cache, transposed=False)
+    actual = untile_cache(tiled_cache, transposed=False)
     assert actual.shape == torch.Size([1, 2, 256, 2])
     assert torch.equal(actual.flatten(), tiled_cache.flatten())
 
     tiled_cache = torch.rand(1, 2, 2, 128, 2)
-    actual = _reshape_tiled_cache(tiled_cache, transposed=True)
+    actual = untile_cache(tiled_cache, transposed=True)
     assert actual.shape == torch.Size([1, 2, 2, 256])
     assert torch.equal(actual.flatten(), tiled_cache.flatten())
 
+
+def test_tile_cache():
+    untiled_cache = torch.rand(1, 2, 256, 2)
+    tile_cache_output = tile_cache(untiled_cache, transposed=False)
+    assert tile_cache_output.shape == torch.Size([1, 2, 128, 2, 2])
+    assert torch.equal(tile_cache_output.flatten(), untiled_cache.flatten())
+
+    untiled_cache = torch.rand(1, 2, 2, 256)
+    tile_cache_output = tile_cache(untiled_cache, transposed=True)
+    assert tile_cache_output.shape == torch.Size([1, 2, 2, 128, 2])
+    assert torch.equal(tile_cache_output.flatten(), untiled_cache.flatten())
 
 # Tests on get_active_block_table()
 def test_get_active_block_table_case_1():

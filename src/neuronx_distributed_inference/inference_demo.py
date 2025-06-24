@@ -20,6 +20,7 @@ from neuronx_distributed_inference.models.application_base import NeuronApplicat
 from neuronx_distributed_inference.models.config import (
     FusedSpecNeuronConfig,
     OnDeviceSamplingConfig,
+    ChunkedPrefillConfig,
     to_torch_dtype,
 )
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
@@ -38,6 +39,7 @@ from neuronx_distributed_inference.utils.distributed import get_init_rank, get_i
 from neuronx_distributed_inference.utils.exceptions import LogitMatchingValidationError
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 from neuronx_distributed_inference.utils.random import set_random_seed
+from neuronx_distributed_inference.utils.constants import BENCHMARK_REPORT_PATH
 
 set_random_seed(0)
 
@@ -120,6 +122,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--max-new-tokens", type=int)
     run_parser.add_argument("--max-length", type=int)
     run_parser.add_argument("--rpl-reduce-dtype", type=to_torch_dtype)
+    run_parser.add_argument("--attention-dtype", type=to_torch_dtype)
     run_parser.add_argument("--output-logits", action="store_true")
     run_parser.add_argument("--vocab-parallel", action="store_true")
     run_parser.add_argument("--layer-boundary-markers", action="store_true", default=False)
@@ -148,6 +151,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--enable-bucketing", action="store_true")
     run_parser.add_argument("--bucket-n-active-tokens", action="store_true")
     run_parser.add_argument("--context-encoding-buckets", nargs="+", type=int)
+    run_parser.add_argument("--prefix-buckets", nargs="+", type=int)
     run_parser.add_argument("--token-generation-buckets", nargs="+", type=int)
 
     # Quantization
@@ -166,6 +170,13 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 
     # MoE
     run_parser.add_argument("--capacity-factor", type=float)
+    run_parser.add_argument("--early-expert-affinity-modulation", action="store_true")
+    run_parser.add_argument("--disable-normalize-top-k-affinities", action="store_true")
+    run_parser.add_argument("--fused-shared-experts", action="store_true")
+
+    # Router Config
+    run_parser.add_argument("--router-act-fn", type=str)
+    run_parser.add_argument("--router-dtype", type=str)
 
     # Speculative decoding
     run_parser.add_argument("--draft-model-path", type=str)
@@ -189,6 +200,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 
     # Parallelism
     run_parser.add_argument("--tp-degree", type=int)
+    run_parser.add_argument("--cp-degree", type=int)
     run_parser.add_argument("--pp-degree", type=int)
     run_parser.add_argument("--ep-degree", type=int)
     run_parser.add_argument("--world-size", type=int)
@@ -224,8 +236,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument(
         "--enable-prefix-caching", dest="is_prefix_caching", action="store_true"
     )
-    run_parser.add_argument("--cp-max-num-seqs", type=int)
-    run_parser.add_argument("--cp-num-active-blocks", type=int)
+    run_parser.add_argument("--max-num-seqs", type=int)
 
     # Async
     run_parser.add_argument("--async-mode", action="store_true")
@@ -242,7 +253,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # Kernels
     run_parser.add_argument("--qkv-kernel-enabled", action="store_true")
     run_parser.add_argument("--qkv-kernel-nbsd-layout", action="store_true")
-    run_parser.add_argument("--attn-kernel-enabled", action="store_true")
+    run_parser.add_argument("--attn-kernel-enabled", action=argparse.BooleanOptionalAction, default=None)
     run_parser.add_argument("--mlp-kernel-enabled", action="store_true")
     run_parser.add_argument("--quantized-mlp-kernel-enabled", action="store_true")
     run_parser.add_argument("--fused-rmsnorm-skip-gamma", action="store_true")
@@ -270,9 +281,18 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 
     # Compiler Args
     run_parser.add_argument("--cc-pipeline-tiling-factor", type=int, default=2)
+    run_parser.add_argument("--enable-spill-reload-dge", action="store_true")
 
     # CPU
     run_parser.add_argument("--on-cpu", action="store_true")
+
+    # Report generation
+    run_parser.add_argument(
+        "--benchmark-report-path",
+        type=str,
+        default=BENCHMARK_REPORT_PATH,
+        help="File path to save benchmark report."
+    )
 
     # Debugging
     run_parser.add_argument(
@@ -282,6 +302,10 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         default=None,
         help=f"Specify '{argparse_utils.AUTO}' when using check accuracy mode with {CheckAccuracyMode.LOGIT_MATCHING} for inferrring capture indices when the test fails and use the indices to capture inputs. Otherwise, provide any number of integer values for capturing inputs at those indices.")
     run_parser.add_argument("--input-capture-save-dir", type=str, default=None)
+
+    run_parser.add_argument("--cast-type", choices=["config", "as-declared"], default="config",
+                            help="If set to 'config', all parameters will be casted to neuron_config.torch_dtype. "
+                            "If set to 'as-declared', casting will be done based on the dtype set for each parameter")
 
     # Optional demo arguments
     run_parser.add_argument(
@@ -312,6 +336,20 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         help="Adds metadata into the generated HLO. This metadata maps the HLO "
         "operators to the corresponding lines in the PyTorch code",
     )
+    run_parser.add_argument(
+        "--apply-seq-ids-mask",
+        action='store_true',
+        help="Avoid KV cache update on inactive (padded) seq_ids"
+    )
+    run_parser.add_argument(
+        "--input-start-offsets",
+        nargs="+",
+        default=None,
+        type=int,
+        help="Shift the input right by an offset. There can be multiple offsets, each per sequence."
+        "If only 1 value is provided, all sequences will be shifted by this amount. "
+        "This flag can be used to test chunked attention."
+    )
 
 
 def validate_file_exists(path):
@@ -339,7 +377,7 @@ def get_modules_to_not_convert_json(json_path):
     return modules_to_not_convert, draft_model_modules_to_not_convert
 
 
-def run_inference(model_cls: Type[NeuronApplicationBase], args):
+def create_neuron_config(model_cls, args):
     # Initialize configs.
     print("Loading configs...")
 
@@ -348,6 +386,11 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
     if args.on_device_sampling:
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
+    if args.is_chunked_prefill:
+        max_num_seqs = config_kwargs.pop("max_num_seqs", 0)
+        config_kwargs["chunked_prefill_config"] = ChunkedPrefillConfig(
+            max_num_seqs=max_num_seqs,
+        )
 
     if (args.quantized and args.quantization_dtype == "f8e4m3") or args.kv_cache_quant:
         os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
@@ -371,6 +414,11 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         )
         adapter_ids = args.adapter_ids
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
+    return adapter_ids, neuron_config
+
+
+def run_inference(model_cls: Type[NeuronApplicationBase], args):
+    adapter_ids, neuron_config = create_neuron_config(model_cls, args)
 
     config = model_cls.get_config_cls()(
         neuron_config, load_config=load_pretrained_config(args.model_path)
@@ -395,7 +443,6 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         # Set eagle specific config changes
         if neuron_config.enable_eagle_speculation:
             draft_neuron_config.is_eagle_draft = True
-            draft_neuron_config.sequence_parallel_enabled = False
 
         if args.draft_model_tp_degree is not None:
             draft_neuron_config.tp_degree = args.draft_model_tp_degree
@@ -415,6 +462,8 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
             draft_model = model_cls(args.draft_model_path, draft_config)
 
     model = model_cls(args.model_path, config)
+    if args.input_start_offsets:
+        assert len(args.input_start_offsets) == 1 or len(args.input_start_offsets) == args.batch_size, "The number of input offsets has to be either 1 or equal or batch size."
 
     # Quantize model.
     if neuron_config.quantized:
@@ -481,7 +530,10 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
     generation_config_kwargs = {
         k: getattr(args, k) for k in generation_config_args if getattr(args, k) is not None
     }
-    generation_config.update(**generation_config_kwargs)
+    remaining_kwargs = generation_config.update(**generation_config_kwargs)
+    # add any remaining ones (this can happen when the model generation config is missing some entries)
+    for k, v in remaining_kwargs.items():
+        generation_config.__dict__[k] = v
 
     # With Medusa, the model is also the draft model.
     if neuron_config.is_medusa:
@@ -504,6 +556,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
             num_tokens_to_check=args.num_tokens_to_check,
             draft_model=draft_model,
             expected_outputs_path=args.expected_outputs_path,
+            input_start_offsets=args.input_start_offsets,
         )
     except LogitMatchingValidationError as e:
         logit_error = e
@@ -530,6 +583,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         draft_model=draft_model,
         adapter_ids=adapter_ids,
         input_capture_hook=input_capture_hook,
+        input_start_offsets=args.input_start_offsets,
     )
 
     if logit_error is not None:
@@ -537,7 +591,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
 
     # Benchmarking.
     if args.benchmark:
-        benchmark_sampling(model, draft_model, generation_config)
+        benchmark_sampling(model, draft_model, generation_config, benchmark_report_path=args.benchmark_report_path)
 
 
 def load_tokenizer(model_path, compiled_model_path, neuron_config):
@@ -555,9 +609,12 @@ def run_generation(
     draft_model=None,
     adapter_ids=None,
     input_capture_hook=None,
+    input_start_offsets=None,
 ):
     print("\nGenerating outputs...")
     print(f"Prompts: {prompts}")
+    if len(prompts) == 1 and model.config.neuron_config.batch_size > 1:
+        prompts = prompts * model.config.neuron_config.batch_size
 
     _, output_tokens = get_generate_outputs(
         model,
@@ -569,6 +626,7 @@ def run_generation(
         adapter_ids=adapter_ids,
         max_length=model.neuron_config.max_length,
         input_capture_hook=input_capture_hook,
+        input_start_offsets=input_start_offsets
     )
 
     print("Generated outputs:")
@@ -587,13 +645,15 @@ def run_accuracy_check(
     num_tokens_to_check=None,
     draft_model=None,
     expected_outputs_path=None,
+    input_start_offsets=None,
 ):
     if model.neuron_config.is_medusa:
         # Medusa doesn't use greedy sampling, so check accuracy doesn't work.
         assert (
             check_accuracy_mode == CheckAccuracyMode.SKIP_ACCURACY_CHECK
         ), "Accuracy checking not supported for Medusa"
-
+    if input_start_offsets:
+        assert all(offset < model.config.neuron_config.max_context_length for offset in input_start_offsets), "Input offset has to be less than max context length"
     if check_accuracy_mode == CheckAccuracyMode.SKIP_ACCURACY_CHECK:
         print("\nSkipping accuracy check")
         return
@@ -612,6 +672,7 @@ def run_accuracy_check(
             draft_model=draft_model,
             expected_token_ids=expected_outputs,
             num_tokens_to_check=num_tokens_to_check,
+            input_start_offsets=input_start_offsets,
         )
     elif check_accuracy_mode == CheckAccuracyMode.LOGIT_MATCHING:
         assert draft_model is None, "Logit matching not supported for speculation"
@@ -633,6 +694,7 @@ def run_accuracy_check(
             divergence_difference_tol=divergence_difference_tol,
             tol_map=tol_map,
             num_tokens_to_check=num_tokens_to_check,
+            input_start_offsets=input_start_offsets,
         )
     else:
         raise ValueError(f"Unsupported check accuracy mode: {check_accuracy_mode}")

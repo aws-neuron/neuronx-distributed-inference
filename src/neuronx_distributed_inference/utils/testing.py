@@ -9,6 +9,7 @@ import torch_neuronx
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.trace import ModelBuilder
 from neuronx_distributed.trace.model_builder import BaseModelInstance
+import os
 
 from neuronx_distributed_inference.utils.random import set_random_seed
 
@@ -26,6 +27,24 @@ class FunctionModule(torch.nn.Module):
 
     def forward(self, *args):
         return self.func(*args)
+
+
+def destroy_mp():
+    # destroy distributed process if already started
+    if parallel_state.model_parallel_is_initialized():
+        parallel_state.destroy_model_parallel()
+        torch.distributed.destroy_process_group()
+
+
+def init_cpu_env():
+    destroy_mp()
+    print("Initializing cpu env")
+    os.environ["WORLD_SIZE"] = "1"
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "8080"
+    os.environ["RANK"] = "0"
+    torch.distributed.init_process_group(backend="gloo")
+    parallel_state.initialize_model_parallel()
 
 
 def validate_accuracy(
@@ -88,6 +107,9 @@ def build_function(
     tp_degree: int = 1,
     compiler_args: Optional[str] = None,
     compiler_workdir: Optional[str] = None,
+    priority_model_idx: Optional[int] = 0,
+    logical_nc_config: int = 1,
+    dry_run: bool = False,
 ):
     """
     Compiles a function to Neuron.
@@ -105,9 +127,14 @@ def build_function(
         compiler_args: The compiler args to use.
         compiler_workdir: Where to save compiler artifacts. Defaults to a tmp folder with a UUID
             for uniqueness.
+        priority_model_idx: default 0 indicating enable WLO (weight layout optimization)
+        logical_nc_config: The number of logical neuron cores to use. Defaults to 1.
+        dry_run: Whether to stop after trace (before compile). If priority_model_idx is set, then
+            dry run mode compiles the priority model in order to produce the weight layout
+            optimization model.
 
     Returns:
-        The Neuron model.
+        The Neuron model, or None if dry run mode is enabled.
     """
     return build_module(
         module_cls=FunctionModule,
@@ -116,6 +143,9 @@ def build_function(
         compiler_args=compiler_args,
         compiler_workdir=compiler_workdir,
         module_init_kwargs={"func": func},
+        priority_model_idx=priority_model_idx,
+        logical_nc_config=logical_nc_config,
+        dry_run=dry_run,
     )
 
 
@@ -127,6 +157,9 @@ def build_module(
     compiler_args: Optional[str] = None,
     compiler_workdir: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
+    priority_model_idx: Optional[int] = 0,
+    logical_nc_config: int = 1,
+    dry_run: bool = False,
 ):
     """
     Compiles a module to Neuron.
@@ -142,9 +175,14 @@ def build_module(
             for uniqueness.
         checkpoint_path: The path to the checkpoint to load. By default, this function saves the
             module state dict to use as the checkpoint.
+        priority_model_idx: default 0 indicating enable WLO (weight layout optimization)
+        logical_nc_config: The number of logical neuron cores to use. Defaults to 1.
+        dry_run: Whether to stop after trace (before compile). If priority_model_idx is set, then
+            dry run mode compiles the priority model in order to produce the weight layout
+            optimization model.
 
     Returns:
-        The Neuron model.
+        The Neuron model, or None if dry run mode is enabled.
     """
     if not _is_tensor_tuple_list(example_inputs):
         raise ValueError("example_inputs must be a list of tensor tuples")
@@ -176,6 +214,7 @@ def build_module(
         tp_degree=tp_degree,
         checkpoint_loader=partial(_load_checkpoint, checkpoint_path),
         compiler_workdir=compiler_workdir,
+        logical_nc_config=logical_nc_config,
     )
 
     module_instance_cls = partial(module_cls, **module_init_kwargs)
@@ -184,11 +223,12 @@ def build_module(
         model_instance=BaseModelInstance(module_instance_cls, input_output_aliases={}),
         example_inputs=example_inputs,
         compiler_args=compiler_args,
-        priority_model_idx=0,
+        priority_model_idx=priority_model_idx,
     )
 
-    neuron_model = model_builder.trace(initialize_model_weights=True)
-    neuron_model.nxd_model.initialize_with_saved_weights(start_rank_tensor=torch.tensor([0]))
+    neuron_model = model_builder.trace(initialize_model_weights=True, dry_run=dry_run)
+    if not dry_run:
+        neuron_model.nxd_model.initialize_with_saved_weights(start_rank_tensor=torch.tensor([0]))
     return neuron_model
 
 
@@ -212,8 +252,7 @@ def _save_checkpoint(module_cls, module_init_kwargs, checkpoint_path, tp_degree=
     module = module_cls(**module_init_kwargs)
     torch.save(module.state_dict(), checkpoint_path)
 
-    parallel_state.destroy_model_parallel()
-    torch.distributed.destroy_process_group()
+    destroy_mp()
 
 
 def _load_checkpoint(checkpoint_path):

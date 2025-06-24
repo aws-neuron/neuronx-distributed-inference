@@ -13,8 +13,9 @@ MEDUSA_MODEL = "medusa_speculation_model"
 LAYOUT_OPT = "layout_opt"
 LM_HEAD_NAME = "lm_head.pt"
 FUSED_SPECULATION_MODEL = "fused_speculation_model"
+VISION_ENCODER_MODEL = "vision_encoder_model"
 
-BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
+BENCHMARK_REPORT_PATH = "./benchmark_report.json"
 
 BASE_COMPILER_WORK_DIR = "/tmp/nxd_model/"
 CTX_ENC_MODEL_COMPILER_WORK_DIR = BASE_COMPILER_WORK_DIR + CONTEXT_ENCODING_MODEL + "/"

@@ -35,15 +35,18 @@ class HiddenStateRollingBuffer(torch.nn.Module):
         hidden_size: int,
         dtype: torch.dtype = torch.float32,
         inplace: bool = False,
+        apply_seq_ids_mask: bool = False,
     ):
         super().__init__()
         self.max_batch_size = max_batch_size
+        # pad to last batch position as garbage
         self.buffer_length = buffer_length
         self.inplace = inplace
-        shape = (max_batch_size, buffer_length, hidden_size)
+        self.shape = (self.max_batch_size + 1, self.buffer_length, hidden_size)
         self.hidden_states = torch.nn.Parameter(
-            torch.zeros(shape, dtype=dtype), requires_grad=False
+            torch.zeros(self.shape, dtype=dtype), requires_grad=False
         )
+        self.apply_seq_ids_mask = apply_seq_ids_mask
 
     def set_state(
         self,
@@ -53,6 +56,10 @@ class HiddenStateRollingBuffer(torch.nn.Module):
     ):
         seq_ids = seq_ids.reshape(seq_ids.shape[0])
         position_ids = position_ids.reshape(position_ids.shape[0])
+        if self.apply_seq_ids_mask and seq_ids.shape[0] > 1:
+            seq_ids_mask = torch.ge(seq_ids, torch.full_like(seq_ids, 0))
+            pad_seq_ids = torch.full_like(seq_ids, self.max_batch_size)
+            seq_ids = torch.where(seq_ids_mask, seq_ids, pad_seq_ids)
         hidden_state = hidden_state.squeeze(1)
         index = (seq_ids, position_ids % self.buffer_length)
         result = torch.index_put(self.hidden_states, index, hidden_state)
@@ -67,5 +74,9 @@ class HiddenStateRollingBuffer(torch.nn.Module):
     ):
         seq_ids = seq_ids.reshape(seq_ids.shape[0])
         position_ids = position_ids.reshape(position_ids.shape[0])
+        if self.apply_seq_ids_mask and seq_ids.shape[0] > 1:
+            seq_ids_mask = torch.ge(seq_ids, torch.full_like(seq_ids, 0))
+            pad_seq_ids = torch.full_like(seq_ids, self.max_batch_size)
+            seq_ids = torch.where(seq_ids_mask, seq_ids, pad_seq_ids)
         index = (position_ids) % self.buffer_length
         return self.hidden_states[seq_ids, index].unsqueeze(1)

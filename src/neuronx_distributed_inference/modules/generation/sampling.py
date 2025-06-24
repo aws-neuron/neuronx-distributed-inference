@@ -364,7 +364,7 @@ class Sampler(torch.nn.Module):
 
         Output:
             Tensor containing 1 sampled token id per batch size.
-            Output size is (1, Batch Size)
+            Output size is (Batch Size,)
 
         Note: Using torch.multinomial on device causes trace to hang.
         This is because torch.multinomial performs a number of distribution
@@ -373,11 +373,7 @@ class Sampler(torch.nn.Module):
         """
         dim = len(token_logits.shape) - 1  # vocab_size dimension
 
-        if self.is_medusa:
-            return self._multinomial_sample(
-                token_logits, sampling_params, return_values, dim, rank_id
-            )
-        elif self.do_sample or self.dynamic:
+        if self.do_sample or self.dynamic or self.is_medusa:
             return self._multinomial_sample(
                 token_logits, sampling_params, return_values, dim, rank_id
             )

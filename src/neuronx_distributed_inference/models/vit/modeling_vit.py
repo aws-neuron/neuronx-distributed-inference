@@ -81,7 +81,9 @@ class NeuronViTEmbeddings(nn.Module):
     def __init__(self, config: ViTInferenceConfig, use_mask_token: bool = False) -> None:
         super().__init__()
 
-        self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_size))
+        self.cls_token = nn.Parameter(
+            torch.randn([1, 1, config.hidden_size], dtype=config.neuron_config.torch_dtype)
+        )
         logger.info(f"use_mask_token {use_mask_token}")
         self.mask_token = (
             nn.Parameter(torch.zeros(1, 1, config.hidden_size)) if use_mask_token else None
@@ -89,7 +91,11 @@ class NeuronViTEmbeddings(nn.Module):
         logger.info(f"self.mask_token {self.mask_token}")
         self.patch_embeddings = NeuronViTPatchEmbeddings(config)
         num_patches = self.patch_embeddings.num_patches
-        self.position_embeddings = nn.Parameter(torch.randn(1, num_patches + 1, config.hidden_size))
+        self.position_embeddings = nn.Parameter(
+            torch.randn(
+                [1, num_patches + 1, config.hidden_size], dtype=config.neuron_config.torch_dtype
+            )
+        )
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.patch_size = config.patch_size
         self.config = config
@@ -198,7 +204,11 @@ class NeuronViTPatchEmbeddings(nn.Module):
         self.num_patches = num_patches
 
         self.projection = nn.Conv2d(
-            num_channels, hidden_size, kernel_size=patch_size, stride=patch_size
+            num_channels,
+            hidden_size,
+            kernel_size=patch_size,
+            stride=patch_size,
+            dtype=config.neuron_config.torch_dtype,
         )
         # self.projection = OutputChannelParallelConv2d( # FIXME: in checkpoint bias is not sharded: Incorrect tensor shape at checkpoint keyprojection.bias: received 768, expected 24.
         #     in_channels=num_channels,
@@ -232,22 +242,15 @@ class NeuronViTPatchEmbeddings(nn.Module):
 
 class NeuronViTAttention(NeuronAttentionBase):
     def __init__(self, config: ViTInferenceConfig):
-        super().__init__()
-        self.config = config
-        self.neuron_config = config.neuron_config
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = getattr(config, "num_key_value_heads", self.num_attention_heads)
-        self.head_dim = self.hidden_size // self.num_attention_heads
-        self.tp_degree = config.neuron_config.tp_degree
-        self.torch_dtype = config.neuron_config.torch_dtype
-        self.fused_qkv = False
-        self.clip_qkv = None
-        self.bias = True
-
-        self.o_proj_layer_name = "o_proj"
-
-        self.init_gqa_properties()
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=getattr(config, "num_key_value_heads", config.num_attention_heads),
+            head_dim=config.hidden_size // config.num_attention_heads,
+            qkv_bias=True,
+            o_bias=True,
+        )
 
 
 class NeuronViTIntermediate(nn.Module):
@@ -307,8 +310,12 @@ class NeuronViTLayer(nn.Module):
         self.attention = NeuronViTAttention(config)
         self.intermediate = NeuronViTIntermediate(config)
         self.output = NeuronViTOutput(config)
-        self.layernorm_before = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.layernorm_after = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layernorm_before = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, dtype=config.neuron_config.torch_dtype
+        )
+        self.layernorm_after = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, dtype=config.neuron_config.torch_dtype
+        )
 
     def forward(
         self,
@@ -552,9 +559,7 @@ class NeuronViTForImageEncoding(NeuronApplicationBase):
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
-        # Prevent auto-down casting when running with fp32
-        if self.config.neuron_config.torch_dtype == torch.float32:
-            compiler_args += " --auto-cast=none"
+        compiler_args += " --auto-cast=none"
         logger.info(f"{self._model_cls.__name__} compiler_args: {compiler_args}")
         return compiler_args
 

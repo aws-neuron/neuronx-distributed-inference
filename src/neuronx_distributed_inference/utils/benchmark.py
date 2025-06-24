@@ -15,8 +15,7 @@ from neuronx_distributed_inference.models.mllama.utils import get_image_tensors
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 from neuronx_distributed_inference.utils.constants import *
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
-
-BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
+from neuronx_distributed_inference.utils.constants import BENCHMARK_REPORT_PATH
 
 
 def benchmark_sampling(
@@ -26,6 +25,7 @@ def benchmark_sampling(
     target: str = None,
     image=None,
     num_runs=20,
+    benchmark_report_path: str = BENCHMARK_REPORT_PATH,
 ):
     neuron_config = model.neuron_config
 
@@ -78,6 +78,7 @@ def benchmark_sampling(
             "attention_mask": attention_mask,
             "max_new_tokens": neuron_config.max_new_tokens,
             "sampling_params": sampling_params,
+            "do_sample": modified_generation_config.do_sample,
             "max_length": (
                 neuron_config.max_length if neuron_config.max_new_tokens is None else None
             ),
@@ -94,7 +95,10 @@ def benchmark_sampling(
             input_param["prompt_lookup_num_tokens"] = model.neuron_config.speculation_length
 
         if pixel_values is not None:
-            input_param["pixel_values"] = pixel_values
+            if model.config.model_type == "llama4":
+                input_param["images_flattened"] = pixel_values
+            else:
+                input_param["pixel_values"] = pixel_values
 
         if aspect_ratios is not None:
             input_param["aspect_ratios"] = aspect_ratios
@@ -194,9 +198,9 @@ def benchmark_sampling(
 
     print("Benchmark completed and its result is as following")
     print(json.dumps(report, indent=4))
-    with open(BENCHMARK_REPORT_FILENAME, "w") as f:
+    with open(benchmark_report_path, "w") as f:
         json.dump(report, f)
-    print("Completed saving result to " + BENCHMARK_REPORT_FILENAME)
+    print("Completed saving result to " + benchmark_report_path)
 
     return report
 
@@ -230,14 +234,23 @@ def get_sample_inputs(model_type, config: InferenceConfig, sampling_params, imag
             None,
             None,
         )
-        if image is not None:
-            pixel_values, aspect_ratios, num_chunks, has_image = get_image_tensors(
-                config, [[]] * batch_size
-            )
-            vision_mask = torch.zeros(
-                (neuron_config.batch_size, NUM_IMAGE_PER_PROMPT, 2),
-                dtype=torch.int32,
-            )
+        if (image is not None):
+            if config.model_type == "llama4":
+                vision_num_chunks = 5
+                num_channels = config.vision_config.num_channels
+                image_size = config.vision_config.image_size
+                vision_tokens = config.get_chunk_size() * vision_num_chunks
+                print(f"profiling with vision_num_chunks: {vision_num_chunks}, num_channels: {num_channels}, image_size: {image_size}, vision_tokens: {vision_tokens}")
+                pixel_values = torch.ones([vision_num_chunks, 1, num_channels, image_size, image_size])
+                vision_mask = torch.ones([1, vision_tokens , 1]).to(bool)
+            else:
+                pixel_values, aspect_ratios, num_chunks, has_image = get_image_tensors(
+                    config, [[]] * batch_size
+                )
+                vision_mask = torch.zeros(
+                    (neuron_config.batch_size, NUM_IMAGE_PER_PROMPT, 2),
+                    dtype=torch.int32,
+                )
         sample_inputs = (
             input_ids,
             attention_mask,
@@ -369,6 +382,8 @@ def create_submodule_latency_collectors(model):
         collectors[TOKEN_GENERATION_MODEL] = LatencyCollector()
     if hasattr(model, "speculation_model"):
         collectors[SPECULATION_MODEL] = LatencyCollector()
+    if hasattr(model, "vision_encoder_model"):
+        collectors[VISION_ENCODER_MODEL] = LatencyCollector()
     return collectors
 
 
@@ -383,6 +398,10 @@ def register_latency_collectors(latency_collectors, model):
     if SPECULATION_MODEL in latency_collectors:
         register_forward_latency_collector(
             latency_collectors[SPECULATION_MODEL], model.speculation_model
+        )
+    if VISION_ENCODER_MODEL in latency_collectors:
+        register_forward_latency_collector(
+            latency_collectors[VISION_ENCODER_MODEL], model.vision_encoder_model
         )
 
 
@@ -456,17 +475,23 @@ class LatencyCollector:
 
 
 def generate_report(latency_list, max_length, max_batch_size, n_runs=20):
-    latency_array = np.array(latency_list)
+    if len(latency_list) > 0:
+        latency_array = np.array(latency_list)
 
-    total_time = np.sum(latency_array)
-    throughput = (n_runs * max_length * max_batch_size) / total_time
+        total_time = np.sum(latency_array)
+        throughput = (n_runs * max_length * max_batch_size) / total_time
 
-    return {
-        "latency_ms_p50": np.percentile(latency_array, 50) * 1000,
-        "latency_ms_p90": np.percentile(latency_array, 90) * 1000,
-        "latency_ms_p95": np.percentile(latency_array, 95) * 1000,
-        "latency_ms_p99": np.percentile(latency_array, 99) * 1000,
-        "latency_ms_p100": np.percentile(latency_array, 100) * 1000,
-        "latency_ms_avg": np.average(latency_array) * 1000,
-        "throughput": throughput,
-    }
+        return {
+            "latency_ms_p50": np.percentile(latency_array, 50) * 1000,
+            "latency_ms_p90": np.percentile(latency_array, 90) * 1000,
+            "latency_ms_p95": np.percentile(latency_array, 95) * 1000,
+            "latency_ms_p99": np.percentile(latency_array, 99) * 1000,
+            "latency_ms_p100": np.percentile(latency_array, 100) * 1000,
+            "latency_ms_avg": np.average(latency_array) * 1000,
+            "throughput": throughput,
+        }
+    else:
+        # In case no latency data points, we return None
+        # We get no latency data points when a model is skipped during benchmark
+        # For example, vision_encoder model will be skipped with text-only inputs
+        return None

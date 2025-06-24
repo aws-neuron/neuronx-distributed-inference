@@ -191,64 +191,40 @@ class NeuronLlamaAttention(NeuronAttentionBase):
     """
 
     def __init__(self, config: InferenceConfig):
-        super().__init__()
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.hidden_size // config.num_attention_heads,
+            rotary_emb=self.get_rope(config=config),
+            use_qk_norm=config.use_qk_norm if hasattr(config, "use_qk_norm") else False,
+        )
 
-        self.config = config
-        self.neuron_config = config.neuron_config
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.use_qk_norm = config.use_qk_norm if hasattr(config, "use_qk_norm") else False
-
-        self.padding_side = self.neuron_config.padding_side
-        self.torch_dtype = self.neuron_config.torch_dtype
-        self.is_medusa = self.neuron_config.is_medusa
-
-        self.attn_kernel_enabled = True
-
-        if parallel_state.model_parallel_is_initialized():
-            self.tp_degree = parallel_state.get_tensor_model_parallel_size()
-        else:
-            self.tp_degree = 1
-        self.fused_qkv = getattr(self.neuron_config, "fused_qkv", False)
-        self.clip_qkv = None
-
-        self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
-        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
-
-        self.init_gqa_properties()
-
-        self.init_rope()
-
-        self.init_qk_norm()
-
-    def init_rope(self):
-        if not hasattr(self.config, "rope_scaling") or self.config.rope_scaling is None:
-            # TODO(yihsian): Check if we can just use our own implementation
-            if self.is_medusa:
-                self.rotary_emb = LlamaRotaryEmbedding(self.config)
+    def get_rope(self, config: InferenceConfig):
+        if not hasattr(config, "rope_scaling") or config.rope_scaling is None:
+            # TODO: Check if we can just use our own implementation
+            if config.neuron_config.is_medusa:
+                rotary_emb = LlamaRotaryEmbedding(config)
             else:
-                self.rotary_emb = RotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
+                rotary_emb = RotaryEmbedding(
+                    getattr(config, "head_dim", config.hidden_size // config.num_attention_heads),
+                    max_position_embeddings=config.max_position_embeddings,
+                    base=config.rope_theta,
                 )
         else:
-            rope_type = self.config.rope_scaling.get(
-                "rope_type", self.config.rope_scaling.get("type", None)
+            rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type", None)
             )
             if rope_type == "llama3":
-                self.rotary_emb = Llama3RotaryEmbedding(
-                    dim=self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                    factor=self.config.rope_scaling["factor"],
-                    low_freq_factor=self.config.rope_scaling["low_freq_factor"],
-                    high_freq_factor=self.config.rope_scaling["high_freq_factor"],
-                    original_max_position_embeddings=self.config.rope_scaling[
+                rotary_emb = Llama3RotaryEmbedding(
+                    dim=getattr(config, "head_dim", config.hidden_size // config.num_attention_heads),
+                    max_position_embeddings=config.max_position_embeddings,
+                    base=config.rope_theta,
+                    factor=config.rope_scaling["factor"],
+                    low_freq_factor=config.rope_scaling["low_freq_factor"],
+                    high_freq_factor=config.rope_scaling["high_freq_factor"],
+                    original_max_position_embeddings=config.rope_scaling[
                         "original_max_position_embeddings"
                     ],
                 )
@@ -256,7 +232,9 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 # LlamaRotaryEmbedding automatically chooses the correct scaling type from config.
                 # Warning: The HF implementation may have precision issues when run on Neuron.
                 # We include it here for compatibility with other scaling types.
-                self.rotary_emb = LlamaRotaryEmbedding(self.config)
+                rotary_emb = LlamaRotaryEmbedding(config)
+
+        return rotary_emb
 
     def prep_qkv_tensors(
         self,
@@ -816,54 +794,6 @@ class NeuronMllamaDecoderLayer(nn.Module):
         return outputs
 
 
-class PartiallyTrainable_Embedding(torch.nn.Module):
-    def __init__(self, config: InferenceConfig):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.tp_degree = parallel_state.get_tensor_model_parallel_size()
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-        self.replication_factor = self.tp_degree // 8
-        self.tok_embeddings = ParallelEmbedding(
-            self.vocab_size,
-            self.hidden_size,
-            self.padding_idx,
-            dtype=config.neuron_config.torch_dtype,
-            shard_across_embedding=True,
-            pad=True,
-        )
-        self.learnable_embedding = nn.Embedding(
-            8,
-            self.hidden_size,
-            dtype=config.neuron_config.torch_dtype,
-        )
-
-        self.num_frozen_embeddings = self.tok_embeddings.num_embeddings
-        self._thresh = self.num_frozen_embeddings - 1
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        xz = torch.zeros_like(hidden_states, device=hidden_states.device)
-        oz = torch.ones_like(hidden_states, device=hidden_states.device)
-        x_orig = torch.minimum(
-            hidden_states, torch.tensor(self._thresh, device=hidden_states.device)
-        )
-        x_new = (
-            torch.maximum(
-                hidden_states, torch.tensor(self._thresh + 1, device=hidden_states.device)
-            )
-            - self.num_frozen_embeddings
-        )
-
-        mask_orig = torch.where(hidden_states >= self.num_frozen_embeddings, xz, oz).unsqueeze(-1)
-        mask_new = torch.where(hidden_states < self.num_frozen_embeddings, xz, oz).unsqueeze(-1)
-        x_orig = self.tok_embeddings(x_orig)
-        x_new = self.learnable_embedding(x_new).type_as(x_orig)
-        return x_orig * mask_orig.type_as(x_orig) + x_new * mask_new.type_as(x_new)
-
-
 class NeuronMllamaTextModel(NeuronBaseModel):
     """
     The neuron version of language model of the Llama Multimodal Model
@@ -903,9 +833,22 @@ class NeuronMllamaTextModel(NeuronBaseModel):
     def init_model(self, config: InferenceConfig):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
+        # LEARABLE_EMBEDDING_SIZE is a model constant in HF's code
+        LEARABLE_EMBEDDING_SIZE = 8
         if parallel_state.model_parallel_is_initialized():
-            self.embed_tokens = PartiallyTrainable_Embedding(config)
+            self.embed_tokens = ParallelEmbedding(
+                config.vocab_size + LEARABLE_EMBEDDING_SIZE,
+                config.hidden_size,
+                self.padding_idx,
+                dtype=config.neuron_config.torch_dtype,
+                shard_across_embedding=not config.neuron_config.vocab_parallel,
+                sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+                sequence_dimension=self.sequence_dimension,
+                tile_cc=self.neuron_config.tile_cc,
+                pad=True,
+                tensor_model_parallel_group=get_tp_group(config),
+                use_spmd_rank=config.neuron_config.vocab_parallel,
+            )
             self.lm_head = ColumnParallelLinear(
                 self.hidden_size,
                 self.vocab_size,
@@ -915,7 +858,7 @@ class NeuronMllamaTextModel(NeuronBaseModel):
             )
         else:
             self.embed_tokens = nn.Embedding(
-                self.vocab_size,
+                self.vocab_size + LEARABLE_EMBEDDING_SIZE,
                 self.hidden_size,
                 self.padding_idx,
             )
@@ -1421,7 +1364,7 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
                 attention_mask,
                 position_ids,
                 seq_ids,
-                sampling_params[seq_ids],
+                sampling_params,
                 pixel_values,
                 aspect_ratios,
                 vision_mask,

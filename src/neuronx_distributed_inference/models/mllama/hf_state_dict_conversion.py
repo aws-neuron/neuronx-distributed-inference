@@ -29,13 +29,7 @@ def convert_hf_state_dict_to_neuron_state_dict(
 
     state_dict["text_model.norm.weight"] = state_dict.pop("language_model.model.norm.weight")
     state_dict["text_model.lm_head.weight"] = state_dict.pop("language_model.lm_head.weight")
-    language_model_embed_tokens = state_dict.pop("language_model.model.embed_tokens.weight")
-    state_dict["text_model.embed_tokens.learnable_embedding.weight"] = (
-        language_model_embed_tokens[-8:].clone().detach().contiguous()
-    )
-    state_dict["text_model.embed_tokens.tok_embeddings.weight"] = (
-        language_model_embed_tokens[:-8].clone().detach().contiguous()
-    )
+    state_dict["text_model.embed_tokens.weight"] = state_dict.pop("language_model.model.embed_tokens.weight")
     state_dict["text_model.rank_util.rank"] = torch.arange(
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
@@ -94,15 +88,27 @@ def convert_hf_state_dict_to_neuron_state_dict(
                 f"text_model.layers.{neuron_decoder_layer}.self_attn.input_layernorm.weight"
             ] = state_dict.pop(f"language_model.model.layers.{l}.input_layernorm.weight")
 
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.self_attn.self_attn.qkv_proj.q_proj.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.self_attn.q_proj.weight")
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.self_attn.self_attn.qkv_proj.k_proj.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.self_attn.k_proj.weight")
-            state_dict[
-                f"text_model.layers.{neuron_decoder_layer}.self_attn.self_attn.qkv_proj.v_proj.weight"
-            ] = state_dict.pop(f"language_model.model.layers.{l}.self_attn.v_proj.weight")
+            if config.neuron_config.fused_qkv:
+                state_dict[
+                    f"text_model.layers.{neuron_decoder_layer}.self_attn.self_attn.qkv_proj.Wqkv.weight"
+                ] = torch.cat(
+                    [
+                        state_dict.pop(f"language_model.model.layers.{l}.self_attn.q_proj.weight"),
+                        state_dict.pop(f"language_model.model.layers.{l}.self_attn.k_proj.weight"),
+                        state_dict.pop(f"language_model.model.layers.{l}.self_attn.v_proj.weight"),
+                    ]
+                )
+            else:
+                state_dict[
+                    f"text_model.layers.{neuron_decoder_layer}.self_attn.self_attn.qkv_proj.q_proj.weight"
+                ] = state_dict.pop(f"language_model.model.layers.{l}.self_attn.q_proj.weight")
+                state_dict[
+                    f"text_model.layers.{neuron_decoder_layer}.self_attn.self_attn.qkv_proj.k_proj.weight"
+                ] = state_dict.pop(f"language_model.model.layers.{l}.self_attn.k_proj.weight")
+                state_dict[
+                    f"text_model.layers.{neuron_decoder_layer}.self_attn.self_attn.qkv_proj.v_proj.weight"
+                ] = state_dict.pop(f"language_model.model.layers.{l}.self_attn.v_proj.weight")
+
             state_dict[
                 f"text_model.layers.{neuron_decoder_layer}.self_attn.self_attn.o_proj.weight"
             ] = state_dict.pop(f"language_model.model.layers.{l}.self_attn.o_proj.weight")
@@ -226,15 +232,24 @@ def _convert_image_transformer_state_dict(state_dict, prefix, config):
             # attention
             neuron_attn_key_prefix = f"{neuron_transformer_key_prefix}.attn"
             ckpt_attn_key_prefix = f"{ckpt_transformer_key_prefix}.self_attn"
-            state_dict[f"{neuron_attn_key_prefix}.q_proj.weight"] = state_dict.pop(
-                f"{ckpt_attn_key_prefix}.q_proj.weight"
-            )
-            state_dict[f"{neuron_attn_key_prefix}.k_proj.weight"] = state_dict.pop(
-                f"{ckpt_attn_key_prefix}.k_proj.weight"
-            )
-            state_dict[f"{neuron_attn_key_prefix}.v_proj.weight"] = state_dict.pop(
-                f"{ckpt_attn_key_prefix}.v_proj.weight"
-            )
+            if config.neuron_config.fused_qkv:
+                state_dict[f"{neuron_attn_key_prefix}.qkv_proj.Wqkv.weight"] = torch.cat(
+                    [
+                        state_dict.pop(f"{ckpt_attn_key_prefix}.q_proj.weight"),
+                        state_dict.pop(f"{ckpt_attn_key_prefix}.k_proj.weight"),
+                        state_dict.pop(f"{ckpt_attn_key_prefix}.v_proj.weight"),
+                    ]
+                )
+            else:
+                state_dict[f"{neuron_attn_key_prefix}.q_proj.weight"] = state_dict.pop(
+                    f"{ckpt_attn_key_prefix}.q_proj.weight"
+                )
+                state_dict[f"{neuron_attn_key_prefix}.k_proj.weight"] = state_dict.pop(
+                    f"{ckpt_attn_key_prefix}.k_proj.weight"
+                )
+                state_dict[f"{neuron_attn_key_prefix}.v_proj.weight"] = state_dict.pop(
+                    f"{ckpt_attn_key_prefix}.v_proj.weight"
+                )
             state_dict[f"{neuron_attn_key_prefix}.o_proj.weight"] = state_dict.pop(
                 f"{ckpt_attn_key_prefix}.o_proj.weight"
             )

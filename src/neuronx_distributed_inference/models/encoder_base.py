@@ -3,7 +3,6 @@ import logging
 import os
 from typing import List, Union
 
-import torch
 from torch import nn
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
@@ -89,10 +88,7 @@ class NeuronEncoderApplication(NeuronApplicationBase):
 
         # Flag for model type
         compiler_args += "--model-type=transformer "
-
-        # Prevent auto-down casting when running with fp32
-        if self.config.neuron_config.torch_dtype == torch.float32:
-            compiler_args += " --auto-cast=none"
+        compiler_args += " --auto-cast=none"
 
         return compiler_args
 

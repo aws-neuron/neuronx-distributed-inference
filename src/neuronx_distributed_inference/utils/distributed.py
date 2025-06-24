@@ -2,6 +2,7 @@ import os
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
+from neuronx_distributed.parallel_layers.utils import divide
 
 
 def get_init_world_size() -> int:
@@ -36,3 +37,25 @@ def get_dp_rank_spmd(global_rank: torch.tensor, tp_degree: int):
         rounding_mode="floor",
     ).to(torch.int32)
     return dp_rank
+
+
+def get_cp_rank(global_rank: torch.tensor, tp_degree: int):
+    cp_rank = torch.div(
+        global_rank,
+        tp_degree,
+        rounding_mode="floor"
+    ).to(torch.int32)
+
+    return cp_rank
+
+
+def split_along_dim(tensor, dim, rank, num_partitions):
+    if tensor is None:
+        return None
+
+    num_per_partition = divide(tensor.size(dim), num_partitions)
+    indices = torch.arange(0, num_per_partition, device=tensor.device)
+    indices = indices + (rank * num_per_partition)
+    tensor = torch.index_select(tensor, dim=dim, index=indices)
+
+    return tensor

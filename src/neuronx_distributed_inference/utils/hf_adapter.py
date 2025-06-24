@@ -2,7 +2,6 @@ import copy
 import os
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Union
-
 import torch
 from neuronx_distributed.utils.medusa_utils import (
     evaluate_posterior,
@@ -49,6 +48,10 @@ def load_pretrained_config(
             config: PretrainedConfig = hf_config
         config_dict = config.to_dict()
 
+        # Fix transformers_version (config.to_dict() sets it to current transformers version).
+        if config.transformers_version is not None:
+            config_dict["transformers_version"] = config.transformers_version
+
         # Set torch_dtype in NeuronConfig.
         if "torch_dtype" in config_dict:
             if self.neuron_config is not None and not self.neuron_config.overrides_torch_dtype:
@@ -62,6 +65,8 @@ def load_pretrained_config(
         for k, v in config_dict.items():
             if isinstance(getattr(config, k), PretrainedConfig):
                 config_dict[k] = SimpleNamespace(**v)
+                if config.transformers_version is not None:
+                    config_dict[k].transformers_version = config.transformers_version
 
         self.__dict__.update(config_dict)
         if hasattr(config, "attribute_map"):
@@ -92,9 +97,20 @@ def to_pretrained_config(config: InferenceConfig):
 
 
 class HuggingFaceGenerationAdapter(PreTrainedModel):
-    def __init__(self, model: NeuronApplicationBase):
+    def __init__(self, model: NeuronApplicationBase, input_start_offsets=None):
         hf_config = to_pretrained_config(model.config)
         super().__init__(hf_config)
+        if self.generation_config is not None:
+            # In transformers v4.50+, the logic for default generation config args is changed.
+            # - For models defined in v4.50+, it uses the model's default generation config.
+            # - For models defined before v4.50, it uses the generation_config passed to generate().
+            # See https://github.com/huggingface/transformers/pull/36684 for context.
+            #
+            # There's an edge case where the transformers version on self.generation_config
+            # is set to the installed version (rather than the model's version), which causes
+            # the v4.50+ behavior to apply even for models defined before v4.50.
+            # To mitigate this issue, we fix the transformers version on self.generation_config.
+            self.generation_config.transformers_version = hf_config.transformers_version
 
         self.neuron_model = model
         self.neuron_config = model.config.neuron_config
@@ -103,6 +119,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         self.sampler = None
         self.prev_kv_cache_populated = False
         self.lora_checkpoint = LoraCheckpoint(self.neuron_config.lora_config)
+        self.input_start_offsets = input_start_offsets
 
         # WARNING: Neuron Forward is needed by any models with additional input args
         self.forward = self.neuron_model.forward
@@ -119,15 +136,12 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         logits_processor: LogitsProcessorList,
         stopping_criteria: StoppingCriteriaList,
         generation_config: GenerationConfig,
-        logits_warper: Optional[LogitsProcessorList] = None,
         **model_kwargs,
     ) -> Union[SampleDecoderOnlyOutput, torch.LongTensor]:
         r"""
         We override the GenerationMixin sample function (_sample for transformers>=4.39.0) to add support for right side padding.
         """
-
         # init values
-        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
         pad_token_id = generation_config._pad_token_tensor
         output_scores = generation_config.output_scores
         output_logits = generation_config.output_logits
@@ -168,13 +182,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             # forward pass to get next token
             outputs = self(**model_inputs, return_dict=True)
 
-            if not self.on_device_sampling:
+            if outputs.logits is not None:
                 next_token_logits = outputs.logits[:, -1, :].clone()
 
                 # pre-process distribution
                 next_token_scores = logits_processor(input_ids, next_token_logits)
-                if do_sample:
-                    next_token_scores = logits_warper(input_ids, next_token_scores)
 
                 if return_dict_in_generate:
                     if output_scores:
@@ -251,7 +263,15 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
+            if self.input_start_offsets:
+                if len(self.input_start_offsets) > 1:
+                    position_ids += torch.tensor(self.input_start_offsets, dtype=position_ids.dtype, device=position_ids.device)[:, None]
+                else:
+                    position_ids += self.input_start_offsets[0]
+                position_ids.masked_fill_(attention_mask == 0, 0)
+            else:
+                position_ids.masked_fill_(attention_mask == 0, 1)
+
             if self.neuron_model.kv_cache_populated:
                 position_ids = torch.amax(position_ids, 1, keepdim=True)
                 position_ids = position_ids + 1

@@ -38,19 +38,31 @@ def check_context_encode(batch_size, max_batch_size, hidden_size, position_ids, 
 
 
 def check_token_generation_b2(
-    batch_size, max_batch_size, k, hidden_size, position_ids, seq_ids, num_accepted
+    batch_size, max_batch_size, k, hidden_size, position_ids, seq_ids, num_accepted, apply_seq_ids_mask=False
 ):
     next_position_ids = position_ids + num_accepted
-    state = HiddenStateRollingBuffer(max_batch_size, k * 2, hidden_size, inplace=True)
+    state = HiddenStateRollingBuffer(max_batch_size, k * 2, hidden_size, inplace=True, apply_seq_ids_mask=apply_seq_ids_mask)
 
     # Set state for prior iteration
     hidden_state = torch.rand((batch_size, 1, hidden_size))
     state.set_state(seq_ids, next_position_ids, hidden_state)
 
     # Get state for next iteration
-    position_ids = next_position_ids  # simulates next step
-    actual = state.get_state(seq_ids, position_ids)
-    torch.testing.assert_close(actual=actual, expected=hidden_state)
+    if apply_seq_ids_mask:
+        seq_ids_mask = seq_ids.reshape(-1) < 0
+        masked_hidden_states = state.hidden_states[:-1][~seq_ids_mask, :, :]
+        # expect masked out hidden_states on invalid seq_ids not updated
+        torch.allclose(masked_hidden_states, torch.zeros_like(masked_hidden_states), atol=0)
+
+        # Get state for next iteration
+        position_ids = next_position_ids  # simulates next step
+        actual = state.get_state(seq_ids, position_ids)
+        torch.testing.assert_close(actual=actual[seq_ids_mask], expected=hidden_state[seq_ids_mask])
+    else:
+        # Get state for next iteration
+        position_ids = next_position_ids  # simulates next step
+        actual = state.get_state(seq_ids, position_ids)
+        torch.testing.assert_close(actual=actual, expected=hidden_state)
 
 
 def check_token_generation_b4_rollback(
@@ -103,19 +115,25 @@ def test_context_encoding(error_logger):
 
 def test_token_generation(error_logger):
     @error_logger
-    def inner_test():
+    def inner_test(apply_seq_ids_mask=False):
         for _ in range(1000):
             max_batch_size = batch_size = 2
             k = 4
             hidden_size = 128
             position_ids = torch.randint(128256, size=(batch_size, 1))
-            seq_ids = torch.randperm(batch_size).reshape(batch_size, 1)
+            if apply_seq_ids_mask:
+                seq_ids = torch.arange(batch_size).reshape(batch_size, 1)
+                indices = torch.randperm(batch_size)[:batch_size-1]
+                seq_ids[indices] = -1
+            else:
+                seq_ids = torch.randperm(batch_size).reshape(batch_size, 1)
             num_accepted = torch.randint(1, k, size=(batch_size, 1))
             check_token_generation_b2(
-                batch_size, max_batch_size, k, hidden_size, position_ids, seq_ids, num_accepted
+                batch_size, max_batch_size, k, hidden_size, position_ids, seq_ids, num_accepted,apply_seq_ids_mask=apply_seq_ids_mask
             )
 
     inner_test()
+    inner_test(apply_seq_ids_mask=True)
 
 
 def test_token_generation_b4_rollback(error_logger):

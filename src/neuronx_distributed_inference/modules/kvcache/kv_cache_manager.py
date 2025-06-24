@@ -13,19 +13,62 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402;
     get_shardable_head_counts,
 )
 from neuronx_distributed_inference.modules.flashdecode.utils import get_cache_size
-from neuronx_distributed_inference.modules.kvcache.utils import update_cache_const_indices, fill_prefix
+from neuronx_distributed_inference.modules.kvcache.utils import dynamic_update_slice, update_cache_const_indices, fill_prefix
+
+from neuronx_distributed_inference.modules.attention.utils import get_kv_head_indices_context_parallel_full_tp_decode
 
 
-def _reshape_tiled_cache(cache: Tensor, transposed: bool):
-    # We merge the tiles BHS(128 tiled)D -> BHSD
-    cache_shape = cache.shape
-    desired_shape = (
-        cache_shape[0],
-        cache_shape[1],
-        cache_shape[2] if transposed else cache_shape[2] * cache_shape[3],
-        cache_shape[3] * cache_shape[4] if transposed else cache_shape[4],
-    )
+def untile_cache(cache: Tensor, transposed: bool):
+    """
+    If transposed flag is True, K-tensor is stored in BHD(128-tiled)S format and we untile it into BHDS format.
+    Otherwise tensor is untiled into BHSD. `transposed` flag is False for V tensor.
+    """
+    if transposed:
+        batch_size, head_dim, dim_per_head, tile_size, seq_len = cache.shape
+        desired_shape = (
+            batch_size,
+            head_dim,
+            dim_per_head,
+            tile_size * seq_len,
+        )
+    else:
+        batch_size, head_dim, tile_size, seq_len, dim_per_head = cache.shape
+        desired_shape = (
+            batch_size,
+            head_dim,
+            tile_size * seq_len,
+            dim_per_head,
+        )
+
     cache = cache.reshape(desired_shape)
+    return cache
+
+
+def tile_cache(cache: Tensor, transposed: bool):
+    """
+    If the transposed flag is true, this indicates that the K tensor is stored in BHDS.
+    The tiling is done on the S dimension. So if transposed=true, we tile it as BHD(128 tiled)S.
+    `transposed` flag is False for V tensor.
+    """
+    if transposed:
+        batch_size, head_dim, dim_per_head, seq_len = cache.shape
+        desired_shape = (
+            batch_size,
+            head_dim,
+            dim_per_head,
+            128,
+            seq_len // 128,
+        )
+    else:
+        batch_size, head_dim, seq_len, dim_per_head = cache.shape
+        desired_shape = (
+            batch_size,
+            head_dim,
+            128,
+            seq_len // 128,
+            dim_per_head,
+        )
+    cache = cache.view(desired_shape)
     return cache
 
 
@@ -59,8 +102,9 @@ class KVCacheManager(nn.Module):
     and vends out read and write operations.
     """
 
-    def __init__(self, config: InferenceConfig, num_kv_head, **kwargs):
+    def __init__(self, config: InferenceConfig, num_kv_head, global_rank=None, **kwargs):
         super().__init__()
+        self.config = config
         self.neuron_config = config.neuron_config
         self.is_medusa = config.neuron_config.is_medusa
         self.num_medusa_heads = config.neuron_config.num_medusa_heads
@@ -74,6 +118,7 @@ class KVCacheManager(nn.Module):
         self.batch_size = config.neuron_config.batch_size
         self.padding_side = config.neuron_config.padding_side
         self.k_cache_transposed = config.neuron_config.k_cache_transposed
+        self.global_rank = global_rank
 
         # NOTE: Tiling the sequence dimension of the KV cache enables specific compiler optimizations like cascaded reductions
         self.is_kv_cache_tiled = config.neuron_config.kv_cache_tiling
@@ -81,7 +126,7 @@ class KVCacheManager(nn.Module):
         self.quant = config.neuron_config.kv_cache_quant
 
         num_layer = config.num_hidden_layers
-        dtype = config.neuron_config.torch_dtype
+        dtype = config.neuron_config.attention_dtype if config.neuron_config.attention_dtype is not None else config.neuron_config.torch_dtype
         if self.quant:
             self.quant_dtype = torch.float8_e4m3fn
             self.dequant_dtype = dtype
@@ -96,6 +141,7 @@ class KVCacheManager(nn.Module):
 
     def _get_num_kv_heads_per_rank(self, config: InferenceConfig):
         tp_degree = config.neuron_config.tp_degree
+
         num_kv_head = self.num_kv_head
         num_atten_head = config.num_attention_heads
 
@@ -133,6 +179,8 @@ class KVCacheManager(nn.Module):
                     f" but got {max_len}. Padding it to {padded_max_len} meet the requirement."
                 )
             max_len = get_cache_size(padded_max_len, self.num_cores_per_group)
+
+        self.max_len = max_len
 
         if self.is_kv_cache_tiled:
             num_tiles = int(max_len / 128)
@@ -186,9 +234,10 @@ class KVCacheManager(nn.Module):
         else:
             k_cache = self.past_key_values[2 * idx]
             v_cache = self.past_key_values[2 * idx + 1]
-            if self.is_kv_cache_tiled:
-                k_cache = _reshape_tiled_cache(k_cache, self.k_cache_transposed)
-                v_cache = _reshape_tiled_cache(v_cache, False)
+
+        if self.is_kv_cache_tiled:
+            k_cache = untile_cache(cache=k_cache, transposed=self.k_cache_transposed)
+            v_cache = untile_cache(cache=v_cache, transposed=False)
 
         return k_cache, v_cache
 
@@ -310,7 +359,9 @@ class KVCacheManager(nn.Module):
                     kvcache_buffer[4][1] is the V cache of the 4th layer
         :return: list of tuple of (K, V)
         """
+
         updated_kv_cache = []
+
         for idx, kv_per_layer in enumerate(new_key_values):
             k_cache, v_cache = self.update_kv_by_layer_id(
                 idx=idx,
@@ -321,13 +372,18 @@ class KVCacheManager(nn.Module):
                 seq_len=seq_len,
                 scatter_index=scatter_index,
                 kv_active_mask=kv_active_mask,
-                kvcache_buffer=kvcache_buffer,
+                kvcache_buffer=kvcache_buffer
             )
 
-            # Retiling
-            # TODO once compiler fixes CR 158191111 we can turn back output tiling on
-            # k_cache = k_cache.view(cache_shape)
-            # v_cache = v_cache.view(cache_shape)
+            # If is_kv_cache_tiled=True, we store the KV cache in a sequence tiled layout in the HBM.
+            # This tiling functions as a hint for the compiler. The torch level logic is not dependent on the layout,
+            # so we keep just the storage in tiled layout and the compute is performed in the non tiled layout.
+            # Here, before we update the cache which is in non-tiled layout, we tile it along sequence
+            # so we can write it back to the tiled buffer.
+            if self.is_kv_cache_tiled:
+                k_cache = tile_cache(k_cache, self.k_cache_transposed)
+                v_cache = tile_cache(v_cache, False)
+
             updated_kv_cache.append(k_cache)
             updated_kv_cache.append(v_cache)
 
@@ -355,10 +411,25 @@ class KVCacheManager(nn.Module):
         k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer)
 
         if is_for_context_encoding:
+            if self.neuron_config.cp_degree > 1:
+                # When we run CP, decode will run in full TP, selectively write the heads that are used in decode
+                rank = self.global_rank.get_rank()
+                kv_head_indices = get_kv_head_indices_context_parallel_full_tp_decode(self.num_kv_head, self.neuron_config.tp_degree, self.neuron_config.cp_degree, device=k_cache.device)
+                head_idx = torch.index_select(kv_head_indices, dim=0, index=rank)
+                latest_k = torch.index_select(latest_k, dim=1, index=head_idx)
+                latest_v = torch.index_select(latest_v, dim=1, index=head_idx)
+
             if self.is_continuous_batching:
                 assert seq_ids.dim() == 1 and seq_ids.shape[0] == 1, "only supports single seq_id"
-                k_cache = update_cache_const_indices(k_cache, latest_k, seq_ids)
-                v_cache = update_cache_const_indices(v_cache, latest_v, seq_ids)
+                if self.neuron_config.k_cache_transposed:
+                    cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
+                    indices = [cache_idx] + [torch.zeros(1, device=seq_ids.device) for _ in range(k_cache.dim() - 1)]
+                    indices = [t.squeeze().to(torch.int32) for t in indices]
+                    k_cache = dynamic_update_slice(k_cache, latest_k, indices)
+                    v_cache = dynamic_update_slice(v_cache, latest_v, indices)
+                else:
+                    k_cache = update_cache_const_indices(k_cache, latest_k, seq_ids)
+                    v_cache = update_cache_const_indices(v_cache, latest_v, seq_ids)
             else:
                 k_cache = fill_prefix(k_cache, latest_k)
                 v_cache = fill_prefix(v_cache, latest_v)
@@ -422,6 +493,12 @@ class KVCacheManager(nn.Module):
                     )
                     latest_k, latest_v = updated_latest_k, updated_latest_v
                 else:
+                    if self.config.neuron_config.apply_seq_ids_mask:
+                        seq_ids_mask = torch.ge(seq_ids, torch.full_like(seq_ids, 0))
+                        seq_ids_mask = seq_ids_mask.reshape(-1, 1).broadcast_to(position_ids.shape)
+                        padded_pos_id = torch.full_like(position_ids, self.max_len - 1)
+                        position_ids = torch.where(seq_ids_mask, position_ids, padded_pos_id)
+
                     scatter_index_new_k = self._get_index_to_update_new_position(
                         scatter_index, position_ids, latest_k, self.k_cache_transposed
                     )
