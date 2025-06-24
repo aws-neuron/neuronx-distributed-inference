@@ -3,6 +3,7 @@ import os
 import re
 import time
 import warnings
+from copy import deepcopy
 from functools import partial
 from typing import List, Type
 
@@ -18,10 +19,11 @@ from neuronx_distributed.quantization.quantization_utils import (
 )
 from neuronx_distributed.trace.model_builder import ModelBuilder
 from neuronx_distributed.trace.trace import get_sharded_checkpoint
+from neuronx_distributed.utils.model_utils import init_on_device
 from safetensors.torch import load_file
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
-from neuronx_distributed_inference.models.model_wrapper import ModelWrapper
+from neuronx_distributed_inference.models.model_wrapper import ModelWrapper, CONTEXT_ENCODING_MODEL_TAG
 from neuronx_distributed_inference.modules.checkpoint import (
     load_state_dict,
     prune_state_dict,
@@ -126,6 +128,10 @@ class NeuronApplicationBase(torch.nn.Module):
         if not hasattr(config, "neuron_config"):
             raise ValueError("Config must include a NeuronConfig")
 
+        if getattr(config, "fused_spec_config", None) is not None:
+            if (config.fused_spec_config.draft_config.neuron_config.torch_dtype != config.neuron_config.torch_dtype) and (config.neuron_config.cast_type == "config"):
+                raise ValueError("cast-type must be set to 'as-declared' to be able to run different precisions for draft and target model!")
+
     @classmethod
     def get_config_cls(cls) -> InferenceConfig:
         """Gets the config class for this model."""
@@ -170,15 +176,38 @@ class NeuronApplicationBase(torch.nn.Module):
                     sharded_checkpoint_dir=sharded_checkpoint_dir
                 )
 
+    def _save_configs_to_compiler_workdir(self):
+        # save full model neuron config
+        base_compile_work_dir = self.get_builder().compiler_workdir
+        self.config.save(base_compile_work_dir)
+
+        # generate a new config for each submodel and bucket size
+        for submodel in self.models:
+            for bucket_rank, bucket_size in enumerate(submodel.config.neuron_config.buckets):
+                specific_config = deepcopy(submodel.config)
+                specific_config.neuron_config.buckets = [bucket_size]
+
+                if submodel.tag == CONTEXT_ENCODING_MODEL_TAG:
+                    specific_config.neuron_config.context_encoding_buckets = specific_config.neuron_config.buckets
+                else:
+                    specific_config.neuron_config.token_generation_buckets = specific_config.neuron_config.buckets
+
+                submodel_path = os.path.join(base_compile_work_dir, submodel.tag, f"_tp0_bk{bucket_rank}")
+                specific_config.save(submodel_path)
+
     def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None, dry_run=False):
         """Compiles this model and saves it to the given path."""
         compiled_model_path = normalize_path(compiled_model_path)
 
         self.config.save(compiled_model_path)
+        logger.info(f"Saving the neuron_config to {compiled_model_path}")
 
         traced_model = self.get_builder(debug).trace(
             initialize_model_weights=False, dry_run=dry_run
         )
+
+        self._save_configs_to_compiler_workdir()
+
         if dry_run:
             return
 
@@ -373,22 +402,23 @@ class NeuronApplicationBase(torch.nn.Module):
         else:
             model_sd = self.get_state_dict(model_path, self.config)
 
-        if self.neuron_config.torch_dtype != torch.float32:
+        if self.neuron_config.torch_dtype != torch.float32 and self.neuron_config.cast_type == "config":
             _cast_helper(model_sd)
+
         return model_sd
 
     @classmethod
     def get_state_dict(cls, model_name_or_path: str, config: InferenceConfig) -> dict:
         """Gets the state dict for this model."""
-
         if os.path.isdir(model_name_or_path):
             model_sd = load_state_dict(model_name_or_path)
         elif os.path.isfile(model_name_or_path):
             model_sd = torch.load(model_name_or_path)
         else:
             # model_name_or_path is a model name
-            model = cls.load_hf_model(model_name_or_path, device_map="cpu")
-            model_sd = model.state_dict()
+            with init_on_device(torch.device("cpu"), force_custom_init_on_device=True):
+                model = cls.load_hf_model(model_name_or_path)
+                model_sd = model.state_dict()
 
         param_name_list = list(model_sd.keys())
         for param_name in param_name_list:

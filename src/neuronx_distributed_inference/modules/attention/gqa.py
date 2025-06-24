@@ -13,6 +13,7 @@ from neuronx_distributed.parallel_layers.mappings import (
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
 from neuronx_distributed.quantization.quantization_layers import BaseQuantizeParallelLinear
 from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_kernel, rmsnorm_qkv_isa_fused_add_kernel
+from neuronxcc.nki.compiler.backends.neuron.dimensions import CCPipeline  # noqa: N813
 from neuronxcc.nki.language import nc
 from torch import nn
 from torch.distributed import ProcessGroup
@@ -45,22 +46,25 @@ class GQA(enum.Enum):
     # Example:
     # tp_degree = 32
     # num_attention_heads: 56 -> 64
-    # num_kev_value_heads: 8  -> 64
-    # | K1 K1 | K2 K2 | ... | K7 K7| Pad Pad | ... | Pad Pad |
-    # | Q1 Q2 | Q3 Q4 | ... | Q55 Q56 | Pad Pad | ... | Pad Pad |
+    # num_kev_value_heads: 8  -> 56
+    # adding 8 padding ranks, (inclusive) from 57 to 64
+    # | KV1 KV1 | KV1 KV1 | ... | KV8 KV8 | Pad1 Pad1 | ... | Pad8 Pad8 |
+    # | Q1  Q2  | Q3  Q4  | ... | Q55 Q56 | Pad1 Pad1 | ... | Pad8 Pad8 |
     CONVERT_TO_MHA = "convert-to-mha"
 
     # This transforms a GQA attention mechanism such that there is exactly
     # one K/V head per tp_degree through replication e.g. 8 K/V heads with
     # tp_degree=32 results in 32 K/V heads. This is more memory efficient but
-    # does not work for all configurations. Q heads are padded interleaved
-    # to retain correct alignment between Q and K/V heads.
+    # does not work for all configurations since
+    # tp_degree % initial_num_kev_value_heads != 0 can only be padded at the end
+    # Q heads are padded interleaved to retain correct alignment between Q and K/V heads.
     # Example:
     # tp_degree = 32
     # num_attention_heads: 56 -> 64
     # num_kev_value_heads: 8  -> 32
-    # | K1    | K1    | K1    | K1     | K2    | ...
-    # | Q1 Q2 | Q3 Q4 | Q5 Q6 | Q7 Pad | Q8 Q9 | ...
+    # adding 8 padding ranks, one every 8th rank
+    # | KV1   | KV1   | KV1   | KV1     | KV2   | ... | KV2   | | KV8     |
+    # | Q1 Q2 | Q3 Q4 | Q5 Q6 | Q7 Pad1 | Q8 Q9 | ... | Q5 Q6 | | Q7 Pad8 |
     REPLICATE_TO_TP_DEGREE = "replicate-to-tp-degree"
 
 
@@ -74,6 +78,7 @@ def determine_sharding_strategy(
     if sharding_strategy == GQA.REPLICATE_TO_TP_DEGREE and (
         tp_degree % source_key_value_heads != 0
     ):
+        logger.warning(f"TP degree ({tp_degree}) and KV heads ({source_key_value_heads}) are not divisible. Overriding attention sharding strategy to GQA.CONVERT_TO_MHA!")
         sharding_strategy = GQA.CONVERT_TO_MHA
 
     return sharding_strategy
@@ -320,7 +325,7 @@ class BaseGroupQueryAttention(nn.Module):
                 old_keys.append(key)
 
         for key_index in range(len(old_keys)):
-            model_state_dict[new_keys[key_index]] = model_state_dict.pop(old_keys[key_index])
+            model_state_dict[new_keys[key_index]] = model_state_dict[old_keys[key_index]]
 
 
 class GroupQueryAttention_QKV(BaseGroupQueryAttention):
@@ -340,12 +345,15 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         sequence_parallel_enabled: bool = False,
         sequence_dimension: Optional[int] = None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
-        rms_norm_eps: float = None,
+        rms_norm_eps: float = 1e-6,
         qkv_kernel_enabled: bool = False,
         fused_rmsnorm_skip_gamma: bool = False,
+        tiling_factor: int = 1,
+        seq_len_threshold_for_cc_tiling: int = 16834,
         logical_nc_config: int = 1,
         qkv_kernel_nbsd_layout: bool = False,
         on_cpu: bool = False,
+        rank_ordering: dict = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -373,8 +381,11 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         self.qkv_kernel_enabled = qkv_kernel_enabled
         self.fused_rmsnorm = not self.sequence_parallel_enabled
         self.fused_rmsnorm_skip_gamma = fused_rmsnorm_skip_gamma and self.fused_rmsnorm
+        self.tiling_factor = tiling_factor
+        self.seq_len_threshold_for_cc_tiling = seq_len_threshold_for_cc_tiling
         self.logical_nc_config = logical_nc_config
         self.qkv_kernel_nbsd_layout = qkv_kernel_nbsd_layout
+        self.rank_ordering = rank_ordering
 
         if self.tensor_model_parallel_group is not None:
             if self.fused_qkv:
@@ -384,7 +395,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
+                    sequence_parallel_enabled=False,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
+                    rank_ordering=rank_ordering,
                 )
                 if self.qkv_kernel_enabled:
                     # we need to transpose the weights on the CPU side to avoid
@@ -396,6 +409,11 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 setattr(self.Wqkv.weight, "num_attention_heads", self.num_attention_heads)
                 setattr(self.Wqkv.weight, "num_key_value_heads", self.num_key_value_heads)
                 setattr(self.Wqkv.weight, "head_dim", self.head_dim)
+                if self.bias:
+                    setattr(self.Wqkv.bias, "fused_qkv", True)
+                    setattr(self.Wqkv.bias, "num_attention_heads", self.num_attention_heads)
+                    setattr(self.Wqkv.bias, "num_key_value_heads", self.num_key_value_heads)
+                    setattr(self.Wqkv.bias, "head_dim", self.head_dim)
 
             else:
                 self.q_proj = ColumnParallelLinear(
@@ -406,6 +424,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     dtype=dtype,
                     sequence_parallel_enabled=False,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
+                    rank_ordering=rank_ordering,
                 )
                 self.k_proj = ColumnParallelLinear(
                     self.hidden_size,
@@ -415,6 +434,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     dtype=dtype,
                     sequence_parallel_enabled=False,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
+                    rank_ordering=rank_ordering,
                 )
                 self.v_proj = ColumnParallelLinear(
                     self.hidden_size,
@@ -424,6 +444,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     dtype=dtype,
                     sequence_parallel_enabled=False,
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
+                    rank_ordering=rank_ordering,
                 )
         else:
             if self.fused_qkv:
@@ -449,6 +470,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 hidden_states,
                 self.sequence_dimension,
                 process_group=self.tensor_model_parallel_group,
+                tile_cc=self.tiling_factor > 1,
             )
 
         if self.qkv_kernel_enabled:
@@ -527,6 +549,26 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         )
         bs, seqlen, h = hidden_states.shape
 
+        padded_seqlen = seqlen
+        # The QKV kernel we are calling here is a unified kernel,
+        # underneath there are two separate kernel implementations: TKG & CTE
+        # We only want to pad the sequence length for the CTE, which has batch * original seqlen > 64
+        if bs * seqlen > 64 and seqlen % 2 != 0:
+            logger.debug("For the CTE QKV kernel pad the sequence length to the next even number")
+            hidden_states = F.pad(
+                hidden_states,
+                pad=(
+                    0,
+                    0,  # hidden_dim: no padding
+                    0,
+                    1,  # seq_dim: pad 1 at end
+                    0,
+                    0,
+                ),  # batch_dim: no padding
+                value=1.0,  # pad non-zeros to avoid possible numerical issues
+            )
+            padded_seqlen = seqlen + 1
+
         h2, fused_qkv_size = self.Wqkv.weight.shape
         logger.debug(
             f"fused QKV projection weight - shape: {self.Wqkv.weight.shape}, dtype: {self.Wqkv.weight.dtype}"
@@ -545,17 +587,25 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             norm_weights = rmsnorm.weight.unsqueeze(0)
             assert norm_weights.shape == (1, h)
 
-        grid = (nc(self.logical_nc_config),)
+        if seqlen <= self.seq_len_threshold_for_cc_tiling:  # Keep regular grid for TKG. Messes up the impl
+            grid = (nc(self.logical_nc_config),)
+        else:  # Add CC pipelining dim for CTE kernel grid
+            grid = (CCPipeline(self.tiling_factor) * nc(self.logical_nc_config),)
 
         if self.qkv_kernel_nbsd_layout:
             QKV = torch.zeros(
                 n,
                 bs,
-                seqlen,
+                padded_seqlen,
                 self.head_dim,
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
+
+            if seqlen <= self.seq_len_threshold_for_cc_tiling:  # Keep regular grid for TKG. Messes up the impl
+                grid = (nc(self.logical_nc_config),)
+            else:  # Add CC pipelining dim for CTE kernel grid
+                grid = (CCPipeline(self.tiling_factor) * nc(self.logical_nc_config),)
 
             if residual is not None:
                 # attn_out is set to zeros becauses we getting the residual from fused-add-MLP directly
@@ -583,6 +633,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     kernel_name="QKV",
                     # Run RMSNorm inside the kernel if NOT using SP norm
                     fused_rmsnorm=fused_rmsnorm,
+                    # required shape: [1, hidden(sharded)]
+                    bias=self.Wqkv.bias.unsqueeze(0) if self.bias else None,
                     skip_gamma=self.fused_rmsnorm_skip_gamma,
                 )
                 residual = hidden_states  # store residual for MLP
@@ -601,11 +653,13 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     eps=self.rms_norm_eps,
                     # Run RMSNorm inside the kernel if NOT using SP norm
                     fused_rmsnorm=fused_rmsnorm,
+                    # required shape: [1, hidden(sharded)]
+                    bias=self.Wqkv.bias.unsqueeze(0) if self.bias else None,
                     skip_gamma=self.fused_rmsnorm_skip_gamma,
                     use_dma_transpose=True,
                 )
 
-            assert QKV.shape == (n, bs, seqlen, self.head_dim)
+            assert QKV.shape == (n, bs, padded_seqlen, self.head_dim)
 
             # switch from:
             #   output layout: [n, b, s, d]
@@ -613,8 +667,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             # back to original layout:
             #   output layout: [b, s, n*d]
             QKV = (
-                QKV.permute(1, 2, 0, 3)  # after permute: batch, seqlen, num_heads, d_head
-                .reshape(bs, seqlen, fused_qkv_size)
+                QKV.permute(1, 2, 0, 3)  # after permute: batch, padded_seqlen, num_heads, d_head
+                .reshape(bs, padded_seqlen, fused_qkv_size)
                 .to(hidden_states.dtype)
             )
 
@@ -622,7 +676,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             assert residual is None, "fused_add_qkv only support for nbsd layout"
             QKV = torch.zeros(
                 bs,
-                seqlen,
+                padded_seqlen,
                 fused_qkv_size,
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
@@ -643,9 +697,14 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 eps=self.rms_norm_eps,
                 # Run RMSNorm inside the kernel if NOT using SP norm
                 fused_rmsnorm=fused_rmsnorm,
+                # required shape: [1, hidden(sharded)]
+                bias=self.Wqkv.bias.unsqueeze(0) if self.bias else None,
                 skip_gamma=self.fused_rmsnorm_skip_gamma,
             )
 
+        # unpad the last token if it's needed
+        if padded_seqlen != seqlen:
+            QKV = QKV[:, :-1, :]
         assert QKV.shape == (bs, seqlen, fused_qkv_size)
 
         return (*self._split_fused_qkv(QKV), residual)
@@ -1003,6 +1062,8 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         rpl_reduce_dtype: torch.dtype = None,
         out_proj_kernel_enabled: bool = False,
         logical_nc_config: int = 1,
+        rank_ordering: dict = None,
+        tiling_factor: int = 1,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -1015,12 +1076,14 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
             desired_sharding_strategy=desired_sharding_strategy,
             tensor_model_parallel_group=tensor_model_parallel_group,
         )
+        self.tiling_factor = tiling_factor
 
         self.input_is_parallel = input_is_parallel
         self.out_proj_kernel_enabled = out_proj_kernel_enabled
         self.logical_nc_config = logical_nc_config
         self.rpl_reduce_dtype = rpl_reduce_dtype
         self.sequence_parallel_enabled = sequence_parallel_enabled
+        self.rank_ordering = rank_ordering
 
         if self.tensor_model_parallel_group is not None:
             self.o_proj = RowParallelLinear(
@@ -1033,6 +1096,8 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
                 sequence_dimension=sequence_dimension,
                 tensor_model_parallel_group=self.tensor_model_parallel_group,
                 reduce_dtype=rpl_reduce_dtype,
+                rank_ordering=rank_ordering,
+                tile_cc=self.tiling_factor > 1,
             )
             if self.out_proj_kernel_enabled:
                 # we need to transpose the weights on the CPU side to avoid

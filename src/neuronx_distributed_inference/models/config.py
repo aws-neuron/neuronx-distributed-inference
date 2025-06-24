@@ -4,18 +4,30 @@ import logging
 import importlib
 import os
 import warnings
-from typing import Dict, List, Type, Union
+from typing import Dict, List, Type, Union, Optional
 
 import torch
 from neuronx_distributed.quantization.quantization_config import (
     ActivationQuantizationType,
     QuantizedDtype,
 )
+from neuronx_distributed.modules.moe.moe_configs import BlockwiseMatmulConfig, RouterConfig
 from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 
 CONFIG_FILE = "neuron_config.json"
+CHUNKED_ATTENTION_SUPPORTED_NEURON_CONFIG = {
+    "flash_decoding_enabled": False,
+    "attn_kernel_enabled": False,
+    "attn_tkg_builtin_kernel_enabled": False,
+    "attn_tkg_nki_kernel_enabled": False,
+    "attn_block_tkg_nki_kernel_enabled": False,
+    "attn_block_tkg_nki_kernel_cache_update": False,
+    "is_prefix_caching": False,
+    "is_chunked_prefill": False,
+    "cp_degree": 1,
+}
 
 
 def to_torch_dtype(dtype_str: str) -> torch.dtype:
@@ -88,7 +100,20 @@ class NeuronConfig:
             self.torch_dtype = torch.bfloat16
             self.overrides_torch_dtype = False
 
-        self.rpl_reduce_dtype = kwargs.pop("rpl_reduce_dtype", self.torch_dtype)
+        self.cast_type = kwargs.pop("cast_type", "config")
+        if self.cast_type not in ["config", "as-declared"]:
+            raise ValueError("cast_type must be one of config, as-declared")
+
+        self.rpl_reduce_dtype = kwargs.pop("rpl_reduce_dtype", None)
+        if isinstance(self.rpl_reduce_dtype, str):
+            self.rpl_reduce_dtype = to_torch_dtype(self.rpl_reduce_dtype)
+
+        self.attention_dtype = kwargs.pop("attention_dtype", None)
+        if isinstance(self.attention_dtype, str):
+            self.attention_dtype = to_torch_dtype(self.attention_dtype)
+
+        if self.attention_dtype != self.torch_dtype and self.attention_dtype is not None:
+            assert self.cast_type == "as-declared", "attention dtype and torch dtype are different, however global cast is enabled. To enable running multiple precisions, set cast-type to 'as-declared'"
 
         # fallback to sequence_length is for compatibility with vllm
         self.max_context_length = kwargs.pop("max_context_length", self.seq_len)
@@ -106,7 +131,6 @@ class NeuronConfig:
         # Attention
         self.fused_qkv = kwargs.pop("fused_qkv", False)
         self.sequence_parallel_enabled = kwargs.pop("sequence_parallel_enabled", False)
-        self.target_sequence_parallel_enabled = self.sequence_parallel_enabled
         self.weight_gather_seq_len_threshold = kwargs.pop("weight_gather_seq_len_threshold", 32768)
         # TODO: Remove Llama attn_cls and multiple attention feature.
         self.attn_cls = kwargs.pop("attn_cls", "NeuronLlamaAttention")
@@ -140,6 +164,7 @@ class NeuronConfig:
         self.buckets = kwargs.pop("buckets", [self.seq_len])
         self.bucket_n_active_tokens = kwargs.pop("bucket_n_active_tokens", False)
         self.context_encoding_buckets = kwargs.pop("context_encoding_buckets", None)
+        self.prefix_buckets = kwargs.pop("prefix_buckets", None)
         self.token_generation_buckets = kwargs.pop("token_generation_buckets", None)
         if self.context_encoding_buckets is not None:
             self.context_encoding_buckets.sort()
@@ -202,25 +227,33 @@ class NeuronConfig:
         self.is_block_kv_layout = kwargs.pop("is_block_kv_layout", False)
         self.pa_num_blocks = kwargs.pop("pa_num_blocks", self.batch_size)
         self.pa_block_size = kwargs.pop("pa_block_size", self.seq_len)
+
         # # Prefix caching
         self.is_prefix_caching = kwargs.pop("is_prefix_caching", False)
+
         # # Chunked prefill
         # When chunked prefill is enabled, max_context_length will be
-        # used as chunk size. Batch size will be 1 because it concatenates
-        # all requests along seq dim. cp_max_num_seqs is used to denote how
-        # many sequences are there in one concatenated request.
-        self.is_chunked_prefill = kwargs.pop("is_chunked_prefill", False)
-        self.cp_max_num_seqs = kwargs.pop("cp_max_num_seqs", 0)
-        self.cp_num_active_blocks = kwargs.pop("cp_num_active_blocks", 0)
+        # used as chunk size. Batch size will be 1 for CTE because it
+        # concatenates all requests along seq dim. cp_config.max_num_seqs
+        # is used to denote how many sequences are there in one concatenated
+        # request.
+        self.chunked_prefill_config = kwargs.pop("chunked_prefill_config", None)
+        if type(self.chunked_prefill_config) is dict:
+            self.chunked_prefill_config = ChunkedPrefillConfig(
+                **self.chunked_prefill_config
+            )
+        self.is_chunked_prefill = self.chunked_prefill_config is not None
         if self.is_chunked_prefill:
             assert (
                 self.is_block_kv_layout
-            ), "is_block_kv_layout has to be true for chunked prefill \
-                because it depends on block KV"
-            assert (
-                self.batch_size == 1
-            ), "batch_size has to be 1 for chunked prefill \
-                because it concatenates all requests into one long request"
+            ), "is_block_kv_layout has to be true for chunked prefill" \
+                + " because it depends on block KV"
+            if not self.chunked_prefill_config.tkg_model_enabled:
+                assert (
+                    self.batch_size == 1
+                ), "batch_size has to be 1 for chunked prefill CTE model" \
+                    + " because it concatenates all requests into one" \
+                    + " long request"
 
         # Lora
         self.lora_config = kwargs.pop("lora_config", None)
@@ -229,10 +262,14 @@ class NeuronConfig:
 
         # Distributed config
         self.tp_degree = kwargs.pop("tp_degree", 1)
+        self.cp_degree = kwargs.pop("cp_degree", 1)
         self.pp_degree = kwargs.pop("pp_degree", 1)
         self.ep_degree = kwargs.pop("ep_degree", 1)
         self.save_sharded_checkpoint = kwargs.pop("save_sharded_checkpoint", False)
         self.skip_sharding = kwargs.pop("skip_sharding", False)
+
+        if self.tp_degree % self.cp_degree != 0:
+            raise ValueError("TP Degree must be evenly divisible by CP Degree")
 
         # QK layer normalization
         self.qk_layernorm = kwargs.pop("qk_layernorm", False)
@@ -273,7 +310,7 @@ class NeuronConfig:
         self.k_cache_transposed = kwargs.pop("k_cache_transposed", False)
 
         # Kernels
-        self.attn_kernel_enabled = kwargs.pop("attn_kernel_enabled", False)  # CTE attention kernel.
+        self.attn_kernel_enabled = kwargs.pop("attn_kernel_enabled", None)  # CTE attention kernel.
         self.qkv_kernel_enabled = kwargs.pop("qkv_kernel_enabled", False)
         self.qkv_kernel_nbsd_layout = kwargs.pop("qkv_kernel_nbsd_layout", False)
         self.mlp_kernel_enabled = kwargs.pop("mlp_kernel_enabled", False)
@@ -289,6 +326,10 @@ class NeuronConfig:
         self.attn_tkg_nki_kernel_enabled = kwargs.pop("attn_tkg_nki_kernel_enabled", False)
         self.attn_tkg_builtin_kernel_enabled = kwargs.pop("attn_tkg_builtin_kernel_enabled", False)
         self.attn_block_tkg_nki_kernel_enabled = kwargs.pop("attn_block_tkg_nki_kernel_enabled", False)
+        if self.attn_block_tkg_nki_kernel_enabled:
+            assert (
+                self.qkv_kernel_enabled
+            ), "When attn-block-tkg-nki-kernel-enabled, self.qkv_kernel_enabled is also required."
         attn_tkg_kernel_enablement = [
             self.attn_tkg_nki_kernel_enabled,
             self.attn_tkg_builtin_kernel_enabled,
@@ -299,10 +340,7 @@ class NeuronConfig:
             "[attn-tkg-nki-kernel-enabled, attn-tkg-builtin-kernel-enabled, attn-block-tkg-nki-kernel-enabled]"
         )
 
-        # Enable in-kernel KV cache update by default if attn_block_tkg_nki_kernel_enabled.
-        self.attn_block_tkg_nki_kernel_cache_update = kwargs.pop(
-            "attn_block_tkg_nki_kernel_cache_update", self.attn_block_tkg_nki_kernel_enabled
-        )
+        self.attn_block_tkg_nki_kernel_cache_update = kwargs.pop("attn_block_tkg_nki_kernel_cache_update", False)
         if not self.attn_block_tkg_nki_kernel_enabled:
             assert not self.attn_block_tkg_nki_kernel_cache_update, \
                 'attn-block-tkg-nki-kernel-cache-update can only be enabled with attn-block-tkg-nki-kernel-enabled'
@@ -310,16 +348,20 @@ class NeuronConfig:
             self.kv_cache_tiling = False  # Don't do kv cache tiling when kernel does cache update.
 
         # Check attention features incompatible with attention block kernel or transposed K cache.
-        attn_tkg_or_k_cache_tp__incompatible_features = [
+        attn_tkg_incompatible_features = [
+            (self.flash_decoding_enabled, 'flash decoding'),
+            (self.is_chunked_prefill, 'contexted prefill'),
+        ]
+        k_cache_tp_incompatible_features = [
             (self.flash_decoding_enabled, 'flash decoding'),
             (self.is_chunked_prefill, 'contexted prefill'),
             (self.is_block_kv_layout, 'block KV cache'),
         ]
         if sum(attn_tkg_kernel_enablement) > 0:
-            for flag, feature in attn_tkg_or_k_cache_tp__incompatible_features:
+            for flag, feature in attn_tkg_incompatible_features:
                 assert not flag, f'Attention TKG kernels do not yet support {feature} feature.'
         if self.k_cache_transposed:
-            for flag, feature in attn_tkg_or_k_cache_tp__incompatible_features:
+            for flag, feature in k_cache_tp_incompatible_features:
                 assert not flag, f'Transposed K cache is not yet supported by {feature} feature.'
 
         if self.quantized_mlp_kernel_enabled or self.mlp_kernel_enabled:
@@ -345,18 +387,7 @@ class NeuronConfig:
                 )
 
         # Logical NeuronCore Configuration (LNC)
-        lnc = get_platform_lnc()
-        if "logical_neuron_cores" in kwargs:
-            # For backward compatibility, default to the deprecated logical_neuron_cores attribute if set.
-            warning_message = (
-                "'logical_neuron_cores' is deprecated and replaced by 'logical_nc_config'. "
-                "In a future release, this attribute will be removed."
-            )
-            warnings.warn(warning_message, category=DeprecationWarning)
-            lnc = kwargs.pop("logical_neuron_cores")
-        self.logical_nc_config = int(
-            os.environ.get("NEURON_LOGICAL_NC_CONFIG", kwargs.pop("logical_nc_config", lnc))
-        )
+        self.logical_nc_config = self._get_lnc(kwargs)
 
         if self.is_mlp_quantized():
             self.quantization_type = "per_channel_symmetric"
@@ -364,7 +395,18 @@ class NeuronConfig:
 
         # compiler flags
         self.cc_pipeline_tiling_factor = kwargs.pop("cc_pipeline_tiling_factor", 2)
+        self.seq_len_threshold_for_cc_tiling = kwargs.pop("seq_len_threshold_for_cc_tiling", 16384)
+        self.tile_cc = False
+        # manual tiling of cc with NKI, when MLP kernels are enabled
+        # the compiler flow with cc_tiling > 1 with kernels are not accurate
+        if self.cc_pipeline_tiling_factor > 1 and (
+                self.mlp_kernel_enabled or self.quantized_mlp_kernel_enabled):
+            self.tile_cc = True
+
         self.target = kwargs.pop("target", None)
+
+        # Flag to enable dge for spill reload DMAs in order to get reduction in DMA rings memory for long context
+        self.enable_spill_reload_dge = kwargs.pop("enable_spill_reload_dge", False)
 
         # weights_to_skip_layout_optimization
         self.weights_to_skip_layout_optimization = []
@@ -374,8 +416,10 @@ class NeuronConfig:
 
         self._verify_quantized_config()
 
+        self.apply_seq_ids_mask = kwargs.pop("apply_seq_ids_mask", False)
+
         # warmup flag
-        self.skip_warmup = kwargs.pop("skip_warmup", True if get_platform_target() == "trn2" else False)
+        self.skip_warmup = kwargs.pop("skip_warmup", False)
 
     def _verify_quantized_config(self):
         if not self.quantized:
@@ -385,6 +429,38 @@ class NeuronConfig:
         QuantizedDtype.has_dtype(self.quantization_dtype)
         if self.is_mlp_quantized():
             assert self.quantization_dtype == "f8e4m3"
+
+    def _get_lnc(self, kwargs):
+        env_lnc = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", -1))
+        kwargs_lnc = -1
+        platform_lnc = get_platform_lnc()
+        if "logical_neuron_cores" in kwargs:
+            # For backward compatibility, default to the deprecated logical_neuron_cores attribute if set.
+            warning_message = (
+                "'logical_neuron_cores' is deprecated and replaced by 'logical_nc_config'. "
+                "In a future release, this attribute will be removed."
+            )
+            warnings.warn(warning_message, category=DeprecationWarning)
+            kwargs_lnc = int(kwargs.pop("logical_neuron_cores"))
+
+        if "logical_nc_config" in kwargs:
+            kwargs_lnc = int(kwargs.pop("logical_nc_config"))
+
+        # Warn that LNC will not match provided LNC if NEURON_LOGICAL_NC_CONFIG != logical_nc_config kwarg
+        if env_lnc != -1 and kwargs_lnc != -1 and env_lnc != kwargs_lnc:
+            warning_message = (
+                f"NEURON_LOGICAL_NC_CONFIG={env_lnc} does not match provided logical_nc_config={kwargs_lnc}. "
+                "Using NEURON_LOGICAL_NC_CONFIG to set LNC."
+            )
+            warnings.warn(warning_message, category=UserWarning)
+
+        # LNC set with priority: NEURON_LOGICAL_NC_CONFIG > logical_nc_config kwarg > platform LNC
+        if env_lnc != -1:
+            return env_lnc
+        elif kwargs_lnc != -1:
+            return kwargs_lnc
+        else:
+            return platform_lnc
 
     def __getattribute__(self, name):
         # Maintain backward compatibility without serializing deprecated 'logical_neuron_cores' attr.
@@ -436,6 +512,19 @@ class MoENeuronConfig(NeuronConfig):
     ) -> None:
         self.capacity_factor = float(capacity_factor) if capacity_factor is not None else None
         self.glu_mlp = glu_mlp
+
+        self.early_expert_affinity_modulation = kwargs.pop("early_expert_affinity_modulation", False)
+        self.normalize_top_k_affinities = not kwargs.pop("disable_normalize_top_k_affinities", False)
+        self.fused_shared_experts = kwargs.pop("fused_shared_experts", False)
+
+        self.blockwise_matmul_config = kwargs.pop("blockwise_matmul_config", {})
+        self.blockwise_matmul_config = BlockwiseMatmulConfig.from_kwargs(**self.blockwise_matmul_config)
+
+        self.router_config = kwargs.pop("router_config", None)
+        if isinstance(self.router_config, dict):
+            self.router_config = RouterConfig(**self.router_config)
+        else:
+            self.router_config = RouterConfig.from_kwargs(**kwargs)
         super().__init__(**kwargs)
 
 
@@ -444,7 +533,12 @@ class InferenceConfig:
     attribute_map: Dict[str, str] = {}
 
     def __init__(
-        self, neuron_config: NeuronConfig, fused_spec_config=None, load_config=None, **kwargs
+        self,
+        neuron_config: NeuronConfig,
+        fused_spec_config=None,
+        load_config=None,
+        metadata: Optional[Dict] = None,
+        **kwargs
     ):
         self.neuron_config = neuron_config
         self.fused_spec_config = fused_spec_config
@@ -452,6 +546,8 @@ class InferenceConfig:
             load_config(self)
         else:
             self.load_config()
+
+        self.metadata = metadata
 
         # Override config values from kwargs.
         for key, value in kwargs.items():
@@ -494,6 +590,13 @@ class InferenceConfig:
         """
         missing_attributes = [x for x in self.get_required_attributes() if not hasattr(self, x)]
         assert len(missing_attributes) == 0, f"Config must define {missing_attributes}"
+        self._validate_chunked_attention_support()
+
+    def _validate_chunked_attention_support(self):
+        if hasattr(self, "attention_chunk_size"):
+            for config, config_value in CHUNKED_ATTENTION_SUPPORTED_NEURON_CONFIG.items():
+                if getattr(self.neuron_config, config) != config_value:
+                    raise ValueError(f"The Neuron config {config}: {config_value} is not yet supported with chunked attention.")
 
     def save(self, model_path: Union[str, os.PathLike]):
         """
@@ -623,6 +726,24 @@ class OnDeviceSamplingConfig:
         self.deterministic = kwargs.pop("deterministic", False)
         self.global_topk = kwargs.pop("global_topk", 256)
         self.on_device_sampling_config = kwargs.pop("on_device_sampling_config", True)
+
+
+class ChunkedPrefillConfig:
+    def __init__(self, **kwargs):
+        # max_num_seqs is the actual batch size for chunked prefill
+        self.max_num_seqs = kwargs.pop("max_num_seqs", 0)
+
+        # Whether to enable a separate TKG model for decoding-only requests.
+        # With chunked prefill, the CTE model is always enabled and it can
+        # process both prefilling and decoding requests in one iteration,
+        # while a separate TKG model is OPTIONAL. The seprate TKG model can
+        # process decoding-only requests, but in a faster way for now.
+        self.tkg_model_enabled = kwargs.pop("tkg_model_enabled", True)
+
+        # query len of the tile to be used by the kernel
+        self.kernel_q_tile_size = kwargs.pop("kernel_q_tile_size", 128)
+        # kv cache len of the tile to be used by the kernel
+        self.kernel_kv_tile_size = kwargs.pop("kernel_kv_tile_size", 1024)
 
 
 def get_platform_lnc():

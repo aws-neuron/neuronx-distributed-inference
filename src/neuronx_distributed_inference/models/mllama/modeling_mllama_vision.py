@@ -73,6 +73,7 @@ class ColumnParallelConv2dPatch(torch.nn.Module):
         kernel_size: int,
         stride: int,
         bias: int,
+        dtype=torch.float32,
     ) -> None:
         super().__init__()
         if isinstance(kernel_size, int):
@@ -80,9 +81,7 @@ class ColumnParallelConv2dPatch(torch.nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self._linear = ColumnParallelLinear(
-            in_channels * kernel_size[0] * kernel_size[1],
-            out_channels,
-            bias=bias,
+            in_channels * kernel_size[0] * kernel_size[1], out_channels, bias=bias, dtype=dtype
         )
 
     def _unfold(self, x):
@@ -121,6 +120,7 @@ class ImageFeedForward(torch.nn.Module):
         sequence_parallel_enabled: bool,
         act_layer: Callable = nn.GELU,
         ffn_in_sp: bool = False,
+        dtype=torch.float32,
     ):
         super().__init__()
         if ffn_in_sp:
@@ -130,8 +130,8 @@ class ImageFeedForward(torch.nn.Module):
             assert (
                 sequence_parallel_enabled
             ), "sequence_parallel_enabled must be True if ffn_in_sp=True"
-            self.c_fc = nn.Linear(dim, hidden_dim, bias=True)
-            self.c_proj = nn.Linear(hidden_dim, dim, bias=True)
+            self.c_fc = nn.Linear(dim, hidden_dim, bias=True, dtype=dtype)
+            self.c_proj = nn.Linear(hidden_dim, dim, bias=True, dtype=dtype)
         else:
             # Parallel Layers (weights in TP)
             self.c_fc = ColumnParallelLinear(
@@ -141,6 +141,7 @@ class ImageFeedForward(torch.nn.Module):
                 gather_output=False,
                 sequence_parallel_enabled=sequence_parallel_enabled,
                 sequence_dimension=1 if sequence_parallel_enabled else None,
+                dtype=dtype,
             )
             self.c_proj = RowParallelLinear(
                 hidden_dim,
@@ -149,6 +150,7 @@ class ImageFeedForward(torch.nn.Module):
                 input_is_parallel=True,
                 sequence_parallel_enabled=sequence_parallel_enabled,
                 sequence_dimension=1 if sequence_parallel_enabled else None,
+                dtype=dtype,
             )
         self.non_linearity = act_layer()
         self.dropout = dropout
@@ -164,29 +166,16 @@ class NeuronImageAttention(NeuronAttentionBase):
     def __init__(
         self, config: InferenceConfig, hidden_size, num_attention_heads, sequence_parallel_enabled
     ):
-        super().__init__()
-        self.config = config
-        self.neuron_config = config.neuron_config
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_attention_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
-        self.padding_side = self.neuron_config.padding_side
-        self.torch_dtype = self.neuron_config.torch_dtype
-        self.num_cores_per_group = config.num_cores_per_group
-
-        if parallel_state.model_parallel_is_initialized():
-            self.tp_degree = parallel_state.get_tensor_model_parallel_size()
-        else:
-            self.tp_degree = 1
-        self.fused_qkv = getattr(self.neuron_config, "fused_qkv", False)
-        self.clip_qkv = None
-        self.attn_kernel_enabled = True
-
-        self.sequence_parallel_enabled = sequence_parallel_enabled
-        self.sequence_dimension = 1 if sequence_parallel_enabled else None
-
-        self.init_gqa_properties()
+        # TODO: VisionEncoder should have a separate config to avoid having to explicitly pass SP to AttentionBase
+        super().__init__(
+            config=config,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_attention_heads,
+            head_dim=hidden_size // num_attention_heads,
+            num_cores_per_group=config.num_cores_per_group,
+            sequence_parallel_enabled=sequence_parallel_enabled,
+        )
 
     @staticmethod
     def perform_maskless_sdpa(Q, K, V, mask_gen_vectors, use_flash_attention, dtype):

@@ -28,6 +28,7 @@ class MockNeuronConfig:
         self.token_tree_config = None
         self.on_device_sampling_config = MockOnDeviceSamplingConfig()
         self.output_logits = False
+        self.is_prefix_caching = False
 
 
 class MockInferenceConfig:
@@ -61,6 +62,10 @@ class TestNeuronFusedSpecModel(NeuronFusedSpecModel):
         position_ids,
         seq_ids,
         acceptance,  # To mock expected acceptance rate - Determines number of mock tokens generated per sequence in the forward pass.
+        slot_mapping=None,
+        active_block_table=None,
+        num_queries=None,
+        computed_context_lens=None,
     ):
         return self._tkg_impl(input_ids, attention_mask, position_ids, seq_ids, acceptance)
 
@@ -71,6 +76,10 @@ class TestNeuronFusedSpecModel(NeuronFusedSpecModel):
         position_ids,
         seq_ids,
         acceptance,  # To mock expected acceptance rate - Determines number of mock tokens generated per sequence in the forward pass.
+        slot_mapping=None,
+        active_block_table=None,
+        num_queries=None,
+        computed_context_lens=None,
     ):
         return self._tkg_impl(input_ids, attention_mask, position_ids, seq_ids, acceptance)
 

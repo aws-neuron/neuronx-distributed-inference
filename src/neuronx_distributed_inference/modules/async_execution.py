@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union
 
 import torch
 
@@ -44,7 +44,7 @@ class AsyncTensorWrapper:
         return self.async_result
 
     def sync_async_result_to_cpu(
-        self, seq_ids: torch.Tensor, is_fused_speculation: bool = False, early_exit: bool = False
+        self, seq_ids: torch.Tensor, is_fused_speculation: bool = False, early_exit: bool = False, is_prefix_caching: bool = False
     ):
         if not self.on_cpu:  # cases 1 and 2
             synced_result = get_async_output(self.async_result)
@@ -58,11 +58,71 @@ class AsyncTensorWrapper:
         # handle unpadding based on supplied seq_ids
         batch_size = seq_ids.shape[0]
         seq_ids = seq_ids.reshape(batch_size)  # make sure it's 1d tensor for index_select
+        if is_prefix_caching:
+            seq_ids = torch.arange(batch_size)
         if isinstance(synced_result, torch.Tensor):
             return torch.index_select(synced_result, 0, seq_ids)
 
         index_select = lambda x: torch.index_select(x, 0, seq_ids)  # noqa: E731
         return list(map(index_select, synced_result))
+
+
+def execute_model_prefix_caching(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    model_to_execute: "ModelWrapper",
+    input_dict: Dict[str, Any],
+    pad_type: str = "first_fit",
+) -> Tuple[AsyncTensorWrapper, bool]:
+    if "num_queries" not in input_dict:
+        full_context_lens = input_dict["full_context_lens"]
+        computed_context_lens = input_dict["computed_context_lens"]
+        num_queries = full_context_lens - computed_context_lens
+        input_dict["num_queries"] = num_queries
+
+    if (
+        not neuron_base_instance.neuron_config.enable_fused_speculation
+        and not neuron_base_instance.neuron_config.enable_eagle_speculation
+    ):
+        return model_to_execute(
+            input_dict["input_ids"],
+            input_dict["attention_mask"],
+            input_dict["position_ids"],
+            input_dict["seq_ids"],
+            input_dict["sampling_params"],
+            torch.empty(0),  # prev_hidden
+            torch.empty(0),  # adapter_ids
+            torch.empty(0),  # accepted_indices
+            torch.empty(0),  # current_length
+            torch.empty(0),  # medusa_mask
+            torch.empty(0),  # scatter_index
+            input_dict["slot_mapping"],
+            input_dict["block_table"],
+            input_dict["num_queries"],
+            input_dict["computed_context_lens"],
+            pad_type=pad_type
+        ), model_to_execute.is_neuron()
+    elif neuron_base_instance.neuron_config.enable_eagle_speculation:
+        return model_to_execute(
+            input_dict["input_ids"],
+            input_dict["attention_mask"],
+            input_dict["position_ids"],
+            input_dict["seq_ids"],
+            input_dict["sampling_params"],
+            torch.empty(0),  # prev_hidden
+            torch.empty(0),  # adapter_ids
+            input_dict["slot_mapping"],
+            input_dict["block_table"],
+            input_dict["num_queries"],
+            input_dict["computed_context_lens"],
+            torch.empty(0),  # target_input_ids
+            torch.empty(0),  # target_attention_mask
+            torch.empty(0),  # target_position_ids
+            torch.empty(0),  # target_slot_mapping
+            torch.empty(0),  # target_active_block_table
+            pad_type=pad_type
+        ), model_to_execute.is_neuron()
+    else:
+        raise NotImplementedError("Non-EAGLE fused speculation with prefix caching does not support async mode.")
 
 
 def execute_model(
@@ -71,9 +131,15 @@ def execute_model(
     input_dict: Dict[str, Any],
     hits_bucket_boundary: bool = False,
 ) -> Tuple[AsyncTensorWrapper, bool]:
-    ordered_tuple_inputs = neuron_base_instance._convert_input_dict_to_ordered_tuple(input_dict)
-
     pad_type = "first_fit" if not hits_bucket_boundary else "second_fit"
+
+    if neuron_base_instance.neuron_config.is_prefix_caching:
+        return execute_model_prefix_caching(neuron_base_instance,
+                                            model_to_execute,
+                                            input_dict,
+                                            pad_type)
+
+    ordered_tuple_inputs = neuron_base_instance._convert_input_dict_to_ordered_tuple(input_dict)
     return model_to_execute(*ordered_tuple_inputs, pad_type=pad_type), model_to_execute.is_neuron()
 
 
@@ -100,9 +166,13 @@ def within_bounds(inputs: Dict[str, Any], max_length: int, generation_length: in
     return (max_length - inputs["position_ids"].max().item()) > generation_length * 2
 
 
-def will_hit_bucket_boundary(known_length: int, buckets: List[int], max_num_tokens_generated=1):
+def will_hit_bucket_boundary(known_length: int, buckets: Union[List[int], List[Tuple[int, int]]], max_num_tokens_generated=1):
     hits_bucket_boundary = False
+
     for bucket in buckets:
+        # If buckets are 2D, use last index.
+        if not isinstance(bucket, int):
+            bucket = bucket[-1]
         # we do max_num_tokens_generated * 2 because we speculatively execute one step
         # ahead, before knowing the results of the current neff execution. In the worst case
         # both neffs will have full matching tokens, which is problematic near the bucket boundary
@@ -119,6 +189,8 @@ def causal_lm_async_execution(
     inputs: Dict[str, Any],
     is_fused_speculation: bool = False,
 ):
+    is_prefix_caching = neuron_base_instance.neuron_config.is_prefix_caching
+
     # PREFILL STAGE:
     is_prefill = neuron_base_instance._is_prefill(inputs["position_ids"])
     neuron_base_instance.async_should_stop = False
@@ -133,8 +205,9 @@ def causal_lm_async_execution(
         # not [0, num_requested_prefills] but [0, max_num_seqs]. To prevent out-of-bound accesses,
         # we convert the sequence IDs to their argsorted values.
         _seq_ids = torch.argsort(inputs["seq_ids"])
+
         outputs = prefill_outputs.sync_async_result_to_cpu(
-            _seq_ids, is_fused_speculation=is_fused_speculation
+            _seq_ids, is_fused_speculation=is_fused_speculation, is_prefix_caching=is_prefix_caching
         )
 
         # clean up async state
@@ -187,20 +260,19 @@ def causal_lm_async_execution(
             next_outputs = neuron_base_instance.prior_outputs
             inputs["input_ids"] = next_outputs.get_ranked_tensor()
             if neuron_base_instance.next_cpu_inputs is not None:
-                inputs["attention_mask"] = neuron_base_instance.next_cpu_inputs["attention_mask"]
-                inputs["position_ids"] = neuron_base_instance.next_cpu_inputs["position_ids"]
+                for key in neuron_base_instance.next_cpu_inputs:
+                    inputs[key] = neuron_base_instance.next_cpu_inputs[key]
             elif not is_fused_speculation:
                 raise RuntimeError(
                     "Expected next_cpu_inputs to be generated for a non fused_spec model."
                 )
-
             next_outputs, is_run_on_neuron = execute_model(
                 neuron_base_instance, generation_model, inputs
             )
         else:
             if neuron_base_instance.prior_outputs is not None:
                 outputs = neuron_base_instance.prior_outputs.sync_async_result_to_cpu(
-                    inputs["seq_ids"], is_fused_speculation=is_fused_speculation
+                    inputs["seq_ids"], is_fused_speculation=is_fused_speculation, is_prefix_caching=is_prefix_caching
                 )
                 neuron_base_instance.prior_outputs = None
                 neuron_base_instance.prior_seq_ids = None
@@ -215,7 +287,7 @@ def causal_lm_async_execution(
     # output to be returned
     outputs: AsyncTensorWrapper = neuron_base_instance.prior_outputs if not stay_in_sync_mode else next_outputs
     outputs = outputs.sync_async_result_to_cpu(
-        inputs["seq_ids"], is_fused_speculation=is_fused_speculation
+        inputs["seq_ids"], is_fused_speculation=is_fused_speculation, is_prefix_caching=is_prefix_caching
     )
 
     if stay_in_sync_mode:

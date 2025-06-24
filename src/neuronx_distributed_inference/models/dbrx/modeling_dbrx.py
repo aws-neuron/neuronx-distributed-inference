@@ -89,6 +89,10 @@ def convert_dbrx_to_neuron_state_dict(dbrx_state_dict, config):
         )
         neuron_state_dict[f"layers.{l}.ffn.expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
+        neuron_state_dict[f"layers.{l}.self_attn.global_rank.rank"] = torch.arange(
+            0, config.neuron_config.world_size, dtype=torch.int32
+        )
+
         neuron_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = (
             dbrx_state_dict[f"blocks.{l}.norm_attn_norm.attn.Wqkv.weight"].clone().detach()
         )
@@ -135,37 +139,27 @@ class DbrxInferenceConfig(InferenceConfig):
 
 class NeuronDbrxAttention(NeuronAttentionBase):
     def __init__(self, config: DbrxInferenceConfig):
-        super().__init__()
-        self.config = config
-        self.neuron_config = config.neuron_config
-        self.hidden_size = config.d_model
-        self.num_attention_heads = config.n_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
-        self.max_position_embeddings = config.max_seq_len
-        self.torch_dtype = config.neuron_config.torch_dtype
-        self.padding_side = config.neuron_config.padding_side
-        self.num_key_value_heads = config.attn_config.kv_n_heads
-        self.rope_theta = config.attn_config.rope_theta
+        rotary_emb = RotaryEmbedding(
+            config.d_model // config.n_heads,
+            max_position_embeddings=config.max_seq_len,
+            base=config.attn_config.rope_theta,
+        )
+
+        super().__init__(
+            config=config,
+            hidden_size=config.d_model,
+            num_attention_heads=config.n_heads,
+            head_dim=config.d_model // config.n_heads,
+            num_key_value_heads=config.attn_config.kv_n_heads,
+            clip_qkv=config.attn_config.clip_qkv,
+            rotary_emb=rotary_emb,
+        )
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
                 "NeuronDbrxAttention has to be initialized in a distributed env. Please use neuronx_distributed"
                 " module to initialize a distributed env."
             )
-        self.tp_degree = parallel_state.get_tensor_model_parallel_size()
-        self.fused_qkv = config.neuron_config.fused_qkv
-        self.clip_qkv = config.attn_config.clip_qkv
-
-        self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
-        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
-
-        self.init_gqa_properties()
-
-        self.rotary_emb = RotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
-        )
 
 
 class NeuronDbrxBlock(nn.Module):
@@ -308,9 +302,7 @@ class NeuronDbrxForCausalLM(NeuronBaseForCausalLM):
         compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
         # Run collectives without pipelining
         compiler_args += " --tensorizer-options='--skip-pass=SimpleAllReduceTiling'"
-        # Prevent auto-downcasting when running with fp32
-        if self.neuron_config.torch_dtype == torch.float32:
-            compiler_args += " --auto-cast=none"
+        compiler_args += " --auto-cast=none"
         # Enable vector-offset DGE
         compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         return compiler_args

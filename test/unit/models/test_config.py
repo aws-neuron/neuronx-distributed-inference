@@ -1,3 +1,4 @@
+import os
 import json
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ from neuronx_distributed_inference.models.config import (
     FusedSpecNeuronConfig,
     InferenceConfig,
     NeuronConfig,
+    ChunkedPrefillConfig,
     get_platform_lnc,
 )
 from neuronx_distributed_inference.models.mllama.modeling_mllama import (
@@ -52,7 +54,7 @@ def test_serialize_deserialize_basic_inference_config():
     assert deserialized_config.neuron_config.tp_degree == 1
 
 
-def test_serialize_deserialize_inference_config_with_nested_config():
+def test_serialize_deserialize_inference_config_with_nested_lora_config():
     lora_config = LoraServingConfig(max_lora_rank=32)
     neuron_config = NeuronConfig(lora_config=lora_config)
     config = InferenceConfig(
@@ -63,6 +65,36 @@ def test_serialize_deserialize_inference_config_with_nested_config():
 
     deserialized_config = verify_serialize_deserialize(config)
     assert deserialized_config.neuron_config.lora_config.max_lora_rank == 32
+
+
+def test_serialize_deserialize_inference_config_with_nested_chunked_prefill_config():
+    chunked_prefill_config = ChunkedPrefillConfig(
+        max_num_seqs=8,
+        tkg_model_enabled=True,
+        kernel_q_tile_size=256,
+        kernel_kv_tile_size=2048,
+    )
+    neuron_config = NeuronConfig(
+        chunked_prefill_config=chunked_prefill_config,
+        is_block_kv_layout=True,
+        batch_size=1,
+    )
+    config = InferenceConfig(
+        neuron_config=neuron_config,
+        hidden_size=4096,
+    )
+    actual = config.neuron_config.chunked_prefill_config
+    assert actual.max_num_seqs == 8
+    assert actual.tkg_model_enabled
+    assert actual.kernel_q_tile_size == 256
+    assert actual.kernel_kv_tile_size == 2048
+
+    deserialized_config = verify_serialize_deserialize(config)
+    deserialized_actual = deserialized_config.neuron_config.chunked_prefill_config
+    assert deserialized_actual.max_num_seqs == 8
+    assert deserialized_actual.tkg_model_enabled
+    assert deserialized_actual.kernel_q_tile_size == 256
+    assert deserialized_actual.kernel_kv_tile_size == 2048
 
 
 def test_serialize_deserialize_inference_config_with_fused_spec_config():
@@ -93,16 +125,50 @@ def test_serialize_deserialize_inference_config_with_fused_spec_config():
     assert type(deserialized_config.fused_spec_config.worker_cls) is type(NeuronBaseModel)
 
 
-def test_neuron_config_logical_neuron_cores_backward_compatible():
+def test_neuron_config_lnc():
+    # Capture original env var so that it can be reset at end of test
+    original_env_value = os.environ.get("NEURON_LOGICAL_NC_CONFIG")
+    platform_lnc = get_platform_lnc()
+    os.environ["NEURON_LOGICAL_NC_CONFIG"] = str(platform_lnc - 1)
+    expected_lnc_value = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", platform_lnc))
+
     with warnings.catch_warnings(record=True) as w:
-        neuron_config = NeuronConfig(logical_neuron_cores=2)
+        neuron_config = NeuronConfig(logical_nc_config=platform_lnc)
+        assert neuron_config.logical_nc_config == expected_lnc_value
+
+        # Validate the deprecation warning is triggered once.
+        lnc_mismatch_warning_count = 0
+        for warning in w:
+            message = str(warning.message)
+            if "does not match provided logical_nc_config" in message:
+                lnc_mismatch_warning_count += 1
+
+        assert lnc_mismatch_warning_count == 1
+    
+    # Reset env variable at the end of the test
+    del os.environ["NEURON_LOGICAL_NC_CONFIG"]
+    if original_env_value is not None:
+        os.environ["NEURON_LOGICAL_NC_CONFIG"] = original_env_value
+
+
+def test_neuron_config_logical_neuron_cores_backward_compatible():
+
+    # Unset environment variable
+    original_env_value = os.environ.get("NEURON_LOGICAL_NC_CONFIG")
+    if original_env_value is not None:
+        del os.environ["NEURON_LOGICAL_NC_CONFIG"]
+
+    with warnings.catch_warnings(record=True) as w:
+        logical_neuron_cores=1
+        neuron_config = NeuronConfig(logical_neuron_cores=logical_neuron_cores)
         config = InferenceConfig(
             neuron_config=neuron_config,
             hidden_size=4096,
         )
+        expected_lnc_value = logical_neuron_cores
         assert config.hidden_size == 4096
-        assert neuron_config.logical_nc_config == 2
-        assert neuron_config.logical_neuron_cores == 2
+        assert neuron_config.logical_nc_config == expected_lnc_value
+        assert neuron_config.logical_neuron_cores == expected_lnc_value
 
         # Validate that the deprecated "logical_neuron_cores" attr isn't serialized.
         config_json = json.loads(config.to_json_string())
@@ -110,8 +176,8 @@ def test_neuron_config_logical_neuron_cores_backward_compatible():
         assert "logical_neuron_cores" not in config_json["neuron_config"]
 
         deserialized_config = verify_serialize_deserialize(config)
-        assert deserialized_config.neuron_config.logical_nc_config == 2
-        assert deserialized_config.neuron_config.logical_neuron_cores == 2
+        assert deserialized_config.neuron_config.logical_nc_config == expected_lnc_value
+        assert deserialized_config.neuron_config.logical_neuron_cores == expected_lnc_value
 
         # Validate the deprecation warning is triggered three times (once in constructor, twice on access).
         lnc_deprecation_warning_count = 0
@@ -119,7 +185,6 @@ def test_neuron_config_logical_neuron_cores_backward_compatible():
             message = str(warning.message)
             if "Unexpected keyword arguments" in message:
                 continue
-
             if (
                 issubclass(warning.category, DeprecationWarning)
                 and "deprecated" in message
@@ -128,6 +193,10 @@ def test_neuron_config_logical_neuron_cores_backward_compatible():
                 lnc_deprecation_warning_count += 1
         assert lnc_deprecation_warning_count == 3
 
+    # Reset environment variable
+    if original_env_value is not None:
+        os.environ["NEURON_LOGICAL_NC_CONFIG"] = original_env_value
+
 
 def test_serialize_deserialize_pretrained_config_adapter():
     neuron_config = NeuronConfig()
@@ -135,6 +204,7 @@ def test_serialize_deserialize_pretrained_config_adapter():
 
     # Assert that an attribute from config.json is set on the config.
     assert config.model_type == "llama"
+    assert config.transformers_version == "4.31.0"
 
     # Assert that torch_dtype is copied to neuron_config correctly.
     assert not hasattr(config, "torch_dtype")
@@ -311,3 +381,21 @@ def test_inference_config_from_json_string_invalid_fused_spec_worker_cls():
         config = InferenceConfig.from_json_string(config_json)
         message = str(e_info)
         assert worker_cls_name in message and worker_cls_module in message
+
+def test_neuron_config_invalid_dtype_setting():
+    # Should have cast_type as-declared also set when attention_dtype != torch_dtype
+    with pytest.raises(AssertionError):
+        NeuronConfig(torch_dtype = torch.bfloat16, attention_dtype = torch.float32) # Exception
+    
+    NeuronConfig(torch_dtype = torch.bfloat16, attention_dtype = torch.float32, cast_type = 'as-declared') # Works
+
+def test_invalid_cast_type():
+    with pytest.raises(ValueError):
+        NeuronConfig(cast_type = 'user-defined') # Exception
+    
+    NeuronConfig(cast_type = 'as-declared') # Works
+    NeuronConfig(cast_type = 'config') # Works
+
+def test_invalid_cp_tp_configuration():
+    with pytest.raises(ValueError):
+        NeuronConfig(tp_degree = 32, cp_degree = 7)

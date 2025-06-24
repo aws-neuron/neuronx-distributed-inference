@@ -39,7 +39,7 @@ setup(
     package_data={"": []},
     install_requires=[
         "neuronx_distributed",
-        "transformers==4.48.*",
+        "transformers==4.51.*",
         "huggingface-hub",
         "sentencepiece",
         "torchvision",
@@ -47,8 +47,7 @@ setup(
         "blobfile",
     ],
     extras_require={
-        "test": ["pytest", "pytest-forked", "pytest-cov", "pytest-xdist", "accelerate", "diffusers==0.32.0"],
-        "flux": ["diffusers==0.32.0"],
+        "test": ["pytest", "pytest-forked", "pytest-cov", "pytest-xdist", "accelerate"],
     },
     python_requires=">=3.7",
     package_dir={"": "src"},

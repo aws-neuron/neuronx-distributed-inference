@@ -228,8 +228,8 @@ def apply_scaling(freqs: torch.Tensor):
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False, device=None):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
     if use_scaled:
         freqs = apply_scaling(freqs)
@@ -250,6 +250,12 @@ def apply_rotary_pos_emb(
 
 
 def apply_rotary_polar_compatible(query, key, freqs_cis):
+    # Ensure freqs_cis is in FP32 for accuracy
+    if freqs_cis.dtype != torch.float32:
+        raise ValueError(
+            f"Expect freqs_cis.dtype == torch.float32 to ensure accuracy, got {freqs_cis.dtype}"
+        )
+
     freqs_cis_real = freqs_cis.cos().unsqueeze(2)
     freqs_cis_imag = freqs_cis.sin().unsqueeze(2)
 
@@ -470,3 +476,45 @@ def neuron_scaled_dot_product_attention(
     attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
     return attn_weight @ value
+
+
+def get_context_parallel_reordered_tp_mapping(world_size, cp_degree):
+    # world_size: world size
+    # cp_degree: the cp degree CTE attention is running in
+
+    # Flattens the CP mesh which contains the TP ordering with the contigous KV heads
+    # This is done to enable running full TP decode after doing context parallel CTE
+
+    # Returns a list where each index, i, is the original rank and list[i] is the new rank
+
+    tp_degree = world_size // cp_degree
+
+    return [(rank % tp_degree) * cp_degree + (rank // tp_degree) for rank in range(world_size)]
+
+
+def get_kv_head_indices_context_parallel_full_tp_decode(num_kv_heads, world_size, cp_degree, device):
+    # world_size: world_size
+    # cp_degree: the cp degree CTE attention is running in
+
+    # Returns the index of the first KV head per rank wrt the context parallel KV heads per rank
+    # Example: TP = 4, KV = 4, CP = 2
+    # CP Heads: [[(R0) KV0 KV1, (R1) KV2 KV3], [(R2) KV0 KV1, (R3) KV2 KV3]]
+    # TP Heads: [(R0) KV0, (R2) KV1, (R1) KV2, (R3) KV3]
+    # Output: [0, 1, 0, 1]
+
+    tp_ordering = get_context_parallel_reordered_tp_mapping(world_size, cp_degree)
+    tp_degree = world_size // cp_degree
+
+    assert world_size >= num_kv_heads, "CP is with full TP decode is currently not supported with num_kv_heads > world_size"
+
+    # If TP < num_kv_heads or TP == num_kv_heads, no need to interleave for padding
+    cp_interleave_factor = max(tp_degree // num_kv_heads, 1)
+
+    heads_in_cp = torch.stack(torch.arange(num_kv_heads, device=device, dtype=torch.int32).repeat_interleave(cp_interleave_factor).tensor_split(tp_degree)).repeat(cp_degree, 1)
+    heads_in_tp = torch.arange(num_kv_heads, device=device, dtype=torch.int32).repeat_interleave(world_size // num_kv_heads)
+    heads_in_tp = torch.index_select(heads_in_tp, dim=0, index=torch.tensor(tp_ordering, dtype=torch.int32, device=device))
+    heads_in_tp = heads_in_tp.view(-1, 1)
+    mask = (heads_in_cp == heads_in_tp)
+    indices = mask.int().argmax(dim=1)
+
+    return indices

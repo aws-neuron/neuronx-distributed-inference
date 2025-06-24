@@ -6,6 +6,7 @@ from neuronx_distributed_inference.models.mllama.utils import (
 )
 from neuronx_distributed_inference.models.model_wrapper import DecoderModelInstance, ModelWrapper
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
+from neuronx_distributed_inference.modules.padding import pad_tensor
 
 
 class ModelWrapperMllama(ModelWrapper):
@@ -82,21 +83,13 @@ class ModelWrapperMllama(ModelWrapper):
         else:
             args_need_padding = None
 
-        # pad the inputs up to the compiled batch size in the end
-        def pad_helper(tensor):
-            if tensor is None or tensor.shape[0] == self.neuron_config.batch_size:
-                return tensor
-
-            padded_shape = list(tensor.shape)
-            padded_shape[0] = self.neuron_config.batch_size
-            padded_tensor = torch.zeros(padded_shape, dtype=tensor.dtype)
-            padded_tensor[: tensor.shape[0]] = tensor
-            return padded_tensor
-
         padded_args = []
         # pad input_ids, attn_mask and position_ids
         for arg in args[0:3]:
-            padded_args.append(pad_helper(arg))
+            padded_shape = list(arg.shape)
+            padded_shape[0] = self.neuron_config.batch_size
+            padded_tensor, _ = pad_tensor(arg, padded_shape)
+            padded_args.append(padded_tensor)
 
         # need to handle seq_ids separately, when compiled batch is 4, if we pad seq_ids from [0,2,1] to [0,2,1,
         # 0]. then the kv cache of padded input could be written into the first cache line, so we need to pad as [0,
@@ -108,11 +101,17 @@ class ModelWrapperMllama(ModelWrapper):
             + [x for x in range(self.neuron_config.max_batch_size) if x not in seq_ids_list],
             dtype=seq_ids.dtype,
         )
+        reorder_seq_ids = not self.is_prefix_caching
+        padded_seq_ids, indices = torch.sort(padded_seq_ids) if reorder_seq_ids else (padded_seq_ids, None)
         padded_args.append(padded_seq_ids)
 
         if args_need_padding is not None:
             for arg in args_need_padding:
-                padded_args.append(pad_helper(arg))
+                padded_shape = list(arg.shape)
+                padded_shape[0] = self.neuron_config.batch_size
+                padded_tensor, _ = pad_tensor(arg, padded_shape)
+                padded_tensor = torch.index_select(padded_tensor, 0, indices)
+                padded_args.append(padded_tensor)
 
         outputs = self._forward(*padded_args)
         # note that we don't do index select here as it should already be handled, simply sliced out padding here

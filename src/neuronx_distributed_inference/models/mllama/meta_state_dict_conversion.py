@@ -28,11 +28,12 @@ def convert_meta_state_dict_to_neuron_state_dict(state_dict: dict, config: Infer
 
     state_dict["text_model.norm.weight"] = state_dict.pop("text_model.norm.weight")
     state_dict["text_model.lm_head.weight"] = state_dict.pop("text_model.output.weight")
-    state_dict["text_model.embed_tokens.learnable_embedding.weight"] = state_dict.pop(
-        "text_model.learnable_embedding.weight"
-    )
-    state_dict["text_model.embed_tokens.tok_embeddings.weight"] = state_dict.pop(
-        "text_model.tok_embeddings.weight"
+    state_dict["text_model.embed_tokens.weight"] = torch.cat(
+        [
+            state_dict["text_model.tok_embeddings.weight"],
+            state_dict.pop("text_model.learnable_embedding.weight"),
+        ],
+        dim=0,
     )
     state_dict["text_model.rank_util.rank"] = torch.arange(
         0, config.neuron_config.tp_degree, dtype=torch.int32

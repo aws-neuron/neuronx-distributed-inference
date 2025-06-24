@@ -1,7 +1,9 @@
 import unittest
 
 import torch
+import os
 
+from unittest.mock import patch
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
 
 
@@ -23,11 +25,15 @@ class TestKVCacheManager(unittest.TestCase):
                         "kv_cache_padding_size": 1,
                         "kv_cache_tiling": False,
                         "torch_dtype": torch.float32,
+                        "attention_dtype": torch.float32,
                         "kv_cache_quant": False,
                         "tp_degree": 1,
+                        "cp_degree": 1,
                         "max_length": 10,
                         "batch_size": 2,
                         "k_cache_transposed": False,
+                        "apply_seq_ids_mask": False,
+                        "is_prefill_stage": True,
                     },
                 )
                 self.num_cores_per_group = 1
@@ -280,7 +286,67 @@ class TestKVCacheManager(unittest.TestCase):
             self.assertTrue(torch.all(updated_v[3][kv_head] == 0))  # Seq 3 should remain zero
             self.assertTrue(torch.all(updated_v[4][kv_head] == 0))  # Seq 4 should remain zero
             self.assertTrue(torch.all(updated_v[5][kv_head] == 0))  # Seq 5 should remain zero
+    
+    def test_update_cache_context_parallel_full_tp_decode(self):
+        tp_degree = 32
+        cp_degree = 4
+        batch_size = 1
+        seq_len = 10
+        active_seq_len = 1
+        head_dim = 8
+        num_kv_heads = 16
+        
+        self.config.neuron_config.cp_degree = cp_degree
+        self.config.neuron_config.tp_degree = tp_degree
+        self.config.neuron_config.is_prefill_stage = True
+        self.config.neuron_config.kv_cache_batch_size = batch_size
+        self.config.neuron_config.batch_size = batch_size
+        self.config.neuron_config.is_continuous_batching = False
 
+        # set cpu-mode to true to use the CPU version of fill_prefix
+        os.environ["NXD_CPU_MODE"] = "1"
+        
+        class MockRank:
+            def get_rank(self):
+                return torch.tensor(0, dtype=torch.int32)
+        
+        kv_cache_manager = KVCacheManager(config=self.config, num_kv_head=num_kv_heads, global_rank=MockRank())
+        
+        k_cache = torch.zeros((batch_size, 1, seq_len, head_dim), dtype=torch.float32)
+        v_cache = torch.zeros((batch_size, 1, seq_len, head_dim), dtype=torch.float32)
+        
+        # Create new key values to be updated, each head will have distinct values so we can tell which head we updated
+        latest_k = torch.ones(batch_size, 2, active_seq_len, head_dim, dtype=torch.float32)
+        latest_k[:, 0:1, :, :] = latest_k[:, 0:1, :, :] * 5
+        latest_k[:, 1:2, :, :] = latest_k[:, 1:2, :, :] * 10
+
+        latest_v = torch.ones(batch_size, 2, active_seq_len, head_dim, dtype=torch.float32)
+        latest_v[:, 0:1, :, :] = latest_v[:, 0:1, :, :] * 5
+        latest_v[:, 1:2, :, :] = latest_v[:, 1:2, :, :] * 10
+
+        
+        seq_ids = torch.tensor([0], dtype=torch.int32)
+        position_ids = torch.tensor([[0]], dtype=torch.long)
+        
+        def mock_get_indices(*args, **kwargs):
+            return torch.cat([torch.zeros((16), dtype=torch.long), torch.ones((16), dtype=torch.long)])
+        
+        with patch('neuronx_distributed_inference.modules.kvcache.kv_cache_manager.get_kv_head_indices_context_parallel_full_tp_decode', 
+                side_effect=mock_get_indices):
+            
+            updated_k, updated_v = kv_cache_manager.update_kv_by_layer_id(
+                idx=0,
+                is_for_context_encoding=True,
+                seq_ids=seq_ids,
+                position_ids=position_ids,
+                kv_per_layer=(latest_k, latest_v),
+                seq_len=seq_len,
+                kvcache_buffer=[k_cache, v_cache]
+            )
+        
+        # verify we only used head 0 for the update
+        self.assertTrue(torch.all(updated_k[0, 0, 0:1] == 5))
+        self.assertTrue(torch.all(updated_v[0, 0, 0:1] == 5))
 
 if __name__ == "__main__":
     unittest.main()

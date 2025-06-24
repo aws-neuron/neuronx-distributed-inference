@@ -10,6 +10,7 @@ import warnings
 from contextlib import nullcontext
 from functools import partial
 from typing import List, Optional, Union
+import math
 
 import torch
 from torch_neuronx.testing.validation import custom_allclose, logit_validation
@@ -80,9 +81,10 @@ def check_accuracy_embeddings(
         # Save plot, expecting a y=x straight line
         matplotlib.rcParams["agg.path.chunksize"] = 10000
         matplotlib.rcParams["path.simplify_threshold"] = 1.0
-        plt.plot(
+        plt.scatter(
             actual_output.float().detach().numpy().reshape(-1),
             expected_output.float().detach().numpy().reshape(-1),
+            s=1,
         )
         plt.xlabel("Actual Output")
         plt.ylabel("Expected Output")
@@ -106,6 +108,7 @@ def get_generate_outputs_from_token_ids(
     is_hf=False,
     draft_model=None,
     input_capture_hook=None,
+    input_start_offsets=None,
     **generate_kwargs,
 ):
     if not is_hf:
@@ -153,15 +156,16 @@ def get_generate_outputs_from_token_ids(
         attention_mask = inputs.attention_mask
 
         attention_mask[token_ids == tokenizer.pad_token_id] = 0
-
-    generation_model = model if is_hf else HuggingFaceGenerationAdapter(model)
+    generation_model = model if is_hf else HuggingFaceGenerationAdapter(model, input_start_offsets)
+    token_ids = _shift_tensors_by_offset(input_start_offsets, token_ids, tokenizer.pad_token_id)
+    attention_mask = _shift_tensors_by_offset(input_start_offsets, attention_mask, 0)
+   
     outputs = generation_model.generate(
         token_ids,
         attention_mask=attention_mask,
         input_capture_hook=input_capture_hook,
         **generate_kwargs,
     )
-
     if not is_hf:
         model.reset()
         if draft_model is not None:
@@ -175,7 +179,7 @@ def get_generate_outputs_from_token_ids(
     output_tokens = tokenizer.batch_decode(
         output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-
+    
     return outputs, output_tokens
 
 
@@ -187,6 +191,7 @@ def get_generate_outputs(
     draft_model=None,
     device="neuron",
     input_capture_hook=None,
+    input_start_offsets=None,
     **generate_kwargs,
 ):
     tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -220,8 +225,10 @@ def get_generate_outputs(
             is_hf=is_hf,
             draft_model=draft_model,
             input_capture_hook=input_capture_hook,
+            input_start_offsets=input_start_offsets,
             **generate_kwargs,
         )
+
 
 # FIXME: add on cpu check support
 def check_accuracy(
@@ -230,10 +237,11 @@ def check_accuracy(
     generation_config: Optional[GenerationConfig] = None,
     expected_token_ids: Optional[List] = None,
     num_tokens_to_check: int = None,
-    do_sample: bool = True,
+    do_sample: bool = False,
     draft_model: PreTrainedModel = None,
     prompt: Optional[str] = None,
     image=None,
+    input_start_offsets: List[int] = None,
     execution_mode: str = "config",
 ):
     """
@@ -246,7 +254,7 @@ def check_accuracy(
     }
 
     print(
-        f"run accuracy check with generation_config as: {generation_kwargs} and {execution_mode=}"
+        f"run accuracy check with generation_config as: {generation_kwargs} and execution_mode={execution_mode}"
     )
     if prompt is None:
         prompts = [TEST_PROMPT] * neuron_config.batch_size
@@ -269,11 +277,11 @@ def check_accuracy(
             tokenizer,
             is_hf=True,
             generation_config=generation_config,
+            input_start_offsets=input_start_offsets,
             **generation_kwargs,
         )
 
     print(f"Expected output: {outputs_expected}")
-
     mode_being_tested = "async mode" if neuron_model.neuron_config.async_mode else "sync mode"
     output_token_ids, outputs_actual = get_generate_outputs(
         neuron_model,
@@ -282,17 +290,31 @@ def check_accuracy(
         is_hf=False,
         draft_model=draft_model,
         generation_config=generation_config,
+        input_start_offsets=input_start_offsets,
         **generation_kwargs,
     )
+     
     print(f"Actual output  : {outputs_actual}")
-
     pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token) if tokenizer else 0
-    output_token_ids = output_token_ids[output_token_ids != pad_token_id]
-    expected_token_ids = expected_token_ids[expected_token_ids != pad_token_id]
-    if num_tokens_to_check is not None:
-        print(f"Validating the first {num_tokens_to_check} tokens")
-        expected_token_ids = expected_token_ids[:num_tokens_to_check]
-        output_token_ids = output_token_ids[:num_tokens_to_check]
+    
+    # Process each batch element separately to maintain the 2D structure
+    expected_id_list = []
+    actual_id_list = []
+    bs, _ = output_token_ids.shape
+    for i in range(bs):
+        expected_seq = expected_token_ids[i]
+        expected_seq = expected_seq[expected_seq != pad_token_id]     
+        actual_seq = output_token_ids[i]
+        actual_seq = actual_seq[actual_seq != pad_token_id]
+        if num_tokens_to_check:
+            expected_seq = expected_seq[:num_tokens_to_check]
+            actual_seq = actual_seq[:num_tokens_to_check]
+        expected_id_list.append(expected_seq)
+        actual_id_list.append(actual_seq)
+
+    expected_token_ids = torch.stack(expected_id_list)
+    output_token_ids = torch.stack(actual_id_list)
+
 
     if draft_model is not None or neuron_config.enable_fused_speculation:
         # Handle corner scenario where last few tokens are not generated as part of speculation.
@@ -310,6 +332,7 @@ def check_accuracy(
     ), f"\nActual: ({device}) {output_token_ids} \nExpected (hf-cpu): {expected_token_ids}"
     print(f"The output from Neuronx NxD on {device} using {mode_being_tested} is accurate!")
 
+
 def check_accuracy_logits(
     neuron_model: NeuronApplicationBase,
     tokenizer: PreTrainedTokenizer = None,
@@ -324,31 +347,47 @@ def check_accuracy_logits(
     image=None,
     num_image_per_prompt=1,
     inputs=None,
+    input_start_offsets=None,
+    pad_token_id=0,
 ):
-    if neuron_model.neuron_config.enable_fused_speculation:
-        generation_config.prompt_lookup_num_tokens = neuron_model.neuron_config.speculation_length
+    if neuron_model.neuron_config.on_device_sampling_config is not None:
+        # should output both tokens and logits for logit matching check
         assert (
             neuron_model.neuron_config.output_logits
-        ), "output_logits is required to enable logits tests for fused speculation"
-    elif neuron_model.neuron_config.on_device_sampling_config is not None:
-        raise ValueError("Logits validation is not supported with on-device sampling.")
+        ), "output_logits is required to enable logit validation with on-device sampling"
+
+    if neuron_model.neuron_config.enable_fused_speculation:
+        generation_config.prompt_lookup_num_tokens = neuron_model.neuron_config.speculation_length
 
     if image is not None and tokenizer is None:
         raise ValueError("A tokenizer is required to check logit accuracy for a multimodal model")
 
     if inputs is None and tokenizer is None:
-        raise ValueError("Must provide either a tokenizer or inputs that include input_ids and attention_mask")
+        raise ValueError(
+            "Must provide either a tokenizer or inputs that include input_ids and attention_mask"
+        )
+
+    is_chunked_prefill = neuron_model.config.neuron_config.is_chunked_prefill
 
     if inputs is None:
         if prompt is None:
             prompt = MM_TEST_PROMPT if image else TEST_PROMPT
-        prompts = [prompt] * neuron_model.config.neuron_config.batch_size
+
+        if is_chunked_prefill:
+            # The actual batch size is stored as max_num_seqs
+            prompts = [prompt] * neuron_model.config.neuron_config.chunked_prefill_config.max_num_seqs
+        else:
+            prompts = [prompt] * neuron_model.config.neuron_config.batch_size
 
         inputs = tokenizer(prompts, padding=True, return_tensors="pt")
 
+
     initial_input_ids = inputs.input_ids
     initial_attention_mask = inputs.attention_mask
-    initial_input_len = inputs.input_ids.shape[1]
+    pad_token_id = tokenizer.pad_token_id if tokenizer else pad_token_id
+    initial_input_ids = _shift_tensors_by_offset(input_start_offsets, initial_input_ids, pad_token_id)
+    initial_attention_mask = _shift_tensors_by_offset(input_start_offsets, initial_attention_mask, 0)
+    initial_input_len = initial_input_ids.shape[1]
     seq_len = neuron_model.config.neuron_config.seq_len
     max_new_tokens = seq_len - initial_input_len
     if num_tokens_to_check is None:
@@ -359,7 +398,10 @@ def check_accuracy_logits(
     if spec_len > 0:
         # With speculation, generation stops (spec_len - 1) tokens early.
         num_tokens_to_check -= spec_len - 1
-    if initial_input_len + num_tokens_to_check > neuron_model.config.neuron_config.max_context_length:
+    if (
+        initial_input_len + num_tokens_to_check
+        > neuron_model.config.neuron_config.max_context_length
+    ):
         warnings.warn(
             (
                 "input_len + num_tokens_to_check exceeds max_context_length. "
@@ -369,7 +411,6 @@ def check_accuracy_logits(
             ),
             category=UserWarning,
         )
-
     if expected_logits is None:
         # Generate goldens with HF on CPU
         # logit_validation assumes greedy sampling
@@ -378,14 +419,13 @@ def check_accuracy_logits(
             inputs.input_ids,
             max_new_tokens=num_tokens_to_check,
             min_new_tokens=num_tokens_to_check,
-            do_sample=False,
+            do_sample=False,     
             attention_mask=inputs.attention_mask,
             return_dict_in_generate=True,
             output_scores=True,
             generation_config=generation_config,
         )
         expected_logits = torch.stack(outputs.scores)
-
     expected_logits = expected_logits[:num_tokens_to_check, :, :]
     expected_token_ids = expected_logits.argmax(dim=2).T
     if tokenizer is not None:
@@ -397,7 +437,7 @@ def check_accuracy_logits(
         print("Expected Output: ", expected_token_ids)
     print("Expected Logits Shape: ", expected_logits.shape)
 
-    model = HuggingFaceGenerationAdapter(neuron_model)
+    model = HuggingFaceGenerationAdapter(neuron_model, input_start_offsets=input_start_offsets)
     expected_attention_mask = torch.ones(
         (
             initial_attention_mask.shape[0],
@@ -409,7 +449,7 @@ def check_accuracy_logits(
         (initial_attention_mask, expected_attention_mask), dim=1
     )
 
-    def generate_fn(input_ids):
+    def generate_fn_base(input_ids):
         input_length = input_ids.shape[1]
         attention_mask = extrapolated_attention_mask[:, :input_length]
         new_tokens = num_tokens_to_check + initial_input_len - input_length
@@ -446,7 +486,7 @@ def check_accuracy_logits(
             [image] * num_image_per_prompt
         ] * neuron_model.config.neuron_config.batch_size
 
-    def generate_mm_fn(input_ids):
+    def generate_fn_mm(input_ids):
         input_length = input_ids.shape[1]
         new_tokens = num_tokens_to_check + initial_input_len - input_length
         if spec_len > 0:
@@ -489,19 +529,189 @@ def check_accuracy_logits(
         print("Actual Logits Shape: ", actual_logits.shape)
         return torch.stack(model_outputs.scores)
 
+    def generate_fn_with_chunked_prefill(input_ids):
+        return generate_with_chunked_prefill(neuron_model, tokenizer, input_ids)
+    
+    if image is not None:
+        generate_fn = generate_fn_mm
+    elif is_chunked_prefill:
+        generate_fn = generate_fn_with_chunked_prefill
+    else:
+        generate_fn = generate_fn_base
+
     passed, results, status_msg = logit_validation(
         input_ids=initial_input_ids,
-        generate_fn=(
-            generate_fn if image is None else generate_mm_fn
-        ),  # use different generation functions
+        generate_fn=generate_fn,
         expected_logits=expected_logits,
         tol_map=tol_map,
         divergence_difference_tol=divergence_difference_tol,
     )
-
     if not passed:
         raise LogitMatchingValidationError(status_msg, results)
 
-    print("Passed logits validation!")
+    print(status_msg)
 
     return results
+
+def _shift_tensors_by_offset(input_start_offsets, input_tensors, pad_token_id):
+    """Shift input tensor right by offsets
+
+    Args:
+      input_start_offsets: Tensor of (bs, 1) or (1, 1) shape
+      input_tensors: Tensor of (bs, input_len) shape
+      pad_token_id: after shifting, pad the rest of the output tensors with this token id
+
+    Returns:
+      input tensor shifted by offsets, padded by token_id
+    """
+    if input_start_offsets:
+        bs, seq_len = input_tensors.shape
+        max_offset = max(input_start_offsets)
+        new_token_ids = torch.full((bs, max_offset + seq_len), pad_token_id, dtype= input_tensors.dtype, device= input_tensors.device)
+        if len(input_start_offsets) > 1: 
+            for idx, offset in enumerate(input_start_offsets):
+                new_token_ids[idx, offset:offset + seq_len] = input_tensors[idx, :]
+        else:           
+            offset = input_start_offsets[0]
+            new_token_ids[:, offset:offset + seq_len] = input_tensors # if there is only one offset value, shift all sequences the same amount
+        return new_token_ids
+    return input_tensors
+
+    
+
+
+def generate_with_chunked_prefill(
+    neuron_model: NeuronApplicationBase,
+    tokenizer: PreTrainedTokenizer, 
+    input_ids: torch.Tensor,
+):
+    """
+    Generate sequences with chunked prefill.
+
+    This func will generate the block table and slot mapping by default, 
+    because chunked prefill uses block KV cache.
+
+    To simplify the process, for now it will 
+    1. First run prefilling for all of the seq, where the len to prefill is
+       the same for all seq for each iteration.
+    2. And then decode all seq together.
+
+    In future, we can extend this func to run both prefill and decode in 
+    one iteration.
+
+    Args:
+        neuron_model: NeuronApplicationBase
+        input_ids: [max_num_seqs, input_len]
+
+    Return:
+        output_logits: [output_len, max_num_seqs, vocab_size], and output_len
+            equals to seq_len - input_len
+    """
+    neuron_config = neuron_model.config.neuron_config
+
+    chunk_size = neuron_config.max_context_length
+    max_num_seqs = neuron_config.chunked_prefill_config.max_num_seqs
+
+    seq_len = neuron_config.seq_len
+    block_size = neuron_config.pa_block_size
+    num_blocks_per_seq = math.ceil(seq_len / block_size)
+
+    _, input_len = input_ids.shape
+
+    # Prepare block table and slot mapping
+    slot_mapping = torch.arange(max_num_seqs*seq_len).reshape(max_num_seqs, -1)
+    block_table = torch.arange(max_num_seqs*num_blocks_per_seq).reshape(max_num_seqs, -1)
+
+    # previous context only
+    computed_context_lens = torch.zeros(max_num_seqs, dtype=torch.int)
+
+    output_logits = []
+    output_token_ids = []
+
+    # Step 1: Prefill for all the seq
+    assert chunk_size % max_num_seqs == 0
+    max_prefill_len_per_seq = chunk_size // max_num_seqs
+    assert chunk_size >= max_num_seqs
+    num_iter_for_prefill = math.ceil(input_len / max_prefill_len_per_seq)
+    for i in range(num_iter_for_prefill):
+        start = i * max_prefill_len_per_seq
+        end = min(input_len, (i + 1) * max_prefill_len_per_seq)
+        actual_prefill_len = end - start
+
+        # input_ids: (1, seq_len)
+        cur_input_ids = input_ids[:, start: end].reshape(1, -1)
+        # slot_mapping: (seq_len,)
+        cur_slot_mapping = slot_mapping[:, start: end].reshape(-1)
+        # block_table: (cp_max_num_seqs, num_active_blocks)
+        last_block_id = math.ceil(end / block_size)
+        cur_block_table = block_table[:, :last_block_id]
+
+        full_context_lens = computed_context_lens + actual_prefill_len
+
+        position_ids = torch.arange(start, end).repeat(max_num_seqs).reshape(1, -1)
+
+        prefill_outputs = neuron_model(
+            input_ids=cur_input_ids,
+            position_ids=position_ids,
+            slot_mapping=cur_slot_mapping,
+            block_table=cur_block_table,
+            full_context_lens=full_context_lens,
+            computed_context_lens=computed_context_lens,
+        )
+
+        computed_context_lens += actual_prefill_len        
+    # Only take the last logits because it is the first generated output, and 
+    # it is of shape (1, cp_max_num_seqs, vocab_size)
+    prefill_logits = prefill_outputs.logits.squeeze()
+    output_logits.append(prefill_logits)
+
+    decode_input_ids = prefill_logits.argmax(dim=1)
+    output_token_ids.append(decode_input_ids)
+
+    # Step 2: Decode for all seq
+    num_iter_for_decode = seq_len - input_len - 1
+    assert num_iter_for_decode >= 0
+    for i in range(num_iter_for_decode):
+        start = input_len + i
+        end = start + 1
+        actual_prefill_len = end - start
+
+        # input_ids: (1, seq_len)
+        cur_input_ids = decode_input_ids.reshape(1, -1)
+        # slot_mapping: (seq_len,)
+        cur_slot_mapping = slot_mapping[:, start: end].reshape(-1)
+        # block_table: (cp_max_num_seqs, num_active_blocks)
+        last_block_id = math.ceil(end / block_size)
+        cur_block_table = block_table[:, :last_block_id]
+
+        full_context_lens = computed_context_lens + actual_prefill_len
+
+        position_ids = torch.arange(start, end).repeat(max_num_seqs).reshape(1, -1)
+
+        decode_outputs = neuron_model(
+            input_ids=cur_input_ids,
+            position_ids=position_ids,
+            slot_mapping=cur_slot_mapping,
+            block_table=cur_block_table,
+            full_context_lens=full_context_lens,
+            computed_context_lens=computed_context_lens,
+        )
+        decode_logits = decode_outputs.logits.squeeze()
+        output_logits.append(decode_logits)
+
+        decode_input_ids = decode_logits.argmax(dim=1)
+        output_token_ids.append(decode_input_ids)
+
+        computed_context_lens += actual_prefill_len 
+
+    output_logits = torch.stack(output_logits).squeeze()
+    output_token_ids = torch.stack(output_token_ids).squeeze().T
+    output_tokens = tokenizer.batch_decode(
+            output_token_ids, 
+            skip_special_tokens=True, 
+            clean_up_tokenization_spaces=False,
+    )
+    print("Actual Output: ", output_tokens)
+    print("Actual Output Tokens: ", output_token_ids)
+    print("Actual Logits Shape: ", output_logits.shape)
+    return output_logits

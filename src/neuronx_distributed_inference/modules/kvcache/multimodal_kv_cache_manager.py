@@ -24,7 +24,7 @@ class MultimodalKVCacheManager(KVCacheManager):
         **kwargs
     ):
         super().__init__(config, **kwargs)
-        dtype = config.neuron_config.torch_dtype
+        dtype = config.neuron_config.attention_dtype if config.neuron_config.attention_dtype is not None else config.neuron_config.torch_dtype
 
         # override past_key_values from base class with correct num_hidden_layers passed as arg
         # as num_hidden_layers are interpreted differently in the various config's
