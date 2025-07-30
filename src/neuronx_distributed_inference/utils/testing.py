@@ -37,6 +37,10 @@ def destroy_mp():
 
 
 def init_cpu_env():
+    """
+    If the CPU implementation uses a distributed framework,
+    We will need to call this function first.
+    """
     destroy_mp()
     print("Initializing cpu env")
     os.environ["WORLD_SIZE"] = "1"

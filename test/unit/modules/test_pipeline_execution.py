@@ -652,8 +652,7 @@ def test_pipeline():
     # Test passes only if all models pass
     final_result = all(results)
     print(f"\nOverall pipeline test: {'PASSED' if final_result else 'FAILED'}")
-    
-    return final_result
+
 
 if __name__ == "__main__":
     # Set environment variables

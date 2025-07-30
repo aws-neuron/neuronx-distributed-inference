@@ -1,5 +1,5 @@
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state, utils
@@ -13,9 +13,10 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402;
     get_shardable_head_counts,
 )
 from neuronx_distributed_inference.modules.flashdecode.utils import get_cache_size
-from neuronx_distributed_inference.modules.kvcache.utils import dynamic_update_slice, update_cache_const_indices, fill_prefix
+from neuronx_distributed_inference.modules.kvcache.utils import dynamic_update_slice, update_cache_const_indices, fill_prefix, get_kv_shapes
 
-from neuronx_distributed_inference.modules.attention.utils import get_kv_head_indices_context_parallel_full_tp_decode
+from neuronx_distributed_inference.modules.attention.utils import get_kv_head_indices_context_parallel_full_tp_decode, get_kv_head_indices_context_parallel_dp_decode
+from neuronx_distributed_inference.utils.distributed import split_along_dim, get_dp_rank
 
 
 def untile_cache(cache: Tensor, transposed: bool):
@@ -102,7 +103,7 @@ class KVCacheManager(nn.Module):
     and vends out read and write operations.
     """
 
-    def __init__(self, config: InferenceConfig, num_kv_head, global_rank=None, **kwargs):
+    def __init__(self, config: InferenceConfig, num_kv_head, global_rank=None, attention_chunk_size=None, sliding_window=None, layer_to_cache_size_mapping=None, **kwargs):
         super().__init__()
         self.config = config
         self.neuron_config = config.neuron_config
@@ -119,10 +120,12 @@ class KVCacheManager(nn.Module):
         self.padding_side = config.neuron_config.padding_side
         self.k_cache_transposed = config.neuron_config.k_cache_transposed
         self.global_rank = global_rank
+        self.attention_chunk_size = attention_chunk_size
+        self.sliding_window = sliding_window
 
         # NOTE: Tiling the sequence dimension of the KV cache enables specific compiler optimizations like cascaded reductions
         self.is_kv_cache_tiled = config.neuron_config.kv_cache_tiling
-        self._init_kv_shape(config)
+        self._init_kv_shape(config, layer_to_cache_size_mapping)
         self.quant = config.neuron_config.kv_cache_quant
 
         num_layer = config.num_hidden_layers
@@ -130,17 +133,30 @@ class KVCacheManager(nn.Module):
         if self.quant:
             self.quant_dtype = torch.float8_e4m3fn
             self.dequant_dtype = dtype
-        self.past_key_values = nn.ParameterList(
-            [
-                nn.Parameter(torch.zeros(k_or_v_shape, dtype=dtype), requires_grad=False)
-                for _ in range(num_layer) for k_or_v_shape in [self.k_shape, self.v_shape]
-            ]
-        )
+
+        if layer_to_cache_size_mapping:
+            self.past_key_values = nn.ParameterList(
+                [
+                    nn.Parameter(torch.zeros(k_or_v_shape, dtype=dtype), requires_grad=False)
+                    for layer_idx in range(num_layer) for k_or_v_shape in [self.k_shapes[layer_idx], self.v_shapes[layer_idx]]
+                ]
+            )
+        else:
+            self.past_key_values = nn.ParameterList(
+                [
+                    nn.Parameter(torch.zeros(k_or_v_shape, dtype=dtype), requires_grad=False)
+                    for _ in range(num_layer) for k_or_v_shape in [self.k_shape, self.v_shape]
+                ]
+            )
         if self.quant:
             self.past_key_values = self.past_key_values.to(self.quant_dtype)
 
     def _get_num_kv_heads_per_rank(self, config: InferenceConfig):
         tp_degree = config.neuron_config.tp_degree
+        dp_degree = config.neuron_config.attention_dp_degree
+
+        if dp_degree > 1:
+            tp_degree = tp_degree // dp_degree
 
         num_kv_head = self.num_kv_head
         num_atten_head = config.num_attention_heads
@@ -154,6 +170,7 @@ class KVCacheManager(nn.Module):
             num_kv_heads_per_rank = utils.divide(num_key_value_heads, tp_degree)
         else:
             num_kv_heads_per_rank = num_key_value_heads
+
         return num_kv_heads_per_rank
 
     def _get_hidden_dim_per_head(self, config: InferenceConfig):
@@ -162,11 +179,16 @@ class KVCacheManager(nn.Module):
         hidden_dim_per_head = getattr(config, "head_dim", hidden_size // num_atten_head)
         return hidden_dim_per_head
 
-    def _init_kv_shape(self, config: InferenceConfig):
+    def _init_kv_shape(self, config: InferenceConfig, layer_to_cache_size_mapping: Optional[List[int]] = None):
         max_batch_size = (
             config.neuron_config.kv_cache_batch_size + config.neuron_config.kv_cache_padding_size
         )
         max_len = config.neuron_config.max_length
+        if self.attention_chunk_size and self.attention_chunk_size < max_len and not layer_to_cache_size_mapping:
+            logging.warning('initializing chunk-size kv cache for all layers')
+            max_len = self.attention_chunk_size
+        elif self.sliding_window:
+            max_len = self.sliding_window
         num_kv_heads_per_rank = self._get_num_kv_heads_per_rank(config)
         hidden_dim_per_head = self._get_hidden_dim_per_head(config)
 
@@ -181,38 +203,21 @@ class KVCacheManager(nn.Module):
             max_len = get_cache_size(padded_max_len, self.num_cores_per_group)
 
         self.max_len = max_len
-
-        if self.is_kv_cache_tiled:
-            num_tiles = int(max_len / 128)
-            # KV cache layout : BHS(128 tiled)D
-            self.v_shape = (
-                max_batch_size,
-                num_kv_heads_per_rank,
-                128,  # Sequence dim is tiled
-                num_tiles,  # max_len = 128 * num_tiles
-                hidden_dim_per_head,
-            )
-            self.k_shape = self.v_shape if not self.k_cache_transposed else (
-                max_batch_size,
-                num_kv_heads_per_rank,
-                hidden_dim_per_head,
-                128,  # Sequence dim is tiled
-                num_tiles,  # max_len = 128 * num_tiles
-            )
+        if layer_to_cache_size_mapping:
+            self.k_shapes = []
+            self.v_shapes = []
+            for cache_len in layer_to_cache_size_mapping:
+                k_shape, v_shape = get_kv_shapes(cache_len, max_batch_size,
+                                                 num_kv_heads_per_rank, hidden_dim_per_head,
+                                                 self.k_cache_transposed, self.is_kv_cache_tiled)
+                self.k_shapes.append(k_shape)
+                self.v_shapes.append(v_shape)
         else:
-            # KV cache layout : BHSD
-            self.v_shape = (
-                max_batch_size,
-                num_kv_heads_per_rank,
-                max_len,
-                hidden_dim_per_head,
-            )
-            self.k_shape = self.v_shape if not self.k_cache_transposed else (
-                max_batch_size,
-                num_kv_heads_per_rank,
-                hidden_dim_per_head,
-                max_len,
-            )
+            k_shape, v_shape = get_kv_shapes(max_len, max_batch_size,
+                                             num_kv_heads_per_rank, hidden_dim_per_head,
+                                             self.k_cache_transposed, self.is_kv_cache_tiled)
+            self.k_shape = k_shape
+            self.v_shape = v_shape
 
     def _fetch_cache(self, idx: int, kvcache_buffer=None):
         if kvcache_buffer is not None:
@@ -295,15 +300,15 @@ class KVCacheManager(nn.Module):
         if attn_kernel_enabled:  # Attention TKG Kernels do not need slicing.
             skip_slice = True
 
+        if hasattr(self, "v_shapes"):
+            seq_len = self.v_shapes[idx][2]
         # slice for partial view
         if not skip_slice:
             k_cache = _slice_kv_cacheline(self.padding_side, seq_len, k_cache, self.k_cache_transposed)
             v_cache = _slice_kv_cacheline(self.padding_side, seq_len, v_cache, False)
-
         if self.quant:
             k_cache = dequantize.direct_cast_dequantize(k_cache, self.dequant_dtype)
             v_cache = dequantize.direct_cast_dequantize(v_cache, self.dequant_dtype)
-
         return k_cache, v_cache
 
     def get_cache(
@@ -410,18 +415,26 @@ class KVCacheManager(nn.Module):
 
         k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer)
 
+        if not is_for_context_encoding and self.neuron_config.attention_dp_degree > 1:
+            dp_rank = get_dp_rank(self.global_rank.get_rank(), self.neuron_config.tp_degree // self.neuron_config.attention_dp_degree)
+            seq_ids = split_along_dim(seq_ids, dim=0, rank=dp_rank, num_partitions=self.neuron_config.attention_dp_degree)
+            position_ids = split_along_dim(position_ids, dim=0, rank=dp_rank, num_partitions=self.neuron_config.attention_dp_degree)
+
         if is_for_context_encoding:
-            if self.neuron_config.cp_degree > 1:
-                # When we run CP, decode will run in full TP, selectively write the heads that are used in decode
+            if self.neuron_config.cp_degree > 1 and self.neuron_config.cp_degree != self.neuron_config.attention_dp_degree:
+                # When we run CP without DP, decode will run in full TP, selectively write the heads that are used in decode
                 rank = self.global_rank.get_rank()
-                kv_head_indices = get_kv_head_indices_context_parallel_full_tp_decode(self.num_kv_head, self.neuron_config.tp_degree, self.neuron_config.cp_degree, device=k_cache.device)
+                if self.neuron_config.attention_dp_degree == 1:
+                    kv_head_indices = get_kv_head_indices_context_parallel_full_tp_decode(self.num_kv_head, self.neuron_config.tp_degree, self.neuron_config.cp_degree, k_cache.device)
+                else:
+                    kv_head_indices = get_kv_head_indices_context_parallel_dp_decode(self.num_kv_head, self.neuron_config.tp_degree, self.neuron_config.cp_degree, self.neuron_config.attention_dp_degree, k_cache.device)
                 head_idx = torch.index_select(kv_head_indices, dim=0, index=rank)
                 latest_k = torch.index_select(latest_k, dim=1, index=head_idx)
                 latest_v = torch.index_select(latest_v, dim=1, index=head_idx)
 
             if self.is_continuous_batching:
                 assert seq_ids.dim() == 1 and seq_ids.shape[0] == 1, "only supports single seq_id"
-                if self.neuron_config.k_cache_transposed:
+                if self.neuron_config.k_cache_transposed or self.neuron_config.attention_dp_degree > 1:
                     cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
                     indices = [cache_idx] + [torch.zeros(1, device=seq_ids.device) for _ in range(k_cache.dim() - 1)]
                     indices = [t.squeeze().to(torch.int32) for t in indices]
@@ -500,10 +513,10 @@ class KVCacheManager(nn.Module):
                         position_ids = torch.where(seq_ids_mask, position_ids, padded_pos_id)
 
                     scatter_index_new_k = self._get_index_to_update_new_position(
-                        scatter_index, position_ids, latest_k, self.k_cache_transposed
+                        scatter_index, position_ids, latest_k, self.k_cache_transposed, idx
                     )
                     scatter_index_new_v = self._get_index_to_update_new_position(
-                        scatter_index, position_ids, latest_v, False
+                        scatter_index, position_ids, latest_v, False, idx
                     )
                 k_cache = torch.scatter(
                     input=k_cache,
@@ -516,7 +529,15 @@ class KVCacheManager(nn.Module):
                 )
         return k_cache, v_cache
 
-    def _get_index_to_update_new_position(self, scatter_index, position_ids, full_k, transposed: bool):
+    def _get_index_to_update_new_position(self, scatter_index, position_ids, full_k, transposed: bool, layer_idx: int):
+        if self.attention_chunk_size:
+            if hasattr(self, "v_shapes"):
+                cache_len = self.v_shapes[layer_idx][2]
+            else:
+                cache_len = self.attention_chunk_size
+            position_ids = position_ids % cache_len
+        elif self.sliding_window:
+            position_ids = position_ids % self.sliding_window
         index = scatter_index if self.is_medusa else position_ids
         view_shape = (-1, 1, index.shape[-1], 1) if not transposed else (-1, 1, 1, index.shape[-1])
         return index.view(*view_shape).expand_as(full_k)

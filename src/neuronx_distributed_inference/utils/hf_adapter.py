@@ -268,7 +268,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                     position_ids += torch.tensor(self.input_start_offsets, dtype=position_ids.dtype, device=position_ids.device)[:, None]
                 else:
                     position_ids += self.input_start_offsets[0]
-                position_ids.masked_fill_(attention_mask == 0, 0)
+                for i, offset in enumerate(self.input_start_offsets):
+                    position_ids[i, 0:offset] = torch.arange(offset)
             else:
                 position_ids.masked_fill_(attention_mask == 0, 1)
 

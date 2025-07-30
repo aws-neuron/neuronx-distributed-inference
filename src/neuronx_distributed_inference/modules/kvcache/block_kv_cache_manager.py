@@ -37,7 +37,7 @@ class BlockKVCacheManager(KVCacheManager):
         self.is_chunked_prefill = config.neuron_config.is_chunked_prefill
         self.is_prefix_caching = config.neuron_config.is_prefix_caching
 
-    def _init_kv_shape(self, config: InferenceConfig):
+    def _init_kv_shape(self, config: InferenceConfig, layer_to_cache_size_mapping=None):
         # This func is called before finishing the invocation of the
         # self.__init__(), so we can't use child attributes like
         # self.is_chunked_prefill here.

@@ -23,10 +23,11 @@ def benchmark_sampling(
     draft_model: NeuronApplicationBase = None,
     generation_config: GenerationConfig = None,
     target: str = None,
-    image=None,
+    image=False,
     num_runs=20,
     benchmark_report_path: str = BENCHMARK_REPORT_PATH,
 ):
+    torch.manual_seed(0)
     neuron_config = model.neuron_config
 
     sampling_params = prepare_sampling_params(
@@ -95,10 +96,7 @@ def benchmark_sampling(
             input_param["prompt_lookup_num_tokens"] = model.neuron_config.speculation_length
 
         if pixel_values is not None:
-            if model.config.model_type == "llama4":
-                input_param["images_flattened"] = pixel_values
-            else:
-                input_param["pixel_values"] = pixel_values
+          input_param["pixel_values"] = pixel_values
 
         if aspect_ratios is not None:
             input_param["aspect_ratios"] = aspect_ratios
@@ -205,7 +203,7 @@ def benchmark_sampling(
     return report
 
 
-def get_sample_inputs(model_type, config: InferenceConfig, sampling_params, image=None):
+def get_sample_inputs(model_type, config: InferenceConfig, sampling_params, image=False):
     if hasattr(config, "neuron_config"):
         neuron_config = config.neuron_config
     else:
@@ -234,15 +232,19 @@ def get_sample_inputs(model_type, config: InferenceConfig, sampling_params, imag
             None,
             None,
         )
-        if (image is not None):
+        if image:
             if config.model_type == "llama4":
-                vision_num_chunks = 5
+                vision_num_chunks = 8
                 num_channels = config.vision_config.num_channels
                 image_size = config.vision_config.image_size
                 vision_tokens = config.get_chunk_size() * vision_num_chunks
                 print(f"profiling with vision_num_chunks: {vision_num_chunks}, num_channels: {num_channels}, image_size: {image_size}, vision_tokens: {vision_tokens}")
-                pixel_values = torch.ones([vision_num_chunks, 1, num_channels, image_size, image_size])
+                pixel_values = torch.ones([vision_num_chunks, num_channels, image_size, image_size])
                 vision_mask = torch.ones([1, vision_tokens , 1]).to(bool)
+            elif config.model_type == "llava":
+                num_channels = config.vision_config.num_channels
+                image_size = config.vision_config.image_size
+                pixel_values = torch.ones([neuron_config.batch_size, num_channels, image_size, image_size])
             else:
                 pixel_values, aspect_ratios, num_chunks, has_image = get_image_tensors(
                     config, [[]] * batch_size

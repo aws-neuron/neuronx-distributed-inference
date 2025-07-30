@@ -89,8 +89,8 @@ def convert_dbrx_to_neuron_state_dict(dbrx_state_dict, config):
         )
         neuron_state_dict[f"layers.{l}.ffn.expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
-        neuron_state_dict[f"layers.{l}.self_attn.global_rank.rank"] = torch.arange(
-            0, config.neuron_config.world_size, dtype=torch.int32
+        neuron_state_dict[f"layers.{l}.self_attn.rank_util.rank"] = torch.arange(
+            0, config.neuron_config.tp_degree, dtype=torch.int32
         )
 
         neuron_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = (
@@ -302,7 +302,7 @@ class NeuronDbrxForCausalLM(NeuronBaseForCausalLM):
         compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
         # Run collectives without pipelining
         compiler_args += " --tensorizer-options='--skip-pass=SimpleAllReduceTiling'"
-        compiler_args += " --auto-cast=none"
+        compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
         # Enable vector-offset DGE
         compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         return compiler_args

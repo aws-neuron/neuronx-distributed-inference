@@ -19,15 +19,18 @@ from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 CONFIG_FILE = "neuron_config.json"
 CHUNKED_ATTENTION_SUPPORTED_NEURON_CONFIG = {
     "flash_decoding_enabled": False,
-    "attn_kernel_enabled": False,
     "attn_tkg_builtin_kernel_enabled": False,
     "attn_tkg_nki_kernel_enabled": False,
-    "attn_block_tkg_nki_kernel_enabled": False,
-    "attn_block_tkg_nki_kernel_cache_update": False,
     "is_prefix_caching": False,
     "is_chunked_prefill": False,
-    "cp_degree": 1,
+    "padding_side": "right",
+    "attention_dp_degree": 1,
 }
+
+# scratchpad page size since we get large tensors (used to set compiler and runtime)
+# set to 1024 based on current model configurations and CC tiling factor
+# this is stored in neuron_config since it needs to match between compile and runtime
+LONG_CONTEXT_SCRATCHPAD_PAGE_SIZE = 1024
 
 
 def to_torch_dtype(dtype_str: str) -> torch.dtype:
@@ -42,6 +45,23 @@ def to_torch_dtype(dtype_str: str) -> torch.dtype:
 
 def validate_activation_quantization_type(type: str):
     assert type in ActivationQuantizationType, f"Unsupported activation quantization type: {type}"
+
+
+def validate_attention_data_parallel(self):
+    if self.tp_degree % self.attention_dp_degree != 0:
+        raise ValueError("TP Degree must be evenly divisible by DP Degree")
+
+    if self.tkg_batch_size % self.attention_dp_degree != 0:
+        raise ValueError("Batch Size must be evenly divisible by DP Degree")
+
+    if self.cp_degree > 1 and self.attention_dp_degree > 1 and self.cp_degree < self.attention_dp_degree:
+        raise ValueError("Running DP Degree > CP Degree is not supported when CP and DP is enabled")
+
+    if self.cp_degree > 1 and self.attention_dp_degree > 1 and self.cp_degree % self.attention_dp_degree != 0:
+        raise ValueError("CP Degree % DP Degree should be 0 when CP and DP is enabled")
+
+    if self.attention_dp_degree > 1 and not self.is_continuous_batching:
+        raise ValueError("--is-continuous-batching must be enabled when running DP")
 
 
 def to_dict(obj):
@@ -121,6 +141,7 @@ class NeuronConfig:
         if self.max_new_tokens == 0:
             self.max_new_tokens = None
         self.max_length = kwargs.pop("max_length", self.seq_len)
+        assert self.max_context_length <= self.max_length, "max_context_length cannot be more than max_length"
 
         # Embedding Config
         self.vocab_parallel = kwargs.pop("vocab_parallel", False)
@@ -263,13 +284,20 @@ class NeuronConfig:
         # Distributed config
         self.tp_degree = kwargs.pop("tp_degree", 1)
         self.cp_degree = kwargs.pop("cp_degree", 1)
+        self.attention_dp_degree = kwargs.pop("attention_dp_degree", 1)
         self.pp_degree = kwargs.pop("pp_degree", 1)
         self.ep_degree = kwargs.pop("ep_degree", 1)
         self.save_sharded_checkpoint = kwargs.pop("save_sharded_checkpoint", False)
         self.skip_sharding = kwargs.pop("skip_sharding", False)
 
+        if self.attention_dp_degree > 1:
+            self.kv_cache_batch_size = self.tkg_batch_size // self.attention_dp_degree
+            self.kv_cache_padding_size = 1  # use a padding size of 1 for garbage position writes in DP
+
         if self.tp_degree % self.cp_degree != 0:
             raise ValueError("TP Degree must be evenly divisible by CP Degree")
+
+        validate_attention_data_parallel(self)
 
         # QK layer normalization
         self.qk_layernorm = kwargs.pop("qk_layernorm", False)
@@ -326,10 +354,15 @@ class NeuronConfig:
         self.attn_tkg_nki_kernel_enabled = kwargs.pop("attn_tkg_nki_kernel_enabled", False)
         self.attn_tkg_builtin_kernel_enabled = kwargs.pop("attn_tkg_builtin_kernel_enabled", False)
         self.attn_block_tkg_nki_kernel_enabled = kwargs.pop("attn_block_tkg_nki_kernel_enabled", False)
+        self.attn_block_cte_nki_kernel_enabled = kwargs.pop("attn_block_cte_nki_kernel_enabled", False)
         if self.attn_block_tkg_nki_kernel_enabled:
             assert (
                 self.qkv_kernel_enabled
             ), "When attn-block-tkg-nki-kernel-enabled, self.qkv_kernel_enabled is also required."
+        if self.attn_block_cte_nki_kernel_enabled:
+            assert (
+                self.attn_block_tkg_nki_kernel_enabled and self.qkv_kernel_enabled
+            ), "When attn-block-cte-nki-kernel-enabled, attn-block-tkg-nki-kernel-enabled and qkv_kernel_enabled are also required."
         attn_tkg_kernel_enablement = [
             self.attn_tkg_nki_kernel_enabled,
             self.attn_tkg_builtin_kernel_enabled,
@@ -386,8 +419,17 @@ class NeuronConfig:
                     UserWarning,
                 )
 
+        self.moe_fused_nki_kernel_enabled = kwargs.pop("moe_fused_nki_kernel_enabled", None)
+        self.router_topk_nki_kernel_enabled = kwargs.pop("router_topk_nki_kernel_enabled", None)
+        self.expert_mlp_nki_kernel_enabled = kwargs.pop("expert_mlp_nki_kernel_enabled", None)
+        self.shared_mlp_nki_kernel_enabled = kwargs.pop("shared_mlp_nki_kernel_enabled", None)
+
         # Logical NeuronCore Configuration (LNC)
         self.logical_nc_config = self._get_lnc(kwargs)
+
+        # LM Head Padding for LNC>1
+        self.lm_head_pad = kwargs.pop("lm_head_pad", self.logical_nc_config > 1)
+        self.lm_head_pad_alignment_size = kwargs.pop("lm_head_pad_alignment_size", 1)
 
         if self.is_mlp_quantized():
             self.quantization_type = "per_channel_symmetric"
@@ -420,6 +462,21 @@ class NeuronConfig:
 
         # warmup flag
         self.skip_warmup = kwargs.pop("skip_warmup", False)
+
+        # enable long context flags (to later set compiler/runtime flags)
+        self.scratchpad_page_size = None
+        self.enable_long_context_mode = self.max_context_length >= 32 * 1024
+        if self.enable_long_context_mode:
+            self.scratchpad_page_size = LONG_CONTEXT_SCRATCHPAD_PAGE_SIZE
+
+        # override if user provided a value
+        self.scratchpad_page_size = kwargs.pop("scratchpad_page_size", self.scratchpad_page_size)
+        if self.scratchpad_page_size:
+            self.scratchpad_page_size = int(self.scratchpad_page_size)
+
+        # flag to enable output tensor completion signal
+        self.enable_output_completion_notifications = kwargs.pop(
+            "enable_output_completion_notifications", False)
 
     def _verify_quantized_config(self):
         if not self.quantized:
@@ -516,7 +573,8 @@ class MoENeuronConfig(NeuronConfig):
         self.early_expert_affinity_modulation = kwargs.pop("early_expert_affinity_modulation", False)
         self.normalize_top_k_affinities = not kwargs.pop("disable_normalize_top_k_affinities", False)
         self.fused_shared_experts = kwargs.pop("fused_shared_experts", False)
-
+        self.shared_experts_sequence_parallel_enabled = kwargs.pop("shared_experts_sequence_parallel_enabled", False)
+        self.return_expert_index = kwargs.pop("return_expert_index", False)
         self.blockwise_matmul_config = kwargs.pop("blockwise_matmul_config", {})
         self.blockwise_matmul_config = BlockwiseMatmulConfig.from_kwargs(**self.blockwise_matmul_config)
 
@@ -593,10 +651,12 @@ class InferenceConfig:
         self._validate_chunked_attention_support()
 
     def _validate_chunked_attention_support(self):
-        if hasattr(self, "attention_chunk_size"):
+        if hasattr(self, "attention_chunk_size") and self.attention_chunk_size < self.neuron_config.seq_len:
             for config, config_value in CHUNKED_ATTENTION_SUPPORTED_NEURON_CONFIG.items():
                 if getattr(self.neuron_config, config) != config_value:
-                    raise ValueError(f"The Neuron config {config}: {config_value} is not yet supported with chunked attention.")
+                    raise ValueError(f"The Neuron config {config}: {getattr(self.neuron_config, config)} is not yet supported with chunked attention. Only config value of {config_value} is supported")
+            assert self.attention_chunk_size % self.neuron_config.cp_degree == 0, f"attention_chunk_size: {self.attention_chunk_size} must be divisible by cp_degree: {self.neuron_config.cp_degree}"
+            assert (self.neuron_config.seq_len % self.attention_chunk_size) % self.neuron_config.cp_degree == 0, f"The last chunk must be divisible by cp_degree: {self.neuron_config.cp_degree}"
 
     def save(self, model_path: Union[str, os.PathLike]):
         """
@@ -726,6 +786,7 @@ class OnDeviceSamplingConfig:
         self.deterministic = kwargs.pop("deterministic", False)
         self.global_topk = kwargs.pop("global_topk", 256)
         self.on_device_sampling_config = kwargs.pop("on_device_sampling_config", True)
+        self.top_k_kernel_enabled = kwargs.pop("top_k_kernel_enabled", False)
 
 
 class ChunkedPrefillConfig:

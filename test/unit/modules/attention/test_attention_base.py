@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, Mock, patch
 
+import math
 import pytest
 import torch
 
@@ -21,33 +22,43 @@ class MockTorchModule(MagicMock, torch.nn.Module):
     pass
 
 @pytest.fixture
+@patch("neuronx_distributed_inference.modules.attention.attention_base.init_data_parallel_attention_process_groups")
 @patch("neuronx_distributed_inference.modules.attention.attention_base.init_context_parallel_attention_process_groups")
 @patch("neuronx_distributed_inference.modules.attention.attention_base.get_context_parallel_attention_tp_group")
 @patch("neuronx_distributed_inference.modules.attention.attention_base.get_tensor_model_parallel_group")
-@patch("neuronx_distributed_inference.modules.attention.attention_base.get_tensor_model_parallel_size")
-def attn_module(mock_get_tensor_model_parallel_size, 
-                mock_get_tensor_model_parallel_group, 
-                mock_get_context_parallel_attention_tp_group, 
-                mock_init_context_parallel_attention_process_groups, request):
+@patch("neuronx_distributed_inference.modules.attention.attention_base.GroupQueryAttention_QKV")
+@patch("neuronx_distributed_inference.modules.attention.attention_base.GroupQueryAttention_O")
+def attn_module(mock_GroupQueryAttention_O,
+                mock_GroupQueryAttention_QKV,
+                mock_get_tensor_model_parallel_group,
+                mock_get_context_parallel_attention_tp_group,
+                mock_init_context_parallel_attention_process_groups,
+                mock_init_data_parallel_attention_process_groups,
+                request):
 
     params = request.param if hasattr(request, "param") else {}
-
     tp_degree = params.get("tp_degree", 2)
-    
-    mock_get_tensor_model_parallel_size.return_value = tp_degree
-    mock_get_tensor_model_parallel_group.return_value = None
+    attention_chunk_size = params.get("attention_chunk_size", None)
+    sliding_window = params.get("sliding_window", None)
+
+    mock_get_tensor_model_parallel_group.return_value = MagicMock()
+    mock_get_tensor_model_parallel_group.return_value.size.return_value = tp_degree
+
+    mock_qkv_instance = MagicMock()
+    mock_qkv_instance.get_num_attention_heads.return_value = 4
+    mock_qkv_instance.get_num_key_value_heads.return_value = 4
+    mock_GroupQueryAttention_QKV.return_value = mock_qkv_instance
 
     neuron_config_kwargs = {
         "tp_degree": tp_degree, 
         "logical_nc_config": 1,
         "padding_side": "right",
         "torch_dtype": torch.float32,
+        "on_cpu": True,
     }
 
     neuron_config_kwargs = {**neuron_config_kwargs, **params}
-
     neuron_config = NeuronConfig(**neuron_config_kwargs)
-
     config = InferenceConfig(neuron_config=neuron_config)
 
     module = _create_attn_module(
@@ -55,6 +66,8 @@ def attn_module(mock_get_tensor_model_parallel_size,
                 hidden_size=16,
                 num_attention_heads=4,
                 num_key_value_heads=4,
+                attention_chunk_size=attention_chunk_size,
+                sliding_window=sliding_window
             )
 
     # set random seed explictly again since attn_module initialization increments the seed
@@ -82,8 +95,9 @@ def attn_module(mock_get_tensor_model_parallel_size,
         (None, 1, 1, 256, True, FlashAttentionStrategy.NONE),  # LNC1, q_len < 512
         (True, 1, 1, 256, True, FlashAttentionStrategy.NONE),  # LNC1, enabled, q_len < 512
 
-        (None, 2, 4, 128, False, FlashAttentionStrategy.SHARDED_KERNEL),  # LNC2, cp_enabled, q_len < head_dim
-        (None, 2, 4, 512, False, FlashAttentionStrategy.SHARDED_KERNEL),  # LNC2, cp_enabled, q_len > head_dim
+        (None, 2, 4, 256, False, FlashAttentionStrategy.NONE),  # LNC2, cp_enabled, q_len == head_dim
+        (None, 2, 4, 128, False, FlashAttentionStrategy.NONE),  # LNC2, cp_enabled, q_len < head_dim
+        (None, 2, 4, 512, False, FlashAttentionStrategy.CONTEXT_PARALLEL_KERNEL),  # LNC2, cp_enabled, q_len > head_dim
         (None, 2, 1, 128, False, FlashAttentionStrategy.SHARDED_KERNEL),  # LNC2, q_len < 1024, not divisible by 256
         (None, 2, 1, 3968, False, FlashAttentionStrategy.SHARDED_KERNEL),  # LNC2, q_len >= 1024, not divisible by 512
         (True, 2, 1, 256, False, FlashAttentionStrategy.SHARDED_KERNEL),  # LNC2, q_len < 1024, divisible by 256
@@ -298,6 +312,68 @@ def test_prep_qkv_tensors_rotary_emb(
 
 
 @pytest.mark.parametrize(
+    "batch_size, seq_len, use_sin_cos_cache",
+    # fmt: off
+    [
+        (1, 8, True),   # bs=1, context encoding, uses cache
+        (2, 1, False),  # bs=2, token gen, no cache
+    ],
+    # fmt: on
+)
+@patch("neuronx_distributed_inference.modules.attention.attention_base.precompute_freqs_cis")
+@patch("neuronx_distributed_inference.modules.attention.attention_base.apply_rotary_polar_compatible")
+def test_prep_qkv_tensors_polar_compatible_rotary_emb(
+    mock_apply_rotary_polar_compatible, mock_precompute_freqs_cis, attn_module, batch_size, seq_len, use_sin_cos_cache
+):
+    # Prepare qkv_proj mock.
+    q = torch.rand((batch_size, seq_len, attn_module.num_heads * attn_module.head_dim))
+    k = torch.rand((batch_size, seq_len, attn_module.num_key_value_heads * attn_module.head_dim))
+    v = torch.rand((batch_size, seq_len, attn_module.num_key_value_heads * attn_module.head_dim))
+    attn_module.qkv_proj = MockTorchModule(return_value=(q, k, v, None))
+
+    rotary_freqs = torch.rand((seq_len * 2, attn_module.head_dim))
+    mock_precompute_freqs_cis.return_value = rotary_freqs
+    mock_apply_rotary_polar_compatible.return_value = (q.view(batch_size, seq_len, attn_module.num_heads, attn_module.head_dim), 
+                                                       k.view(batch_size, seq_len, attn_module.num_heads, attn_module.head_dim))
+
+    # Call function.
+    position_ids = torch.ones((batch_size, seq_len), dtype=torch.int32)
+    hidden_states = torch.rand((batch_size, seq_len, attn_module.hidden_size))
+    actual_q, actual_k, actual_v, actual_cos_cache, actual_sin_cache, _ = attn_module.prep_qkv_tensors(
+        position_ids=position_ids,
+        hidden_states=hidden_states,
+        past_key_value=None,
+        use_polar_compatible_rope=True,
+    )
+
+    # Check output.
+    expected_q = (
+        q.view(batch_size, seq_len, attn_module.num_heads, attn_module.head_dim)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    expected_k = (
+        k.view(batch_size, seq_len, attn_module.num_key_value_heads, attn_module.head_dim)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    expected_v = (
+        v.view(batch_size, seq_len, attn_module.num_key_value_heads, attn_module.head_dim)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    torch.testing.assert_close(actual_q, expected_q)
+    torch.testing.assert_close(actual_k, expected_k)
+    torch.testing.assert_close(actual_v, expected_v)
+
+    # Check mocks.
+    mock_apply_rotary_polar_compatible.assert_called_once()
+    mock_precompute_freqs_cis.assert_called_once()
+    torch.testing.assert_close(mock_apply_rotary_polar_compatible.call_args.args[0], q.view(batch_size, seq_len, attn_module.num_heads, attn_module.head_dim))
+    torch.testing.assert_close(mock_apply_rotary_polar_compatible.call_args.args[1], k.view(batch_size, seq_len, attn_module.num_heads, attn_module.head_dim))
+    torch.testing.assert_close(mock_apply_rotary_polar_compatible.call_args.args[2], rotary_freqs[position_ids])
+
+@pytest.mark.parametrize(
     "batch_size, seq_len",
     # fmt: off
     [
@@ -396,36 +472,53 @@ def test_perform_prefill_no_flash_attn(attn_module, batch_size, seq_len, expecte
     torch.testing.assert_close(attn_output, expected_attn_output, atol=5e-5, rtol=2e-3)
 
 @pytest.mark.parametrize(
-    "batch_size, seq_len, expected_attn_output",
+    "batch_size, seq_len",
     # fmt: off
     [   # expected_attn_output shape (bs, n_heads, s, h_dim)
         
-        (1, 4, torch.tensor([[[[0.7745, 0.4369, 0.5191, 0.6159],  [0.7981, 0.7966, 0.2513, 0.4178], [0.6965, 0.9143, 0.9351, 0.9412], [0.6425, 0.4419, 0.7186, 0.5217]],
-                           [[0.0340, 0.9442, 0.8802, 0.0012], [0.2914, 0.7012, 0.6675, 0.1254], [0.6923, 0.2038, 0.6833, 0.7529], [0.7883, 0.4838, 0.2903, 0.4184]]]])),
-        # test case for when seq_len % chunk_size != 0
-        (1, 3, torch.tensor([[[[0.2783, 0.4820, 0.8198, 0.9971],  [0.5041, 0.5280, 0.8281, 0.5717], [0.5932, 0.1123, 0.1535, 0.2417]],
-                           [[0.7262, 0.7011, 0.2038, 0.6511], [0.7471, 0.5870, 0.3399, 0.6359], [0.8102, 0.9801, 0.1147, 0.3168]]]])),
-        (2, 4, torch.tensor([[[[0.3251, 0.0902, 0.3936, 0.6069], [0.2518, 0.2769, 0.6193, 0.5299], [0.5139, 0.4569, 0.6012, 0.8179], [0.7067, 0.6081, 0.7578, 0.6694]],
-                           [[0.0508, 0.2630, 0.8405, 0.4968], [0.1499, 0.1908, 0.4413, 0.2900], [0.3986, 0.7742, 0.7703, 0.0178], [0.5778, 0.4856, 0.6072, 0.1390]]],
-                           [[[0.4037, 0.4018, 0.0513, 0.0683], [0.4139, 0.4607, 0.1760, 0.4174], [0.0500, 0.4663, 0.9397, 0.2961], [0.5858, 0.5939, 0.4102, 0.6053]],
-                           [[0.4423, 0.2768, 0.8998, 0.0960], [0.4947, 0.3326, 0.8797, 0.3519], [0.7403, 0.6766, 0.3798, 0.3948], [0.4946, 0.7121, 0.5746, 0.5633]]]])),
-        
+        (1, 4),
+        (1, 3),
+        (2, 4),
     ],
     # fmt: on
 )
-def test_perform_prefill_chunked_attn_no_flash_attn(attn_module, batch_size, seq_len, expected_attn_output):
+def test_perform_prefill_chunked_attn_no_flash_attn(attn_module, batch_size, seq_len):
     chunk_size = 2
     chunked_attn_mask  = _create_chunked_attn_mask(batch_size, seq_len, chunk_size)
     attn_module.get_flash_attention_strategy = MagicMock(return_value=FlashAttentionStrategy.NONE)
     q = torch.rand((batch_size, attn_module.num_heads, seq_len, attn_module.head_dim))
     k = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
     v = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
+    expected_attn_output = _attn(q, k, v, chunked_attn_mask)
     attn_output, flash_attn_strategy = attn_module.perform_prefill_chunked_attn(
         q, k, v, seq_len, batch_size, chunked_attn_mask, chunk_size
     )
     assert flash_attn_strategy == FlashAttentionStrategy.NONE
     torch.testing.assert_close(attn_output, expected_attn_output, atol=5e-5, rtol=2e-3)
 
+@pytest.mark.parametrize(
+    "batch_size, seq_len, window_size",
+    # fmt: off
+    [
+        (1, 4, 2),
+        (2, 8, 4),
+        (2, 8, 1),
+        (2, 8, 8),
+    ],
+    # fmt: on
+)
+def test_perform_prefill_window_attn_no_flash_attn(attn_module, batch_size, seq_len, window_size):
+    windowed_attn_mask = _create_windowed_attention_mask(batch_size, seq_len, window_size)
+    attn_module.get_flash_attention_strategy = MagicMock(return_value=FlashAttentionStrategy.NONE)
+    q = torch.rand((batch_size, attn_module.num_heads, seq_len, attn_module.head_dim))
+    k = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
+    v = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
+    expected_attn_output = _attn(q, k, v, windowed_attn_mask)
+    attn_output, flash_attn_strategy = attn_module.perform_prefill_windowed_attn(
+        q, k, v, seq_len, batch_size, windowed_attn_mask, window_size
+    )
+    assert flash_attn_strategy == FlashAttentionStrategy.NONE
+    torch.testing.assert_close(attn_output, expected_attn_output, atol=5e-5, rtol=2e-3)
 
 @pytest.mark.parametrize("batch_size", [1, 2])
 @patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_call")
@@ -475,9 +568,9 @@ def test_perform_prefill_context_parallel_attn_kernel(mock_flash_fwd_call, mock_
     mock_flash_fwd_kernel = MagicMock()
     mock_flash_fwd_call.__getitem__.return_value = mock_flash_fwd_kernel
 
-    global_rank = Mock()
-    attn_module.global_rank = global_rank
-    global_rank.get_rank.return_value = torch.tensor(0)
+    rank_util = Mock()
+    attn_module.rank_util = rank_util
+    rank_util.get_rank.return_value = torch.tensor(2) # test is running in tp = 2, cp_rank = 2 // 2 == 1
 
     _setup_perform_prefill_flash_attn_test(
         attn_module, batch_size, q_len, seq_len, FlashAttentionStrategy.CONTEXT_PARALLEL_KERNEL
@@ -569,7 +662,7 @@ def _check_context_parallel_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_m
     assert flash_fwd_args[3] == 1.0
     assert flash_fwd_kwargs["kernel_name"] == "CausalAttentionMMSoftmaxMMWithoutSwap"
     assert flash_fwd_kwargs["global_n_tiles"] == attn_module.cp_degree
-    assert flash_fwd_kwargs["tile_i"] == 0 # we hardcode to global rank 0 for unit testing
+    assert flash_fwd_kwargs["tile_i"] == 1 * q_len # we hardcode to global rank 1 for unit testing
 
 @pytest.mark.parametrize(
     "batch_size, seq_len, expected_attn_output",
@@ -618,23 +711,27 @@ def test_compute_for_token_gen(attn_module, batch_size, seq_len, expected_attn_o
     "attn_module, batch_size, seq_len, sp_enabled",
     # fmt: off
     [
-        ({"cp_degree": 4, "tp_degree": 8}, 1, 64, False),  # bs=1, context encoding, no sequence parallel
-        ({"cp_degree": 4, "tp_degree": 8}, 2, 64, False),  # bs=2, context encoding, no sequence parallel
-        ({"cp_degree": 4, "tp_degree": 8}, 1, 1, False),   # bs=1, token generation, no sequence parallel
-        ({"cp_degree": 4, "tp_degree": 8}, 1, 64, True),   # bs=1, context encoding, sequence parallel
-        ({"cp_degree": 4, "tp_degree": 8}, 2, 64, True),   # bs=2, context encoding, sequence parallel
+        ({"cp_degree": 2, "tp_degree": 4}, 1, 64, False),  # bs=1, context encoding, no sequence parallel
+        ({"cp_degree": 2, "tp_degree": 4}, 2, 64, False),  # bs=2, context encoding, no sequence parallel
+        ({"cp_degree": 2, "tp_degree": 4}, 1, 1, False),   # bs=1, token generation, no sequence parallel
+        ({"cp_degree": 2, "tp_degree": 4}, 1, 64, True),   # bs=1, context encoding, sequence parallel
+        ({"cp_degree": 2, "tp_degree": 4}, 2, 64, True),   # bs=2, context encoding, sequence parallel
+        ({"cp_degree": 2, "attention_dp_degree": 2, "tp_degree": 4, "batch_size": 2, "is_continuous_batching": True}, 2, 1, False), # bs=4, context encoding, sequence parallel, cp with dp
     ], indirect=["attn_module"]
     # fmt: on
 )
 @patch("neuronx_distributed_inference.modules.attention.attention_base.gather_from_tensor_model_parallel_region_with_dim")
 @patch("neuronx_distributed_inference.modules.attention.attention_base.get_context_parallel_attention_cp_group")
-def test_forward_context_parallel(mock_get_context_parallel_attention_cp_group, 
+@patch("neuronx_distributed_inference.modules.attention.attention_base.get_data_parallel_attention_dp_group")
+def test_forward_context_parallel(mock_get_context_parallel_attention_dp_group, 
+                                  mock_get_context_parallel_attention_cp_group, 
                                   mock_gather_from_tensor_model_parallel_region_with_dim, 
                                   attn_module, batch_size, seq_len, sp_enabled):
 
     attn_module.neuron_config.is_prefill_stage = seq_len > 1
     
     cp_degree = attn_module.cp_degree
+    dp_degree = attn_module.dp_degree
     tp_degree = attn_module.tp_degree
     
     if sp_enabled:
@@ -642,28 +739,31 @@ def test_forward_context_parallel(mock_get_context_parallel_attention_cp_group,
         
     attn_module.cp_degree = cp_degree
 
-    global_rank = Mock()
-    attn_module.global_rank = global_rank
-    global_rank.get_rank.return_value = torch.tensor(0)
+    rank_util = Mock()
+    attn_module.rank_util = rank_util
+    rank_util.get_rank.return_value = torch.tensor(0)
 
     q_len = seq_len // cp_degree if seq_len > 1 else seq_len
 
     # Prepare prep_qkv_tensors and o_proj mocks.
-    q = torch.rand((batch_size, attn_module.num_heads, q_len, attn_module.head_dim))
-    k = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
-    v = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
+    q = torch.rand((batch_size // dp_degree, attn_module.num_heads, q_len, attn_module.head_dim))
+    k = torch.rand((batch_size // dp_degree, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
+    v = torch.rand((batch_size // dp_degree, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
     attn_module.prep_qkv_tensors = MagicMock(return_value=(q, k, v, None, None, None))
 
     output_seq_len = seq_len if not sp_enabled else seq_len // cp_degree
 
-    o_proj_output = torch.rand((batch_size, attn_module.num_attention_heads * attn_module.head_dim, attn_module.hidden_size))
-    attn_output = torch.rand((batch_size, output_seq_len, attn_module.hidden_size))
+    o_proj_output = torch.rand((batch_size // dp_degree, attn_module.num_attention_heads * attn_module.head_dim, attn_module.hidden_size))
+    attn_output = torch.rand((batch_size // dp_degree, output_seq_len, attn_module.hidden_size))
 
     # o_proj output is defined based on if we do the final attention gather or not
     # In TKG or SP enabled, we don't gather so o_proj output is the final output
     o_proj_output = o_proj_output if seq_len > 1 and not sp_enabled else attn_output
 
-    if seq_len == 1:
+    if dp_degree > 1:
+        attn_module.o_proj = MockTorchModule(return_value=o_proj_output)
+        o_proj = attn_module.o_proj
+    elif seq_len == 1:
         attn_module.tkg_o_proj = MockTorchModule(return_value=o_proj_output)
         o_proj = attn_module.tkg_o_proj
     else:
@@ -682,10 +782,10 @@ def test_forward_context_parallel(mock_get_context_parallel_attention_cp_group,
     past_key_value = None
     if seq_len == 1:
         past_k = torch.rand(
-            (batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
+            (batch_size // dp_degree, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
         )
         past_v = torch.rand(
-            (batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
+            (batch_size // dp_degree, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
         )
         past_key_value = (past_k, past_v)
 
@@ -704,15 +804,339 @@ def test_forward_context_parallel(mock_get_context_parallel_attention_cp_group,
     attn_module.prep_qkv_tensors.assert_called_once()
     o_proj.assert_called_once()
 
+    if dp_degree > 1:
+        mock_get_context_parallel_attention_dp_group.assert_called_once()
+        mock_gather_from_tensor_model_parallel_region_with_dim.assert_called_once()
+
+        # Assert that the split happened
+        attn_module.prep_qkv_tensors.call_args.args[1].shape == (batch_size // dp_degree, input_seq_len, attn_module.hidden_size)
+
     if seq_len > 1 and not sp_enabled:
         mock_gather_from_tensor_model_parallel_region_with_dim.assert_called_once()
         mock_get_context_parallel_attention_cp_group.assert_called_once()
-    else:
+    elif sp_enabled:
         mock_gather_from_tensor_model_parallel_region_with_dim.assert_not_called()
         mock_get_context_parallel_attention_cp_group.assert_not_called()
+        mock_get_context_parallel_attention_dp_group.assert_not_called()
 
     o_proj_input = o_proj.call_args.args[0]
-    assert o_proj_input.shape == (batch_size, q_len, attn_module.num_heads * attn_module.head_dim)
+    assert o_proj_input.shape == (batch_size // dp_degree, q_len, attn_module.num_heads * attn_module.head_dim)
+
+@pytest.mark.parametrize(
+    "attn_module, seq_len, sp_enabled",
+    # fmt: off
+    [
+        (
+            {"cp_degree": 2, "tp_degree": 4, "attention_chunk_size": 32},
+            64,
+            False,
+        ),  # context encoding, no sequence parallel
+        (
+            {"cp_degree": 2, "tp_degree": 4, "attention_chunk_size": 32},
+            1,
+            False,
+        ),  # token generation, no sequence parallel
+        (
+            {"cp_degree": 2, "tp_degree": 4, "attention_chunk_size": 32, "fused_qkv": True, 
+             "attn_block_tkg_nki_kernel_enabled": True, "attn_block_tkg_nki_kernel_cache_update": True, 
+             "qkv_kernel_enabled": True},
+            1,
+            False,
+        ),  # token generation, tkg attention kernel enabled
+        (
+            {"cp_degree": 2, "tp_degree": 4, "attention_chunk_size": 32},
+            64,
+            True,
+        ),  # context encoding, sequence parallel
+        (
+            {"cp_degree": 2, "tp_degree": 4, "attention_chunk_size": 32},
+            48,
+            True,
+        ),  # context encoding, sequence parallel, seq_len not divisible by chunk size
+    ],
+    indirect=["attn_module"],
+    # fmt: on
+)
+@patch(
+    "neuronx_distributed_inference.modules.attention.attention_base.get_last_kv_chunk"
+)
+@patch(
+    "neuronx_distributed_inference.modules.attention.attention_base.gather_from_sequence_parallel_region"
+)
+@patch("neuronx_distributed_inference.modules.attention.attention_base.split_along_dim")
+@patch(
+    "neuronx_distributed_inference.modules.attention.attention_base.get_context_parallel_attention_cp_group"
+)
+@patch(
+    "neuronx_distributed_inference.modules.attention.attention_base.get_tensor_model_parallel_group"
+)
+def test_chunked_attn_forward_with_context_parallel(
+    mock_get_tensor_model_parallel_group,
+    mock_get_context_parallel_attention_cp_group,
+    mock_split_along_dim,
+    mock_gather_from_sequence_parallel_region,
+    mock_get_last_kv_chunk,
+    attn_module,
+    seq_len,
+    sp_enabled,
+):
+    if sp_enabled:
+        _enable_sequence_parallel_chunked_attn(
+            attn_module, attn_module.tp_degree // attn_module.cp_degree
+        )
+    attn_module.neuron_config.is_prefill_stage = seq_len > 1
+
+    cp_degree = attn_module.cp_degree
+    tp_degree = attn_module.tp_degree
+    attn_chunk_size = attn_module.attention_chunk_size
+
+    chunk_lens = _get_chunk_lens(seq_len, attn_chunk_size)
+
+    attn_module.cp_degree = cp_degree
+    mock_get_context_parallel_attention_cp_group.return_value = MagicMock()
+    mock_get_context_parallel_attention_cp_group.return_value.size().return_value = (
+        cp_degree
+    )
+    rank_util = Mock()
+    attn_module.rank_util = rank_util
+    rank_util.get_rank.return_value = torch.tensor(0)
+
+    n_chunks = seq_len // attn_chunk_size if seq_len > 1 else 1
+    q_len = attn_chunk_size if seq_len > 1 else seq_len
+
+    past_key_value = None
+    if seq_len == 1:
+        past_k = torch.rand(
+            (1, attn_module.num_key_value_heads, attn_chunk_size, attn_module.head_dim)
+        )
+        past_v = torch.rand(
+            (1, attn_module.num_key_value_heads, attn_chunk_size, attn_module.head_dim)
+        )
+        past_key_value = (past_k, past_v)
+
+    # Prepare mocks for the inner loop compute of chunks and o_proj
+    if seq_len == 1:
+        q = torch.rand((1, attn_module.num_heads, seq_len, attn_module.head_dim))
+        k = torch.rand(
+            (1, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
+        )
+        v = torch.rand(
+            (1, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
+        )
+        attn_module.prep_qkv_tensors = MagicMock(
+            return_value=(q, k, v, None, None, None)
+        )
+        tkg_o_proj_output = torch.rand((1, 1, attn_module.hidden_size))
+        attn_module.tkg_o_proj = MockTorchModule(return_value=tkg_o_proj_output)
+        o_proj = attn_module.tkg_o_proj
+
+        if attn_module.neuron_config.attn_block_tkg_nki_kernel_enabled:
+            attn_module.attention_block_tokengen_nki_kernel_chunked_attn = MagicMock(
+                return_value=(tkg_o_proj_output, past_key_value, None, None)
+            )
+    else:
+        attn_module.compute_attention_per_chunk_with_context_parallel = MagicMock()
+        last_k_chunk = None
+        last_v_chunk = None
+        final_outputs = []
+        for q_len in chunk_lens:
+            k = torch.rand(
+                (1, attn_module.num_key_value_heads, q_len, attn_module.head_dim)
+            )
+            v = torch.rand(
+                (1, attn_module.num_key_value_heads, q_len, attn_module.head_dim)
+            )
+            chunked_attn_output = torch.rand((1, q_len, attn_module.hidden_size))
+            last_k_chunk = k
+            last_v_chunk = v
+            final_outputs.append(tuple([chunked_attn_output, None, None, k, v]))
+        attn_module.compute_attention_per_chunk_with_context_parallel.side_effect = (
+            final_outputs
+        )
+        cte_o_proj_output = torch.rand((1, seq_len, attn_module.hidden_size))
+        attn_module.cte_o_proj = MockTorchModule(return_value=cte_o_proj_output)
+        o_proj = attn_module.cte_o_proj
+
+    # If SP is enabled, pass in input // tp
+    input_seq_len = seq_len if not sp_enabled else seq_len // tp_degree
+
+    hidden_states = torch.rand((1, input_seq_len, attn_module.hidden_size))
+    expected_attn_output = torch.rand((1, seq_len, attn_module.hidden_size))
+    if seq_len > 1:
+        if sp_enabled:
+            mock_gather_from_sequence_parallel_region.return_value = torch.rand(
+                (1, seq_len, attn_module.hidden_size)
+            )
+            expected_attn_output = torch.rand(
+                (1, seq_len // tp_degree, attn_module.hidden_size)
+            )
+            mock_split_along_dim.return_value = expected_attn_output
+        else:
+            expected_attn_output = cte_o_proj_output
+    else:
+        expected_attn_output = tkg_o_proj_output
+    mock_get_last_kv_chunk.return_value = (k, v)
+    attention_mask = torch.full((1, 1, seq_len, seq_len), True)
+    position_ids = torch.ones((1, seq_len))
+
+    # Call the tested function
+    actual_output, past_key_value, cos_cache, sin_cache = attn_module.forward(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+    )
+
+    ## Asserts
+    torch.testing.assert_close(actual_output, expected_attn_output)
+    assert cos_cache is None
+    assert sin_cache is None
+
+    if attn_module.neuron_config.attn_block_tkg_nki_kernel_enabled:
+        # When the block kernel is enabled, all attention compute is in the kernel so we only assert that we called the kernel
+        attn_module.attention_block_tokengen_nki_kernel_chunked_attn.assert_called_once()
+        assert torch.equal(attn_module.attention_block_tokengen_nki_kernel_chunked_attn.call_args.kwargs["hidden_states"], hidden_states)
+        assert torch.equal(attn_module.attention_block_tokengen_nki_kernel_chunked_attn.call_args.kwargs["position_ids"], position_ids)
+        assert torch.equal(attn_module.attention_block_tokengen_nki_kernel_chunked_attn.call_args.kwargs["attention_mask"], attention_mask)
+
+        o_proj.assert_not_called()
+        attn_module.prep_qkv_tensors.assert_not_called()
+
+        return
+
+    o_proj.assert_called_once()
+
+    if seq_len > 1:
+        attn_module.compute_attention_per_chunk_with_context_parallel.call_count == cp_degree * n_chunks
+        assert torch.allclose(past_key_value[0], last_k_chunk), "K output is incorrect"
+        assert torch.allclose(past_key_value[1], last_v_chunk), "V output is incorrect"
+        if sp_enabled:
+            mock_gather_from_sequence_parallel_region.assert_called_once()
+            mock_split_along_dim.assert_called_once()
+    else:
+        assert torch.allclose(past_key_value[0], k), "K output is incorrect"
+        assert torch.allclose(past_key_value[1], v), "V output is incorrect"
+
+@pytest.mark.parametrize("position_ids, chunk_size, update_kv_per_layer, attn_block_tkg_nki_kernel_cache_update", [
+    (torch.tensor([20]), 10, False, False),
+    (torch.tensor([20, 10]), 10, False, True),
+    (torch.tensor([5]), 10, True, True),
+])
+def test_attention_block_tokengen_nki_kernel_chunked_attn(attn_module, position_ids, chunk_size, update_kv_per_layer, attn_block_tkg_nki_kernel_cache_update):
+    attn_module.attn_block_tkg_nki_kernel_cache_update = attn_block_tkg_nki_kernel_cache_update
+    attn_module.attention_chunk_size = chunk_size
+
+    kv_mgr = MagicMock()
+    kv_mgr._fetch_cache.return_value = None
+
+    attn_module.attention_block_tokengen_nki_kernel = MagicMock(return_value=(None, None, None, None))
+    # The None values should be real tensors, but since we don't invoke the kernel in the UT, the inputs are not important
+    attn_module.attention_block_tokengen_nki_kernel_chunked_attn(None, None, position_ids, kv_mgr, 
+                                                                None, None, None, None, None, update_kv_per_layer,
+                                                                idx=0, kvcache_buffer=None)
+
+    attn_module.attention_block_tokengen_nki_kernel.assert_called_once()
+    assert all(attn_module.attention_block_tokengen_nki_kernel.call_args.kwargs["position_ids"] == position_ids % chunk_size if attn_block_tkg_nki_kernel_cache_update else position_ids)
+    assert attn_module.attention_block_tokengen_nki_kernel.call_args.kwargs["update_kv_per_layer"] == update_kv_per_layer
+
+    if not attn_block_tkg_nki_kernel_cache_update and update_kv_per_layer:
+        kv_mgr.update_kv_by_layer_id.assert_called_once()
+        assert all(kv_mgr.update_kv_by_layer_id.call_args.kwargs["position_ids"] == position_ids)
+
+@pytest.mark.parametrize(
+    "attn_module, seq_len, chunk_idx, cos_sin_exists",
+    # fmt: off
+    [
+        ({"cp_degree": 2, "tp_degree": 4, "attention_chunk_size": 32}, 64, 0, True),  # context encoding, with cos sin cache
+        ({"cp_degree": 2, "tp_degree": 4, "attention_chunk_size": 32}, 64, 0, False),  # context encoding, without cos sin cache
+        ({"cp_degree": 2, "tp_degree": 4, "attention_chunk_size": 32}, 64, 1, True),  # context encoding, 2nd chunk, without cos sin cache
+    ],
+    indirect=["attn_module"],
+    # fmt: on
+)
+@patch(
+    "neuronx_distributed_inference.modules.attention.attention_base.get_context_parallel_attention_cp_group"
+)
+@patch(
+    "neuronx_distributed_inference.modules.attention.attention_base.gather_from_tensor_model_parallel_region_with_dim"
+)
+def test_compute_attention_per_chunk_with_context_parallel(
+    mock_gather_from_tensor_model_parallel_region_with_dim,
+    mock_get_context_parallel_attention_cp_group,
+    attn_module,
+    seq_len,
+    chunk_idx,
+    cos_sin_exists,
+):
+    cp_degree = attn_module.cp_degree
+
+    attn_module.cp_degree = cp_degree
+    attn_chunk_size = attn_module.attention_chunk_size
+    mock_get_context_parallel_attention_cp_group.return_value = MagicMock()
+    mock_get_context_parallel_attention_cp_group.return_value.size().return_value = (
+        cp_degree
+    )
+    rank_util = Mock()
+    attn_module.rank_util = rank_util
+    rank_util.get_rank.return_value = torch.tensor(0)
+    
+    # Prepare inputs
+    hidden_states = torch.rand((1, seq_len, attn_module.hidden_size))
+    attention_mask = torch.full((1, 1, seq_len, seq_len), True)
+    position_ids = torch.ones((1, seq_len))
+    cos_cache = torch.rand((1, seq_len, attn_module.head_dim)) if cos_sin_exists else None
+    sin_cache = torch.rand((1, seq_len, attn_module.head_dim)) if cos_sin_exists else None
+
+    cp_hidden_states = torch.rand((1, attn_chunk_size // cp_degree, attn_module.hidden_size))
+    cp_attention_mask = torch.full((1, 1, attn_chunk_size // cp_degree, attn_chunk_size // cp_degree), True)
+    cp_position_ids = torch.ones((1, attn_chunk_size // cp_degree))
+    cp_cos_cache = torch.rand((1, attn_chunk_size // cp_degree, attn_module.head_dim))
+    cp_sin_cache = torch.rand((1, attn_chunk_size // cp_degree, attn_module.head_dim))
+    # Prepare mocks
+    q = torch.rand((1, attn_module.num_heads, attn_chunk_size // cp_degree, attn_module.head_dim))
+    k = torch.rand((1, attn_module.num_key_value_heads, attn_chunk_size, attn_module.head_dim))
+    v = torch.rand((1, attn_module.num_key_value_heads, attn_chunk_size, attn_module.head_dim))
+    
+    attn_module.prep_qkv_tensors = MagicMock(return_value=(q, k, v, cp_cos_cache, cp_sin_cache, None))
+    attn_module._split_input_for_context_parallel = MagicMock(return_value=(cp_attention_mask, cp_hidden_states, cp_position_ids, cp_cos_cache, cp_sin_cache))
+    expected_attn_output = torch.rand((1, attn_chunk_size, attn_module.hidden_size))
+    expected_cos_sin = torch.rand((2, 1, attn_chunk_size, attn_module.hidden_size))
+    mock_gather_from_tensor_model_parallel_region_with_dim.side_effect = [expected_attn_output, expected_cos_sin]
+
+    # Prepare inputs
+    hidden_states = torch.rand((1, seq_len, attn_module.hidden_size))
+    attention_mask = torch.full((1, 1, seq_len, seq_len), True)
+    position_ids = torch.ones((1, seq_len))
+
+
+    # Call the tested function
+    actual_output, actual_cos_cache, actual_sin_cache, actual_k, actual_v  = attn_module.compute_attention_per_chunk_with_context_parallel(
+        chunk_idx,
+        hidden_states,
+        position_ids,
+        attention_mask,
+        cos_cache,
+        sin_cache
+    )
+
+    ## Asserts
+    assert torch.allclose(actual_output, expected_attn_output), "attention output is incorrect"
+    if not cos_sin_exists:
+        assert torch.allclose(actual_cos_cache, expected_cos_sin[0]), "cos cache is incorrect"
+        assert torch.allclose(actual_sin_cache, expected_cos_sin[1]), "sin cache is incorrect"
+    else:
+        assert torch.allclose(actual_cos_cache, cp_cos_cache), "cos cache is incorrect"
+        assert torch.allclose(actual_sin_cache, cp_sin_cache), "sin cache is incorrect"
+    assert torch.allclose(actual_k, k), "K output is incorrect"
+    assert torch.allclose(actual_v, v), "V output is incorrect"
+
+
+def _get_chunk_lens(seq_len, attn_chunk_size):
+    chunk_lens = []
+    while seq_len > 0:
+        chunk_lens.append(min(attn_chunk_size, seq_len))
+        seq_len -= attn_chunk_size
+    return chunk_lens
 
 
 @pytest.mark.parametrize(
@@ -1113,10 +1537,74 @@ def test_forward_kv_cache(attn_module, batch_size, seq_len, is_for_speculation):
     assert o_proj_input.shape == (batch_size, q_len, attn_module.num_heads * attn_module.head_dim)
 
 
+
+@pytest.mark.parametrize(
+    "attn_module, batch_size, seq_len",
+    # fmt: off
+    [
+        ({"tp_degree": 2}, 1, 256),   # bs=1, context encoding, seqlen=256
+    ], indirect=["attn_module"],
+    # fmt: on
+)
+@patch("neuronx_distributed_inference.modules.attention.attention_base.nc")
+@patch(
+    "neuronx_distributed_inference.modules.attention.attention_base.llama3_nki_attention_block_cte_kernel"
+)
+@patch(
+    "neuronx_distributed_inference.modules.attention.attention_base.reduce_from_tensor_model_parallel_region"
+)
+def test_nki_attention_block_cte_kernel(
+    mock_reduce_from_tensor_model_parallel_region, mock_llama3_nki_attention_block_cte_kernel, mock_nc, attn_module: NeuronAttentionBase, batch_size, seq_len
+):
+    """Test attention_tokengen_kernel_builtin calls kernel with expected inputs."""
+
+    _enable_nki_attention_block_cte_kernel(attn_module)
+
+    nc_value = Mock()
+    mock_nc.return_value = nc_value
+    grid = (nc_value,)
+
+    mock_llama3_nki_attention_block_cte_kernel.__getitem__.return_value = MagicMock(return_value=(MagicMock(), MagicMock(), MagicMock(), MagicMock()))
+
+    hidden_states = torch.rand((batch_size, seq_len, attn_module.hidden_size))
+
+    cos_cache = torch.rand((batch_size, seq_len, attn_module.head_dim))
+    sin_cache = torch.rand((batch_size, seq_len, attn_module.head_dim))
+    attn_module.rotary_emb = MagicMock(return_value=(cos_cache, sin_cache))
+
+    rmsnorm = Mock()
+    rmsnorm.weight = torch.rand((1, attn_module.hidden_size))
+
+    # assert out_proj kernel is enabled - weight should be transpoed on CPU
+    assert attn_module.o_proj.out_proj_kernel_enabled
+    attn_module.o_proj = MockTorchModule()
+    attn_module.o_proj.o_proj.weight = torch.rand((attn_module.num_heads * attn_module.head_dim, 
+                                                    attn_module.hidden_size))
+    position_ids = torch.ones((batch_size, seq_len))
+    rotary_position_ids = position_ids
+
+    # Act
+    attn_module.forward(
+        hidden_states, rmsnorm=rmsnorm, rotary_position_ids=rotary_position_ids,
+        residual=hidden_states, 
+    )
+
+
+    # Assert
+    mock_nc.assert_called_once_with(attn_module.logical_nc_config)
+    mock_llama3_nki_attention_block_cte_kernel.__getitem__.assert_called_once_with(grid)
+
+
 def _enable_sequence_parallel(attn_module, tp_degree):
     attn_module.tensor_model_parallel_group = MagicMock()
     attn_module.tensor_model_parallel_group.size.return_value = tp_degree
     attn_module.sequence_parallel_enabled = True
+
+def _enable_sequence_parallel_chunked_attn(attn_module, tp_degree):
+    attn_module.tensor_model_parallel_group = MagicMock()
+    attn_module.tensor_model_parallel_group.size.return_value = tp_degree
+    attn_module.neuron_config.sequence_parallel_enabled = True
+    attn_module.sequence_parallel_enabled = False
 
 
 def _enable_attn_tkg_builtin_kernel_enabled(attn_module):
@@ -1129,17 +1617,28 @@ def _enable_attn_tkg_builtin_kernel_enabled(attn_module):
         dtype=torch.float32,
     )
 
+def _enable_nki_attention_block_cte_kernel(attn_module: NeuronAttentionBase):
+    attn_module.attn_block_cte_nki_kernel_enabled = True
+    attn_module.k_cache_transposed = True
+    attn_module.fused_qkv = True
+
+    attn_module.init_gqa_properties()
+
 
 def _create_attn_module(
     config,
     hidden_size,
     num_attention_heads,
     num_key_value_heads,
+    attention_chunk_size,
+    sliding_window,
 ):
     attn_module = NeuronAttentionBase(config=config,
                                       hidden_size=hidden_size,
                                       num_attention_heads=num_attention_heads,
-                                      num_key_value_heads=num_key_value_heads)
+                                      num_key_value_heads=num_key_value_heads,
+                                      attention_chunk_size=attention_chunk_size,
+                                      sliding_window=sliding_window)
     
     return attn_module
 
@@ -1148,7 +1647,7 @@ def _create_attn_mask(batch_size, seq_len):
     mask = mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
     return mask
 
-def _create_chunked_attn_mask(batch_size, seq_len: int, chunk_size: int) -> torch.Tensor:
+def _create_chunked_attn_mask(batch_size: int, seq_len: int, chunk_size: int) -> torch.Tensor:
     block_pos = torch.abs(
         (torch.arange(seq_len).unsqueeze(0) // chunk_size)
         - (torch.arange(seq_len).unsqueeze(1) // chunk_size)
@@ -1157,3 +1656,20 @@ def _create_chunked_attn_mask(batch_size, seq_len: int, chunk_size: int) -> torc
     mask = (block_pos == 0) & (token_pos <= 0)
     mask = mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
     return mask
+
+def _create_windowed_attention_mask(batch_size: int, seq_len: int, window_size: int) -> torch.Tensor:
+    """create a causal, window attention mask"""
+    mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool), diagonal=0)
+    for i in range(seq_len):
+        if i >= window_size:
+            mask[i, : i - window_size + 1] = False
+    mask = mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
+    return mask
+
+def _attn(q, k, v, mask) -> torch.Tensor:
+    """calculate expected attention output with mask"""
+    attn = torch.einsum('bnsd,bntd->bnst', q / math.sqrt(q.shape[-1]), k)
+    attn = attn.masked_fill(~mask, float('-inf'))
+    attn = torch.nn.functional.softmax(attn, dim=-1)
+    attn = torch.einsum('bnts,bnsd->bntd', attn, v)
+    return attn

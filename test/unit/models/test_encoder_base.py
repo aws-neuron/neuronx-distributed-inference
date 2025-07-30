@@ -168,7 +168,7 @@ class ModelWrapperSimpleEncoder(ModelWrapper):
         for i, target_input in enumerate(target_inputs):
             padded_input, padding_mask = pad_tensor(args[i], target_input.shape)
             padded_inputs.append(padded_input)
-            padding_masks.append(padding_mask.float())
+            padding_masks.append(padding_mask)
 
         return padded_inputs, padding_masks
 
@@ -241,9 +241,8 @@ class ModelWrapperSimpleEncoder(ModelWrapper):
             f"ModelWrapperSimpleEncoder.forward() padded_inputs {type(padded_inputs)} {padded_inputs[0].shape}"
         )
         logger.info(
-            f"ModelWrapperSimpleEncoder.forward() padding_masks {type(padding_masks)} {padding_masks[0].shape}"
+            f"ModelWrapperSimpleEncoder.forward() padding_masks {type(padding_masks)} {padding_masks}"
         )
-        logger.info(f"non zeros {torch.count_nonzero(padding_masks[0])}")
 
         output = self._forward(*padded_inputs)
         logger.info(f"ModelWrapperSimpleEncoder.forward() output {type(output)} {output.shape}")

@@ -139,6 +139,99 @@ def test_llama3_2_1b_4layer_continuous_batching_neuron_on_device_sampling():
 
 @pytest.mark.tp1
 @pytest.mark.cpu
+def test_llama3_2_1b_4layer_continuous_batching_cpu_accuracy():
+    neuron_config = NeuronConfig(
+        tp_degree=1,  # constraint: tp_degree > 1 is only supported when using 'torchrun'
+        batch_size=2,
+        ctx_batch_size=1,
+        seq_len=256,
+        max_context_length=256, # constraint: max_context_length should be equal to seq_len in CPU mode
+        # torch_dtype=torch.float32,  # optional: cpu mode backend with tp > 1 supports only float32. Tp=1 supports bfloat16 as well.
+        on_cpu=True,
+        is_continuous_batching=True,
+    )
+    run_llama3_2_1b_4layer(neuron_config, cpu_mode=True, run_accuracy=True, run_perf=False)
+
+
+@pytest.mark.tp32
+def test_llama3_2_1b_4layer_neuron_async():
+    """
+    # with logit enabled
+    {
+        "e2e_model": {
+            "latency_ms_p50": 258.9900493621826,
+            "latency_ms_p90": 261.19418144226074,
+            "latency_ms_p95": 262.8460884094239,
+            "latency_ms_p99": 274.4913291931152,
+            "latency_ms_p100": 277.4026393890381,
+            "latency_ms_avg": 256.90202713012695,
+            "throughput": 1992.9776565782406
+        },
+        "context_encoding_model": {
+            "latency_ms_p50": 0.5402565002441406,
+            "latency_ms_p90": 0.6466150283813477,
+            "latency_ms_p95": 0.6980299949646002,
+            "latency_ms_p99": 1.31319761276245,
+            "latency_ms_p100": 1.466989517211914,
+            "latency_ms_avg": 0.5995035171508789,
+            "throughput": 427020.01352157485
+        },
+        "token_generation_model": {
+            "latency_ms_p50": 0.4699230194091797,
+            "latency_ms_p90": 0.5123615264892578,
+            "latency_ms_p95": 0.5276322364807128,
+            "latency_ms_p99": 0.5546164512634276,
+            "latency_ms_p100": 1.5292167663574219,
+            "latency_ms_avg": 0.4773014225065708,
+            "throughput": 4190.224260168567
+        }
+    }
+    # with logit disabled: The performance should be better than the sync mode
+    {
+        "e2e_model": {
+            "latency_ms_p50": 129.07254695892334,
+            "latency_ms_p90": 135.35146713256836,
+            "latency_ms_p95": 136.5814208984375,
+            "latency_ms_p99": 137.0706558227539,
+            "latency_ms_p100": 137.192964553833,
+            "latency_ms_avg": 130.13672828674316,
+            "throughput": 3934.323589815933
+        },
+        "context_encoding_model": {
+            "latency_ms_p50": 0.49567222595214844,
+            "latency_ms_p90": 0.5086660385131836,
+            "latency_ms_p95": 0.5123734474182129,
+            "latency_ms_p99": 0.5198025703430176,
+            "latency_ms_p100": 0.5216598510742188,
+            "latency_ms_avg": 0.49389600753784185,
+            "throughput": 518327.7372016123
+        },
+        "token_generation_model": {
+            "latency_ms_p50": 0.44274330139160156,
+            "latency_ms_p90": 0.4634857177734375,
+            "latency_ms_p95": 0.4715919494628906,
+            "latency_ms_p99": 0.5100750923156738,
+            "latency_ms_p100": 0.7455348968505859,
+            "latency_ms_avg": 0.4451499320566654,
+            "throughput": 4492.868258475685
+        }
+    }
+    """
+    neuron_config = NeuronConfig(
+        tp_degree=32,
+        batch_size=2,
+        max_context_length=128,
+        seq_len=256,
+        async_mode=True,
+        output_logits=True,
+        on_device_sampling_config=OnDeviceSamplingConfig(),
+    )
+    # loosen the threshold due to kaizen setup differences
+    run_llama3_2_1b_4layer(neuron_config, cpu_mode=False, run_accuracy=True, run_perf=True,
+                           latency_threshold=258 * 1.2, throughput_threshold = 1992 * 0.8)
+
+@pytest.mark.tp1
+@pytest.mark.cpu
 def test_llama3_2_1b_4layer_cpu_accuracy():
     neuron_config = NeuronConfig(
         tp_degree=1,  # constraint: tp_degree > 1 is only supported when using 'torchrun'
@@ -151,7 +244,7 @@ def test_llama3_2_1b_4layer_cpu_accuracy():
     run_llama3_2_1b_4layer(neuron_config, cpu_mode=True, run_accuracy=True, run_perf=False)
 
 def run_llama3_2_1b_4layer(neuron_config, cpu_mode=False, run_accuracy=True, run_perf=True,
-                           latency_threshold=0, throughput_threshold=0):
+                           latency_threshold=None, throughput_threshold=None):
     """Run Llama 3.2 1B 4-layer model tests with the specified configuration.
     
     This function loads a Llama 3.2 1B model with 4 layers from a configuration file,
@@ -187,7 +280,7 @@ def run_llama3_2_1b_4layer(neuron_config, cpu_mode=False, run_accuracy=True, run
     if run_accuracy:
         validate_accuracy(model_path, config, generation_config, cpu_mode=cpu_mode)
     if run_perf:
-        validate_performance(model_path, config, generation_config, latency_threshold, throughput_threshold)
+        validate_performance(model_path, config, generation_config, cpu_mode, latency_threshold, throughput_threshold)
 
     # Clean up the model checkpoint only if the test passes.
     model_tempdir.cleanup()
@@ -204,15 +297,7 @@ def save_checkpoint(config_path):
     return model_tempdir
 
 
-def validate_accuracy(model_path, config, generation_config, cpu_mode=False):
-    input_len = 16
-    input_ids = torch.rand((config.neuron_config.batch_size, input_len)) * config.vocab_size
-    input_ids = input_ids.to(dtype=torch.int32)
-    attention_mask = torch.ones((config.neuron_config.batch_size, input_len), dtype=torch.int32)
-    inputs = Namespace(input_ids=input_ids, attention_mask=attention_mask)
-
-    model = NeuronLlamaForCausalLM(model_path, config)
-    
+def _load_model(model, model_path, cpu_mode):
     if cpu_mode:
         print("\nLoading model to CPU...")
         model.to_cpu()
@@ -221,6 +306,17 @@ def validate_accuracy(model_path, config, generation_config, cpu_mode=False):
         compiled_model_path = model_path + "/compiled_checkpoint_accuracy"
         model.compile(compiled_model_path)
         model.load(compiled_model_path)
+    return model
+
+def validate_accuracy(model_path, config, generation_config, cpu_mode=False):
+    input_len = 16
+    input_ids = torch.rand((config.neuron_config.batch_size, input_len)) * config.vocab_size
+    input_ids = input_ids.to(dtype=torch.int32)
+    attention_mask = torch.ones((config.neuron_config.batch_size, input_len), dtype=torch.int32)
+    inputs = Namespace(input_ids=input_ids, attention_mask=attention_mask)
+
+    model = NeuronLlamaForCausalLM(model_path, config)
+    model = _load_model(model, model_path, cpu_mode)
 
     check_accuracy_logits(
         model,
@@ -231,23 +327,25 @@ def validate_accuracy(model_path, config, generation_config, cpu_mode=False):
     )
 
 
-def validate_performance(model_path, config, generation_config, latency_threshold, throughput_threshold):
+def validate_performance(model_path, config, generation_config, cpu_mode, latency_threshold, throughput_threshold):
     config = copy.deepcopy(config)
 
     model = NeuronLlamaForCausalLM(model_path, config)
-    compiled_model_path = model_path + "/compiled_checkpoint_perf"
-    model.compile(compiled_model_path)
-    model.load(compiled_model_path)
+    model = _load_model(model, model_path, cpu_mode)
 
     benchmark_results = benchmark_sampling(model, generation_config=generation_config)
     latency = benchmark_results["e2e_model"]["latency_ms_p50"]
-    assert latency < latency_threshold, f"latency ({latency}) is above threshold ({latency_threshold})"
+    if latency_threshold:
+        assert latency < latency_threshold, f"latency ({latency}) is above threshold ({latency_threshold})"
     throughput = benchmark_results["e2e_model"]["throughput"]
-    assert throughput > throughput_threshold, f"throughput ({throughput}) is below threshold ({throughput_threshold})"
+    if throughput_threshold:
+        assert throughput > throughput_threshold, f"throughput ({throughput}) is below threshold ({throughput_threshold})"
 
 
 
 if __name__ == "__main__":
     test_llama3_2_1b_4layer_neuron_on_device_sampling()
     test_llama3_2_1b_4layer_continuous_batching_neuron_on_device_sampling()
+    test_llama3_2_1b_4layer_continuous_batching_cpu_accuracy()
+    test_llama3_2_1b_4layer_neuron_async()
     test_llama3_2_1b_4layer_cpu_accuracy()

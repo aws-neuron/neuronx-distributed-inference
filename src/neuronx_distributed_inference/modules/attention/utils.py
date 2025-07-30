@@ -13,8 +13,6 @@ from torch import Tensor, nn
 
 from neuronx_distributed_inference.modules.custom_calls import neuron_cumsum
 
-torch.manual_seed(0)
-
 weight_cache = {}
 
 
@@ -203,40 +201,6 @@ def _rotate_half(x) -> Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_scaling(freqs: torch.Tensor):
-    # Values obtained from grid search, specifically for Llama3.2 MM PyTorch Implementation
-    scale_factor = 8
-    low_freq_factor = 1
-    high_freq_factor = 4
-    old_context_len = 8192  # original llama3 length
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-    new_freqs = []
-    for freq in freqs:
-        wavelen = 2 * math.pi / freq
-        if wavelen < high_freq_wavelen:
-            new_freqs.append(freq)
-        elif wavelen > low_freq_wavelen:
-            new_freqs.append(freq / scale_factor)
-        else:
-            assert low_freq_wavelen != high_freq_wavelen
-            smooth = (old_context_len / wavelen - low_freq_factor) / (
-                high_freq_factor - low_freq_factor
-            )
-            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
-    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
-
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False, device=None):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    if use_scaled:
-        freqs = apply_scaling(freqs)
-    freqs = torch.outer(t, freqs)
-    return freqs
-
-
 def apply_rotary_pos_emb(
     q, k, cos, sin, position_ids=None, unsqueeze_dim=1
 ) -> Tuple[Tensor, Tensor]:
@@ -247,39 +211,6 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-def apply_rotary_polar_compatible(query, key, freqs_cis):
-    # Ensure freqs_cis is in FP32 for accuracy
-    if freqs_cis.dtype != torch.float32:
-        raise ValueError(
-            f"Expect freqs_cis.dtype == torch.float32 to ensure accuracy, got {freqs_cis.dtype}"
-        )
-
-    freqs_cis_real = freqs_cis.cos().unsqueeze(2)
-    freqs_cis_imag = freqs_cis.sin().unsqueeze(2)
-
-    def rotate(input):
-        real = input[..., ::2]
-        imag = input[..., 1::2]
-
-        # For complex multiplication
-        # (a + ib) * (c + id) = (ac - bd) + i(ad + bc)
-
-        # ac - bd
-        rot_real = (real * freqs_cis_real) - (imag * freqs_cis_imag)
-
-        # ad + bc
-        rot_imag = (real * freqs_cis_imag) + (freqs_cis_real * imag)
-
-        return torch.cat([rot_real.unsqueeze(-1), rot_imag.unsqueeze(-1)], dim=-1).reshape(
-            input.shape
-        )
-
-    query_rot = rotate(query)
-    key_rot = rotate(key)
-
-    return query_rot.type_as(query), key_rot.type_as(key)
 
 
 def manual_softmax(prior_scores, active_scores, is_speculation) -> Tuple[Tensor, Tensor]:
@@ -485,7 +416,7 @@ def get_context_parallel_reordered_tp_mapping(world_size, cp_degree):
     # Flattens the CP mesh which contains the TP ordering with the contigous KV heads
     # This is done to enable running full TP decode after doing context parallel CTE
 
-    # Returns a list where each index, i, is the original rank and list[i] is the new rank
+    # Returns a list where each index, i, is the original rank and list[i] is the new rank assuming TP decode
 
     tp_degree = world_size // cp_degree
 
@@ -518,3 +449,163 @@ def get_kv_head_indices_context_parallel_full_tp_decode(num_kv_heads, world_size
     indices = mask.int().argmax(dim=1)
 
     return indices
+
+
+def get_context_parallel_reordered_dp_mapping(world_size, cp_degree, dp_degree):
+    # world_size: world size
+    # cp_degree: the cp degree CTE attention is running in
+    # dp_degree: the dp degree TKG attention is running in
+
+    # Determines the rank ordering for the first TP group in DP i.e. ranks [0, world_size / dp] and
+    # offsets the ranks dp number of times to get the entire rank ordering
+
+    # Returns a list where each index, i, is the original rank and list[i] is the new rank assuming TP + DP decode
+
+    mapping = []
+
+    dp_tp_size = world_size // dp_degree
+
+    # Currently, we don't support CP < DP degree, the reason is due to the KV cache writes, when CP < DP
+    # The TP for CP is greater than the TP for DP, in prefill we only write the cache based on whether
+    # those ranks operate on that batch in DP, when the TP for CP is greater, there is no guarantee that all KV
+    # heads are written. When the TP for CP is lower, we know all heads will be written and can be reordered given we have enough copies.
+
+    # Treat DP like we run full TP in smaller TP blocks to ensure we only reorder ranks within the TP groups
+    tp_mapping = get_context_parallel_reordered_tp_mapping(world_size // dp_degree, cp_degree // dp_degree)
+
+    # Offset all the tp mapping by the dp ranks, the above tp mapping only maps the first [0 - world_size / dp] ranks
+    for dp_rank in range(dp_degree):
+        offset_tp_mapping = tp_mapping.copy()
+        offset_tp_mapping = [rank + (dp_tp_size * dp_rank) for rank in offset_tp_mapping]
+        mapping += offset_tp_mapping
+
+    return mapping
+
+
+def get_kv_head_indices_context_parallel_dp_decode(num_kv_heads, world_size, cp_degree, dp_degree, device):
+    # world_size: world_size
+    # cp_degree: the cp degree CTE attention is running in
+    # dp_degree: the dp degree TKG attention is running in
+
+    # Returns the index of the first KV head per rank wrt the context parallel KV heads per rank assuming DP decode
+
+    cp_tp_degree = world_size // cp_degree
+    dp_tp_degree = world_size // dp_degree
+
+    # TODO: support this case by writing a slice of the KV in kv_manager rather than a single head
+    assert dp_tp_degree >= num_kv_heads, "CP with DP decode when CP != DP is currently not supported with num_kv_heads > (world_size / dp_degree)"
+
+    # If TP < num_kv_heads or TP == num_kv_heads, no need to interleave for padding
+    cp_interleave_factor = max(cp_tp_degree // num_kv_heads, 1)
+    dp_interleave_factor = max(dp_tp_degree // num_kv_heads, 1)
+
+    required_dp_kv_copies = dp_interleave_factor * dp_degree
+    existing_cp_kv_copies = cp_interleave_factor * cp_degree
+
+    assert existing_cp_kv_copies >= required_dp_kv_copies, f"CP{cp_degree} with DP{dp_degree} and {num_kv_heads} KV Heads is not a supported configuration"
+
+    tp_ordering = get_context_parallel_reordered_dp_mapping(world_size, cp_degree, dp_degree)
+
+    heads_in_cp = torch.stack(torch.arange(num_kv_heads, device=device, dtype=torch.int32).repeat_interleave(cp_interleave_factor).tensor_split(cp_tp_degree)).repeat(cp_degree, 1)
+    heads_in_dp = torch.stack(torch.arange(num_kv_heads, device=device, dtype=torch.int32).repeat_interleave(dp_interleave_factor).tensor_split(dp_tp_degree)).repeat(dp_degree, 1)
+    heads_in_dp = torch.index_select(heads_in_dp, dim=0, index=torch.tensor(tp_ordering, dtype=torch.int32, device=device))
+    heads_in_dp = heads_in_dp.view(-1, 1)
+    mask = (heads_in_cp == heads_in_dp)
+    indices = mask.int().argmax(dim=1)
+
+    return indices
+
+
+def validate_tp_prefill_to_dp_decode(num_kv_heads, world_size, dp_degree):
+    # num_kv_heads: total number of kv heads
+    # world_size: world_size
+    # dp_degree: the dp degree decode attention is running in
+
+    # validates whether it's possible to run prefill in full TP and decode in TP + DP
+
+    # This is the reduced tp_degree that decode attention will be running in,
+    # we make sure the reduced tp decode and full tp prefill have the same number of heads
+    tp_degree = world_size // dp_degree
+
+    dp_heads_per_rank = max(num_kv_heads // tp_degree, 1)
+    tp_heads_per_rank = max(num_kv_heads // world_size, 1)
+
+    # If we have more heads in DP decode, we need a collective to write all the expected heads during CTE
+    # this is currently not implemented due to not being able to do this with a reasonable perf
+
+    # TODO: if dp_heads_per_rank < tp_heads_per_rank we can support this case by slicing the KV writes
+    assert tp_heads_per_rank == dp_heads_per_rank, "DP configuration is not supported"
+
+
+def reshape_qkv_for_chunked_flash_attention_kernel(Q, K, V, chunk_size, torch_dtype):
+    # Since bsz is always 1, we can bring n_chunks dimension into batch dimension
+    # Starting shape for Q, K, V: BHSD. Since S = n_chunks * chunk_size, we can reshape as follows
+    bsz, num_heads, q_len, head_dim = Q.shape
+    n_chunks = math.ceil(q_len / chunk_size)
+    Q = Q.reshape(bsz, num_heads, n_chunks, chunk_size, head_dim).squeeze(0)
+    Q = (
+        Q.permute(1, 0, 3, 2)
+        .reshape((n_chunks * num_heads, head_dim, chunk_size))
+        .to(torch_dtype)
+    )
+    K = K.reshape(bsz, num_heads, n_chunks, chunk_size, head_dim).squeeze(0)
+    K = (
+        K.permute(1, 0, 3, 2)
+        .reshape((n_chunks * num_heads, head_dim, chunk_size))
+        .to(torch_dtype)
+    )
+    V = V.reshape(bsz, num_heads, n_chunks, chunk_size, head_dim).squeeze(0)
+    V = V.reshape((n_chunks * num_heads, chunk_size, head_dim)).to(
+        torch_dtype
+    )
+    return Q, K, V
+
+
+def get_last_kv_chunk(attention_chunk_size, position_ids, latest_k, latest_v):
+    """
+    For chunked attention, first determine the latest chunk we are in based on position id.
+    Then we only gather that chunk of KV into KV cache.
+    In the edge case where seq_len bucket is not divisible by chunk size, our latest chunk will not have the full chunk size.
+    In this case, we will have to pad latest kv to chunk size.
+    """
+    latest_position_ids = torch.amax(position_ids, dim=1)
+    chunk_idx = latest_position_ids // attention_chunk_size
+    # Create gather indices for the chunk
+    batch_size, num_heads, seq_len, head_dim = latest_k.shape
+    max_len = position_ids.shape[1]
+
+    if max_len > attention_chunk_size and max_len % attention_chunk_size != 0:
+        chunk_pad_len = attention_chunk_size - max_len % attention_chunk_size
+    else:
+        chunk_pad_len = 0
+    latest_k = F.pad(latest_k, (0, 0, 0, chunk_pad_len), mode='constant', value=0)
+    latest_v = F.pad(latest_v, (0, 0, 0, chunk_pad_len), mode='constant', value=0)
+    chunk_idx = chunk_idx[:, None].expand(batch_size, attention_chunk_size)
+    gather_indices = torch.arange(attention_chunk_size)[None, :].expand(batch_size, attention_chunk_size) + chunk_idx * attention_chunk_size
+    gather_indices = gather_indices[:, None, :, None].expand(batch_size, num_heads, attention_chunk_size, head_dim).to(device=latest_k.device)
+    # Gather the chunks
+    latest_k = torch.gather(latest_k, dim=2, index=gather_indices)
+    latest_v = torch.gather(latest_v, dim=2, index=gather_indices)
+    return latest_k, latest_v
+
+
+def get_last_kv_window(window_size, position_ids, latest_k, latest_v):
+    batch_size, num_head, _, head_dim = latest_k.shape
+    latest_pos = torch.amax(position_ids, dim=1)
+    end_idx = (latest_pos + 1).clamp(min=window_size)
+    start_idx = (end_idx - window_size).clamp(min=0)
+    orig_indices = start_idx[:, None] + torch.arange(window_size)
+
+    # Calculate per-batch left shifts
+    left_shifts = (window_size - (end_idx % window_size)) % window_size
+    base = torch.arange(window_size).expand(batch_size, window_size)
+    shifted_idx = (base + left_shifts[:, None]) % window_size
+
+    # Determine per-batch shifted gather indices
+    gather_idx = torch.gather(orig_indices, dim=1, index=shifted_idx)
+    gather_idx = gather_idx[:, None, :, None].expand(batch_size, num_head, window_size, head_dim).to(device=latest_k.device)
+
+    # Gather to create non-physically contiguous KV cache
+    latest_k = torch.gather(latest_k, dim=2, index=gather_idx)
+    latest_v = torch.gather(latest_v, dim=2, index=gather_idx)
+    return latest_k, latest_v

@@ -1,8 +1,11 @@
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
+from neuronx_distributed_inference.models.llama4.modeling_llama4 import NeuronLlama4ForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
 from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMllamaForCausalLM
 from neuronx_distributed_inference.models.mllama.utils import add_instruct
+from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
+from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
 
 END_TO_END_MODEL = "e2e_model"
 CONTEXT_ENCODING_MODEL = "context_encoding_model"
@@ -34,7 +37,10 @@ MM_TEST_PROMPT = add_instruct("What is in this image? Tell me a story", has_imag
 
 MODEL_TYPES = {
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
+    "llama4": {"causal-lm": NeuronLlama4ForCausalLM},
     "mllama": {"causal-lm": NeuronMllamaForCausalLM},
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
+    "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
+    "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
 }

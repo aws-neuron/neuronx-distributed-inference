@@ -10,6 +10,8 @@ from neuronx_distributed.trace.model_builder import BaseModelInstance, ModelBuil
 
 from neuronx_distributed_inference.modules.attention.utils import distributed_softmax
 
+torch.manual_seed(0)
+
 
 class Model(torch.nn.Module):
     def __init__(self, is_distributed=False, num_heads=None, past_sequence_length=None, dtype=None):

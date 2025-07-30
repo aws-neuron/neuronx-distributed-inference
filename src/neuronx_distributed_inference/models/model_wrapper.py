@@ -11,6 +11,7 @@ from neuronx_distributed.quantization.quantization_config import (
     QuantizedDtype,
     get_default_custom_qconfig_dict,
     get_default_per_channel_custom_qconfig_dict,
+    get_default_expert_wise_per_channel_custom_qconfig_dict,
 )
 from neuronx_distributed.quantization.quantize import convert
 from neuronx_distributed.trace import parallel_model_load, parallel_model_trace
@@ -83,21 +84,18 @@ class ModelWrapper(torch.nn.Module):
             )
 
             long_ctx_reqs = ""
-            max_len_gt_32k = self.neuron_config.seq_len >= 32 * 1024
-            if max_len_gt_32k and self.neuron_config.flash_decoding_enabled:
-                long_ctx_reqs = (
-                    " --internal-disable-fma-on-ios"
-                    " --hbm-scratchpad-page-size=1024 "
-                    " --internal-backend-options='--run-shared-allocation-before-post-sched' "
-                )
-                os.environ["NEURON_SCRATCHPAD_PAGE_SIZE"] = "1024"
-                os.environ["NEURON_RT_EXEC_TIMEOUT"] = "600"
+
+            if self.neuron_config.enable_long_context_mode:
+                long_ctx_reqs = " --internal-disable-fma-on-ios "  # reduce dma rings io by disabling FMA that doesn't use DGE
 
             self.compiler_args = (
-                f"--auto-cast=none --model-type=transformer {long_ctx_reqs}"
+                f"--auto-cast=none --model-type=transformer {long_ctx_reqs} "
                 f"--tensorizer-options='{tensorizer_options}'"
                 f" --lnc={self.neuron_config.logical_nc_config}"
             )
+
+            if self.neuron_config.scratchpad_page_size:
+                self.compiler_args += f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size} "
 
             if self.is_block_kv_layout and (
                 self.neuron_config.attn_block_tkg_nki_kernel_enabled
@@ -151,6 +149,9 @@ class ModelWrapper(torch.nn.Module):
             self.compiler_args += f" --internal-hlo2tensorizer-options='{hlo2tensorizer} --verify-hlo=true' "
         else:
             self.compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true' "
+
+        if self.neuron_config.enable_output_completion_notifications:
+            self.compiler_args += " --internal-backend-options=' --enable-output-completion-notifications ' "
 
         logging.info(f"neuronx-cc compiler_args are: {self.compiler_args}")
 
@@ -1509,7 +1510,8 @@ class ModelWrapper(torch.nn.Module):
                 return AsyncTensorWrapper(
                     async_result=output_logits, batch_padded=was_padded, on_cpu=on_cpu
                 )
-            elif self.neuron_config.enable_fused_speculation:
+            elif self.neuron_config.enable_fused_speculation or \
+                    (self.neuron_config.on_device_sampling_config and self.neuron_config.output_logits and self.neuron_config.is_continuous_batching):
                 output_logits = [torch.cat(x, dim=0) for x in zip(*output_logits)]
                 return output_logits
 
@@ -1556,6 +1558,8 @@ class DecoderModelInstance(BaseModelInstance):
             quantization_type = QuantizationType(self.neuron_config.quantization_type)
             if quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
                 q_config = get_default_per_channel_custom_qconfig_dict()
+            elif quantization_type == QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC:
+                q_config = get_default_expert_wise_per_channel_custom_qconfig_dict()
             elif quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
                 q_config = get_default_custom_qconfig_dict()
             else:

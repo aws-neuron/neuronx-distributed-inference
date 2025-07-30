@@ -38,7 +38,7 @@ from .encoder_utils import (
     get_aspect_ratio_mask,
 )
 from .hf_embeddings import PrecomputedAspectRatioEmbedding, PrecomputedPositionEmbedding
-from .utils import HF_CHECKPOINT, META_CHECKPOINT, get_negative_inf_value, to_2tuple
+from .utils import get_negative_inf_value, to_2tuple
 
 # Try except for the compatibility with older compiler version
 try:
@@ -459,30 +459,7 @@ class VisionEncoder(nn.Module):
         self._set_positional_embedding(scale, width)
 
     def apply_positional_embedding(self, x, ar, ar_ids):
-        if self.config.checkpoint == HF_CHECKPOINT:
-            return self.gated_positional_embedding(x, ar_ids)
-        elif self.config.checkpoint == META_CHECKPOINT:
-            # apply regular position embedding
-            bsz, num_chunks, num_tokens, dim = x.shape
-            x = x.view(bsz * num_chunks, num_tokens, dim)
-            x = x + self.positional_embedding * (1 - self.gated_positional_embedding_gate.tanh())
-            x = x.view(bsz, num_chunks, num_tokens, dim)
-
-            embed = self.gated_positional_embedding.view(
-                self.max_num_tiles**2,
-                self.gated_positional_embedding.shape[2] * self.gated_positional_embedding.shape[3],
-            )
-            for idx in range(ar.shape[0]):
-                arx = ar[idx]
-                ar_mask = get_aspect_ratio_mask(arx, self.max_num_tiles).to(dtype=embed.dtype)
-                _pos_embed = ar_mask @ embed  # (T, T^2) @ (T^2, N*W) -> (T, N*W)
-                _pos_embed = _pos_embed.view(
-                    self.max_num_tiles,
-                    self.gated_positional_embedding.shape[2],
-                    self.gated_positional_embedding.shape[3],
-                )
-                x[idx] += _pos_embed * self.gated_positional_embedding_gate.tanh()
-            return x
+        return self.gated_positional_embedding(x, ar_ids)
 
     def apply_class_embedding(self, x):
         x = torch.cat(
@@ -512,10 +489,7 @@ class VisionEncoder(nn.Module):
         _, ntok, dim = x.shape
         x = x.reshape(bsz * num_concurrent_media, num_chunks, ntok, dim)
 
-        if self.config.checkpoint == HF_CHECKPOINT:
-            x = self.pre_tile_pos_embed(x, ar_ids)
-        elif self.config.checkpoint == META_CHECKPOINT:
-            x = self.pre_tile_pos_embed(x, ar)
+        x = self.pre_tile_pos_embed(x, ar_ids)
 
         x = x.reshape(bsz * num_concurrent_media * num_chunks, ntok, dim)
 
@@ -538,10 +512,7 @@ class VisionEncoder(nn.Module):
 
         x = self.ln_post(x)
         x = x.reshape(bsz * num_concurrent_media, num_chunks, ntok + npad, dim)
-        if self.config.checkpoint == HF_CHECKPOINT:
-            x = self.post_tile_pos_embed(x, ar_ids)
-        elif self.config.checkpoint == META_CHECKPOINT:
-            x = self.post_tile_pos_embed(x, ar)
+        x = self.post_tile_pos_embed(x, ar_ids)
         x = x.reshape(bsz * num_concurrent_media, num_chunks * (ntok + npad), dim)
         x = self.global_transformer(x, mask=attn_mask)
         x = x.reshape(bsz * num_concurrent_media, num_chunks, ntok + npad, dim)
@@ -556,42 +527,17 @@ class VisionEncoder(nn.Module):
         return x
 
     def _set_positional_embedding(self, scale, width):
-        if self.config.checkpoint == HF_CHECKPOINT:
-            self.gated_positional_embedding = PrecomputedPositionEmbedding(
-                config=self.vision_config
-            )
-        elif self.config.checkpoint == META_CHECKPOINT:
-            self.gated_positional_embedding = nn.Parameter(
-                scale
-                * torch.randn(
-                    self.max_num_tiles,
-                    self.max_num_tiles,
-                    self.grid_size[0] * self.grid_size[1] + 1,
-                    width,
-                )
-            )
-            self.gated_positional_embedding_gate = nn.Parameter(torch.zeros(1))
+        self.gated_positional_embedding = PrecomputedPositionEmbedding(
+            config=self.vision_config
+        )
 
     def _set_tile_pos_embedding(self, width):
-        # pre and post tile position embedding
-        if self.config.checkpoint == META_CHECKPOINT:
-            self.pre_tile_pos_embed = TilePositionEmbedding(
-                num_tiles=self.max_num_tiles,
-                width=width,
-                gated=True,
-            )
-            self.post_tile_pos_embed = TilePositionEmbedding(
-                num_tiles=self.max_num_tiles,
-                width=width,
-                gated=True,
-            )
-        elif self.config.checkpoint == HF_CHECKPOINT:
-            self.pre_tile_pos_embed = PrecomputedAspectRatioEmbedding(
-                config=self.vision_config,
-            )
-            self.post_tile_pos_embed = PrecomputedAspectRatioEmbedding(
-                config=self.vision_config,
-            )
+        self.pre_tile_pos_embed = PrecomputedAspectRatioEmbedding(
+            config=self.vision_config,
+        )
+        self.post_tile_pos_embed = PrecomputedAspectRatioEmbedding(
+            config=self.vision_config,
+        )
 
 
 class TilePositionEmbedding(nn.Module):
@@ -668,12 +614,10 @@ class NeuronMllamaVisionModel(nn.Module):
     def forward(self, images: torch.Tensor, aspect_ratios: torch.Tensor) -> torch.Tensor:
         # return vision_tokens shape: (batch_size, num_image_per_prompt, vision_max_num_chunks, num_vision_tokens, hidden_size)
 
-        if self.config.checkpoint == HF_CHECKPOINT:
-            aspect_ratios_ids = convert_aspect_ratios_to_ids(aspect_ratios, self.max_num_chunks).to(
-                "xla"
-            )
-        else:
-            aspect_ratios_ids = None
+        aspect_ratios_ids = convert_aspect_ratios_to_ids(aspect_ratios, self.max_num_chunks).to(
+            "xla"
+        )
+
         vision_tokens = self.vision_encoder(images, aspect_ratios, aspect_ratios_ids)
         vision_tokens = self.vision_projection(vision_tokens)
 

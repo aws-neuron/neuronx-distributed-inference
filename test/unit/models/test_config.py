@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Type
 from unittest.mock import patch
 
+from neuronx_distributed_inference.models.config import LONG_CONTEXT_SCRATCHPAD_PAGE_SIZE
 import pytest
 import torch
 from transformers import AutoConfig
@@ -39,6 +40,30 @@ def test_validate_config():
     with pytest.raises(AssertionError, match=r"Config must define"):
         _ = ValidatingInferenceConfig(neuron_config)
 
+def test_validate_chunked_attention_config():
+    neuron_config = NeuronConfig(cp_degree=2, tp_degree=2, padding_side="left")
+    config = InferenceConfig(
+        neuron_config=neuron_config,
+        hidden_size=4096,
+    )
+    config.attention_chunk_size = 4
+    with pytest.raises(ValueError, match=r"The Neuron config padding_side: left is not yet supported with chunked attention"):
+        _ = config._validate_chunked_attention_support()
+    config.neuron_config.padding_side = "right"
+    config.neuron_config.cp_degree = 3
+    config.neuron_config.tp_degree = 3
+    with pytest.raises(AssertionError, match=r"attention_chunk_size: 4 must be divisible by cp_degree: 3"):
+        _ = config._validate_chunked_attention_support()
+    config.neuron_config.seq_len = 5
+    config.attention_chunk_size = 3
+    with pytest.raises(AssertionError, match=r"The last chunk must be divisible by cp_degree: 3"):
+        _ = config._validate_chunked_attention_support()
+    ## acceptable chunked attention config case
+    config.attention_chunk_size = 2
+    config.neuron_config.seq_len = 4
+    config.neuron_config.cp_degree = 2
+    config.neuron_config.tp_degree = 2
+    config._validate_chunked_attention_support()
 
 def test_serialize_deserialize_basic_inference_config():
     neuron_config = NeuronConfig()
@@ -216,6 +241,18 @@ def test_serialize_deserialize_pretrained_config_adapter():
     assert not hasattr(deserialized_config, "torch_dtype")
     assert deserialized_config.neuron_config.torch_dtype == torch.bfloat16
 
+def test_serialize_deserialize_long_context_neuron_config():
+    neuron_config = NeuronConfig(max_context_length=32 * 1024, seq_len=32 * 1024)
+    config = InferenceConfig(
+        neuron_config=neuron_config,
+        hidden_size=4096,
+    )
+    assert neuron_config.enable_long_context_mode
+    assert neuron_config.scratchpad_page_size == LONG_CONTEXT_SCRATCHPAD_PAGE_SIZE
+    
+    deserialized_config = verify_serialize_deserialize(config)
+    assert deserialized_config.neuron_config.enable_long_context_mode
+    assert deserialized_config.neuron_config.scratchpad_page_size == LONG_CONTEXT_SCRATCHPAD_PAGE_SIZE
 
 def test_kwargs_override_load_config():
     neuron_config = NeuronConfig()
@@ -396,6 +433,22 @@ def test_invalid_cast_type():
     NeuronConfig(cast_type = 'as-declared') # Works
     NeuronConfig(cast_type = 'config') # Works
 
+def test_valid_cp_dp_configurations():
+    NeuronConfig(tp_degree = 32, cp_degree = 4)
+    NeuronConfig(tp_degree = 32, attention_dp_degree = 4, batch_size = 4, ctx_batch_size = 1, tkg_batch_size = 4, is_continuous_batching = True)
+    NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 4, batch_size = 4, ctx_batch_size = 1, tkg_batch_size = 4, is_continuous_batching = True)
+    NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 2, batch_size = 2, ctx_batch_size = 1, tkg_batch_size = 2, is_continuous_batching = True) # cp != dp, cp > dp
+
 def test_invalid_cp_tp_configuration():
     with pytest.raises(ValueError):
-        NeuronConfig(tp_degree = 32, cp_degree = 7)
+        NeuronConfig(tp_degree = 32, cp_degree = 7) # tp % cp != 0
+
+def test_invalid_cp_dp_configuration():
+    with pytest.raises(ValueError):
+        NeuronConfig(tp_degree = 32, attention_dp_degree = 2, batch_size = 2, ctx_batch_size = 1, tkg_batch_size = 2, is_continuous_batching = True) # only DP set
+        NeuronConfig(tp_degree = 32, cp_degree = 7, attention_dp_degree = 7) # tp % cp or tp % dp != 0
+        NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 8, batch_size = 2, ctx_batch_size = 1, tkg_batch_size = 2, is_continuous_batching = True) # cp != dp, cp < dp
+        NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 2, batch_size = 2, ctx_batch_size = 1, tkg_batch_size = 2) # CB = True not set
+        NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 2, batch_size = 2, ctx_batch_size = 2, tkg_batch_size = 5, is_continuous_batching = True) # tkg batch size % dp != 0
+        NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 3, batch_size = 3, ctx_batch_size = 1, tkg_batch_size = 3, is_continuous_batching = True) # cp % dp != 0
+

@@ -62,6 +62,7 @@ from neuronx_distributed_inference.modules.generation.seq_parallel_logits_slice 
 )
 from neuronx_distributed_inference.modules.kvcache import utils as kvcache_utils
 from neuronx_distributed_inference.modules.kvcache.block_kv_cache_manager import BlockKVCacheManager, generate_tokengen_slot_mapping, generate_fusedspec_slot_mapping
+from neuronx_distributed_inference.modules.kvcache.data_parallel_kv_cache_manager import DataParallelKVCacheManager
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
 from neuronx_distributed_inference.modules.lora_serving import LoraCheckpoint, wrap_model_with_lora
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
@@ -109,9 +110,17 @@ class NeuronBaseModel(nn.Module):
         self.is_chunked_prefill = config.neuron_config.is_chunked_prefill
         self.is_prefix_caching = config.neuron_config.is_prefix_caching
         self.attention_chunk_size = None
+        self.sliding_window = None
+        self.layer_to_cache_size_mapping = None
+        self.has_mixed_attn = False
 
         self.setup_attr_for_model(config)
         self.init_model(config)
+        if self.attention_chunk_size and self.attention_chunk_size >= self.config.neuron_config.seq_len:
+            logging.warning(f"attention chunk size {self.attention_chunk_size} is greater than or equal to seq_len {self.config.neuron_config.seq_len}. Chunked attention is disabled")
+            self.attention_chunk_size = None
+            self.has_mixed_attn = False
+
         if optimize_inference:
             self.init_inference_optimization(config)
 
@@ -165,10 +174,18 @@ class NeuronBaseModel(nn.Module):
     def init_inference_optimization(self, config: InferenceConfig):
         if self.on_device_sampling:
             self.sampler = Sampler(config.neuron_config)
-        if config.neuron_config.is_block_kv_layout:
+
+        if config.neuron_config.attention_dp_degree > 1:
+            self.kv_mgr = DataParallelKVCacheManager(config, num_kv_head=self.num_key_value_heads, global_rank=self.rank_util)
+        elif config.neuron_config.is_block_kv_layout:
             self.kv_mgr = BlockKVCacheManager(config, num_kv_head=self.num_key_value_heads)
         else:
-            self.kv_mgr = KVCacheManager(config, num_kv_head=self.num_key_value_heads, global_rank=self.rank_util)
+            self.kv_mgr = KVCacheManager(config,
+                                         num_kv_head=self.num_key_value_heads,
+                                         global_rank=self.rank_util,
+                                         attention_chunk_size=self.attention_chunk_size,
+                                         sliding_window=self.sliding_window,
+                                         layer_to_cache_size_mapping=self.layer_to_cache_size_mapping)
 
     def _is_context_encoding(self, input_ids: torch.Tensor):
         return input_ids.shape[-1] > 1 and input_ids.shape[-1] != self.speculation_length
@@ -222,6 +239,19 @@ class NeuronBaseModel(nn.Module):
         mask = mask[None, None, :, :].expand(self.batch_size, 1, self.n_positions, self.n_positions).to(device=attention_mask.device)
         return mask
 
+    def _create_windowed_attn_mask_cte(self, attention_mask, window_size) -> torch.Tensor:
+        # Create a causal, window attention mask. E.g. n = 5, window_size = 2, mask is:
+        #  [[1 0 0 0 0]
+        #   [1 1 0 0 0]
+        #   [0 1 1 0 0]
+        #   [0 0 1 1 0]
+        #   [0 0 0 1 1]]
+        i = torch.arange(self.n_positions, device=attention_mask.device).unsqueeze(1)
+        j = torch.arange(self.n_positions, device=attention_mask.device).unsqueeze(0)
+        mask = (j <= i) & (j >= (i - window_size + 1))  # Create mask: causal and within window
+        mask = mask[None, None, :, :].expand(self.batch_size, 1, self.n_positions, self.n_positions)
+        return mask
+
     def _create_chunked_prefill_attn_mask(
         self,
         attention_mask: torch.Tensor,
@@ -269,18 +299,37 @@ class NeuronBaseModel(nn.Module):
     def _create_chunked_attn_mask_tkg(
         self, attention_mask, chunk_size, position_ids
     ):
-        # Create tkg attention mask for prior tokens based on the current position ids
+        # Create tkg chunk-size attention mask for prior tokens based on the current position ids
         # For example with chunk_size = 4, seq_len 8:
-        # position_id = 4, current chunk = 2 -> mask = [0 0 0 0 0 0 0 0]: kv cache is reset because we have entered a new chunk
-        # position_id = 3, current chunk = 1 -> mask = [1 1 1 0 0 0 0 0]: attend to all prior tokens in chunk 1. The active token is the last token in chunk 1.
-        # position_id = 5, current chunk = 2 -> mask = [0 0 0 0 1 0 0 0]: attend to first token in chunk 2
+        # position_id = 4: we are in the second chunk -> mask = [0 0 0 0]: kv cache is reset because we have entered a new chunk
+        # position_id = 3: we are in the first chunk -> mask =  [1 1 1 0]: attend to all prior tokens in chunk 1. The active token is the last token in chunk 1.
+        # position_id = 5: we are in the second chunk -> mask = [1 0 0 0]: attend to first token in chunk 2
         # TODO: For TKG, we will compute for only current chunk of cache and mask will have chunk-size length
         batch_size = attention_mask.shape[0]
-        current_chunk_start_idx = (position_ids // chunk_size) * chunk_size
-        mask_len = attention_mask.shape[1]
-        temp_array = torch.arange(mask_len)[None, :].expand(batch_size, mask_len).to(attention_mask.device)
-        attention_mask = (temp_array < position_ids) & (temp_array >= current_chunk_start_idx)
+        local_position_ids_in_chunk = position_ids % chunk_size
+        temp_array = torch.arange(chunk_size)[None, :].expand(batch_size, chunk_size).to(attention_mask.device)
+        attention_mask = temp_array < local_position_ids_in_chunk
         return attention_mask[:, None, None, :]
+
+    def _create_windowed_attn_mask_tkg(
+        self, attention_mask, window_size, position_ids
+    ):
+        # Create tkg mask for sliding window. E.g.:
+        # position = 3, window_size = 4 -> mask = [1,1,1,0]
+        # position = 5, window_size = 4 -> mask = [1,0,1,1]
+        batch_size, _ = attention_mask.shape
+        pos = position_ids[:, 0]
+        idx = torch.arange(window_size, device=attention_mask.device).unsqueeze(0)
+        base_mask = idx < pos.unsqueeze(1)  # for input_len <= window_size
+
+        full_mask = torch.ones((batch_size, window_size), dtype=torch.bool, device=attention_mask.device)
+        zero_pos = pos % window_size
+        zero_mask = idx == zero_pos.unsqueeze(1)
+        full_mask = torch.where(zero_mask, False, full_mask)  # for input_len > window_size
+
+        seq_less_than_window = pos < window_size
+        final_mask = torch.where(seq_less_than_window.unsqueeze(1), base_mask, full_mask)
+        return final_mask[:, None, None, :]
 
     def create_attn_mask(
         self,
@@ -296,12 +345,13 @@ class NeuronBaseModel(nn.Module):
             )
 
         if is_for_context_encoding:
-            if self.attention_chunk_size:
-                return self._create_chunked_attn_mask_cte(attention_mask, self.attention_chunk_size)
+            if self.sliding_window:
+                return self._create_windowed_attn_mask_cte(attention_mask, self.sliding_window)
             else:
                 return self._create_context_attn_mask(attention_mask)
-        elif self.attention_chunk_size:
-            return self._create_chunked_attn_mask_tkg(attention_mask, self.attention_chunk_size, position_ids)
+        else:
+            if self.sliding_window:
+                return self._create_windowed_attn_mask_tkg(attention_mask, self.sliding_window, position_ids)
 
         if self.neuron_config.attn_block_tkg_nki_kernel_enabled and self.is_prefix_caching:
             assert not is_for_context_encoding
@@ -654,6 +704,7 @@ class NeuronBaseModel(nn.Module):
         rotary_position_id = self.set_none_if_empty(rotary_position_id)
         vision_embeddings = self.set_none_if_empty(vision_embeddings)
         vision_mask = self.set_none_if_empty(vision_mask)
+        local_attn_mask = None
 
         if self.neuron_config.is_medusa:
             return self._medusa_forward(
@@ -731,6 +782,11 @@ class NeuronBaseModel(nn.Module):
                 is_for_speculation,
                 position_ids=position_ids,
             )
+            if self.attention_chunk_size:
+                if is_for_context_encoding:
+                    local_attn_mask = self._create_chunked_attn_mask_cte(attention_mask, self.attention_chunk_size)
+                else:
+                    local_attn_mask = self._create_chunked_attn_mask_tkg(attention_mask, self.attention_chunk_size, position_ids)
 
         active_mask = None
         if self.is_prefix_caching:
@@ -799,6 +855,7 @@ class NeuronBaseModel(nn.Module):
             update_cache=True,
             vision_embeddings=vision_embeddings,
             vision_mask=vision_mask,
+            local_attn_mask=local_attn_mask,
         )
 
         batch_size = input_ids.shape[0]
@@ -934,6 +991,7 @@ class NeuronBaseModel(nn.Module):
         is_for_context_encoding: bool = False,
         vision_embeddings: Optional[torch.FloatTensor] = None,
         vision_mask: Optional[torch.BoolTensor] = None,
+        local_attn_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         batch_size, seq_length = input_ids.shape[:2]
@@ -984,7 +1042,9 @@ class NeuronBaseModel(nn.Module):
         if self.sequence_parallel_enabled:
             self.validate_sequence_parallel(seq_length)
 
-        hidden_states = self.process_sequence_parallel_hidden_states(inputs_embeds, seq_length)
+        hidden_states = self.process_sequence_parallel_hidden_states(
+            inputs_embeds, seq_length, kwargs.get("active_block_table", None)
+        )
 
         if self.neuron_config.is_eagle_draft:
             hidden_states = self.process_eagle_draft_hidden_states(
@@ -1012,7 +1072,8 @@ class NeuronBaseModel(nn.Module):
             if self.neuron_config.flash_decoding_enabled
             else self.n_positions
         )
-
+        if self.attention_chunk_size:
+            cache_size = self.attention_chunk_size
         get_kv_per_layer = False
         active_block_table = None if 'active_block_table' not in kwargs else kwargs['active_block_table']
         empty_active_block_table = True if active_block_table is None else len(active_block_table.shape) == 1
@@ -1030,10 +1091,14 @@ class NeuronBaseModel(nn.Module):
                 get_kv_per_layer = True
 
         residual = None
+        if self.attention_chunk_size and not self.has_mixed_attn:
+            attention_mask = local_attn_mask
+            local_attn_mask = None
         for idx, decoder_layer in enumerate(self.layers):
             if self.config.neuron_config.layer_boundary_markers:
                 hidden_states = ModuleMarkerStartWrapper()(hidden_states)
             past_key_value = past_key_values[idx] if past_key_values is not None else None
+
             layer_outputs = decoder_layer(
                 hidden_states,
                 seq_ids=seq_ids,
@@ -1052,6 +1117,7 @@ class NeuronBaseModel(nn.Module):
                 is_for_context_encoding=is_for_context_encoding,
                 seq_len=cache_size,
                 residual=residual,
+                local_mask=local_attn_mask,
                 **kwargs,
             )
 
@@ -1082,8 +1148,9 @@ class NeuronBaseModel(nn.Module):
         if self.config.neuron_config.layer_boundary_markers:
             hidden_states = ModuleMarkerStartWrapper()(hidden_states)
 
-        if self.neuron_config.qkv_kernel_fuse_residual_add:
+        if self.neuron_config.qkv_kernel_fuse_residual_add and is_for_context_encoding:
             # residual add for the last layer which cannot be fused with qkv
+            # TODO: allow fusing residual add for tokengen
             hidden_states = residual + hidden_states
 
         if not self.neuron_config.is_eagle_draft:
@@ -1129,7 +1196,12 @@ class NeuronBaseModel(nn.Module):
             f"must be divisible by TP group size ({tp_group_size})"
         )
 
-    def process_sequence_parallel_hidden_states(self, inputs_embeds: torch.FloatTensor, seq_length: int) -> torch.Tensor:
+    def process_sequence_parallel_hidden_states(
+        self,
+        inputs_embeds: torch.FloatTensor,
+        seq_length: int,
+        active_block_table: torch.IntTensor = None,
+    ) -> torch.Tensor:
         """
         Process input embeddings with sequence parallelism for transformer models.
 
@@ -1159,9 +1231,10 @@ class NeuronBaseModel(nn.Module):
                     inputs_embeds, hidden_states, cc_dim=partition_dim,
                     tp_rank=tp_size, op=compute_op)
             else:
-                if (
-                    self.neuron_config.is_eagle_draft
-                    and seq_length < self.neuron_config.weight_gather_seq_len_threshold
+                shift_target_hidden = self.is_prefix_caching and len(active_block_table.shape) > 1
+                if self.neuron_config.is_eagle_draft and (
+                    seq_length < self.neuron_config.weight_gather_seq_len_threshold
+                    or shift_target_hidden
                 ):
                     hidden_states = inputs_embeds
                 else:

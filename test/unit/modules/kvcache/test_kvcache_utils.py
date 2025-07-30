@@ -2,6 +2,7 @@
 import unittest
 from collections import OrderedDict
 
+import pytest
 import torch
 import torch_neuronx
 from neuronx_distributed.trace.model_builder import BaseModelInstance, ModelBuilder
@@ -20,6 +21,8 @@ from neuronx_distributed_inference.modules.kvcache.utils import (
     contexted_kv_v2,
     dynamic_update_slice,
     get_active_block_table,
+    get_kv_shapes,
+    get_layer_to_kv_cache_size_mapping_for_mixed_attn,
 )
 
 
@@ -532,3 +535,41 @@ class TestDynamicUpdateSlice(unittest.TestCase):
         cache = cache_tensor.clone().detach()
         neuron_output = neuron_module(cache, cache_update, seq_ids)
         torch_neuronx.testing.assert_close(cpu_cache, neuron_output)
+
+@pytest.mark.parametrize(
+    "k_cache_transposed, is_kv_cache_tiled, expected_K_shape, expected_V_shape",
+    # fmt: off
+    [
+        (True, True, (1, 2, 4, 128, 1), (1, 2, 128, 1, 4)),
+        (True, False, (1, 2, 4, 128), (1, 2, 128, 4)),
+        (False, False, (1, 2, 128, 4), (1, 2, 128, 4)),
+        (False, True, (1, 2, 128, 1, 4), (1, 2, 128, 1, 4))
+    ]
+    # fmt: on
+)
+def test_get_kv_shapes(k_cache_transposed, is_kv_cache_tiled, expected_K_shape, expected_V_shape):
+    max_len, bsz, num_kv_heads_per_rank, head_dim = 128, 1, 2, 4
+    actual_k_shape, actual_v_shape = get_kv_shapes(max_len, bsz, num_kv_heads_per_rank, head_dim, k_cache_transposed, is_kv_cache_tiled)
+    assert actual_k_shape == expected_K_shape, "K shape is not the same"
+    assert actual_v_shape == expected_V_shape, "V shape is not the same"
+
+@pytest.mark.parametrize(
+    "is_local_layer, expected_lens, expect_exception",
+    # fmt: off
+    [
+        ([1, 1, 1, 0], [128, 128, 128, 256], False), 
+        ([1, 0, 1, 0], [128, 256, 128, 256], False), 
+        ([1, 1, 1, 0], [], True), 
+    ]
+    # fmt: on
+)        
+def test_get_layer_to_kv_cache_size_mapping_for_mixed_attn(is_local_layer, expected_lens, expect_exception):
+    if not expect_exception:
+        local_size, global_size = 128, 256
+        actual_cache_lens = get_layer_to_kv_cache_size_mapping_for_mixed_attn(local_size, global_size, is_local_layer)
+        assert actual_cache_lens == expected_lens
+    else:
+        local_size, global_size = None, 256
+        with pytest.raises(ValueError) as excinfo:  
+            actual_cache_lens = get_layer_to_kv_cache_size_mapping_for_mixed_attn(local_size, global_size, is_local_layer)
+        assert str(excinfo.value) == "Cache size for the layer has to be specified"

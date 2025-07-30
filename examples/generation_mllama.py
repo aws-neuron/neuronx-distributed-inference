@@ -12,10 +12,9 @@ from neuronx_distributed_inference.modules.generation.sampling import prepare_sa
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 
 # TODO : Either read from os_environment var or from arg_parser.
-checkpoint = "meta"
 model_variant = "11B"
-model_path = f"/home/ubuntu/models/Llama-3.2-{model_variant}-Vision-Instruct-{checkpoint}/"
-traced_model_path = f"/home/ubuntu/workplace/traced_models/Llama-3.2-{model_variant}-Vision-Instruct-{checkpoint}/"
+model_path = f"/home/ubuntu/models/Llama-3.2-{model_variant}-Vision-Instruct/"
+traced_model_path =  f"/home/ubuntu/workplace/traced_models/Llama-3.2-{model_variant}-Vision-Instruct/"
 
 torch.manual_seed(0)
 

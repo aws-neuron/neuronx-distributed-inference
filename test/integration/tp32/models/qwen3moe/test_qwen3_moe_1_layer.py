@@ -19,13 +19,14 @@ def test_1_layer_accuracy():
 
     model_tempdir = save_checkpoint(config_path)
     model_path = model_tempdir.name
-    
+
     generation_config = GenerationConfig(do_sample=False, pad_token_id=0)
     neuron_config = MoENeuronConfig(
         tp_degree=32,
         batch_size=1,
-        max_context_length=128,
-        seq_len=256,
+        max_context_length=512,
+        seq_len=512*10,
+        torch_dtype="float32",
     )
     config = Qwen3MoeInferenceConfig(
         neuron_config,
@@ -40,7 +41,7 @@ def test_1_layer_accuracy():
 
 def save_checkpoint(config_path):
     hf_config = AutoConfig.from_pretrained(config_path)
-    hf_model = AutoModelForCausalLM.from_config(hf_config, torch_dtype=torch.bfloat16)
+    hf_model = AutoModelForCausalLM.from_config(hf_config, torch_dtype=torch.float32)
 
     model_tempdir = tempfile.TemporaryDirectory()
     model_path = model_tempdir.name
@@ -50,7 +51,7 @@ def save_checkpoint(config_path):
 
 
 def validate_accuracy(model_path, config, generation_config):
-    input_len = 16
+    input_len = 256
     input_ids = torch.rand((config.neuron_config.batch_size, input_len)) * config.vocab_size
     input_ids = input_ids.to(dtype=torch.int32)
     attention_mask = torch.ones((config.neuron_config.batch_size, input_len), dtype=torch.int32)
@@ -68,7 +69,7 @@ def validate_accuracy(model_path, config, generation_config):
         # Logits matching for longer sequence length will fail, most likely because
         # experts weights are too close and the router could select different
         # experts because of numeric error.
-        num_tokens_to_check=16,
+        num_tokens_to_check=512,
         inputs=inputs,
     )
 

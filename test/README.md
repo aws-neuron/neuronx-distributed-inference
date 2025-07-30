@@ -16,9 +16,33 @@ pytest test/unit/ --forked
 ```
 
 Run integration tests
-```
+- Note: Many tests use common test utility functions, which requires the `neuronx-distributed-inference` package path to be python path.
+
+```shell
+export PYTHONPATH=$PYTHONPATH:<base_path>/neuronx-distributed-inference
 pytest test/integration/ --forked
 ```
+
+## Integration Tests Overview
+The `test/integration` directory contains end-to-end integration tests that validate the functionality on Neuron devices. These tests use tiny models (N-layer) with generated weights to ensure comprehensive testing without 
+requiring external network connections or long compilation time.
+
+### Directory Structure
+
+Tensor Parallelism Tests:
+- tp32/ - Integration tests for 32-degree tensor parallelism configurations
+- tp64/ - Integration tests for 64-degree tensor parallelism configurations
+
+Utilities:
+- utils/ - Integration test utilities and helper functions
+- unit/ - Unit tests for util functions in integration tests
+
+### Key Test Categories
+- Validate model usability for basic configs or specific features. For example, we test
+  - On different tensor parallelism degrees (TP32, TP64)
+  - For multiple model architectures and sizes
+- Validate the performance of the models
+- Validate the accuracy of the models (logit matching)
 
 ## Writing tests
 
@@ -28,6 +52,18 @@ There are two test directories `unit` and `integration`.
 * `integration` - Integration tests that run on Neuron to validate modeling code works as expected. These tests run models end-to-end using generated weights, so these tests can be run using only resources available in this package (i.e. no network connections required).
 
 Place test files in these directories, using file names that start with `test_`.
+
+### Testing models with Randomized Weights on Neuron
+The integration tests use tiny model (N-layer) instead of full model and load with random model weights. It enables quick turnaround time for feature development and testing.
+
+Many of the models are using 4 layers, which is defined as `num_hidden_layers` in the model config file (`config.json`).
+We utilize `AutoConfig` to load and export the random weights for specific configuration. Here's the example:
+```
+hf_model = AutoModel.from_config(hf_config, torch_dtype=dtype)
+hf_model.save_pretrained(model_path)
+```
+The exported model weights are further loaded for integration tests.
+Please check the existing tests for more details.
 
 ### Testing modules and functions on Neuron
 

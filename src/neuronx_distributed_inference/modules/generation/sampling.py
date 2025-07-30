@@ -198,6 +198,7 @@ class Sampler(torch.nn.Module):
         self.dynamic = neuron_config.on_device_sampling_config.dynamic
         self.deterministic = neuron_config.on_device_sampling_config.deterministic
         self.global_topk = neuron_config.on_device_sampling_config.global_topk
+        self.top_k_kernel_enabled = neuron_config.on_device_sampling_config.top_k_kernel_enabled
         self.IGNORED_LOGITS_VALUE = (
             -3000
         )  # large negative values will be transformed to ~0 in softmax, this is to ignore tokens that are beyond topk range
@@ -234,9 +235,21 @@ class Sampler(torch.nn.Module):
     def _top_k_masked(self, logits, top_k, dim, rank_id):
         if self.global_topk > 0:
             if self.neuron_config.on_cpu:
-                sorted_logits, indeces = torch.topk(input=logits, k=self.global_topk, dim=dim)
+                sorted_logits, indices = torch.topk(input=logits, k=self.global_topk, dim=dim)
+            elif self.top_k_kernel_enabled:
+                sorted_logits, indices = nxd_topk(
+                    tensor=logits,
+                    k=self.global_topk,
+                    dim=dim,
+                    gather_dim=dim,
+                    process_group=self.process_group,
+                    stages=1,
+                    rank_id=rank_id,
+                    use_topk_rotated_kernel=True,
+                    lnc=self.neuron_config.logical_nc_config,
+                )
             else:
-                sorted_logits, indeces = nxd_topk(
+                sorted_logits, indices = nxd_topk(
                     tensor=logits,
                     k=self.global_topk,
                     dim=dim,
@@ -246,7 +259,7 @@ class Sampler(torch.nn.Module):
                     rank_id=rank_id,
                 )
         else:
-            sorted_logits, indeces = torch.sort(input=logits, dim=dim, descending=True)
+            sorted_logits, indices = torch.sort(input=logits, dim=dim, descending=True)
 
         vocab_size = sorted_logits.shape[-1]
         mask = torch.arange(vocab_size, device=logits.device)
@@ -254,7 +267,7 @@ class Sampler(torch.nn.Module):
 
         mask = torch.greater_equal(mask, top_k)
         sorted_logits = sorted_logits.masked_fill_(mask, self.IGNORED_LOGITS_VALUE)
-        return sorted_logits, indeces
+        return sorted_logits, indices
 
     def _top_p(self, top_k_logits_values, probs_cumsum, top_p, dim):
         top_p_mask = torch.greater(probs_cumsum, top_p)

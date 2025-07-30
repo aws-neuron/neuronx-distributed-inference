@@ -32,10 +32,7 @@ from neuronx_distributed_inference.modules.attention.attention_base import (
 )
 from neuronx_distributed_inference.modules.attention.utils import (
     RotaryEmbedding,
-    apply_rotary_polar_compatible,
-    move_heads_front,
     neuron_scaled_dot_product_attention,
-    precompute_freqs_cis,
 )
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm  # noqa: F401
 from neuronx_distributed_inference.modules.kvcache.multimodal_kv_cache_manager import (
@@ -44,7 +41,6 @@ from neuronx_distributed_inference.modules.kvcache.multimodal_kv_cache_manager i
 from neuronx_distributed_inference.utils.distributed import get_tp_group
 
 from .model_wrapper_mllama import ModelWrapperMllama
-from .utils import HF_CHECKPOINT, META_CHECKPOINT
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
@@ -84,13 +80,6 @@ def get_rmsnorm_cls():
 class MllamaInferenceConfig(InferenceConfig):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not hasattr(self, "checkpoint"):
-            self.checkpoint = kwargs.get("checkpoint", HF_CHECKPOINT)
-
-        assert self.checkpoint in [
-            HF_CHECKPOINT,
-            META_CHECKPOINT,
-        ], f"Uknown checkpoint: {self.checkpoint}"
 
         if hasattr(self, "text_config"):
             if isinstance(self.text_config, SimpleNamespace):
@@ -98,8 +87,6 @@ class MllamaInferenceConfig(InferenceConfig):
             # replicating what's done in hf_adapter's load_config()
             self.text_config.pop("torch_dtype", None)
             self.text_config = InferenceConfig(self.neuron_config, **self.text_config)
-            if not hasattr(self.text_config, "checkpoint"):
-                setattr(self.text_config, "checkpoint", self.checkpoint)
 
         if hasattr(self, "vision_config"):
             if isinstance(self.vision_config, SimpleNamespace):
@@ -107,8 +94,6 @@ class MllamaInferenceConfig(InferenceConfig):
             # replicating what's done in hf_adapter's load_config()
             self.vision_config.pop("torch_dtype", None)
             self.vision_config = InferenceConfig(self.neuron_config, **self.vision_config)
-            if not hasattr(self.vision_config, "checkpoint"):
-                setattr(self.vision_config, "checkpoint", self.checkpoint)
 
     def get_required_attributes(self) -> List[str]:
         # To validate if the config.json include all the configs we need in model.
@@ -236,61 +221,6 @@ class NeuronLlamaAttention(NeuronAttentionBase):
 
         return rotary_emb
 
-    def prep_qkv_tensors(
-        self,
-        position_ids,
-        hidden_states,
-        past_key_value,
-        adapter_ids=None,
-        rotary_freqs=None,
-        cos_cache=None,
-        sin_cache=None,
-        rmsnorm=None,
-    ):
-        """
-        Override NeuronAttentionBase.prep_qkv_tensors() to use apply_rotary_polar_compatible
-        to match Llama3.2 MM Pytorch implementation
-        """
-        cos_cache, sin_cache = None, None
-        if self.config.checkpoint == HF_CHECKPOINT:
-            return super().prep_qkv_tensors(
-                position_ids,
-                hidden_states,
-                past_key_value,
-                adapter_ids=adapter_ids,
-                cos_cache=cos_cache,
-                sin_cache=sin_cache,
-                rmsnorm=rmsnorm,
-            )
-
-        Q, K, V, _ = self.qkv_proj(
-            hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids
-        )
-        if self.use_qk_norm:
-            Q = self.qk_norm(Q)
-            K = self.qk_norm(K)
-
-        # Divide hidden_dim across heads for MHA
-        # Change layout: BSHD -> BHSD
-        bsz, q_len, _ = hidden_states.size()
-        if self.sequence_parallel_enabled:
-            q_len *= self.tensor_model_parallel_group.size()
-
-        Q = move_heads_front(
-            Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm
-        )
-        K = move_heads_front(
-            K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm
-        )
-        V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
-
-        # Rotate Q and K
-        if self.rotary_emb is not None:
-            assert rotary_freqs is not None, "rotary_emb is initilazed but rotary_freqs is None"
-            Q, K = apply_rotary_polar_compatible(Q.transpose(1, 2), K.transpose(1, 2), rotary_freqs)
-            Q, K = Q.transpose(1, 2), K.transpose(1, 2)
-        return Q, K, V, cos_cache, sin_cache, None
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -305,7 +235,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         rmsnorm=None,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """
-        Override NeuronAttentionBase.forward() to use apply_rotary_polar_compatible
+        Override NeuronAttentionBase.forward()
         to match Llama3.2 MM Pytorch implementation
         """
         bsz, q_len, _ = hidden_states.size()
@@ -317,7 +247,6 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             hidden_states,
             past_key_value,
             adapter_ids=adapter_ids,
-            rotary_freqs=rotary_freqs,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rmsnorm=rmsnorm,
@@ -812,12 +741,9 @@ class NeuronMllamaTextModel(NeuronBaseModel):
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
         self.num_cross_attention_layers = len(config.cross_attention_layers)
-        if self.config.checkpoint == META_CHECKPOINT:
-            self.num_hidden_layers = config.num_hidden_layers
-        elif self.config.checkpoint == HF_CHECKPOINT:
-            # neuron modeling includes cross attention in the same layer as self attention whereas
-            # hf modeling uses different layer index for cross attention
-            self.num_hidden_layers = config.num_hidden_layers - self.num_cross_attention_layers
+        # neuron modeling includes cross attention in the same layer as self attention whereas
+        # hf modeling uses different layer index for cross attention
+        self.num_hidden_layers = config.num_hidden_layers - self.num_cross_attention_layers
 
     def _init_fusion_schedule(
         self,
@@ -874,16 +800,7 @@ class NeuronMllamaTextModel(NeuronBaseModel):
             self.num_cross_attention_layers,
         )
 
-        if self.config.checkpoint == META_CHECKPOINT:
-            # precompute rope scaling frequences to use in each NeuronLlamaAttention layer.
-            self.rotary_freqs = precompute_freqs_cis(
-                config.hidden_size // config.num_attention_heads,
-                config.neuron_config.max_context_length * 2,
-                config.rope_theta,
-                True,
-            ).to("xla")
-        else:
-            self.rotary_freqs = None
+        self.rotary_freqs = None
 
         self.layers = nn.ModuleList(
             [
@@ -1185,26 +1102,23 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
-        raise Exception("HuggingFace checkpoint is not supported yet")
+        from transformers import MllamaForConditionalGeneration
+        return MllamaForConditionalGeneration.from_pretrained(model_path, **kwargs)
 
     def get_compiler_args(self) -> str:
         return "--enable-saturate-infinity --auto-cast=none --model-type=transformer \
                 --tensorizer-options='--enable-ccop-compute-overlap \
                 --cc-pipeline-tiling-factor=2 --vectorize-strided-dma' -O1 \
-                --hbm-scratchpad-page-size=1024"
+                --hbm-scratchpad-page-size=1024 \
+                --internal-hlo2tensorizer-options='--verify-hlo=true'"
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(
         state_dict: dict, inference_config: InferenceConfig
     ) -> dict:
-        if inference_config.checkpoint == HF_CHECKPOINT:
-            from .hf_state_dict_conversion import convert_hf_state_dict_to_neuron_state_dict
+        from .hf_state_dict_conversion import convert_hf_state_dict_to_neuron_state_dict
 
-            return convert_hf_state_dict_to_neuron_state_dict(state_dict, inference_config)
-        elif inference_config.checkpoint == META_CHECKPOINT:
-            from .meta_state_dict_conversion import convert_meta_state_dict_to_neuron_state_dict
-
-            return convert_meta_state_dict_to_neuron_state_dict(state_dict, inference_config)
+        return convert_hf_state_dict_to_neuron_state_dict(state_dict, inference_config)
 
     def get_model_wrapper_cls(self):
         return ModelWrapperMllama

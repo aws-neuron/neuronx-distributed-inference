@@ -198,7 +198,7 @@ class FlashPASchedule:
 
         block_table_len = block_tables.shape[0]
 
-        block_tables = block_tables.numpy().squeeze()
+        block_tables = block_tables.numpy()
         in_tile_offset = np.arange(num_blocks_per_tile)
         indices = self.tile_block_table_offsets.reshape(-1, 1) + in_tile_offset.reshape(1, -1)
 

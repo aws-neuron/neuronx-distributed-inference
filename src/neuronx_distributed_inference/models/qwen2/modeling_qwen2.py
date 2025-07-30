@@ -213,10 +213,7 @@ class NeuronQwen2ForCausalLM(NeuronBaseForCausalLM):
         tp_degree = neuron_config.tp_degree
         for i in range(num_layers):
             state_dict[f"layers.{i}.self_attn.rank_util.rank"] = torch.arange(
-                0, tp_degree // neuron_config.cp_degree, dtype=torch.int32
-            )
-            state_dict[f"layers.{i}.self_attn.global_rank.rank"] = torch.arange(
-                0, neuron_config.world_size, dtype=torch.int32
+                0, tp_degree, dtype=torch.int32
             )
         # to facilitate rank usage in base model
         state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
@@ -234,4 +231,5 @@ class NeuronQwen2ForCausalLM(NeuronBaseForCausalLM):
         compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --auto-cast=none --model-type transformer -O1"
         # Add flags for cc-overlap
         compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2 --vectorize-strided-dma'"
+        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         return compiler_args

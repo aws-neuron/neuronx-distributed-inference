@@ -16,23 +16,29 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 
 ATTN_CHUNK_SIZE = 128
 
-
+torch.manual_seed(42)
 @pytest.mark.tp32
 @pytest.mark.chunked_attention
 @pytest.mark.parametrize(
-    "batch_size, seq_len, input_start_offsets, latency_threshold, throughput_threshold",
+    "batch_size, seq_len, input_start_offsets, input_len, cp_degree, latency_threshold, throughput_threshold",
     # fmt: off
     [
-        (1, 256, [ATTN_CHUNK_SIZE], 252, 1000),  # seq_len divisible by chunk size
-        (1, 192, [ATTN_CHUNK_SIZE], 252, 1100),  # seq_len not divisible by chunk size
-        (2, 256, [ATTN_CHUNK_SIZE], 270, 2000),  # bs 2
-        (2, 256, [ATTN_CHUNK_SIZE, 0], 270, 2000),  # bs 2, mixed input offset seq1: [..., pad, pad, 1, 2, 3, 4, 5], seq2: [1, 2, 3, 4, 5, pad, pad]
-        (1, 256, [0], 252, 1000),  # base case, input start at 0
+        (1, 256, [ATTN_CHUNK_SIZE], 16, 4, 252, 1000),  # seq_len divisible by chunk size
+        (1, 256, [0], 16, 4, 252, 1000),  # seq_len divisible by chunk size
+        (1, 192, [ATTN_CHUNK_SIZE], 16, 4, 252, 1100),  # seq_len not divisible by chunk size, 
+        (1, 192, [0], 65, 4, 252, 1100),  # seq_len not divisible by chunk size, input length longer than seq_len % chunk_size to make sure KV cache update is correct
+        (1, 256, [ATTN_CHUNK_SIZE], 16, 1, 252, 1000),  # seq_len divisible by chunk size
+        (1, 192, [ATTN_CHUNK_SIZE], 16, 1, 252, 1100),  # seq_len not divisible by chunk size, 
+        (1, 192, [0], 65, 1, 252, 1100),  # seq_len not divisible by chunk size, input length longer than seq_len % chunk_size to make sure KV cache update is correct
+        (2, 192, [ATTN_CHUNK_SIZE, 0], 16, 1, 275, 1880),  # seq_len not divisible by chunk size, bs 2
+        (2, 256, [ATTN_CHUNK_SIZE], 16, 1, 275, 1880),  # bs 2
+        (2, 256, [ATTN_CHUNK_SIZE, 0], 16, 1, 275, 1880),  # bs 2, mixed input offset seq1: [..., pad, pad, 1, 2, 3, 4, 5], seq2: [1, 2, 3, 4, 5, pad, pad]
+        (1, 256, [0], 16, 1, 252, 1000),  # base case, input start at 0
     ],
     # fmt: on
 )
 def test_llama3_2_1b_4layer_chunked_attention(
-    batch_size, seq_len, input_start_offsets, latency_threshold, throughput_threshold
+    batch_size, seq_len, input_start_offsets, input_len, cp_degree, latency_threshold, throughput_threshold
 ):
     # Load model from config, and save with random weights.
     neuron_config = NeuronConfig(
@@ -40,6 +46,7 @@ def test_llama3_2_1b_4layer_chunked_attention(
         batch_size=batch_size,
         seq_len=seq_len,
         sequence_parallel_enabled=True,
+        cp_degree = cp_degree,
     )
     config_path = (
         os.path.dirname(os.path.abspath(__file__)) + "/config_chunked_attention.json"
@@ -53,7 +60,7 @@ def test_llama3_2_1b_4layer_chunked_attention(
         load_config=load_pretrained_config(model_path),
     )
 
-    validate_accuracy(model_path, config, generation_config, input_start_offsets=input_start_offsets)
+    validate_accuracy(model_path, config, generation_config, input_start_offsets=input_start_offsets, input_len=input_len)
     validate_performance(
         model_path, config, generation_config, latency_threshold, throughput_threshold
     )
@@ -73,9 +80,10 @@ def save_checkpoint(config_path):
     return model_tempdir
 
 
-def validate_accuracy(model_path, config, generation_config, input_start_offsets = 0):
-    input_len = 16
+def validate_accuracy(model_path, config, generation_config, input_start_offsets = 0, input_len=16):
+
     input_ids = torch.rand((config.neuron_config.batch_size, input_len)) * config.vocab_size
+
     input_ids = input_ids.to(dtype=torch.int32)
     attention_mask = torch.ones((config.neuron_config.batch_size, input_len), dtype=torch.int32)
     inputs = Namespace(input_ids=input_ids, attention_mask=attention_mask)
@@ -84,11 +92,12 @@ def validate_accuracy(model_path, config, generation_config, input_start_offsets
     compiled_model_path = model_path + "/compiled_checkpoint_accuracy"
     model.compile(compiled_model_path)
     model.load(compiled_model_path)
+    num_tokens_to_check = ATTN_CHUNK_SIZE - input_len if config.neuron_config.seq_len % ATTN_CHUNK_SIZE == 0 else config.neuron_config.seq_len % ATTN_CHUNK_SIZE
     check_accuracy_logits(
         model,
         generation_config=generation_config,
         prompt="",
-        num_tokens_to_check=ATTN_CHUNK_SIZE - input_len,
+        num_tokens_to_check=num_tokens_to_check,
         inputs=inputs,
         input_start_offsets=input_start_offsets,
         pad_token_id=128009,

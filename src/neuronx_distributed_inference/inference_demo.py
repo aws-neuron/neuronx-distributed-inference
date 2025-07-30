@@ -26,6 +26,8 @@ from neuronx_distributed_inference.models.config import (
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
+from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.accuracy import (
     check_accuracy,
@@ -48,6 +50,8 @@ MODEL_TYPES = {
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
+    "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
+    "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
 }
 
 
@@ -109,6 +113,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--do-sample", action="store_true", default=False)
     run_parser.add_argument("--dynamic", action="store_true", default=False)
     run_parser.add_argument("--pad-token-id", type=int, default=0)
+    run_parser.add_argument("--top-k-kernel-enabled", action="store_true", default=False)
 
     # Basic config
     run_parser.add_argument("--torch-dtype", type=to_torch_dtype)
@@ -201,6 +206,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # Parallelism
     run_parser.add_argument("--tp-degree", type=int)
     run_parser.add_argument("--cp-degree", type=int)
+    run_parser.add_argument("--attention-dp-degree", type=int)
     run_parser.add_argument("--pp-degree", type=int)
     run_parser.add_argument("--ep-degree", type=int)
     run_parser.add_argument("--world-size", type=int)
@@ -270,6 +276,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--attn-tkg-builtin-kernel-enabled", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-cache-update", action="store_true")
+    run_parser.add_argument("--attn-block-cte-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--k-cache-transposed", action="store_true")
 
     # Logical NeuronCore Configuration (LNC)
@@ -282,6 +289,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # Compiler Args
     run_parser.add_argument("--cc-pipeline-tiling-factor", type=int, default=2)
     run_parser.add_argument("--enable-spill-reload-dge", action="store_true")
+    run_parser.add_argument("--scratchpad-page-size", type=int)
 
     # CPU
     run_parser.add_argument("--on-cpu", action="store_true")
@@ -350,6 +358,12 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         "If only 1 value is provided, all sequences will be shifted by this amount. "
         "This flag can be used to test chunked attention."
     )
+    run_parser.add_argument(
+        "--enable-output-completion-notifications",
+        action='store_true',
+        help="Enable output tensor notification to be used together "
+        "with `torch.classes.neuron.Runtime.wait_output_completion`. "
+    )
 
 
 def validate_file_exists(path):
@@ -391,18 +405,15 @@ def create_neuron_config(model_cls, args):
         config_kwargs["chunked_prefill_config"] = ChunkedPrefillConfig(
             max_num_seqs=max_num_seqs,
         )
-
     if (args.quantized and args.quantization_dtype == "f8e4m3") or args.kv_cache_quant:
         os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
         os.environ["UNSAFE_FP8FNCAST"] = "1"
-
     if args.modules_to_not_convert_lists:
         modules_to_not_convert, draft_modules = args.modules_to_not_convert_lists
         if modules_to_not_convert is not None:
             config_kwargs["modules_to_not_convert"] = modules_to_not_convert
         if draft_modules is not None:
             config_kwargs["draft_model_modules_to_not_convert"] = draft_modules
-
     adapter_ids = None
     if args.enable_lora:
         config_kwargs["lora_config"] = LoraServingConfig(
@@ -531,6 +542,7 @@ def run_inference(model_cls: Type[NeuronApplicationBase], args):
         k: getattr(args, k) for k in generation_config_args if getattr(args, k) is not None
     }
     remaining_kwargs = generation_config.update(**generation_config_kwargs)
+
     # add any remaining ones (this can happen when the model generation config is missing some entries)
     for k, v in remaining_kwargs.items():
         generation_config.__dict__[k] = v
@@ -615,7 +627,6 @@ def run_generation(
     print(f"Prompts: {prompts}")
     if len(prompts) == 1 and model.config.neuron_config.batch_size > 1:
         prompts = prompts * model.config.neuron_config.batch_size
-
     _, output_tokens = get_generate_outputs(
         model,
         prompts,

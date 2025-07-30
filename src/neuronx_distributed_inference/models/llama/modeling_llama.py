@@ -885,6 +885,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor] = None,  # residual from previous layer used by QKV
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]], Optional[torch.FloatTensor], Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
+        is_token_gen = past_key_value is not None
         entry_hidden_states = hidden_states
 
         qkv_fused_rmsnorm = None
@@ -914,13 +915,16 @@ class NeuronLlamaDecoderLayer(nn.Module):
             # residual will only be returned by attn/qkv if fuse add qkv kernel is enabled
             assert self.qkv_kernel_fuse_residual_add, \
                 "residual add before qkv should be computed in the previous layer, \
-                 unless qkv_kernel_fuse_residual_add is specified"
+                unless qkv_kernel_fuse_residual_add is specified"
             assert (
                 not self.sequence_parallel_enabled
             ), "qkv_kernel_fuse_residual_add should be off when sequence parallelism is enabled"
             assert (
                 self.qkv_kernel_enabled
             ), "qkv_kernel_fuse_residual_add should be used with qkv_kernel_enabled"
+            assert (
+                not is_token_gen  # TODO: allow fusing residual to tokengen for better perf
+            ), "cannot fuse residual add for tokengen"
             residual = attn_output.residual
 
         hidden_states = attn_output.hidden_states
@@ -953,7 +957,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
 
         # if fuse residual add with qkv, we leave this add to the next layer's QKV
         # unless it is the last layer in which case we add it here
-        if not self.qkv_kernel_fuse_residual_add:
+        if not self.qkv_kernel_fuse_residual_add or is_token_gen:
             hidden_states = residual + hidden_states
             residual = None  # set to None to prevent it from being used again
 
@@ -1111,10 +1115,7 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
         tp_degree = neuron_config.tp_degree
         for i in range(num_layers):
             state_dict[f"layers.{i}.self_attn.rank_util.rank"] = torch.arange(
-                0, tp_degree // neuron_config.cp_degree, dtype=torch.int32
-            )
-            state_dict[f"layers.{i}.self_attn.global_rank.rank"] = torch.arange(
-                0, neuron_config.world_size, dtype=torch.int32
+                0, tp_degree, dtype=torch.int32
             )
 
             """

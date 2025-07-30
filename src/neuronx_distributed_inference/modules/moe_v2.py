@@ -31,7 +31,8 @@ def initialize_moe_module(config):
                                                             hidden_act=config.hidden_act,
                                                             glu_mlp=config.neuron_config.glu_mlp,
                                                             early_expert_affinity_modulation=config.neuron_config.early_expert_affinity_modulation,
-                                                            normalize_top_k_affinities=config.neuron_config.normalize_top_k_affinities),
+                                                            normalize_top_k_affinities=config.neuron_config.normalize_top_k_affinities,
+                                                            enable_spmd_rank=config.neuron_config.blockwise_matmul_config.parallelize_token_to_block_mapping),
         blockwise_matmul_config=config.neuron_config.blockwise_matmul_config,
         dtype=config.neuron_config.torch_dtype
     )
@@ -43,7 +44,8 @@ def initialize_moe_module(config):
             hidden_act=config.hidden_act,
             dtype=config.neuron_config.torch_dtype,
             reduce_dtype=config.neuron_config.rpl_reduce_dtype,
-            fused_gate_up_projection=config.neuron_config.fused_shared_experts
+            fused_gate_up_projection=config.neuron_config.fused_shared_experts,
+            sequence_parallel_enabled=config.neuron_config.shared_experts_sequence_parallel_enabled,
         )
 
     moe = MoE(
@@ -51,6 +53,7 @@ def initialize_moe_module(config):
         expert_mlps=expert_mlps,
         shared_experts=shared_experts if config.n_shared_experts else None,
         sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+        return_expert_index=config.neuron_config.return_expert_index,
         sequence_dimension=1,
     )
     # Set MoE module in eval mode

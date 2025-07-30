@@ -238,7 +238,7 @@ def _add_compiler_args():
     )
     # add dma optimzation flag
     compiler_args += " --tensorizer-options='--vectorize-strided-dma'"
-    compiler_args += " --auto-cast=none"
+    compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
     return compiler_args
 
 

@@ -98,11 +98,14 @@ class TestSampling(unittest.TestCase):
             )
             cpu_output = cpu_sampler(x, sampling_params)
             # sample on Neuron
+            compiler_args="--auto-cast=none  --optlevel=1 --enable-saturate-infinity" \
+                            " --enable-mixed-precision-accumulation --model-type transformer -O1" \
+                            " --internal-hlo2tensorizer-options='--verify-hlo=true'"
             neuron_sampler = parallel_model_trace(
                 self.get_neuron_sampling_model,
                 (x, sampling_params),
                 tp_degree=1,
-                compiler_args="--auto-cast=none  --optlevel=1 --enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1",
+                compiler_args=compiler_args,
                 compiler_workdir="/tmp/torch_top_k/",
             )
             neuron_output = neuron_sampler(x, sampling_params)
@@ -175,11 +178,14 @@ class TestSampling(unittest.TestCase):
             )
             cpu_output = cpu_sampler(x, sampling_params)
             # sample on Neuron
+            compiler_args="--auto-cast=none  --optlevel=1 --enable-saturate-infinity" \
+                            " --enable-mixed-precision-accumulation --model-type transformer -O1" \
+                            " --internal-hlo2tensorizer-options='--verify-hlo=true'"
             neuron_sampler = parallel_model_trace(
                 self.get_neuron_sampling_model,
                 (x, sampling_params),
                 tp_degree=1,
-                compiler_args="--auto-cast=none  --optlevel=1 --enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1",
+                compiler_args=compiler_args,
                 compiler_workdir="/tmp/torch_top_k/",
             )
             neuron_output = neuron_sampler(x, sampling_params)

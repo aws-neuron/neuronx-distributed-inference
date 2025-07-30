@@ -253,6 +253,7 @@ class NeuronSimpleVisionEncoderApplication(NeuronApplicationBase):
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
+        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         if self.config.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
         print(f"compiler_args: {compiler_args}")
@@ -290,6 +291,7 @@ class NeuronSimpleTextEncoderApplication(NeuronApplicationBase):
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
+        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         if self.config.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
         print(f"compiler_args: {compiler_args}")
@@ -328,6 +330,7 @@ class NeuronSimpleFusionEncoderApplication(NeuronApplicationBase):
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
+        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         if self.config.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
         print(f"compiler_args: {compiler_args}")

@@ -49,6 +49,16 @@ def get_cp_rank(global_rank: torch.tensor, tp_degree: int):
     return cp_rank
 
 
+def get_dp_rank(global_rank: torch.tensor, tp_degree: int):
+    dp_rank = torch.div(
+        global_rank,
+        tp_degree,
+        rounding_mode="floor"
+    ).to(torch.int32)
+
+    return dp_rank
+
+
 def split_along_dim(tensor, dim, rank, num_partitions):
     if tensor is None:
         return None

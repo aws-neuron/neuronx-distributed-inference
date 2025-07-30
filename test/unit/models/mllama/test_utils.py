@@ -48,7 +48,7 @@ def trace_nxd_model(model_class, example_inputs, tp_degree=1, **model_init_kwarg
         key="test_nxd_model",
         model_instance=TestModelBuilderInstance(model_class, {}, **model_init_kwargs),
         example_inputs=[example_inputs],
-        compiler_args="--enable-saturate-infinity --enable-mixed-precision-accumulation --auto-cast=none --model-type=transformer -O1",
+        compiler_args="--enable-saturate-infinity --enable-mixed-precision-accumulation --auto-cast=none --model-type=transformer -O1 --internal-hlo2tensorizer-options='--verify-hlo=true'",
     )
     logger.info("Added models. Starting trace.")
 

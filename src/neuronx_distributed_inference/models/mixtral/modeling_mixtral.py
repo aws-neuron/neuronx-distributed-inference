@@ -324,7 +324,7 @@ class NeuronMixtralForCausalLM(NeuronBaseForCausalLM):
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
-        compiler_args += " --auto-cast=none"
+        compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
         # Enable vector-offset DGE
         compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         return compiler_args

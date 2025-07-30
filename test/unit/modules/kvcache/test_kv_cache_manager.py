@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import os
+from parameterized import parameterized
 
 from unittest.mock import patch
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
@@ -29,6 +30,7 @@ class TestKVCacheManager(unittest.TestCase):
                         "kv_cache_quant": False,
                         "tp_degree": 1,
                         "cp_degree": 1,
+                        "attention_dp_degree": 1,
                         "max_length": 10,
                         "batch_size": 2,
                         "k_cache_transposed": False,
@@ -347,6 +349,65 @@ class TestKVCacheManager(unittest.TestCase):
         # verify we only used head 0 for the update
         self.assertTrue(torch.all(updated_k[0, 0, 0:1] == 5))
         self.assertTrue(torch.all(updated_v[0, 0, 0:1] == 5))
+
+            
+    @parameterized.expand(
+        [
+            # Test case 1: seq 0 in chunk 0, seq 1 in chunk 1
+            ('test case 1', torch.tensor([[2], [4]], dtype=torch.int32), [4]),
+            # Test case 2: both seqs in chunk 1
+            ('test case 2', torch.tensor([[2], [2]], dtype=torch.int32), [4]),
+            # Test case 3: seq 0 in chunk 0
+            ('test case 3', torch.tensor([[0]], dtype=torch.int32), [4]),
+            # Test case 4: NOPE layer. Position ids stay the same
+            ('test case 4', torch.tensor([[2], [4]], dtype=torch.int32), [10]),
+            # Test case 5: seq 0 in chunk 0, seq 1 in chunk 1, no mixed cache sizes
+            ('test case 5', torch.tensor([[2], [4]], dtype=torch.int32), None),
+        ]
+    )    
+    def test_chunked_attention_get_scatter_indices_for_cache_update_during_tkg(self, test_name, position_ids, cache_sizes):
+        """Test get scatter indices for kv cache update during tkg for chunked attention"""
+        # Setup
+        os.environ["NXD_CPU_MODE"] = "1"
+
+        # Test parameters
+        batch_size = position_ids.shape[0]
+        head_dim = 8
+        num_kv_heads = 4
+        attention_chunk_size = 4
+
+        self.config.neuron_config.tp_degree = 1
+        self.config.neuron_config.cp_degree = 1
+        self.config.neuron_config.is_prefill_stage = False
+        self.config.neuron_config.kv_cache_batch_size = batch_size
+        self.config.neuron_config.batch_size = batch_size
+        self.config.neuron_config.is_continuous_batching = False
+        self.config.neuron_config.kv_cache_padding_size  = 0
+        self.config.neuron_config.max_length = 10
+
+        # Initialize kv cache manager
+        kv_cache_manager = KVCacheManager(config=self.config, num_kv_head=num_kv_heads, attention_chunk_size=attention_chunk_size)
+        if cache_sizes is not None:
+            kv_cache_manager.v_shapes = [(batch_size, num_kv_heads, cache_sizes[0], head_dim)]
+
+        latest_k = torch.zeros((batch_size, num_kv_heads, 1, head_dim))
+
+        # Test the _get_index_to_update_new_position method 
+        scatter_indices = kv_cache_manager._get_index_to_update_new_position(None, position_ids, latest_k, False, 0)
+
+        # Check that scatter_indices have the correct shape
+        self.assertEqual(scatter_indices.shape, (batch_size, num_kv_heads, 1, head_dim))
+
+        if cache_sizes is not None:
+            expected_indices = (position_ids % cache_sizes[0])[:, None, :, None].expand(batch_size, num_kv_heads, 1, head_dim)
+        else:
+            expected_indices = (position_ids % attention_chunk_size)[:, None, :, None].expand(batch_size, num_kv_heads, 1, head_dim)
+
+        # Check that scatter_indices have the correct values
+        self.assertTrue(torch.all(scatter_indices == expected_indices),
+                       f"Mismatch for test {test_name}")
+           
+    
 
 if __name__ == "__main__":
     unittest.main()

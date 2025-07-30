@@ -49,11 +49,14 @@ class TestSampler(unittest.TestCase):
         )
 
         # compile the forward method for Neuron
+        compiler_args = "--auto-cast=none --optlevel=1 --enable-saturate-infinity" \
+                        " --enable-mixed-precision-accumulation --model-type transformer -O1" \
+                        " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         compiled_forward = parallel_model_trace(
             self.get_sampling_model,
             (token_logits, sampling_params),
             tp_degree=1,
-            compiler_args="--auto-cast=none --optlevel=1 --enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1",
+            compiler_args=compiler_args,
             compiler_workdir="/tmp/torch_top_k_non_deterministic/",
         )
 

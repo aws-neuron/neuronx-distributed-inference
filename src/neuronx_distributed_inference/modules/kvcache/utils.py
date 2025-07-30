@@ -35,7 +35,35 @@ def dynamic_update_slice(
     """
 
     if cpu_mode():
-        raise NotImplementedError("dynamic_update_slice() is not implemented for CPU mode")
+        def dynamic_update_slice(operand, update, start_indices):
+            """
+            Performs DynamicUpdateSlice operation for PyTorch tensors.
+
+            Args:
+                operand: The tensor to be updated (shape: [N1, N2, ..., Nk])
+                update: The tensor containing the new values (must fit within operand starting from start_indices)
+                start_indices: List/tuple of starting indices for each dimension
+            """
+            # Make a copy of the input tensor
+            result = operand.clone()
+
+            # Create slices for the update region
+            slices = []
+            update_slices = []
+            for dim, (start, update_size, operand_size) in \
+                    enumerate(zip(start_indices, update.shape, operand.shape)):
+                # Calculate the end index
+                end = min(start + update_size, operand_size)
+                # Create slice for result tensor
+                slices.append(slice(start, end))
+                # Create slice for update tensor
+                update_slices.append(slice(0, end - start))
+
+            # Apply the update
+            result[tuple(slices)] = update[tuple(update_slices)]
+            return result
+
+        return dynamic_update_slice(tensor, update, start_indices)
 
     @xla_hlo_call
     def xla_dynamic_update_slice(tensor, update, *start_indices):
@@ -416,3 +444,50 @@ def contexted_kv_indexing_dynamic(
         cached_to_ctx.append(torch.zeros(num_q, dtype=dtype, device=device))
     cached_to_ctx = torch.cat(cached_to_ctx, dim=0)
     return cache_mask, cached_to_ctx, active_to_ctx
+
+
+def get_layer_to_kv_cache_size_mapping_for_mixed_attn(local_cache_size, global_cache_size, is_layer_locals: List[int]):
+    if local_cache_size is None or global_cache_size is None:
+        raise ValueError("Cache size for the layer has to be specified")
+    layer_cache_mapping = []
+    for is_layer_local in is_layer_locals:
+        if not is_layer_local:
+            layer_cache_mapping.append(global_cache_size)
+        else:
+            layer_cache_mapping.append(local_cache_size)
+    return layer_cache_mapping
+
+
+def get_kv_shapes(max_len: int, bsz: int, num_kv_heads_per_rank: int, head_dim: int, k_cache_transposed: bool = False, is_kv_cache_tiled: bool = False):
+    if is_kv_cache_tiled:
+        num_tiles = int(max_len / 128)
+        # KV cache layout : BHS(128 tiled)D
+        v_shape = (
+            bsz,
+            num_kv_heads_per_rank,
+            128,  # Sequence dim is tiled
+            num_tiles,  # max_len = 128 * num_tiles
+            head_dim,
+        )
+        k_shape = v_shape if not k_cache_transposed else (
+            bsz,
+            num_kv_heads_per_rank,
+            head_dim,
+            128,  # Sequence dim is tiled
+            num_tiles,  # max_len = 128 * num_tiles
+        )
+    else:
+        # KV cache layout : BHSD
+        v_shape = (
+            bsz,
+            num_kv_heads_per_rank,
+            max_len,
+            head_dim,
+        )
+        k_shape = v_shape if not k_cache_transposed else (
+            bsz,
+            num_kv_heads_per_rank,
+            head_dim,
+            max_len,
+        )
+    return k_shape, v_shape

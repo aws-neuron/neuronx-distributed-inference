@@ -88,7 +88,7 @@ class NeuronEncoderApplication(NeuronApplicationBase):
 
         # Flag for model type
         compiler_args += "--model-type=transformer "
-        compiler_args += " --auto-cast=none"
+        compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
 
         return compiler_args
 

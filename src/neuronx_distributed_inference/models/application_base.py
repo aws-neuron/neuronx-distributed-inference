@@ -29,6 +29,12 @@ from neuronx_distributed_inference.modules.checkpoint import (
     prune_state_dict,
     save_state_dict_safetensors,
 )
+from neuronx_distributed_inference.utils.runtime_env import set_env_vars
+from neuronx_distributed_inference.utils.snapshot import (
+    ScriptModuleWrapper,
+    SnapshotOutputFormat,
+    get_snapshot_hook,
+)
 
 COMPILED_MODEL_FILE_NAME = "model.pt"
 logger = logging.getLogger("Neuron")
@@ -222,6 +228,9 @@ class NeuronApplicationBase(torch.nn.Module):
     ):
         compiled_model_path = normalize_path(compiled_model_path)
 
+        # set env vars for long context if needed
+        set_env_vars(self.neuron_config)
+
         """Loads the compiled model checkpoint to the Neuron device."""
         self.traced_model = torch.jit.load(compiled_model_path + COMPILED_MODEL_FILE_NAME)
 
@@ -240,6 +249,10 @@ class NeuronApplicationBase(torch.nn.Module):
             self.warmup()  # warmup will be executed only if both flags are false
         else:
             logger.info("Skipping model warmup")
+
+        enable_snapshot = bool(os.environ.get("NXD_INFERENCE_CAPTURE_SNAPSHOT", False))
+        if enable_snapshot:
+            self._register_snapshot_hooks_from_env()
 
     def warmup(self):
         """Invoke each model once to trigger any lazy initializations."""
@@ -305,6 +318,84 @@ class NeuronApplicationBase(torch.nn.Module):
         self.traced_model.nxd_model.initialize(weights, start_rank_tensor)
         logger.info(f"Finished weights loading in {time.monotonic() - start_time} seconds")
 
+    def _register_snapshot_hooks_from_env(self):
+        """
+        Registers snapshot hooks based on configuration from environment variables.
+        """
+        assert "NXD_INFERENCE_CAPTURE_OUTPUT_PATH" in os.environ, (
+            "Must set NXD_INFERENCE_CAPTURE_OUTPUT_PATH to enable snapshots"
+        )
+        assert "NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT" in os.environ, (
+            "Must set NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT to enable snapshots"
+        )
+        assert "NXD_INFERENCE_CAPTURE_AT_REQUESTS" in os.environ, (
+            "Must set NXD_INFERENCE_CAPTURE_AT_REQUESTS to enable snapshots"
+        )
+
+        output_path = os.environ["NXD_INFERENCE_CAPTURE_OUTPUT_PATH"]
+        output_format = os.environ["NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT"]
+        capture_at_requests_str = os.environ["NXD_INFERENCE_CAPTURE_AT_REQUESTS"]
+        capture_at_requests = [int(val_str) for val_str in capture_at_requests_str.split(",")]
+        save_transposed_priority_model_inputs = bool(
+            os.environ.get("NXD_INFERENCE_SAVE_TRANSPOSED_PRIORITY_MODEL_INPUTS", False)
+        )
+        self.register_snapshot_hooks(
+            output_path=output_path,
+            output_format=SnapshotOutputFormat[output_format],
+            capture_at_requests=capture_at_requests,
+            save_transposed_priority_model_inputs=save_transposed_priority_model_inputs,
+        )
+
+    def register_snapshot_hooks(
+        self,
+        output_path: str,
+        output_format: SnapshotOutputFormat,
+        capture_at_requests: List[int],
+        ranks: List[int] = [0],
+        save_transposed_priority_model_inputs: bool = False,
+    ):
+        """
+        Registers snapshot hooks to capture input snapshots for all submodels and bucket.
+
+        Args:
+            output_path: The base path where input snapshots are saved.
+            output_format: The output format to use.
+                NPY_IMAGES: Save each tensor as a separate .npy file.
+                NPY_PICKLE: Save tensors in .npy format in a pickle object file.
+            capture_at_requests: The request numbers at which this hook captures input snapshots for
+                each submodel bucket. For example, [0] means to capture the first request to each
+                submodel bucket.
+            ranks: The list of ranks to snapshot. Each rank is a separate NeuronCore device.
+                Defauls to [0], which means to capture the snapshot for the rank0 device.
+            save_transposed_priority_model_inputs: Whether to save the transposed inputs for the
+                priority model, which means to apply the priority model's transposed layout to its
+                own inputs. When this is enabled, the snapshot includes two copies of the priority
+                model inputs: one default (which matches the HLO), and one transposed (which
+                matches the NEFF). The transposed inputs are saved in a subfolder named "transposed_inputs".
+        """
+        assert self.is_loaded_to_neuron, "Must load model before you register snapshot hooks"
+        for submodel in self.models:
+            submodel.model = ScriptModuleWrapper(submodel.model)
+            snapshot_hook = get_snapshot_hook(
+                output_path,
+                output_format,
+                capture_at_requests,
+                self,
+                ranks,
+                save_transposed_priority_model_inputs,
+            )
+            submodel.model.register_forward_hook(snapshot_hook)
+            logger.info(f"Registered snapshot hooks for {submodel.tag=}")
+
+    def unregister_snapshot_hooks(self):
+        """
+        Unregisters snapshot hooks for this model.
+        """
+        for submodel in self.models:
+            if isinstance(submodel.model, ScriptModuleWrapper):
+                submodel.model = submodel.model.wrapped_module
+                logger.info(f"Unregistered snapshot hooks for {submodel.tag=}")
+
     def to_cpu(self):
         """
         This function initializes the Neuron version of the specified model, shards and loads the weights,
@@ -347,19 +438,33 @@ class NeuronApplicationBase(torch.nn.Module):
             skip_collective_init=True,
         )
 
-        neuron_base_model = self.models[0].model_cls(self.config)
-        if self.neuron_config.torch_dtype == torch.bfloat16:
-            neuron_base_model.bfloat16()
+        # get model based on config
+        def get_neuron_model(model_cls, config):
+            neuron_model = model_cls(config)
+            if self.neuron_config.torch_dtype == torch.bfloat16:
+                neuron_model.bfloat16()
 
-        model_sd = self.checkpoint_loader_fn()
+            model_sd = self.checkpoint_loader_fn()
 
-        get_sharded_checkpoint(
-            model_sd, neuron_base_model, torch.distributed.get_rank(), self.neuron_config.tp_degree
-        )
-        neuron_base_model.load_state_dict(model_sd, strict=False)
+            get_sharded_checkpoint(
+                model_sd, neuron_model, torch.distributed.get_rank(), self.neuron_config.tp_degree
+            )
+            neuron_model.load_state_dict(model_sd, strict=False)
+            return neuron_model
 
-        for model_wrapper in self.models:
-            model_wrapper.model = neuron_base_model
+        if self.config.neuron_config.is_continuous_batching:
+            warnings.warn(f"CPU inference with continuous batching uses {len(self.models)}x memory because submodels are created separately. \
+                If this extra memory usage causes the model to fail to load on CPU, disable continuous batching.")
+            # TODO: implement weight sharing across submodels as implemented in neuron devices
+            for model_wrapper in self.models:
+                # we should create ctx encoding model and token gen model separately with specific config when the configs are different
+                neuron_base_model = get_neuron_model(model_wrapper.model_cls, model_wrapper.config)
+                model_wrapper.model = neuron_base_model
+        else:
+            neuron_base_model = get_neuron_model(self.models[0].model_cls, self.config)
+            for model_wrapper in self.models:
+                # for other cases, we should use a unified model to reduce memory footprint
+                model_wrapper.model = neuron_base_model
 
         self.eval()
 
@@ -530,7 +635,7 @@ class NeuronApplicationBase(torch.nn.Module):
         `torch.device`: The device on which the module is (assuming that all the module parameters are on the same
         device).
         """
-        # We dont want HF to move parameters to device
+        # We don't want HF to move parameters to device
         return torch.device("cpu")
 
     def reset(self):

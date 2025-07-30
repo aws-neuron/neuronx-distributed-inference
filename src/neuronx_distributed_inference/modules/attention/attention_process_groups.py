@@ -4,6 +4,8 @@ from neuronx_distributed_inference.models.config import InferenceConfig
 
 _ATTENTION_TP_CP_GROUP = None
 _ATTENTION_CP_GROUP = None
+_ATTENTION_TP_DP_GROUP = None
+_ATTENTION_DP_GROUP = None
 
 # TODO: Add mesh validation per instance to fail fast on non-working TP, CP configurations
 
@@ -69,3 +71,47 @@ def get_context_parallel_attention_cp_group():
     assert _ATTENTION_CP_GROUP is not None, "_ATTENTION_CP_GROUP is not initialized"
 
     return _ATTENTION_CP_GROUP
+
+
+def init_data_parallel_attention_process_groups(config: InferenceConfig):
+    """
+    initializes process groups needed to run data parallel attention
+
+    example: TP = 8, DP = 4
+
+    Attention will run in TP = 8 // 4 = 2
+
+    _ATTENTION_TP_DP_GROUP = [[0, 1], [2, 3], [4, 5], [6, 7]]
+    _ATTENTION_DP_GROUP = [[0, 2, 4, 6], [1, 3, 5, 7]]
+    """
+
+    global _ATTENTION_TP_DP_GROUP
+    global _ATTENTION_DP_GROUP
+
+    tp_degree = config.neuron_config.tp_degree
+    dp_degree = config.neuron_config.attention_dp_degree
+
+    if dp_degree > 1 and _ATTENTION_DP_GROUP is None and _ATTENTION_TP_DP_GROUP is None:
+        tp_dp_group_mesh = get_tp_cp_group_mesh(tp_degree, dp_degree)
+        tp_dp_group = torch.distributed.new_group(
+            tp_dp_group_mesh[0], pg_options={"xla_pg_options": {"mesh": tp_dp_group_mesh}}
+        )
+        _ATTENTION_TP_DP_GROUP = tp_dp_group
+
+        dp_group_mesh = get_cp_group_mesh(tp_degree, dp_degree)
+        dp_group = torch.distributed.new_group(
+            dp_group_mesh[0], pg_options={"xla_pg_options": {"mesh": dp_group_mesh}}
+        )
+        _ATTENTION_DP_GROUP = dp_group
+
+
+def get_data_parallel_attention_tp_group():
+    assert _ATTENTION_TP_DP_GROUP is not None, "_ATTENTION_TP_DP_GROUP is not initialized"
+
+    return _ATTENTION_TP_DP_GROUP
+
+
+def get_data_parallel_attention_dp_group():
+    assert _ATTENTION_DP_GROUP is not None, "_ATTENTION_DP_GROUP is not initialized"
+
+    return _ATTENTION_DP_GROUP

@@ -2,6 +2,7 @@ import unittest
 import os 
 import torch
 from types import SimpleNamespace
+
 from neuronx_distributed_inference.models.config import MoENeuronConfig
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 from neuronx_distributed.parallel_layers import parallel_state
@@ -59,6 +60,8 @@ class TestInitializeMoEModule(unittest.TestCase):
                         router_config={"act_fn": configs.router_act_fn,"dtype": configs.router_dtype},
                         early_expert_affinity_modulation=configs.early_expert_affinity_modulation,
                         disable_normalize_top_k_affinities=configs.disable_normalize_top_k_affinities,
+                        return_expert_index=configs.return_expert_index,
+                        shared_experts_sequence_parallel_enabled=configs.shared_experts_sequence_parallel_enabled,
                         logical_nc_config=1)
         return config(
             hidden_size=configs.hidden_size,
@@ -82,6 +85,8 @@ class TestInitializeMoEModule(unittest.TestCase):
                 "router_dtype": torch.float32,
                 "top_k":1,
                 "n_shared_experts": 0,
+                "return_expert_index": True,
+                "shared_experts_sequence_parallel_enabled": False,
                 "hidden_size": 5120,
                 "intermediate_size": 8192,
                 "num_experts": 1,
@@ -99,6 +104,8 @@ class TestInitializeMoEModule(unittest.TestCase):
                 "router_dtype": torch.float16,
                 "top_k": 4,
                 "n_shared_experts": 1,
+                "return_expert_index": True,
+                "shared_experts_sequence_parallel_enabled": True,
                 "hidden_size": 128,
                 "intermediate_size": 512,
                 "num_experts": 16,
@@ -116,6 +123,8 @@ class TestInitializeMoEModule(unittest.TestCase):
                 "router_dtype": torch.bfloat16,
                 "top_k":1,
                 "n_shared_experts": 5,
+                "return_expert_index": False,
+                "shared_experts_sequence_parallel_enabled": True,
                 "hidden_size": 1280,
                 "intermediate_size": 128,
                 "num_experts": 5,
@@ -168,6 +177,9 @@ class TestInitializeMoEModule(unittest.TestCase):
             # Test shared expert configs
             if module_config.n_shared_experts:
                 assert module.shared_experts.num_shared_experts == module_config.n_shared_experts, f"Expected num_shared_experts to be {module_config.n_shared_experts} but got {module.shared_experts.num_shared_experts}"
+                assert module.shared_experts.sequence_parallel_enabled == module_config.neuron_config.shared_experts_sequence_parallel_enabled, f"Expected num_shared_experts to be {module_config.neuron_config.shared_experts_sequence_parallel_enabled} but got {module.shared_experts.sequence_parallel_enabled}"
+
+            assert module.return_expert_index == module_config.neuron_config.return_expert_index, f"Expected return_expert_index to be {module_config.neuron_config.return_expert_index} but got {module.return_expert_index}"
 
 if __name__ == "__main__":
     unittest.main()

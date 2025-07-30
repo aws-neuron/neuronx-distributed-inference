@@ -17,9 +17,6 @@ from neuronx_distributed_inference.models.mllama.image_transform import custom_i
 
 logger = logging.getLogger(__name__)
 
-
-HF_CHECKPOINT = "HF"
-META_CHECKPOINT = "META"
 NUM_IMAGE_PER_PROMPT = 1
 
 
