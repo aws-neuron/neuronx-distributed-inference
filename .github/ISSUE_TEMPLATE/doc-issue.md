@@ -1,7 +1,7 @@
 ---
 name: AWS Neuron SDK Bug Report
 about: Create a report to help us improve the AWS Neuron SDK docs!
-title: '[ISSUE] '
+title: '[ISSUE]'
 labels: bug
 assignees: ''
 ---
