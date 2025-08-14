@@ -6,8 +6,6 @@ labels: bug
 assignees: ''
 ---
 ## Hardware Used
-
-
 ## Instance type
 
 [Inf2.xlarge/Inf2.48xlarge etc]
