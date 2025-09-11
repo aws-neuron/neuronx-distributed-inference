@@ -63,6 +63,10 @@ def validate_attention_data_parallel(self):
     if self.attention_dp_degree > 1 and not self.is_continuous_batching:
         raise ValueError("--is-continuous-batching must be enabled when running DP")
 
+    # TODO: support cache update within the attn kernel when DP is enabled, this can be done by avoiding garbage cache writes.
+    if self.attention_dp_degree > 1 and self.attn_block_tkg_nki_kernel_cache_update:
+        raise ValueError("attn_block_tkg_nki_kernel_cache_update is currently not supported with DP")
+
 
 def to_dict(obj):
     if type(obj) is dict:
@@ -145,6 +149,10 @@ class NeuronConfig:
 
         # Embedding Config
         self.vocab_parallel = kwargs.pop("vocab_parallel", False)
+
+        # TTFT Optimizations
+        # This is currently ignored by the Application Base as it's causing logits regression , ticket: V1849736968
+        self.enable_cte_modular_flow = kwargs.pop("enable_cte_modular_flow", False)
 
         # Layer boundary markers
         self.layer_boundary_markers = kwargs.pop("layer_boundary_markers", False)
@@ -297,8 +305,6 @@ class NeuronConfig:
         if self.tp_degree % self.cp_degree != 0:
             raise ValueError("TP Degree must be evenly divisible by CP Degree")
 
-        validate_attention_data_parallel(self)
-
         # QK layer normalization
         self.qk_layernorm = kwargs.pop("qk_layernorm", False)
 
@@ -339,6 +345,7 @@ class NeuronConfig:
 
         # Kernels
         self.attn_kernel_enabled = kwargs.pop("attn_kernel_enabled", None)  # CTE attention kernel.
+        self.strided_context_parallel_kernel_enabled = kwargs.pop("strided_context_parallel_kernel_enabled", False)
         self.qkv_kernel_enabled = kwargs.pop("qkv_kernel_enabled", False)
         self.qkv_kernel_nbsd_layout = kwargs.pop("qkv_kernel_nbsd_layout", False)
         self.mlp_kernel_enabled = kwargs.pop("mlp_kernel_enabled", False)
@@ -349,6 +356,9 @@ class NeuronConfig:
         self.activation_quantization_type = kwargs.pop("activation_quantization_type", None)
         if self.activation_quantization_type is not None:
             validate_activation_quantization_type(self.activation_quantization_type)
+
+        if self.strided_context_parallel_kernel_enabled and not self.cp_degree > 1:
+            raise ValueError("CP must also be enabled when strided_context_parallel_kernel_enabled is set.")
 
         # Token-gen attention kernels
         self.attn_tkg_nki_kernel_enabled = kwargs.pop("attn_tkg_nki_kernel_enabled", False)
@@ -374,9 +384,13 @@ class NeuronConfig:
         )
 
         self.attn_block_tkg_nki_kernel_cache_update = kwargs.pop("attn_block_tkg_nki_kernel_cache_update", False)
+        self.attn_block_tkg_nki_kernel_cascaded_attention = kwargs.pop("attn_block_tkg_nki_kernel_cascaded_attention", False)
         if not self.attn_block_tkg_nki_kernel_enabled:
             assert not self.attn_block_tkg_nki_kernel_cache_update, \
                 'attn-block-tkg-nki-kernel-cache-update can only be enabled with attn-block-tkg-nki-kernel-enabled'
+            assert not self.attn_block_tkg_nki_kernel_cascaded_attention, \
+                'attn_block_tkg_nki_kernel_cascaded_attention can only be enabled with attn-block-tkg-nki-kernel-enabled'
+
         if self.attn_block_tkg_nki_kernel_cache_update:
             self.kv_cache_tiling = False  # Don't do kv cache tiling when kernel does cache update.
 
@@ -405,7 +419,7 @@ class NeuronConfig:
         if self.rmsnorm_quantize_kernel_enabled:
             assert (
                 self.quantized_mlp_kernel_enabled
-            ), "quantized_mlp_kernel must be enabled to use rmsomrm_quantize_kernel!"
+            ), "quantized_mlp_kernel must be enabled to use rmsnorm_quantize_kernel!"
         self.quantize_clamp_bound = kwargs.pop("quantize_clamp_bound", float("inf"))
 
         if self.quantized or self.is_mlp_quantized():
@@ -477,6 +491,8 @@ class NeuronConfig:
         # flag to enable output tensor completion signal
         self.enable_output_completion_notifications = kwargs.pop(
             "enable_output_completion_notifications", False)
+
+        validate_attention_data_parallel(self)
 
     def _verify_quantized_config(self):
         if not self.quantized:
@@ -569,12 +585,25 @@ class MoENeuronConfig(NeuronConfig):
     ) -> None:
         self.capacity_factor = float(capacity_factor) if capacity_factor is not None else None
         self.glu_mlp = glu_mlp
+        self.glu_type = kwargs.pop("glu_type", "glu")
+        self.hidden_act_scaling_factor = kwargs.pop("hidden_act_scaling_factor", 1.)
+        self.hidden_act_bias = kwargs.pop("hidden_act_bias", 0.)
 
         self.early_expert_affinity_modulation = kwargs.pop("early_expert_affinity_modulation", False)
         self.normalize_top_k_affinities = not kwargs.pop("disable_normalize_top_k_affinities", False)
         self.fused_shared_experts = kwargs.pop("fused_shared_experts", False)
         self.shared_experts_sequence_parallel_enabled = kwargs.pop("shared_experts_sequence_parallel_enabled", False)
         self.return_expert_index = kwargs.pop("return_expert_index", False)
+        self.hybrid_sharding_config = kwargs.pop("hybrid_sharding_config", None)
+        if type(self.hybrid_sharding_config) is dict:
+            self.hybrid_sharding_config = HybridShardingConfig(
+                **self.hybrid_sharding_config
+            )
+
+        self.moe_tp_degree = kwargs.pop("moe_tp_degree", 1)
+        self.moe_ep_degree = kwargs.pop("moe_ep_degree", 1)
+        self.transpose_shared_experts_weights = kwargs.pop("transpose_shared_experts_weights", False)
+
         self.blockwise_matmul_config = kwargs.pop("blockwise_matmul_config", {})
         self.blockwise_matmul_config = BlockwiseMatmulConfig.from_kwargs(**self.blockwise_matmul_config)
 
@@ -805,6 +834,14 @@ class ChunkedPrefillConfig:
         self.kernel_q_tile_size = kwargs.pop("kernel_q_tile_size", 128)
         # kv cache len of the tile to be used by the kernel
         self.kernel_kv_tile_size = kwargs.pop("kernel_kv_tile_size", 1024)
+
+
+class HybridShardingConfig:
+    def __init__(self, **kwargs):
+        self.moe_cte_tp_degree = kwargs.pop("moe_cte_tp_degree", 1)
+        self.moe_cte_ep_degree = kwargs.pop("moe_cte_ep_degree", 1)
+        self.moe_tkg_tp_degree = kwargs.pop("moe_tkg_tp_degree", 1)
+        self.moe_tkg_ep_degree = kwargs.pop("moe_tkg_ep_degree", 1)
 
 
 def get_platform_lnc():

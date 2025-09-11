@@ -15,7 +15,8 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402;
 from neuronx_distributed_inference.modules.flashdecode.utils import get_cache_size
 from neuronx_distributed_inference.modules.kvcache.utils import dynamic_update_slice, update_cache_const_indices, fill_prefix, get_kv_shapes
 
-from neuronx_distributed_inference.modules.attention.utils import get_kv_head_indices_context_parallel_full_tp_decode, get_kv_head_indices_context_parallel_dp_decode
+from neuronx_distributed_inference.modules.attention.utils import get_kv_head_indices_context_parallel_full_tp_decode, get_kv_head_indices_context_parallel_dp_decode, get_cp8_tp8_rank_ordering
+from neuronx_distributed_inference.modules.attention.attention_process_groups import get_tp_cp_group_mesh
 from neuronx_distributed_inference.utils.distributed import split_along_dim, get_dp_rank
 
 
@@ -415,19 +416,30 @@ class KVCacheManager(nn.Module):
 
         k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer)
 
+        cte_rank_ordering = None
+        if self.neuron_config.cp_degree == 8 and self.neuron_config.tp_degree // self.neuron_config.cp_degree == 8:
+            cte_rank_ordering = get_cp8_tp8_rank_ordering(self.neuron_config.tp_degree, self.neuron_config.cp_degree)
+
         if not is_for_context_encoding and self.neuron_config.attention_dp_degree > 1:
-            dp_rank = get_dp_rank(self.global_rank.get_rank(), self.neuron_config.tp_degree // self.neuron_config.attention_dp_degree)
+            dp_rank = get_dp_rank(self.get_rank(device=seq_ids.device), self.neuron_config.tp_degree // self.neuron_config.attention_dp_degree, self.neuron_config.attention_dp_degree)
             seq_ids = split_along_dim(seq_ids, dim=0, rank=dp_rank, num_partitions=self.neuron_config.attention_dp_degree)
             position_ids = split_along_dim(position_ids, dim=0, rank=dp_rank, num_partitions=self.neuron_config.attention_dp_degree)
 
         if is_for_context_encoding:
             if self.neuron_config.cp_degree > 1 and self.neuron_config.cp_degree != self.neuron_config.attention_dp_degree:
                 # When we run CP without DP, decode will run in full TP, selectively write the heads that are used in decode
-                rank = self.global_rank.get_rank()
+                rank = self.get_rank(device=seq_ids.device)
                 if self.neuron_config.attention_dp_degree == 1:
-                    kv_head_indices = get_kv_head_indices_context_parallel_full_tp_decode(self.num_kv_head, self.neuron_config.tp_degree, self.neuron_config.cp_degree, k_cache.device)
+                    kv_head_indices = get_kv_head_indices_context_parallel_full_tp_decode(self.num_kv_head, self.neuron_config.tp_degree, self.neuron_config.cp_degree, k_cache.device, cte_rank_ordering)
                 else:
-                    kv_head_indices = get_kv_head_indices_context_parallel_dp_decode(self.num_kv_head, self.neuron_config.tp_degree, self.neuron_config.cp_degree, self.neuron_config.attention_dp_degree, k_cache.device)
+                    decode_ordering = None
+                    if self.neuron_config.attention_dp_degree == 8 and self.neuron_config.tp_degree // self.neuron_config.attention_dp_degree == 8:
+                        decode_ordering = sum(get_tp_cp_group_mesh(self.neuron_config.tp_degree, self.neuron_config.attention_dp_degree), [])
+
+                    kv_head_indices = get_kv_head_indices_context_parallel_dp_decode(self.num_kv_head, self.neuron_config.tp_degree,
+                                                                                     self.neuron_config.cp_degree, self.neuron_config.attention_dp_degree,
+                                                                                     k_cache.device, cte_rank_ordering=cte_rank_ordering,
+                                                                                     decode_rank_ordering=decode_ordering)
                 head_idx = torch.index_select(kv_head_indices, dim=0, index=rank)
                 latest_k = torch.index_select(latest_k, dim=1, index=head_idx)
                 latest_v = torch.index_select(latest_v, dim=1, index=head_idx)
@@ -553,3 +565,11 @@ class KVCacheManager(nn.Module):
             garbage_pos = self.kv_cache_batch_size + self.kv_cache_padding_size - 1  # last position
             seq_ids = torch.where(seq_ids < self.kv_cache_batch_size, seq_ids, garbage_pos)
         return seq_ids
+
+    def get_rank(self, device=torch.device("cpu")):
+        rank = self.global_rank.get_rank()
+        if self.neuron_config.attention_dp_degree == 8 and self.neuron_config.tp_degree // self.neuron_config.attention_dp_degree == 8:
+            rank_ordering = get_cp8_tp8_rank_ordering(self.neuron_config.tp_degree, self.neuron_config.attention_dp_degree, device=device)
+            return torch.index_select(rank_ordering, dim=0, index=rank)
+
+        return rank

@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +12,7 @@ from neuronx_distributed.parallel_layers.utils import get_padding_length
 from torch import Tensor, nn
 
 from neuronx_distributed_inference.modules.custom_calls import neuron_cumsum
+from neuronx_distributed_inference.modules.attention.attention_process_groups import tp_mesh_8_by_8, _fully_contiguous_tp_mesh, get_tp_cp_group_mesh
 
 weight_cache = {}
 
@@ -409,7 +410,7 @@ def neuron_scaled_dot_product_attention(
     return attn_weight @ value
 
 
-def get_context_parallel_reordered_tp_mapping(world_size, cp_degree):
+def get_context_parallel_reordered_tp_mapping(world_size, cp_degree, num_kv_heads, device=torch.device("cpu"), cte_rank_ordering=None):
     # world_size: world size
     # cp_degree: the cp degree CTE attention is running in
 
@@ -417,13 +418,35 @@ def get_context_parallel_reordered_tp_mapping(world_size, cp_degree):
     # This is done to enable running full TP decode after doing context parallel CTE
 
     # Returns a list where each index, i, is the original rank and list[i] is the new rank assuming TP decode
+    # This ordering aligns the KV heads written by CTE with how we shard weights in TKG
+
+    assert world_size >= num_kv_heads, "CP is with full TP decode is currently not supported with num_kv_heads > world_size"
+
+    if cte_rank_ordering is None:
+        cte_rank_ordering = list(range(0, world_size))
 
     tp_degree = world_size // cp_degree
+    cp_interleave_factor = max(tp_degree // num_kv_heads, 1)
 
-    return [(rank % tp_degree) * cp_degree + (rank // tp_degree) for rank in range(world_size)]
+    heads_in_cp = torch.stack(torch.arange(num_kv_heads, device=device, dtype=torch.int32).repeat_interleave(cp_interleave_factor).tensor_split(tp_degree)).repeat(cp_degree, 1)
+    heads_in_cp = torch.index_select(heads_in_cp, dim=0, index=torch.tensor(cte_rank_ordering, dtype=torch.int32, device=device))
+    heads_in_tp = torch.arange(num_kv_heads, device=device, dtype=torch.int32).repeat_interleave(world_size // num_kv_heads)
+    heads_in_tp = heads_in_tp.view(-1, 1)
+
+    output = []
+    used_indices = set()
+
+    for cp_heads_per_rank in heads_in_cp:
+        for idx, tp_head_per_rank in enumerate(heads_in_tp):
+            if idx not in used_indices and tp_head_per_rank[0] in cp_heads_per_rank:
+                output.append(idx)
+                used_indices.add(idx)
+                break
+
+    return output
 
 
-def get_kv_head_indices_context_parallel_full_tp_decode(num_kv_heads, world_size, cp_degree, device):
+def get_kv_head_indices_context_parallel_full_tp_decode(num_kv_heads, world_size, cp_degree, device, cte_rank_ordering=None):
     # world_size: world_size
     # cp_degree: the cp degree CTE attention is running in
 
@@ -433,7 +456,7 @@ def get_kv_head_indices_context_parallel_full_tp_decode(num_kv_heads, world_size
     # TP Heads: [(R0) KV0, (R2) KV1, (R1) KV2, (R3) KV3]
     # Output: [0, 1, 0, 1]
 
-    tp_ordering = get_context_parallel_reordered_tp_mapping(world_size, cp_degree)
+    tp_ordering = get_context_parallel_reordered_tp_mapping(world_size, cp_degree, num_kv_heads, device, cte_rank_ordering)
     tp_degree = world_size // cp_degree
 
     assert world_size >= num_kv_heads, "CP is with full TP decode is currently not supported with num_kv_heads > world_size"
@@ -451,10 +474,11 @@ def get_kv_head_indices_context_parallel_full_tp_decode(num_kv_heads, world_size
     return indices
 
 
-def get_context_parallel_reordered_dp_mapping(world_size, cp_degree, dp_degree):
+def get_context_parallel_reordered_dp_mapping(world_size: int, cp_degree: int, dp_degree: int, num_kv_heads: int, device: torch.device = torch.device("cpu"), cte_rank_ordering: List = None):
     # world_size: world size
     # cp_degree: the cp degree CTE attention is running in
     # dp_degree: the dp degree TKG attention is running in
+    # cte_rank_ordering: ordering of ranks used during CTE
 
     # Determines the rank ordering for the first TP group in DP i.e. ranks [0, world_size / dp] and
     # offsets the ranks dp number of times to get the entire rank ordering
@@ -465,13 +489,16 @@ def get_context_parallel_reordered_dp_mapping(world_size, cp_degree, dp_degree):
 
     dp_tp_size = world_size // dp_degree
 
-    # Currently, we don't support CP < DP degree, the reason is due to the KV cache writes, when CP < DP
+    # We don't support CP < DP degree, the reason is due to the KV cache writes, when CP < DP
     # The TP for CP is greater than the TP for DP, in prefill we only write the cache based on whether
     # those ranks operate on that batch in DP, when the TP for CP is greater, there is no guarantee that all KV
     # heads are written. When the TP for CP is lower, we know all heads will be written and can be reordered given we have enough copies.
 
+    if cte_rank_ordering is not None:
+        cte_rank_ordering = cte_rank_ordering[0:dp_tp_size]
+
     # Treat DP like we run full TP in smaller TP blocks to ensure we only reorder ranks within the TP groups
-    tp_mapping = get_context_parallel_reordered_tp_mapping(world_size // dp_degree, cp_degree // dp_degree)
+    tp_mapping = get_context_parallel_reordered_tp_mapping(dp_tp_size, cp_degree // dp_degree, num_kv_heads, device, cte_rank_ordering)
 
     # Offset all the tp mapping by the dp ranks, the above tp mapping only maps the first [0 - world_size / dp] ranks
     for dp_rank in range(dp_degree):
@@ -479,13 +506,24 @@ def get_context_parallel_reordered_dp_mapping(world_size, cp_degree, dp_degree):
         offset_tp_mapping = [rank + (dp_tp_size * dp_rank) for rank in offset_tp_mapping]
         mapping += offset_tp_mapping
 
+    # The above ordering assumes a continuous ordering in decode, when we have 8x8 that's not the case.
+    if dp_degree == 8 and dp_tp_size == 8:
+        shuffle_accounted_ordering = [-1] * world_size
+        true_ordering = sum(get_tp_cp_group_mesh(world_size, dp_degree), [])
+
+        for rank in range(0, world_size):
+            shuffle_accounted_ordering[rank] = mapping[true_ordering.index(rank)]
+
+        return shuffle_accounted_ordering
+
     return mapping
 
 
-def get_kv_head_indices_context_parallel_dp_decode(num_kv_heads, world_size, cp_degree, dp_degree, device):
+def get_kv_head_indices_context_parallel_dp_decode(num_kv_heads: int, world_size: int, cp_degree: int, dp_degree: int, device: torch.device, cte_rank_ordering: List = None, decode_rank_ordering: List = None):
     # world_size: world_size
     # cp_degree: the cp degree CTE attention is running in
     # dp_degree: the dp degree TKG attention is running in
+    # decode_rank_ordering: ordering of ranks during decode
 
     # Returns the index of the first KV head per rank wrt the context parallel KV heads per rank assuming DP decode
 
@@ -504,11 +542,15 @@ def get_kv_head_indices_context_parallel_dp_decode(num_kv_heads, world_size, cp_
 
     assert existing_cp_kv_copies >= required_dp_kv_copies, f"CP{cp_degree} with DP{dp_degree} and {num_kv_heads} KV Heads is not a supported configuration"
 
-    tp_ordering = get_context_parallel_reordered_dp_mapping(world_size, cp_degree, dp_degree)
+    tp_ordering = get_context_parallel_reordered_dp_mapping(world_size, cp_degree, dp_degree, num_kv_heads, device, cte_rank_ordering)
 
     heads_in_cp = torch.stack(torch.arange(num_kv_heads, device=device, dtype=torch.int32).repeat_interleave(cp_interleave_factor).tensor_split(cp_tp_degree)).repeat(cp_degree, 1)
     heads_in_dp = torch.stack(torch.arange(num_kv_heads, device=device, dtype=torch.int32).repeat_interleave(dp_interleave_factor).tensor_split(dp_tp_degree)).repeat(dp_degree, 1)
     heads_in_dp = torch.index_select(heads_in_dp, dim=0, index=torch.tensor(tp_ordering, dtype=torch.int32, device=device))
+
+    if decode_rank_ordering:
+        heads_in_dp = torch.index_select(heads_in_dp, dim=0, index=torch.tensor(decode_rank_ordering, dtype=torch.int32, device=device))
+
     heads_in_dp = heads_in_dp.view(-1, 1)
     mask = (heads_in_cp == heads_in_dp)
     indices = mask.int().argmax(dim=1)
@@ -609,3 +651,111 @@ def get_last_kv_window(window_size, position_ids, latest_k, latest_v):
     latest_k = torch.gather(latest_k, dim=2, index=gather_idx)
     latest_v = torch.gather(latest_v, dim=2, index=gather_idx)
     return latest_k, latest_v
+
+
+def stride_tensor(tensor: torch.tensor, dim: int, stride: int):
+    """
+    Reorders elements in a tensor along the specified dimension using stride pattern.
+
+    Takes a tensor and reorders its elements along the specified dimension
+    by grouping elements that are `step_size` apart. For example, with step_size=2,
+    elements at positions [0,2,4,...] are grouped together, followed by elements
+    at positions [1,3,5,...].
+
+    tensor: Tensor to stride
+    dim: Dimension to stride on
+    step_size: The stride length
+
+    Example:
+        tensor = torch.tensor([0, 1, 2, 3, 4, 5])
+        stride_tensor(tensor, 0, 2)
+
+        tensor([0, 2, 4, 1, 3, 5])
+    """
+    dim_size = tensor.shape[dim]
+    assert dim_size % stride == 0, f"Dimension size {dim_size} must be divisible by stride {stride}"
+
+    block_size = dim_size // stride
+    indices = (torch.arange(dim_size, device=tensor.device) % block_size) * stride + (torch.arange(dim_size, device=tensor.device) // block_size)
+
+    idx = [slice(None)] * tensor.dim()
+    idx[dim] = indices
+
+    return tensor[tuple(idx)]
+
+
+def order_strided_tensor(tensor: torch.tensor, dim: int, stride: int):
+    """
+    Restores the original order of a tensor that was previously reordered by stride_tensor.
+
+    This function is the inverse operation of `stride_tensor`. It takes a tensor whose
+    elements have been reordered along a specified dimension using a stride pattern,
+    and restores them to their original sequential order.
+
+    tensor: Tensor to stride
+    dim: Dimension to stride on
+    step_size: The stride length
+
+    Example:
+        tensor = torch.tensor([0, 2, 4, 1, 3, 5])
+        stride_tensor(tensor, 0, 2)
+
+        tensor([0, 1, 2, 3, 4, 5])
+    """
+    dim_size = tensor.shape[dim]
+    assert dim_size % stride == 0, f"Dimension size {dim_size} must be divisible by stride {stride}"
+
+    block_size = dim_size // stride
+    inverse_indices = block_size * (torch.arange(dim_size, device=tensor.device) % stride) + (torch.arange(dim_size, device=tensor.device) // stride)
+
+    idx = [slice(None)] * tensor.dim()
+    idx[dim] = inverse_indices
+
+    return tensor[tuple(idx)]
+
+
+def get_cp8_tp8_rank_ordering(world_size, cp_degree, device=torch.device("cpu")):
+    """
+    When the 8x8 mesh is being used, the TP group ranks are discontiguous. This function returns the rank ordering
+    needed to correct for the sharding such that the discontiguous ranks get the right weights.
+    """
+    non_contiguous_mesh = tp_mesh_8_by_8()
+    non_contiguous_mesh = sum(non_contiguous_mesh, [])
+
+    contiguous_mesh = _fully_contiguous_tp_mesh(world_size, cp_degree)
+    contiguous_mesh = sum(contiguous_mesh, [])
+
+    combined = dict(zip(non_contiguous_mesh, contiguous_mesh))
+
+    cte_rank_ordering = []
+    for i in range(0, world_size):
+        cte_rank_ordering.append(combined[i])
+
+    return torch.tensor(cte_rank_ordering, device=device)
+
+
+def chunk_and_reorder_tensor(tensor: torch.tensor, order: List, dim: int):
+    """
+    Split a tensor into chunks along a specified dimension and reorder them.
+    The number of chunks is defined by the length of the order specified.
+
+    Example:
+        tensor = [0, 1, 2, 3]
+        order = [1, 0]
+
+        output = [2, 3, 0, 1]
+
+    tensor (torch.Tensor): The input tensor of any dimension
+    order (list): List specifying the new ordering of chunks
+    dim (int): The dimension along which to reorder chunks (default: 0)
+    """
+    n_chunks = len(order)
+    dim_size = tensor.shape[dim]
+
+    chunk_starts = torch.tensor([int(dim_size * i / n_chunks) for i in range(n_chunks)], device=tensor.device)
+    chunk_ends = torch.tensor([int(dim_size * (i + 1) / n_chunks) for i in range(n_chunks)], device=tensor.device)
+
+    # Create indices for each chunk in the specified order
+    indices = torch.cat([torch.arange(chunk_starts[i], chunk_ends[i], device=tensor.device) for i in order])
+
+    return torch.index_select(tensor, dim, indices)

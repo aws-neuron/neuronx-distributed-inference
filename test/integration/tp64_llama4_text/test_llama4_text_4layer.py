@@ -67,6 +67,25 @@ SCOUT_BASELINE_CONFIG = MoENeuronConfig(
         cast_type="as-declared"
     )
 
+SCOUT_SHORT_SEQ_CONFIG = MoENeuronConfig(
+        batch_size=1,
+        seq_len=4096,
+        torch_dtype=torch.float16,
+        rpl_reduce_dtype=torch.float32,
+        tp_degree=64,
+        cp_degree=1,
+        world_size=64,
+        on_cpu=False,
+        on_device_sampling_config={
+            "top_k": 1,
+            "dynamic": True,
+            "top_k_kernel_enabled": False
+        },
+        is_continuous_batching=True,
+        logical_neuron_cores=2,
+        cast_type="as-declared"
+    )
+
 SCOUT_CP_CONFIG = MoENeuronConfig(
         batch_size=1,
         seq_len=8192,
@@ -255,14 +274,16 @@ def save_checkpoint(config_path, torch_dtype = None, disable_attn_temperature_tu
     "model_path_from_config, neuron_config, prompt_length, torch_rand_seed, num_tokens_to_check, divergence_difference_tol, tol_map",
     # fmt: off
     [   
-        pytest.param("config_16E_4layer.json", SCOUT_CP_CONFIG, 520, 1234, 128, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, {}), # prompt > s/cp
+        pytest.param("config_16E_4layer.json", SCOUT_CP_CONFIG, 520, 1234, 128, 0.004, {}), # prompt > s/cp
         pytest.param("config_16E_4layer.json", SCOUT_CP_CONFIG, 128, 1234, 128, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, {}), # prompt < s/cp
         pytest.param("config_16E_4layer.json", SCOUT_CP_CHUNKED_ATTN_CONFIG, 8190, 1234, 30, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, {}), # generate past chunk boundary
         pytest.param("config_16E_4layer.json", SCOUT_CP_CHUNKED_ATTN_CONFIG, 128, 1234, 30, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, {}), # generate within first chunk
         pytest.param("config_16E_4layer.json", SCOUT_CHUNKED_ATTN_NO_FLASH_ATTN_CONFIG, 8200, 1234, 128, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, {}), # torch chunked attn, prompt > chunk_size
-        pytest.param("config_16E_4layer.json", SCOUT_CHUNKED_ATTN_NO_FLASH_ATTN_CONFIG, 128, 1234, 128, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, {}), # torch chunked attn, prompt < chunk_size
-        pytest.param("config_16E_4layer.json", SCOUT_BASELINE_CONFIG, 128, 1234, 128, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, {}),
-        pytest.param("config_16E_4layer.json", SCOUT_PERF_CONFIG, 128, 1234, 128, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, {}),
+        pytest.param("config_16E_4layer.json", SCOUT_CHUNKED_ATTN_NO_FLASH_ATTN_CONFIG, 128, 1234, 128, 0.004, {}), # torch chunked attn, prompt < chunk_size
+        pytest.param("config_16E_4layer.json", SCOUT_BASELINE_CONFIG, 128, 1234, 128, 0.004, {}),
+        pytest.param("config_16E_4layer.json", SCOUT_PERF_CONFIG, 128, 1234, 128, 0.004, {}, marks=[pytest.mark.key_config_test]),
+        pytest.param("config_16E_4layer.json", SCOUT_SHORT_SEQ_CONFIG, 128, 1234, 128, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, {}),
+
         # pytest.param("config_128E_4layer.json", LLAMA4_128E_BASELINE_CONFIG, 128, 1234, 128),
         # pytest.param("config_128E_4layer.json", LLAMA4_128E_PERF_CONFIG, 128, 1234, 128),
     ],

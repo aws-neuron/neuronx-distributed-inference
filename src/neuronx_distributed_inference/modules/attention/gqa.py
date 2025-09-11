@@ -1131,10 +1131,17 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         kernel_attn_in = attention_output.permute(0, 2, 3, 1)
 
         out = torch.zeros(B, S, H, dtype=attention_output.dtype, device=attention_output.device)
+
+        # TODO: deperecate this and pass bias as None once the bias argument is available generally.
+        o_proj_kernel_kwargs = {}
+        if self.bias:
+            o_proj_kernel_kwargs["bias"] = self.o_proj.bias.unsqueeze(0)
+
         _traced_o_proj_kernel[(nc(self.logical_nc_config),)](
             active=kernel_attn_in,
             weight=self.o_proj.weight,
             out=out,
+            **o_proj_kernel_kwargs,
         )
 
         # All-reduce or reduce-scatter, depending on whether SP is enabled
@@ -1200,5 +1207,11 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         if o_proj_scale is not None:
             model_state_dict[f"{prefix}.o_proj.scale"] = o_proj_scale
             verify_scale_dimension(tensor=o_proj_weight, tensor_scale=o_proj_scale)
+
+        bias_key = f"{prefix}.o_proj.bias"
+        if self.out_proj_kernel_enabled and bias_key in model_state_dict:
+            # Kernel adds bias before the summation reduce across TP ranks.
+            # Divide the bias value by tp_degree so that it is mathematically equivalent.
+            model_state_dict[bias_key] /= self.tp_degree
 
         return True

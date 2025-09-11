@@ -24,7 +24,6 @@ class TestRegisterSnapshotHooksFromEnv:
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', '/output/path')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', 'NUMPY_IMAGES')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', '0,1,2')
-        monkeypatch.setenv('NXD_INFERENCE_SAVE_TRANSPOSED_PRIORITY_MODEL_INPUTS', 'true')
 
         mock_register = Mock()
         neuron_app.register_snapshot_hooks = mock_register
@@ -37,7 +36,6 @@ class TestRegisterSnapshotHooksFromEnv:
             output_path='/output/path',
             output_format=SnapshotOutputFormat.NUMPY_IMAGES,
             capture_at_requests=[0, 1, 2],
-            save_transposed_priority_model_inputs=True
         )
     
     def test_register_snapshot_hooks_from_env_default_transposed_inputs(self, neuron_app, monkeypatch):
@@ -46,7 +44,6 @@ class TestRegisterSnapshotHooksFromEnv:
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', '/output/path')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', 'NUMPY_PICKLE')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', '0,1,2')
-        monkeypatch.delenv('NXD_INFERENCE_SAVE_TRANSPOSED_PRIORITY_MODEL_INPUTS', raising=False)
 
         mock_register = Mock()
         neuron_app.register_snapshot_hooks = mock_register
@@ -59,7 +56,6 @@ class TestRegisterSnapshotHooksFromEnv:
             output_path='/output/path',
             output_format=SnapshotOutputFormat.NUMPY_PICKLE,
             capture_at_requests=[0, 1, 2],
-            save_transposed_priority_model_inputs=False
         )
     
     def test_register_snapshot_hooks_from_env_missing_output_path(self, neuron_app, monkeypatch):
@@ -121,7 +117,8 @@ class TestRegisterSnapshotHooks:
 
     @patch("neuronx_distributed_inference.models.application_base.ScriptModuleWrapper")
     @patch("neuronx_distributed_inference.models.application_base.get_snapshot_hook")
-    def test_register_snapshot_hooks_success(self, mock_get_snapshot_hook, mock_wrapper, neuron_app):
+    @patch("neuronx_distributed_inference.models.application_base.register_nxd_model_hook")
+    def test_register_snapshot_hooks_success(self, mock_register_hook, mock_get_snapshot_hook, mock_wrapper, neuron_app):
         """Test successful registration of snapshot hooks."""
         # Arrange
         mock_wrapper_instance1 = Mock()
@@ -132,6 +129,13 @@ class TestRegisterSnapshotHooks:
         mock_hook2 = Mock()
         mock_get_snapshot_hook.side_effect = [mock_hook1, mock_hook2]
 
+        mock_builder = Mock()
+        neuron_app._builder = mock_builder
+        neuron_app.models[0].async_mode = False
+        neuron_app.models[0].pipeline_execution = False
+        neuron_app.models[1].async_mode = False
+        neuron_app.models[1].pipeline_execution = False
+
         model1 = neuron_app.models[0].model
         model2 = neuron_app.models[1].model
         
@@ -141,7 +145,6 @@ class TestRegisterSnapshotHooks:
             output_format=SnapshotOutputFormat.NUMPY_IMAGES,
             capture_at_requests=[0, 1, 2],
             ranks=[0, 1],
-            save_transposed_priority_model_inputs=True
         )
         
         # Assert
@@ -153,8 +156,16 @@ class TestRegisterSnapshotHooks:
         
         assert mock_get_snapshot_hook.call_count == 2
         mock_get_snapshot_hook.assert_has_calls([
-            call('/test/path', SnapshotOutputFormat.NUMPY_IMAGES, [0, 1, 2], neuron_app, [0, 1], True),
-            call('/test/path', SnapshotOutputFormat.NUMPY_IMAGES, [0, 1, 2], neuron_app, [0, 1], True)
+            call('/test/path', SnapshotOutputFormat.NUMPY_IMAGES, [0, 1, 2], mock_builder, [0, 1], is_input_ranked=False),
+            call('/test/path', SnapshotOutputFormat.NUMPY_IMAGES, [0, 1, 2], mock_builder, [0, 1], is_input_ranked=False)
+        ])
+
+        assert mock_register_hook.call_count == 4
+        mock_register_hook.assert_has_calls([
+            call(mock_wrapper_instance1, "forward_async", mock_hook1),
+            call(mock_wrapper_instance1, "forward_ranked", mock_hook1),
+            call(mock_wrapper_instance2, "forward_async", mock_hook2),
+            call(mock_wrapper_instance2, "forward_ranked", mock_hook2),
         ])
         
         # Check that models are wrapped and hooks are registered
@@ -186,7 +197,8 @@ class TestUnregisterSnapshotHooks:
             app = NeuronApplicationBase.__new__(NeuronApplicationBase)
             return app
     
-    def test_unregister_snapshot_hooks_with_wrapped_models(self, neuron_app):
+    @patch("neuronx_distributed_inference.models.application_base.unregister_nxd_model_hooks")
+    def test_unregister_snapshot_hooks_with_wrapped_models(self, mock_unregister_hooks, neuron_app):
         """Test unregistering hooks when all models are wrapped."""
         # Arrange
         mock_traced_model1 = Mock()
@@ -214,8 +226,19 @@ class TestUnregisterSnapshotHooks:
         # Assert
         assert mock_model1.model == mock_traced_model1
         assert mock_model2.model == mock_traced_model2
+
+        # Verify unregister_nxd_model_hooks was called correctly for each model
+        expected_calls = [
+            call(mock_traced_model1, "forward_async"),
+            call(mock_traced_model1, "forward_ranked"),
+            call(mock_traced_model2, "forward_async"),
+            call(mock_traced_model2, "forward_ranked")
+        ]
+        mock_unregister_hooks.assert_has_calls(expected_calls, any_order=False)
+        assert mock_unregister_hooks.call_count == 4
     
-    def test_unregister_snapshot_hooks_with_non_wrapped_models(self, neuron_app):
+    @patch("neuronx_distributed_inference.models.application_base.unregister_nxd_model_hooks")
+    def test_unregister_snapshot_hooks_with_non_wrapped_models(self, mock_unregister_hooks, neuron_app):
         """Test unregistering hooks when models are not wrapped (no-op)."""
         # Arrange
         mock_traced_model1 = Mock()
@@ -237,8 +260,12 @@ class TestUnregisterSnapshotHooks:
         # Models should remain unchanged since they're not wrapped
         assert mock_model1.model == mock_traced_model1
         assert mock_model2.model == mock_traced_model2
+
+        # Verify unregister_nxd_model_hooks was NOT called since models aren't wrapped
+        mock_unregister_hooks.assert_not_called()
     
-    def test_unregister_snapshot_hooks_mixed_models(self, neuron_app):
+    @patch("neuronx_distributed_inference.models.application_base.unregister_nxd_model_hooks")
+    def test_unregister_snapshot_hooks_mixed_models(self, mock_unregister_hooks, neuron_app):
         """Test unregistering hooks with mix of wrapped and non-wrapped models."""
         # Arrange
         mock_traced_model = Mock()
@@ -261,3 +288,11 @@ class TestUnregisterSnapshotHooks:
         # Models should remain unchanged since they're not wrapped
         assert mock_model1.model == mock_traced_model
         assert mock_model2.model == mock_traced_model
+
+        # Verify unregister_nxd_model_hooks was called only for the wrapped model
+        expected_calls = [
+            call(mock_traced_model, "forward_async"),
+            call(mock_traced_model, "forward_ranked")
+        ]
+        mock_unregister_hooks.assert_has_calls(expected_calls, any_order=False)
+        assert mock_unregister_hooks.call_count == 2

@@ -120,7 +120,6 @@ class SequenceParallelTestModule(torch.nn.Module):
         else:
             index = torch.max(position_ids, dim=1, keepdim=True).indices
             index_expanded = index.unsqueeze(1).expand(self.batch_size, 1, self.hidden_size)
-        print(index_expanded)
         out = torch.gather(hidden_states, dim=1, index=index_expanded)
         return out
 

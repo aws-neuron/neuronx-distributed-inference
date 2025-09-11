@@ -1,5 +1,7 @@
 import os
+import uuid
 from functools import partial
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -11,6 +13,10 @@ from neuronx_distributed_inference.utils.testing import (
     build_function,
     build_module,
     validate_accuracy,
+    build_cpu_model,
+    _rand_interval,
+    _get_rand_weights,
+    _get_shared_checkpoint_path,
 )
 
 torch.manual_seed(0)
@@ -315,3 +321,278 @@ def test_build_module_with_multiple_example_inputs():
     ]
     with pytest.raises(ValueError, match="example_inputs must contain exactly one input"):
         build_module(module_cls, example_inputs)
+
+
+def test_build_cpu_model(monkeypatch):
+    """Test build_cpu_model creates a model and returns it with a checkpoint path."""
+    # Setup mocks
+    config = {"test_config": "value"}
+    mock_model = Mock()
+    model_cls = Mock(return_value=mock_model)
+    
+    # Mock uuid.uuid4 to return a consistent UUID
+    mock_uuid = Mock(return_value=uuid.UUID("12345678-1234-5678-1234-567812345678"))
+    monkeypatch.setattr(uuid, "uuid4", mock_uuid)
+    
+    # Mock _get_rand_weights to return the original model
+    mock_get_rand_weights = Mock(return_value=mock_model)
+    monkeypatch.setattr("neuronx_distributed_inference.utils.testing._get_rand_weights", mock_get_rand_weights)
+    
+    cpu_model, ckpt_path = build_cpu_model(model_cls, config)
+    
+    # Verify function behavior
+    model_cls.assert_called_once_with(config)
+    mock_get_rand_weights.assert_called_once()
+    assert cpu_model == mock_model
+    assert ckpt_path == "/tmp/nxd_inference/ckpt_12345678.pt"
+
+
+@pytest.mark.parametrize(
+    "low,high,dtype,shape", 
+    [
+        # Test case 1: 1D tensor with float32
+        (-5.0, 10.0, torch.float32, (100,)),
+        # Test case 2: Multi-dimensional output with float32
+        (-5.0, 10.0, torch.float32, (3, 4, 5)),
+        # Test case 3-5: Different dtypes with same shape
+        (-5.0, 10.0, torch.float16, (3, 4, 5)),
+        (-5.0, 10.0, torch.float32, (3, 4, 5)),
+        (-5.0, 10.0, torch.float64, (3, 4, 5)),
+    ]
+)
+def test_rand_interval(low, high, dtype, shape):
+    """Test _rand_interval generates values in the expected range."""
+    result = _rand_interval(low, high, dtype, *shape)
+    
+    # Check shape
+    expected_shape = torch.Size(shape) if isinstance(shape, tuple) else shape
+    assert result.shape == expected_shape, "Should return a tensor of specified shape"
+    
+    # Check range
+    assert torch.all(result >= low) and torch.all(result < high), "All values should be in range"
+    
+    # Check dtype
+    assert result.dtype == dtype, f"Should return a tensor with dtype {dtype}"
+
+@pytest.mark.parametrize(
+    "low1,high1,low2,high2", 
+    [
+        # Different distributions for different ranges
+        (0.0, 1.0, -10.0, 10.0),
+    ]
+)
+def test_rand_interval_distribution(low1, high1, low2, high2):
+    """Test that _rand_interval distributions have expected statistical properties."""
+    shape = (3, 4, 5)
+    
+    # Generate two result sets with different ranges
+    result1 = _rand_interval(low1, high1, torch.float32, *shape)
+    result2 = _rand_interval(low2, high2, torch.float32, *shape)
+    
+    # Rescale result2 to the range of result1 for comparison
+    result2_rescaled = (result2 - low2) / (high2 - low2) * (high1 - low1) + low1
+    
+    # Verify means are similar (uniform distributions should have similar statistical properties)
+    assert abs(result1.mean() - 0.5) < 0.1, "Mean should be close to the center of the range"
+    assert abs(result2_rescaled.mean() - 0.5) < 0.1, "Mean should be close to the center of the range"
+
+
+def test_get_rand_weights(monkeypatch):
+    """Test _get_rand_weights initializes model weights and saves them to a checkpoint."""
+    # Create a simple model
+    class SimpleModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight_layer = torch.nn.Linear(10, 20)
+            self.layernorm = torch.nn.LayerNorm(20)
+        
+        def forward(self, x):
+            return self.layernorm(self.weight_layer(x))
+    
+    # Mock torch.save
+    mock_save = Mock()
+    monkeypatch.setattr(torch, "save", mock_save)
+    
+    model = SimpleModel()
+    ckpt_path = "/tmp/test_weights.pt"
+    dtype = torch.float16
+    weight_range = (-1, 1)
+    bias_range = (-2, 2)
+    
+    # Call function
+    result_model = _get_rand_weights(
+        model, 
+        ckpt_path, 
+        dtype=dtype, 
+        weight_range=weight_range, 
+        bias_range=bias_range
+    )
+    
+    # Verify mock was called
+    mock_save.assert_called_once()
+    
+    # Check model properties
+    assert id(result_model) == id(model), "Should return the same model object"
+    
+    # Check weight parameters
+    for name, param in result_model.named_parameters():
+        if name.endswith("weight"):
+            # LayerNorm weights should stay in FP32 as per _get_rand_weights implementation
+            if 'layernorm' in name:
+                assert param.dtype == torch.float32, f"{name} should be kept in torch.float32"
+            else:
+                assert param.dtype == dtype, f"{name} should be converted to {dtype}"
+            assert torch.all(param >= weight_range[0]) and torch.all(param < weight_range[1]), \
+                f"{name} should be in weight range"
+        elif name.endswith("bias"):
+            # LayerNorm bias should stay in FP32 as well
+            if 'layernorm' in name:
+                assert param.dtype == torch.float32, f"{name} should be kept in torch.float32"
+            else:
+                assert param.dtype == dtype, f"{name} should be converted to {dtype}"
+            assert torch.all(param >= bias_range[0]) and torch.all(param < bias_range[1]), \
+                f"{name} should be in bias range"
+
+
+def test_get_shared_checkpoint_path(monkeypatch):
+    """Test _get_shared_checkpoint_path returns a path with expected format."""
+    # Mock
+    mock_uuid = Mock(return_value=uuid.UUID("12345678-1234-5678-1234-567812345678"))
+    monkeypatch.setattr(uuid, "uuid4", mock_uuid)
+    
+    mock_mkdir = Mock()
+    monkeypatch.setattr(Path, "mkdir", mock_mkdir)
+    
+    # Call function
+    path = _get_shared_checkpoint_path("/tmp/nxd_inference")
+    
+    # Verify results
+    assert path == "/tmp/nxd_inference/ckpt_12345678.pt", "Path should have correct format with UUID prefix"
+    mock_mkdir.assert_called_once_with(parents=True, exist_ok=True)
+
+
+def test_build_module_with_custom_checkpoint_loader(monkeypatch):
+    """Test build_module with a custom checkpoint_loader_fn."""
+    # Define a simple dummy model class directly in the test
+    class DummyModel(torch.nn.Module):
+        def __init__(self, hidden_size=32):
+            super().__init__()
+            self.linear1 = torch.nn.Linear(16, hidden_size)
+            self.activation = torch.nn.ReLU()
+            self.linear2 = torch.nn.Linear(hidden_size, 8)
+        
+        def forward(self, x):
+            x = self.activation(self.linear1(x))
+            return self.linear2(x)
+    
+    # Setup mocks
+    mock_model_builder = Mock()
+    mock_model_builder.trace.return_value = Mock()
+    mock_model_builder.add = Mock()
+    
+    mock_model_builder_cls = Mock(return_value=mock_model_builder)
+    monkeypatch.setattr("neuronx_distributed_inference.utils.testing.ModelBuilder", mock_model_builder_cls)
+    
+    mock_save_checkpoint = Mock()
+    monkeypatch.setattr("neuronx_distributed_inference.utils.testing._save_checkpoint", mock_save_checkpoint)
+    
+    # Create model instance to get correct shapes
+    dummy = DummyModel(hidden_size=32)
+    actual_state_dict = dummy.state_dict()
+    
+    # Define a custom checkpoint loader with correct key names and tensor shapes
+    custom_state_dict = {
+        'linear1.weight': torch.randn_like(actual_state_dict['linear1.weight']),
+        'linear1.bias': torch.randn_like(actual_state_dict['linear1.bias']),
+        'linear2.weight': torch.randn_like(actual_state_dict['linear2.weight']),
+        'linear2.bias': torch.randn_like(actual_state_dict['linear2.bias'])
+    }
+    
+    mock_custom_loader = Mock(return_value=custom_state_dict)
+    
+    # Create test inputs matching the model's expected input shape
+    example_inputs = [(torch.zeros((1, 16), dtype=torch.float32),)]
+    
+    # Call the function with mocked custom checkpoint loader
+    build_module(
+        DummyModel, 
+        example_inputs,
+        module_init_kwargs={"hidden_size": 32},
+        checkpoint_loader_fn=mock_custom_loader
+    )
+    
+    # Verify ModelBuilder was instantiated correctly
+    mock_model_builder_cls.assert_called_once()
+    
+    # Verify the checkpoint loader was passed to ModelBuilder
+    _, kwargs = mock_model_builder_cls.call_args
+    assert "checkpoint_loader" in kwargs
+    checkpoint_loader_fn = kwargs["checkpoint_loader"]
+    
+    # Call the checkpoint loader function that was passed to ModelBuilder
+    result = checkpoint_loader_fn()
+    
+    # Verify our mock was called exactly once
+    mock_custom_loader.assert_called_once()
+    
+    # Verify the checkpoint path argument format (exact path will contain a UUID)
+    checkpoint_path_arg = mock_custom_loader.call_args[0][0]
+    assert str(checkpoint_path_arg).startswith("/tmp/nxdi_test_"), "Checkpoint path should start with the expected prefix"
+    assert str(checkpoint_path_arg).endswith("checkpoint.pt"), "Checkpoint path should have the expected suffix"
+    
+    # Verify the result is our custom state dict
+    assert result == custom_state_dict, "Custom checkpoint loader should be used and return our state dict"
+
+
+def test_build_function_with_custom_checkpoint_loader(monkeypatch):
+    """Test build_function with a custom checkpoint_loader_fn."""
+    # Setup mocks
+    mock_model_builder = Mock()
+    mock_model_builder.trace.return_value = Mock()
+    mock_model_builder.add = Mock()
+    
+    mock_model_builder_cls = Mock(return_value=mock_model_builder)
+    monkeypatch.setattr("neuronx_distributed_inference.utils.testing.ModelBuilder", mock_model_builder_cls)
+    
+    mock_save_checkpoint = Mock()
+    monkeypatch.setattr("neuronx_distributed_inference.utils.testing._save_checkpoint", mock_save_checkpoint)
+    
+    # Define a custom state dict and create a mock checkpoint loader
+    custom_state_dict = {"function_weight": torch.tensor([2.0])}
+    mock_custom_loader = Mock(return_value=custom_state_dict)
+    
+    # Create a simple function and example inputs
+    def example_func(x):
+        return x * 2
+    
+    example_inputs = [(torch.zeros((3), dtype=torch.float32),)]
+    
+    # Call the function with mocked custom checkpoint loader
+    build_function(
+        example_func,
+        example_inputs,
+        checkpoint_loader_fn=mock_custom_loader
+    )
+
+    # Verify ModelBuilder was instantiated correctly
+    mock_model_builder_cls.assert_called_once()
+
+    # Verify the checkpoint loader was passed to ModelBuilder
+    _, kwargs = mock_model_builder_cls.call_args
+    assert "checkpoint_loader" in kwargs
+    checkpoint_loader_fn = kwargs["checkpoint_loader"]
+
+    # Call the checkpoint loader function that was passed to ModelBuilder
+    result = checkpoint_loader_fn()
+
+    # Verify our mock was called exactly once
+    mock_custom_loader.assert_called_once()
+
+    # Verify the checkpoint path argument format (exact path will contain a UUID)
+    checkpoint_path_arg = mock_custom_loader.call_args[0][0]
+    assert str(checkpoint_path_arg).startswith(
+        "/tmp/nxdi_test_"), "Checkpoint path should start with the expected prefix"
+    assert str(checkpoint_path_arg).endswith("checkpoint.pt"), "Checkpoint path should have the expected suffix"
+
+    # Verify the result is our custom state dict
+    assert result == custom_state_dict, "Custom checkpoint loader should be used and return our state dict"

@@ -18,7 +18,7 @@ class DataParallelKVCacheManager(KVCacheManager):
         garbage_pos = self.kv_cache_batch_size + self.kv_cache_padding_size - 1
 
         dp_rank = torch.div(
-            self.global_rank.get_rank(),
+            self.get_rank(device=seq_ids.device),
             self.config.neuron_config.tp_degree // self.config.neuron_config.attention_dp_degree,
             rounding_mode="floor",
         ).to(torch.int32)

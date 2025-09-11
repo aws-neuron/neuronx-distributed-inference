@@ -142,3 +142,115 @@ def test_convert_input_dict_to_ordered_tuple():
 
     for i in range(5, 22):
         assert mock_args[i].numel() == 0
+
+
+def test_select_buckets_for_padding_length():
+    batch_size = 4
+    context_encoding_buckets = [2048, 4096, 8192]
+    token_generation_buckets = [512, 1024, 8192]
+    mock_model = generate_mock_llama4_scout(batch_size=batch_size,
+                                            seq_len=8192,
+                                            context_encoding_buckets=context_encoding_buckets,
+                                            token_generation_buckets=token_generation_buckets)
+
+    # Test context encoding case
+    position_ids = torch.arange(1024, dtype=torch.int32).repeat(batch_size, 1)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    assert selected_buckets == context_encoding_buckets
+
+    # Test token generation case
+    position_ids = torch.tensor([[1], [2], [3], [4]])
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    assert selected_buckets == token_generation_buckets
+
+    # Speculative decoding case
+    speculation_len = 5
+    position_ids = torch.arange(1, 1 + speculation_len, dtype=torch.int32).repeat(batch_size, 1)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    assert selected_buckets == token_generation_buckets
+
+
+def test_context_encoding_padding_length():
+    batch_size = 4
+    mock_model = generate_mock_llama4_scout(batch_size=batch_size,
+                                            seq_len=16384,
+                                            context_encoding_buckets=[1024, 2048, 4096, 8192, 16384],
+                                            token_generation_buckets=[64, 128, 256, 512, 16384])
+
+    position_ids = torch.arange(2, dtype=torch.int32).repeat(batch_size, 1)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 1024
+
+    position_ids = position_ids = torch.arange(513, dtype=torch.int32).repeat(batch_size, 1)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 1024
+
+    position_ids = torch.arange(2048, dtype=torch.int32).repeat(batch_size, 1)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 2048
+
+    position_ids = torch.arange(2049, dtype=torch.int32).repeat(batch_size, 1)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 4096
+
+    position_ids = torch.arange(4096, dtype=torch.int32).repeat(batch_size, 1)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 4096
+
+    position_ids = torch.arange(16384, dtype=torch.int32).repeat(batch_size, 1)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 16384
+
+    position_ids = torch.arange(16385, dtype=torch.int32).repeat(batch_size, 1)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    with pytest.raises(ValueError):
+        pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+
+
+def test_token_generation_padding_length():
+    mock_model = generate_mock_llama4_scout(batch_size=4,
+                                            seq_len=16384,
+                                            context_encoding_buckets=[1024, 2048, 4096, 8192, 16384],
+                                            token_generation_buckets=[64, 128, 256, 512, 1024, 16384])
+
+
+    position_ids = torch.tensor([[1], [2], [3], [4]], dtype=torch.int32)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 64
+
+    position_ids = torch.tensor([[64], [1], [1], [1]], dtype=torch.int32)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 128
+
+    position_ids = torch.tensor([[1], [255], [1], [1]], dtype=torch.int32)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 256
+
+    position_ids = torch.tensor([[1], [256], [1], [1]], dtype=torch.int32)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 512
+
+    position_ids = torch.tensor([[256], [511], [512], [256]], dtype=torch.int32)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 1024
+
+    position_ids = torch.tensor([[1], [72], [192], [3456]], dtype=torch.int32)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)
+    assert pad_limit == 16384
+
+    position_ids = torch.tensor([[1], [72], [192], [16384]], dtype=torch.int32)
+    selected_buckets = mock_model._select_buckets_for_padding_length(position_ids)
+    with pytest.raises(ValueError):
+        pad_limit = mock_model.get_padding_length(selected_buckets, position_ids)

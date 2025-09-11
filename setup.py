@@ -39,6 +39,7 @@ setup(
     package_data={"": []},
     install_requires=[
         "neuronx_distributed",
+        "torch_neuronx>=2.5",
         "transformers==4.51.*",
         "huggingface-hub",
         "sentencepiece",

@@ -6,9 +6,10 @@ import torch
 
 from collections import defaultdict
 from enum import Enum
-from typing import Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
-from neuronx_distributed.trace.hlo_utils import get_input_order, get_wlt_map, read_hlo, read_metaneff
+from neuronx_distributed.trace import ModelBuilder
+from neuronx_distributed.trace.hlo_utils import read_metaneff
 from torch_neuronx.proto import metaneff_pb2
 
 
@@ -87,9 +88,9 @@ def get_snapshot_hook(
     output_path: str,
     output_format: SnapshotOutputFormat,
     capture_at_requests: List[int],
-    app_model,
-    ranks: List[int] = [0],
-    save_transposed_priority_model_inputs: bool = False,
+    model_builder: ModelBuilder,
+    ranks: Optional[List[int]] = None,
+    is_input_ranked: bool = False,
 ):
     """
     Creates a forward hook that saves input snapshots.
@@ -109,21 +110,30 @@ def get_snapshot_hook(
         capture_at_requests: The request numbers at which this hook captures input snapshots for
             each submodel bucket. For example, [0] means to capture the first request to each
             submodel bucket.
-        app_model: The NeuronApplicationBase model.
+        model_builder: The ModelBuilder instance used to compile the model.
         ranks: The list of ranks to snapshot. Each rank is a separate NeuronCore device.
             Defauls to [0], which means to capture the snapshot for the rank0 device.
-        save_transposed_priority_model_inputs: Whether to save the transposed inputs for the
-            priority model, which means to apply the priority model's transposed layout to its
-            own inputs. When this is enabled, the snapshot includes two copies of the priority
-            model inputs: one default (which matches the HLO), and one transposed (which
-            matches the NEFF). The transposed inputs are saved in a subfolder named "transposed_inputs".
+        is_input_ranked: Whether the first input arg is a list of ranked inputs. Set this to true
+            when you create a snapshot hook for a model that uses async or pipeline execution.
+            These execution modes use inputs that are on-device. To capture them, the hook moves the
+            inputs to CPU.
     """
+    if ranks is None:
+        ranks = [0]
+
     submodel_bucket_request_counts: Dict[str, Dict[int, int]] = {}
 
     def snapshot_hook(traced_model, args, output):
         """
         Capture arguments, states, and weights.
         """
+        if is_input_ranked:
+            # When input is ranked, the first arg contains the ranked input, which is a input list
+            # where each index is a rank. Therefore, args[0][0] retrieves the first rank's input.
+            # TODO: Add support to capture all ranks.
+            assert ranks == [0], "Ranked input snapshots only supports rank=0 currently"
+            args = args[0][0]
+
         model_name, bucket_idx = traced_model.nxd_model.router(args)
         if model_name not in submodel_bucket_request_counts:
             submodel_bucket_request_counts[model_name] = defaultdict(int)
@@ -133,66 +143,44 @@ def get_snapshot_hook(
         if request_idx not in capture_at_requests:
             return
 
-        is_priority_model = _is_priority_model(app_model, model_name, bucket_idx)
         all_rank_tensors = _get_all_input_tensors(
-            app_model,
+            model_builder,
             traced_model,
             model_name,
             bucket_idx,
             args,
             ranks,
-            apply_wlt=not is_priority_model,
         )
         for rank, rank_tensors in enumerate(all_rank_tensors):
             base_path = os.path.join(output_path, model_name, f"_tp0_bk{bucket_idx}", f"request{request_idx}")
             _save_tensors(rank_tensors, base_path, output_format, rank)
         logger.info(f"Saved input snapshot to {base_path}")
 
-        if is_priority_model and save_transposed_priority_model_inputs:
-            # Save an extra copy of the priority model inputs with layout optimization applied.
-            all_rank_tensors = _get_all_input_tensors(
-                app_model,
-                traced_model,
-                model_name,
-                bucket_idx,
-                args,
-                ranks,
-                apply_wlt=True,
-            )
-            for rank, rank_tensors in enumerate(all_rank_tensors):
-                base_path = os.path.join(
-                    output_path,
-                    model_name,
-                    f"_tp0_bk{bucket_idx}",
-                    f"request{request_idx}",
-                    "transposed_inputs",
-                )
-                _save_tensors(rank_tensors, base_path, output_format, rank)
-            logger.info(f"Saved optimized priority model input snapshot to {base_path}")
-
     return snapshot_hook
 
 
-def _get_all_input_tensors(app_model, traced_model, model_name, bucket_idx, input_args, ranks, apply_wlt):
+def _get_all_input_tensors(model_builder, traced_model, model_name, bucket_idx, input_args, ranks):
     all_rank_tensors = []
     flattener = getattr(traced_model.nxd_model.flattener_map, model_name)
-    input_tensors = flattener(input_args)
+    input_tensors = [input.to("cpu") for input in flattener(input_args)]
     for rank in ranks:
         state_tensors = [state.to("cpu") for state in traced_model.nxd_model.state[rank].values()]
         weights_dict = {key: weights.to("cpu") for key, weights in traced_model.nxd_model.weights[rank].items()}
-        weights_tensors = _get_weights_tensors(app_model, weights_dict, apply_wlt, model_name, bucket_idx)
+        weights_tensors = _get_weights_tensors(model_builder, weights_dict, model_name, bucket_idx)
         rank_tensors = input_tensors + state_tensors + weights_tensors
+
+        # Filter out empty tensors.
+        rank_tensors = [tensor for tensor in rank_tensors if tensor.shape != ()]
         all_rank_tensors.append(rank_tensors)
     return all_rank_tensors
 
 
-def _get_weights_tensors(app_model, rank_weights, apply_wlt, model_name, bucket_idx):
-    # The model weights need to be transformed to match the compiled model inputs.
+def _get_weights_tensors(model_builder, rank_weights, model_name, bucket_idx):
+    # The model weights need to be filtered/reordered to match the compiled model inputs.
     # This process requires information from the artifacts in the compiler workdir,
     # which means that the compiler workdir must be present to capture input snapshots.
-    # TODO: Update NxDModel to include info necessary to transform inputs on CPU
+    # TODO: Update NxDModel to include info necessary to filter/reorder inputs on CPU
     #       so snapshot doesn't depend on compiler workdir being present.
-    model_builder = app_model.get_builder()
     assert os.path.exists(model_builder.compiler_workdir), (
         "Unable to find compiler workdir. "
         "To create weights for a snapshot, the model's compiler workdir must be available."
@@ -210,34 +198,8 @@ def _get_weights_tensors(app_model, rank_weights, apply_wlt, model_name, bucket_
         if input.type == metaneff_pb2.MetaTensor.Type.INPUT_WEIGHT
     ]
 
-    if apply_wlt:
-        layout_opt_hlo_path = os.path.join(layout_opt_path, "model/graph.hlo")
-        layout_opt_metaneff_path = os.path.join(layout_opt_path, "metaneff")
-        wlt_metaneff = read_metaneff(layout_opt_metaneff_path)
-        checkpoint_keys, _ = get_input_order(wlt_metaneff)
-        _apply_weight_layout_transformation(rank_weights, layout_opt_hlo_path, checkpoint_keys)
-
     # Return weight tensors in the correct order.
     return [rank_weights[key] for key in weight_input_keys]
-
-
-def _is_priority_model(app_model, model_name, bucket_idx):
-    for model in app_model.models:
-        if model.tag == model_name and bucket_idx == model.priority_model_idx:
-            return True
-    return False
-
-
-def _apply_weight_layout_transformation(checkpoint, layout_opt_hlo_path, checkpoint_keys):
-    wlt_hlo = read_hlo(layout_opt_hlo_path)
-    wlt_map = get_wlt_map(wlt_hlo)
-
-    for idx, key in enumerate(checkpoint_keys):
-        if idx in wlt_map:
-            transform = wlt_map[idx]
-            prev_shape = checkpoint[key].shape
-            checkpoint[key] = transform(checkpoint[key])
-            logger.debug(f"Transformed {key} from {prev_shape} to {checkpoint[key].shape}")
 
 
 def _save_tensors(tensors, base_path, output_format, rank):
@@ -274,3 +236,43 @@ def _to_numpy(tensor):
 def _dump_pickle(file_path, obj):
     with open(file_path, "wb") as f:
         pickle.dump(obj, f)
+
+
+_original_func_map: Dict[Any, Dict[str, Callable]] = defaultdict(dict)
+
+
+def register_nxd_model_hook(traced_model, func_name, hook):
+    """
+    Registers a hook for a function on the given traced model's NxDModel.
+
+    Args:
+        traced_model: The traced model to update.
+        func_name: The name of the function to hook into.
+        hook: The hook function to add.
+    """
+    nxd_model = traced_model.nxd_model
+    assert hasattr(nxd_model, func_name), f"nxd_model has no function named {func_name}"
+    func = getattr(nxd_model, func_name)
+
+    def wrapped_func(*args, **kwargs):
+        output = func(*args, **kwargs)
+        hook(traced_model, args, output)
+        return output
+
+    setattr(nxd_model, func_name, wrapped_func)
+    _original_func_map[nxd_model][func_name] = func
+
+
+def unregister_nxd_model_hooks(traced_model, func_name):
+    """
+    Unegisters hooks for a function on the given traced model's NxDModel.
+
+    Args:
+        traced_model: The traced model to update.
+        func_name: The name of the function to restore.
+    """
+    nxd_model = traced_model.nxd_model
+    assert hasattr(nxd_model, func_name), f"nxd_model has no function named {func_name}"
+    if nxd_model in _original_func_map and func_name in _original_func_map[nxd_model]:
+        setattr(nxd_model, func_name, _original_func_map[nxd_model][func_name])
+        del _original_func_map[nxd_model][func_name]

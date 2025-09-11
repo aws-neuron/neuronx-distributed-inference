@@ -451,4 +451,5 @@ def test_invalid_cp_dp_configuration():
         NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 2, batch_size = 2, ctx_batch_size = 1, tkg_batch_size = 2) # CB = True not set
         NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 2, batch_size = 2, ctx_batch_size = 2, tkg_batch_size = 5, is_continuous_batching = True) # tkg batch size % dp != 0
         NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 3, batch_size = 3, ctx_batch_size = 1, tkg_batch_size = 3, is_continuous_batching = True) # cp % dp != 0
+        NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 4, batch_size = 2, ctx_batch_size = 1, tkg_batch_size = 2, is_continuous_batching = True, attn_block_tkg_nki_kernel_cache_update=True) # attn_block_tkg_nki_kernel_cache_update set to True
 

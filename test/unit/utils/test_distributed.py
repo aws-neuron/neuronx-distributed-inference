@@ -5,7 +5,8 @@ from unittest.mock import patch, MagicMock
 
 from neuronx_distributed_inference.utils.distributed import (
     get_init_world_size, get_init_rank, get_tp_group, 
-    get_dp_rank_spmd, get_cp_rank, get_dp_rank, split_along_dim
+    get_dp_rank_spmd, get_cp_rank, get_dp_rank, split_along_dim,
+    get_rank_8_by_8,
 )
 
 # Tests for environment variable functions
@@ -177,3 +178,16 @@ def test_split_along_dim_3d():
 def test_split_along_dim_none_tensor():
     result = split_along_dim(None, 0, 0, 2)
     assert result is None
+
+def test_get_rank_8_by_8():
+    tp = 8
+
+    cp_8_by_8_mesh = [0, 1, 2, 3, 12, 13, 14, 15, 4, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 28, 29, 30, 31, 20, 21, 22, 23, 24, 25, 26, 27, 32, 33, 34, 35, 44, 45, 46, 47, 36, 37, 38, 39, 40, 41, 42, 43, 48, 49, 50, 51, 60, 61, 62, 63, 52, 53, 54, 55, 56, 57, 58, 59]
+    
+    expected_result = sum([[i] * tp for i in range(tp)], [])
+    actual_result = []
+
+    for rank in cp_8_by_8_mesh:
+        actual_result.append(get_rank_8_by_8(rank, tp))
+    
+    assert actual_result == expected_result

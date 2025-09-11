@@ -1,12 +1,16 @@
 # test_simple_pipeline.py
 
+import gc
 import logging
 import os
+import time
+from typing import List, Tuple
+
+import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
 from safetensors.torch import save_file
-from typing import List, Tuple
+from torch import nn
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
@@ -19,6 +23,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 BASE_DIR = "/tmp/simple_pipeline_test/"
+
 
 def create_directories():
     directories = [
@@ -33,11 +38,12 @@ def create_directories():
         os.path.join(BASE_DIR, "compiled/model2"),
         os.path.join(BASE_DIR, "compiled/model3"),
         os.path.join(BASE_DIR, "compiled/model4"),
-        os.path.join(BASE_DIR, "compiled/model5")
+        os.path.join(BASE_DIR, "compiled/model5"),
     ]
     for directory in directories:
         os.makedirs(directory, exist_ok=True)
-        
+
+
 # Simple Models
 class Model1(NeuronEncoderBase):
     """
@@ -46,12 +52,14 @@ class Model1(NeuronEncoderBase):
     - Transforms it to hidden representation [batch_size, hidden_size=128]
     - Output is distributed across ranks (tp_degree=2) for parallel processing
     """
+
     def __init__(self, config: InferenceConfig):
         super().__init__(config)
         self.linear = nn.Linear(config.input_size, config.hidden_size, bias=False)
 
     def forward(self, x):
         return self.linear(x)
+
 
 class Model2(NeuronEncoderBase):
     """
@@ -60,12 +68,14 @@ class Model2(NeuronEncoderBase):
     - Transforms it to final output [batch_size, output_size=32]
     - Demonstrates simple pipeline connection: Model1 -> Model2
     """
+
     def __init__(self, config: InferenceConfig):
         super().__init__(config)
         self.linear = nn.Linear(config.hidden_size, config.output_size, bias=False)
 
     def forward(self, x):
         return self.linear(x)
+
 
 class Model3(NeuronEncoderBase):
     """
@@ -76,13 +86,15 @@ class Model3(NeuronEncoderBase):
     - Processes both inputs separately and combines results
     - Demonstrates handling mixed ranked/non-ranked inputs in pipeline
     """
+
     def __init__(self, config: InferenceConfig):
         super().__init__(config)
         self.linear1 = nn.Linear(config.hidden_size, config.output_size, bias=False)
         self.linear2 = nn.Linear(config.aux_size, config.output_size, bias=False)
-        
+
     def forward(self, x1, x2):
         return self.linear1(x1) + self.linear2(x2)
+
 
 class Model4(NeuronEncoderBase):
     """
@@ -93,18 +105,19 @@ class Model4(NeuronEncoderBase):
     3. CPU input2 [batch_size, aux_size2=24]
     4. Ranked input2 from Model2 [batch_size, output_size=32]
     """
+
     def __init__(self, config: InferenceConfig):
         super().__init__(config)
         self.linear1 = nn.Linear(config.aux_size1, config.final_size, bias=False)
         self.linear2 = nn.Linear(config.hidden_size, config.final_size, bias=False)
         self.linear3 = nn.Linear(config.aux_size2, config.final_size, bias=False)
         self.linear4 = nn.Linear(config.output_size, config.final_size, bias=False)
-        
+
     def forward(self, cpu1, ranked1, cpu2, ranked2):
-        return (self.linear1(cpu1) + 
-                self.linear2(ranked1) + 
-                self.linear3(cpu2) + 
-                self.linear4(ranked2))
+        return (
+            self.linear1(cpu1) + self.linear2(ranked1) + self.linear3(cpu2) + self.linear4(ranked2)
+        )
+
 
 class Model5(NeuronEncoderBase):
     """
@@ -113,18 +126,20 @@ class Model5(NeuronEncoderBase):
     - Applies non-linear transformation
     - Demonstrates non-pipelined execution
     """
+
     def __init__(self, config: InferenceConfig):
         super().__init__(config)
         self.linear = nn.Linear(config.final_size, config.post_size, bias=False)
-        
+
     def forward(self, x):
         # Add non-linear transformation
         x = F.relu(x)
         return self.linear(x)
-        
+
 
 class Model1Wrapper(ModelWrapper):
     """ModelWrapper for Model1 which transforms input through a linear layer."""
+
     def __init__(
         self,
         config: InferenceConfig,
@@ -137,11 +152,11 @@ class Model1Wrapper(ModelWrapper):
         model_init_kwargs={},
     ) -> None:
         super().__init__(
-            config, 
-            model_cls, 
-            tag, 
-            compiler_args, 
-            priority_model_idx, 
+            config,
+            model_cls,
+            tag,
+            compiler_args,
+            priority_model_idx,
             pipeline_execution,
             return_ranked_to_cpu,
             model_init_kwargs,
@@ -149,10 +164,7 @@ class Model1Wrapper(ModelWrapper):
         self.bucket_config = None
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
-        x = torch.ones([
-            self.neuron_config.batch_size,
-            self.config.input_size
-        ])
+        x = torch.ones([self.neuron_config.batch_size, self.config.input_size])
         inputs = [(x,)]
         return inputs
 
@@ -169,9 +181,11 @@ class Model1Wrapper(ModelWrapper):
             args = self.convert_int64_to_int32(*args)
         output = self._forward(*args)
         return output
+
 
 class Model2Wrapper(ModelWrapper):
     """ModelWrapper for Model2 which transforms hidden states."""
+
     def __init__(
         self,
         config: InferenceConfig,
@@ -184,11 +198,11 @@ class Model2Wrapper(ModelWrapper):
         model_init_kwargs={},
     ) -> None:
         super().__init__(
-            config, 
-            model_cls, 
-            tag, 
-            compiler_args, 
-            priority_model_idx, 
+            config,
+            model_cls,
+            tag,
+            compiler_args,
+            priority_model_idx,
             pipeline_execution,
             return_ranked_to_cpu,
             model_init_kwargs,
@@ -196,10 +210,7 @@ class Model2Wrapper(ModelWrapper):
         self.bucket_config = None
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
-        x = torch.ones([
-            self.neuron_config.batch_size,
-            self.config.hidden_size
-        ])
+        x = torch.ones([self.neuron_config.batch_size, self.config.hidden_size])
         inputs = [(x,)]
         return inputs
 
@@ -217,8 +228,10 @@ class Model2Wrapper(ModelWrapper):
         output = self._forward(*args)
         return output
 
+
 class Model3Wrapper(ModelWrapper):
     """ModelWrapper for Model3 which handles mixed ranked/non-ranked inputs."""
+
     def __init__(
         self,
         config: InferenceConfig,
@@ -231,11 +244,11 @@ class Model3Wrapper(ModelWrapper):
         model_init_kwargs={},
     ) -> None:
         super().__init__(
-            config, 
-            model_cls, 
-            tag, 
-            compiler_args, 
-            priority_model_idx, 
+            config,
+            model_cls,
+            tag,
+            compiler_args,
+            priority_model_idx,
             pipeline_execution,
             return_ranked_to_cpu,
             model_init_kwargs,
@@ -243,14 +256,8 @@ class Model3Wrapper(ModelWrapper):
         self.bucket_config = None
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
-        x1 = torch.ones([
-            self.neuron_config.batch_size,
-            self.config.hidden_size
-        ])
-        x2 = torch.ones([
-            self.neuron_config.batch_size,
-            self.config.aux_size
-        ])
+        x1 = torch.ones([self.neuron_config.batch_size, self.config.hidden_size])
+        x2 = torch.ones([self.neuron_config.batch_size, self.config.aux_size])
         inputs = [(x1, x2)]
         return inputs
 
@@ -268,8 +275,10 @@ class Model3Wrapper(ModelWrapper):
         output = self._forward(*args)
         return output
 
+
 class Model4Wrapper(ModelWrapper):
     """ModelWrapper for Model4 which handles multiple alternating CPU and ranked inputs."""
+
     def __init__(
         self,
         config: InferenceConfig,
@@ -282,11 +291,11 @@ class Model4Wrapper(ModelWrapper):
         model_init_kwargs={},
     ) -> None:
         super().__init__(
-            config, 
-            model_cls, 
-            tag, 
-            compiler_args, 
-            priority_model_idx, 
+            config,
+            model_cls,
+            tag,
+            compiler_args,
+            priority_model_idx,
             pipeline_execution,
             return_ranked_to_cpu,
             model_init_kwargs,
@@ -294,22 +303,10 @@ class Model4Wrapper(ModelWrapper):
         self.bucket_config = None
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
-        cpu1 = torch.ones([
-            self.neuron_config.batch_size,
-            self.config.aux_size1
-        ])
-        ranked1 = torch.ones([
-            self.neuron_config.batch_size,
-            self.config.hidden_size
-        ])
-        cpu2 = torch.ones([
-            self.neuron_config.batch_size,
-            self.config.aux_size2
-        ])
-        ranked2 = torch.ones([
-            self.neuron_config.batch_size,
-            self.config.output_size
-        ])
+        cpu1 = torch.ones([self.neuron_config.batch_size, self.config.aux_size1])
+        ranked1 = torch.ones([self.neuron_config.batch_size, self.config.hidden_size])
+        cpu2 = torch.ones([self.neuron_config.batch_size, self.config.aux_size2])
+        ranked2 = torch.ones([self.neuron_config.batch_size, self.config.output_size])
         inputs = [(cpu1, ranked1, cpu2, ranked2)]
         return inputs
 
@@ -327,8 +324,10 @@ class Model4Wrapper(ModelWrapper):
         output = self._forward(*args)
         return output
 
+
 class Model5Wrapper(ModelWrapper):
     """ModelWrapper for Model5 with pipeline_execution=False"""
+
     def __init__(
         self,
         config: InferenceConfig,
@@ -340,21 +339,18 @@ class Model5Wrapper(ModelWrapper):
         model_init_kwargs={},
     ) -> None:
         super().__init__(
-            config, 
-            model_cls, 
-            tag, 
-            compiler_args, 
-            priority_model_idx, 
+            config,
+            model_cls,
+            tag,
+            compiler_args,
+            priority_model_idx,
             pipeline_execution,
             model_init_kwargs,
         )
         self.bucket_config = None
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
-        x = torch.ones([
-            self.neuron_config.batch_size,
-            self.config.final_size
-        ])
+        x = torch.ones([self.neuron_config.batch_size, self.config.final_size])
         inputs = [(x,)]
         return inputs
 
@@ -372,48 +368,42 @@ class Model5Wrapper(ModelWrapper):
         output = self._forward(*args)
         return output
 
-    
+
 class Model1App(NeuronApplicationBase):
     def __init__(self, model_path: str, config: InferenceConfig):
         super().__init__(model_path=model_path, config=config)
         self.model = Model1Wrapper(
-            config=config,
-            model_cls=Model1,
-            pipeline_execution=True,
-            tag="model1"
+            config=config, model_cls=Model1, pipeline_execution=True, tag="model1"
         )
         self.models.append(self.model)
-    
+
     def forward(self, x):
         return self.models[0].forward(x)
+
 
 class Model2App(NeuronApplicationBase):
     def __init__(self, model_path: str, config: InferenceConfig):
         super().__init__(model_path=model_path, config=config)
         self.model = Model2Wrapper(
-            config=config,
-            model_cls=Model2,
-            pipeline_execution=True,
-            tag="model2"
+            config=config, model_cls=Model2, pipeline_execution=True, tag="model2"
         )
         self.models.append(self.model)
-    
+
     def forward(self, x):
         return self.models[0].forward(x)
+
 
 class Model3App(NeuronApplicationBase):
     def __init__(self, model_path: str, config: InferenceConfig):
         super().__init__(model_path=model_path, config=config)
         self.model = Model3Wrapper(
-            config=config,
-            model_cls=Model3,
-            pipeline_execution=True,
-            tag="model3"
+            config=config, model_cls=Model3, pipeline_execution=True, tag="model3"
         )
         self.models.append(self.model)
-    
+
     def forward(self, x1, x2):
         return self.models[0].forward(x1, x2)
+
 
 class Model4App(NeuronApplicationBase):
     def __init__(self, model_path: str, config: InferenceConfig):
@@ -423,13 +413,13 @@ class Model4App(NeuronApplicationBase):
             model_cls=Model4,
             pipeline_execution=True,
             return_ranked_to_cpu=True,
-            tag="model4"
+            tag="model4",
         )
         self.models.append(self.model)
-    
+
     def forward(self, cpu1, ranked1, cpu2, ranked2):
         return self.models[0].forward(cpu1, ranked1, cpu2, ranked2)
-    
+
 
 class Model5App(NeuronApplicationBase):
     def __init__(self, model_path: str, config: InferenceConfig):
@@ -438,13 +428,14 @@ class Model5App(NeuronApplicationBase):
             config=config,
             model_cls=Model5,
             pipeline_execution=False,  # Set pipeline execution to False
-            tag="model5"
+            tag="model5",
         )
         self.models.append(self.model)
-    
+
     def forward(self, x):
         return self.models[0].forward(x)
-    
+
+
 class SimplePipeline(nn.Module):
     """
         Complete Pipeline Architecture:
@@ -467,9 +458,15 @@ class SimplePipeline(nn.Module):
         [CPU]   : Tensor on CPU
         [Neuron]: Tensor on Neuron device
     """
-    def __init__(self, config1: InferenceConfig, config2: InferenceConfig, 
-                 config3: InferenceConfig, config4: InferenceConfig,
-                 config5: InferenceConfig):  # Add config5
+
+    def __init__(
+        self,
+        config1: InferenceConfig,
+        config2: InferenceConfig,
+        config3: InferenceConfig,
+        config4: InferenceConfig,
+        config5: InferenceConfig,
+    ):  # Add config5
         super().__init__()
         self.model1_path = os.path.join(BASE_DIR, "model1")
         self.model2_path = os.path.join(BASE_DIR, "model2")
@@ -482,24 +479,24 @@ class SimplePipeline(nn.Module):
         self.model3_app = Model3App(self.model3_path, config3)
         self.model4_app = Model4App(self.model4_path, config4)
         self.model5_app = Model5App(self.model5_path, config5)
-        
+
         self.config1 = config1
         self.config2 = config2
         self.config3 = config3
         self.config4 = config4
         self.config5 = config5
 
-
     def compile_and_load(self, compiled_path):
-        for app, name in [(self.model1_app, "model1"), 
-                         (self.model2_app, "model2"),
-                         (self.model3_app, "model3"),
-                         (self.model4_app, "model4"),
-                         (self.model5_app, "model5")]:
+        for app, name in [
+            (self.model1_app, "model1"),
+            (self.model2_app, "model2"),
+            (self.model3_app, "model3"),
+            (self.model4_app, "model4"),
+            (self.model5_app, "model5"),
+        ]:
             app.compile(os.path.join(compiled_path, name))
             app.load(os.path.join(compiled_path, name))
-        
-        
+
     def forward(self, x, aux_input1, aux_input2):
         # First stage: transform input
         model1_output = self.model1_app.forward(x)
@@ -507,44 +504,41 @@ class SimplePipeline(nn.Module):
         # Second stage: parallel branches
         model2_output = self.model2_app.forward(model1_output)
         model3_output = self.model3_app.forward(model1_output, aux_input1)
-        
+
         # Third stage: combine multiple inputs
         model4_output = self.model4_app.forward(
-            aux_input1,
-            model1_output,
-            aux_input2,
-            model2_output
+            aux_input1, model1_output, aux_input2, model2_output
         )
-        
+
         model4_output_cpu = model4_output
         model5_output = self.model5_app.forward(model4_output_cpu)
-        
+
         return model2_output, model3_output, model4_output, model5_output
-    
+
 
 def test_pipeline():
     """Test the complete pipeline with all models."""
     # Create all necessary directories
     create_directories()
-    
+
     # Configs for all models
     config1 = InferenceConfig(
         NeuronConfig(batch_size=1, torch_dtype=torch.float32, tp_degree=2),
         input_size=64,
-        hidden_size=128
+        hidden_size=128,
     )
-    
+
     config2 = InferenceConfig(
         NeuronConfig(batch_size=1, torch_dtype=torch.float32, tp_degree=2),
         hidden_size=128,
-        output_size=32
+        output_size=32,
     )
-    
+
     config3 = InferenceConfig(
         NeuronConfig(batch_size=1, torch_dtype=torch.float32, tp_degree=2),
         hidden_size=128,
         aux_size=16,
-        output_size=32
+        output_size=32,
     )
 
     config4 = InferenceConfig(
@@ -553,13 +547,13 @@ def test_pipeline():
         output_size=32,
         aux_size1=16,
         aux_size2=24,
-        final_size=48
+        final_size=48,
     )
 
     config5 = InferenceConfig(
         NeuronConfig(batch_size=1, torch_dtype=torch.float32, tp_degree=2),
         final_size=48,
-        post_size=24  # New output size after post-processing
+        post_size=24,  # New output size after post-processing
     )
 
     # Create CPU models
@@ -568,66 +562,73 @@ def test_pipeline():
     cpu_model3 = Model3(config3)
     cpu_model4 = Model4(config4)
     cpu_model5 = Model5(config5)
-    
+
     # Save model states
-    save_file(cpu_model1.state_dict(), 
-              os.path.join(BASE_DIR, "model1", _SAFETENSORS_MODEL_FILENAME))
-    save_file(cpu_model2.state_dict(), 
-              os.path.join(BASE_DIR, "model2", _SAFETENSORS_MODEL_FILENAME))
-    save_file(cpu_model3.state_dict(), 
-              os.path.join(BASE_DIR, "model3", _SAFETENSORS_MODEL_FILENAME))
-    save_file(cpu_model4.state_dict(), 
-              os.path.join(BASE_DIR, "model4", _SAFETENSORS_MODEL_FILENAME))
-    save_file(cpu_model5.state_dict(), 
-              os.path.join(BASE_DIR, "model5", _SAFETENSORS_MODEL_FILENAME))
+    save_file(
+        cpu_model1.state_dict(), os.path.join(BASE_DIR, "model1", _SAFETENSORS_MODEL_FILENAME)
+    )
+    save_file(
+        cpu_model2.state_dict(), os.path.join(BASE_DIR, "model2", _SAFETENSORS_MODEL_FILENAME)
+    )
+    save_file(
+        cpu_model3.state_dict(), os.path.join(BASE_DIR, "model3", _SAFETENSORS_MODEL_FILENAME)
+    )
+    save_file(
+        cpu_model4.state_dict(), os.path.join(BASE_DIR, "model4", _SAFETENSORS_MODEL_FILENAME)
+    )
+    save_file(
+        cpu_model5.state_dict(), os.path.join(BASE_DIR, "model5", _SAFETENSORS_MODEL_FILENAME)
+    )
 
     # Create pipeline
     pipeline = SimplePipeline(config1, config2, config3, config4, config5)
-    
+
     # Compile and load
     compiled_path = os.path.join(BASE_DIR, "compiled")
     pipeline.compile_and_load(compiled_path)
 
     # Create test inputs
-    test_input = torch.randn(1, 64)     # [batch_size, input_size]
-    aux_input1 = torch.randn(1, 16)     # [batch_size, aux_size1]
-    aux_input2 = torch.randn(1, 24)     # [batch_size, aux_size2]
+    test_input = torch.randn(1, 64)  # [batch_size, input_size]
+    aux_input1 = torch.randn(1, 16)  # [batch_size, aux_size1]
+    aux_input2 = torch.randn(1, 24)  # [batch_size, aux_size2]
 
     # Generate CPU reference outputs
     with torch.no_grad():
         # Model1 intermediate output used by other models
         cpu_intermediate1 = cpu_model1(test_input)
-        
+
         # Model2 output
         cpu_output2 = cpu_model2(cpu_intermediate1)
-        
+
         # Model3 output (uses Model1 output and aux_input1)
         cpu_output3 = cpu_model3(cpu_intermediate1, aux_input1)
-        
+
         # Model4 output (uses aux_input1, Model1 output, aux_input2, Model2 output)
         cpu_output4 = cpu_model4(
-            aux_input1,         # CPU input1
+            aux_input1,  # CPU input1
             cpu_intermediate1,  # Ranked input1 from Model1
-            aux_input2,        # CPU input2
-            cpu_output2        # Ranked input2 from Model2
+            aux_input2,  # CPU input2
+            cpu_output2,  # Ranked input2 from Model2
         )
-        
+
         cpu_output5 = cpu_model5(cpu_output4)
 
     # Get pipeline outputs including Model5
     pipeline_output2, pipeline_output3, pipeline_output4, pipeline_output5 = pipeline(
         test_input, aux_input1, aux_input2
     )
-    
+
     # Convert pipeline outputs to CPU
-    pipeline_output2 = pipeline_output2[0][0].to('cpu')
-    pipeline_output3 = pipeline_output3[0][0].to('cpu')
+    pipeline_output2 = pipeline_output2[0][0].to("cpu")
+    pipeline_output3 = pipeline_output3[0][0].to("cpu")
 
     # Test if Model4 output is already on CPU
-    assert pipeline_output4.device.type == 'cpu', "Model4 output should be on CPU due to return_ranked_to_cpu=True"
-    assert pipeline_output5.device.type == 'cpu', "Model5 output should be on CPU due to pipeline_execution=False"
-    
-
+    assert (
+        pipeline_output4.device.type == "cpu"
+    ), "Model4 output should be on CPU due to return_ranked_to_cpu=True"
+    assert (
+        pipeline_output5.device.type == "cpu"
+    ), "Model5 output should be on CPU due to pipeline_execution=False"
 
     # Check accuracy for all models
     results = []
@@ -635,31 +636,295 @@ def test_pipeline():
         ("Model2", pipeline_output2, cpu_output2),
         ("Model3", pipeline_output3, cpu_output3),
         ("Model4", pipeline_output4, cpu_output4),
-        ("Model5", pipeline_output5, cpu_output5)
+        ("Model5", pipeline_output5, cpu_output5),
     ]:
         passed, max_err = check_accuracy_embeddings(
-            p_out, 
-            c_out, 
-            plot_outputs=False, 
-            rtol=1.3e-6, 
-            atol=1e-5
+            p_out, c_out, plot_outputs=False, rtol=1.3e-6, atol=1e-5
         )
-        print(f"Pipeline test for {name} {'passed' if passed else 'failed'} "
-              f"with max error: {max_err}")
+        print(
+            f"Pipeline test for {name} {'passed' if passed else 'failed'} "
+            f"with max error: {max_err}"
+        )
         results.append(passed)
-    
-    
+
     # Test passes only if all models pass
     final_result = all(results)
     print(f"\nOverall pipeline test: {'PASSED' if final_result else 'FAILED'}")
+    del pipeline
+    gc.collect()
+
+
+# Add necessary base classes for model testing
+class LargeModel1(NeuronEncoderBase):
+    def __init__(self, config: InferenceConfig):
+        super().__init__(config)
+        # Create parameter a and b with the desired shapes
+        self.a = nn.Parameter(torch.ones(config.large_output_size))
+        self.b = nn.Parameter(torch.ones(config.large_output_size))
+
+    def forward(self, x):
+        # Simple broadcast addition
+        # x: [batch_size, input_size] -> [batch_size, large_output_size]
+        expanded = x.mean(dim=-1, keepdim=True).expand(-1, self.a.shape[0])
+        return expanded + self.a + self.b
+
+
+class LargeModel2(NeuronEncoderBase):
+    def __init__(self, config: InferenceConfig):
+        super().__init__(config)
+        # Create parameter a and b with the desired shapes
+        self.a = nn.Parameter(torch.ones(config.final_size))
+        self.b = nn.Parameter(torch.ones(config.final_size))
+
+    def forward(self, x):
+        # Simple reduction and addition
+        # x: [batch_size, large_output_size] -> [batch_size, final_size]
+        reduced = x.mean(dim=-1, keepdim=True).expand(-1, self.a.shape[0])
+        return reduced + self.a + self.b
+
+
+class LargeModel1Wrapper(ModelWrapper):
+    """ModelWrapper for LargeModel1 which transforms input through a large linear layer."""
+
+    def __init__(
+        self,
+        config: InferenceConfig,
+        model_cls,
+        tag="",
+        compiler_args: str = None,
+        priority_model_idx: int = None,
+        pipeline_execution: bool = True,
+        return_ranked_to_cpu: bool = False,
+        model_init_kwargs={},
+    ) -> None:
+        super().__init__(
+            config,
+            model_cls,
+            tag,
+            compiler_args,
+            priority_model_idx,
+            pipeline_execution,
+            return_ranked_to_cpu,
+            model_init_kwargs,
+        )
+        self.bucket_config = None
+
+    def input_generator(self) -> List[Tuple[torch.Tensor]]:
+        x = torch.ones([self.neuron_config.batch_size, self.config.input_size])
+        inputs = [(x,)]
+        return inputs
+
+    def get_model_instance(self):
+        return EncoderModelInstance(self.model_cls, self.config)
+
+    def forward(self, *args):
+        logging.debug(f"calling forward on network {self.tag}")
+        if self.model is None:
+            raise RuntimeError(
+                "Forward called before load. Run load() or load_state_dict() before calling forward"
+            )
+        if not self.neuron_config.on_cpu:
+            args = self.convert_int64_to_int32(*args)
+        output = self._forward(*args)
+        return output
+
+
+class LargeModel2Wrapper(ModelWrapper):
+    """ModelWrapper for LargeModel2 which transforms large hidden states."""
+
+    def __init__(
+        self,
+        config: InferenceConfig,
+        model_cls,
+        tag="",
+        compiler_args: str = None,
+        priority_model_idx: int = None,
+        pipeline_execution: bool = True,
+        return_ranked_to_cpu: bool = True,  # Set to True to return output to CPU
+        model_init_kwargs={},
+    ) -> None:
+        super().__init__(
+            config,
+            model_cls,
+            tag,
+            compiler_args,
+            priority_model_idx,
+            pipeline_execution,
+            return_ranked_to_cpu,
+            model_init_kwargs,
+        )
+        self.bucket_config = None
+
+    def input_generator(self) -> List[Tuple[torch.Tensor]]:
+        x = torch.ones([self.neuron_config.batch_size, self.config.large_output_size])
+        inputs = [(x,)]
+        return inputs
+
+    def get_model_instance(self):
+        return EncoderModelInstance(self.model_cls, self.config)
+
+    def forward(self, *args):
+        logging.debug(f"calling forward on network {self.tag}")
+        if self.model is None:
+            raise RuntimeError(
+                "Forward called before load. Run load() or load_state_dict() before calling forward"
+            )
+        if not self.neuron_config.on_cpu:
+            args = self.convert_int64_to_int32(*args)
+        output = self._forward(*args)
+        return output
+
+
+# Add Application classes
+class LargeModel1App(NeuronApplicationBase):
+    def __init__(self, model_path: str, config: InferenceConfig, pipeline_execution: bool = True):
+        super().__init__(model_path=model_path, config=config)
+        self.model = LargeModel1Wrapper(
+            config=config,
+            model_cls=LargeModel1,
+            pipeline_execution=pipeline_execution,
+            tag="large_model1",
+        )
+        self.models.append(self.model)
+
+    def forward(self, x):
+        return self.models[0].forward(x)
+
+
+class LargeModel2App(NeuronApplicationBase):
+    def __init__(self, model_path: str, config: InferenceConfig, pipeline_execution: bool = True):
+        super().__init__(model_path=model_path, config=config)
+        self.model = LargeModel2Wrapper(
+            config=config,
+            model_cls=LargeModel2,
+            pipeline_execution=pipeline_execution,
+            return_ranked_to_cpu=True,
+            tag="large_model2",
+        )
+        self.models.append(self.model)
+
+    def forward(self, x):
+        return self.models[0].forward(x)
+
+
+class LargePipeline(nn.Module):
+    def __init__(
+        self, config1: InferenceConfig, config2: InferenceConfig, pipeline_execution: bool = True
+    ):
+        super().__init__()
+        self.model1_path = os.path.join(BASE_DIR, "model1")
+        self.model2_path = os.path.join(BASE_DIR, "model2")
+
+        # Pass pipeline_execution configuration to apps
+        self.model1_app = LargeModel1App(
+            self.model1_path, config1, pipeline_execution=pipeline_execution
+        )
+        self.model2_app = LargeModel2App(
+            self.model2_path, config2, pipeline_execution=pipeline_execution
+        )
+
+        self.pipeline_execution = pipeline_execution
+
+    def compile_and_load(self, compiled_path):
+        suffix = "_pipe" if self.pipeline_execution else "_nopipe"
+        for app, name in [(self.model1_app, "model1"), (self.model2_app, "model2")]:
+            app.compile(os.path.join(compiled_path, name + suffix))
+            app.load(os.path.join(compiled_path, name + suffix))
+
+    def forward(self, x):
+        model1_output = self.model1_app.forward(x)
+        model2_output = self.model2_app.forward(model1_output)
+        return model2_output
+
+
+def test_large_pipeline():
+    # Create directories
+
+    # Create configs
+    config1 = InferenceConfig(
+        NeuronConfig(batch_size=32, torch_dtype=torch.float32, tp_degree=2),
+        input_size=1024,
+        large_output_size=1440 * 1280,
+    )
+
+    config2 = InferenceConfig(
+        NeuronConfig(batch_size=32, torch_dtype=torch.float32, tp_degree=2),
+        large_output_size=1440 * 1280,
+        final_size=1024,
+    )
+
+    # Create CPU models
+    cpu_model1 = LargeModel1(config1)
+    cpu_model2 = LargeModel2(config2)
+
+    # Save model states
+    save_file(
+        cpu_model1.state_dict(), os.path.join(BASE_DIR, "model1", _SAFETENSORS_MODEL_FILENAME)
+    )
+    save_file(
+        cpu_model2.state_dict(), os.path.join(BASE_DIR, "model2", _SAFETENSORS_MODEL_FILENAME)
+    )
+
+    # Create pipeline version
+    pipeline = LargePipeline(config1, config2, pipeline_execution=True)
+    pipeline.compile_and_load(os.path.join(BASE_DIR, "compiled"))
+
+    # # Create test input
+    test_input = torch.randn(config1.neuron_config.batch_size, config1.input_size)
+
+    # Warmup both versions
+    print("\nWarming up...")
+    for _ in range(5):
+        _ = pipeline(test_input)
+
+    # Measure latency for both versions
+    n_iterations = 100
+    times_pipeline = []
+    times_non_pipeline = []
+
+    print("\nTesting pipeline execution...")
+    for i in range(n_iterations):
+        start = time.perf_counter()
+        _ = pipeline(test_input)
+        end = time.perf_counter()
+        times_pipeline.append(end - start)
+
+    del pipeline
+    gc.collect()  # unload the model to avoid error in testing phase
+
+    non_pipeline = LargePipeline(config1, config2, pipeline_execution=False)
+    non_pipeline.compile_and_load(os.path.join(BASE_DIR, "compiled"))
+
+    print("\nWarming up non pipeline ...")
+    for _ in range(5):
+        _ = non_pipeline(test_input)
+
+    print("\nTesting non-pipeline execution...")
+    for i in range(100):
+        start = time.perf_counter()
+        _ = non_pipeline(test_input)
+        end = time.perf_counter()
+        times_non_pipeline.append(end - start)
+
+    # Calculate statistics
+    avg_time_pipeline = np.mean(times_pipeline) * 1000
+    std_time_pipeline = np.std(times_pipeline) * 1000
+
+    avg_time_non_pipeline = np.mean(times_non_pipeline) * 1000
+    std_time_non_pipeline = np.std(times_non_pipeline) * 1000
+
+    print("\nResults:")
+    print(f"Pipeline Execution: {avg_time_pipeline:.2f} ± {std_time_pipeline:.2f} ms")
+    print(f"Non-Pipeline Execution: {avg_time_non_pipeline:.2f} ± {std_time_non_pipeline:.2f} ms")
+    print(f"Speedup from pipeline: {avg_time_non_pipeline/avg_time_pipeline:.2f}x")
+
+    # Assert that non-pipeline execution is slower
+    assert (
+        avg_time_non_pipeline > avg_time_pipeline
+    ), "Error: Pipeline execution was slower than non-pipeline execution"
 
 
 if __name__ == "__main__":
-    # Set environment variables
-    os.environ["XLA_FALLBACK_CPU"] = "0"
-    os.environ["XLA_IR_DEBUG"] = "1"
-    os.environ["XLA_HLO_DEBUG"] = "1"
-    os.environ["NEURON_FUSE_SOFTMAX"] = "1"
-    
     # Run test
     test_pipeline()
+    test_large_pipeline()

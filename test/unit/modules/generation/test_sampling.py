@@ -14,7 +14,9 @@ from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSa
 from neuronx_distributed_inference.modules.generation.sampling import (
     Sampler,
     cumsum,
+    infer_sampling_params,
     prepare_sampling_params,
+    validate_sampling_params
 )
 
 
@@ -202,6 +204,11 @@ class TestSampling(unittest.TestCase):
                 ([10], [0.5], [0.9]),
                 ([20], [0.9], [0.5]),
                 ([50], [0.5], [0.9]),
+                ([1], [1], [0.0]),
+                ([-1], [1], [1.0]),
+                ([0], [1], [1.0]),
+                ([-1], [0.9], [1.0]),
+                ([0], [0.9], [1.0]),
             ]
             for dynamic_tc in dynamic_sampling_params:
                 top_k, top_p, temperature = dynamic_tc
@@ -264,6 +271,102 @@ def test_cumsum(dim, shape, dtype):
     tensor_in_neuron = tensor_in.to(xm.xla_device())
     actual_output = cumsum(tensor_in_neuron, dim=dim, on_cpu=False)
     torch_neuronx.testing.assert_close(actual_output.cpu(), expected_output)
+
+
+@pytest.mark.parametrize(
+    "params, on_device_sampling_config, is_valid, expected_error_pattern",
+    [
+        # Valid cases
+        (torch.tensor([[5, 0.5, 1.0]]), {"global_topk": 10}, True, None),
+        (torch.tensor([[1.0, 1.0, 0.0]]), {"global_topk": 10}, True, None),  # Valid greedy sampling
+        (torch.tensor([[-1, 0.5, 1.0]]), {"global_topk": 10}, True, None),  # Valid with -1 for top_k
+        (torch.tensor([[10, 1.0, 0.5]]), {"global_topk": 10}, True, None),  # Valid with top_k = global_topk
+        (torch.tensor([[5, 0.5, 1.0], [3, 0.7, 0.8]]), {"global_topk": 10}, True, None),  # Multiple batch items
+        (torch.tensor([[0, 0.5, 1.0]]), {"global_topk": 10}, True, None), # top_k = 0
+        (torch.tensor([[5, 0.5, 0.0]]), {"global_topk": 10}, True, None),
+
+        
+        # Invalid shape
+        (torch.tensor([[5, 0.5]]), {"global_topk": 10}, False, "Expected tensor of shape \\(batch_size, 3\\)"),
+        (torch.tensor([[5, 0.5], [5, 0.5]]), {"global_topk": 10}, False, "Expected tensor of shape \\(batch_size, 3\\)"),
+        
+        # Invalid top_k
+        (torch.tensor([[-2, 0.5, 1.0]]), {"global_topk": 10}, False, "Invalid top-k values"),
+        (torch.tensor([[11, 0.5, 1.0]]), {"global_topk": 10}, False, "Invalid top-k values"),
+        (torch.tensor([[5.5, 0.5, 1.0]]), {"global_topk": 10}, False, "top-k values should be able to be represented as integer"),
+        
+        # Invalid top_p
+        (torch.tensor([[5, 0.0, 1.0]]), {"global_topk": 10}, False, "Invalid top-p values"),
+        (torch.tensor([[5, 1.1, 1.0]]), {"global_topk": 10}, False, "Invalid top-p values"),
+        (torch.tensor([[5, -0.1, 1.0]]), {"global_topk": 10}, False, "Invalid top-p values"),
+        
+        # Invalid temperature
+        (torch.tensor([[5, 0.5, -0.1]]), {"global_topk": 10}, False, "Invalid temperature values"),
+        
+        # Invalid combination (temperature = 0 with top_k > 1 or top_p < 1)
+        (torch.tensor([[-1, 0.9, 0.0]]), {"global_topk": 10}, False, "Invalid sampling parameters found"),
+        (torch.tensor([[0, 0.9, 0.0]]), {"global_topk": 10}, False, "Invalid sampling parameters found"),
+    ]
+)
+def test_validate_sampling_params(params, on_device_sampling_config, is_valid, expected_error_pattern):
+    """
+    Test the validate_sampling_params function with various input scenarios.
+    
+    This test covers:
+    1. Valid params shape
+    2. Valid top_k values
+    3. Valid top_p values
+    4. Valid temperature values
+    5. Valid combinations of parameters
+    6. Invalid cases for each of the above
+    
+    Args:
+        params: Input tensor with sampling parameters
+        on_device_sampling_config: Config dict or object with global_topk
+        is_valid: Whether the input should be considered valid
+        expected_error_pattern: Expected error message pattern if invalid
+    """
+    
+    
+    # Convert dict to OnDeviceSamplingConfig if needed
+    if isinstance(on_device_sampling_config, dict):
+        config_obj = OnDeviceSamplingConfig()
+        for key, value in on_device_sampling_config.items():
+            setattr(config_obj, key, value)
+        on_device_sampling_config = config_obj
+    
+    if is_valid:
+        # Should not raise an exception
+        validate_sampling_params(params, on_device_sampling_config)
+    else:
+        # Should raise ValueError with the expected message
+        with pytest.raises(ValueError, match=expected_error_pattern):
+            validate_sampling_params(params, on_device_sampling_config)
+
+
+@pytest.mark.parametrize(
+    "input_params, expected_params",
+    [
+        # Temperature = 0 should set top_k=1, top_p=1
+        (torch.tensor([[5.0, 0.5, 0.0]]), torch.tensor([[1.0, 1.0, 0.0]])),
+        (torch.tensor([[10.0, 0.8, 0.0]]), torch.tensor([[1.0, 1.0, 0.0]])),
+        # Temperature > 0 should remain unchanged
+        (torch.tensor([[5.0, 0.5, 1.0]]), torch.tensor([[5.0, 0.5, 1.0]])),
+        (torch.tensor([[3.0, 0.7, 0.8]]), torch.tensor([[3.0, 0.7, 0.8]])),
+        # Multiple batch items with mixed temperatures
+        (torch.tensor([[5.0, 0.5, 0.0], [3.0, 0.7, 1.0]]), torch.tensor([[1.0, 1.0, 0.0], [3.0, 0.7, 1.0]])),
+        (torch.tensor([[2.0, 0.9, 0.5], [8.0, 0.3, 0.0]]), torch.tensor([[2.0, 0.9, 0.5], [1.0, 1.0, 0.0]])),
+    ]
+)
+def test_infer_sampling_params(input_params, expected_params):
+    """
+    Test the infer_sampling_params function.
+    
+    This test verifies that when temperature = 0, the function correctly sets
+    top_k and top_p to 1 for greedy sampling, while leaving other parameters unchanged.
+    """
+    result = infer_sampling_params(input_params.clone())
+    torch.testing.assert_close(result, expected_params)
 
 
 if __name__ == "__main__":

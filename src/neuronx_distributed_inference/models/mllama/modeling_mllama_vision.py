@@ -251,7 +251,6 @@ class NeuronImageAttention(NeuronAttentionBase):
             and (Q.shape == K_active.shape == V_active.shape)
             and (self.padding_side == "right" or bsz == 1)
         )
-        assert int(self.logical_nc_config) == 1
         attn_output = self.perform_maskless_sdpa(
             Q=Q,
             K=K_active,

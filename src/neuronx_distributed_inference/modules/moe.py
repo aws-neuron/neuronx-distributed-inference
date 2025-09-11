@@ -29,8 +29,10 @@ def initialize_moe_module(
         intermediate_size=intermediate_size,
         hidden_act=hidden_act,
         capacity_factor=config.neuron_config.capacity_factor,
+        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
         glu_mlp=config.neuron_config.glu_mlp,
         normalize_top_k_affinities=normalize_top_k_affinities,
+        is_prefill=config.neuron_config.is_prefill_stage
     )
     moe = MoE(
         router=router,

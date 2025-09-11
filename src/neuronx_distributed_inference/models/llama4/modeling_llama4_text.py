@@ -1,3 +1,4 @@
+
 # coding=utf-8
 # Copyright 2025 The LLAMA4 and HuggingFace Inc. team. All rights reserved.
 #
@@ -319,7 +320,7 @@ class NeuronLlama4Attention(NeuronAttentionBase):
 
 
 class NeuronMoEDecoderLayer(nn.Module):
-    def __init__(self, config: InferenceConfig):
+    def __init__(self, config: InferenceConfig, rmsnorm: Optional[nn.Module] = None):
         super().__init__()
         # The following list of configs are required for Llama4
         # HF config of Llama4 does not include `n_shared_experts`
@@ -327,17 +328,17 @@ class NeuronMoEDecoderLayer(nn.Module):
         config.n_shared_experts = 1
         config.neuron_config.router_config.dtype = torch.float32
         config.neuron_config.router_config.act_fn = "sigmoid"
-        config.neuron_config.fused_shared_experts = True
+        config.neuron_config.fused_shared_experts = False
+        config.neuron_config.transpose_shared_experts_weights = True
         config.neuron_config.early_expert_affinity_modulation = True
         config.neuron_config.normalize_top_k_affinities = False
 
-        self.moe = initialize_moe_module(
-            config=config,
-        )
+        self.moe = initialize_moe_module(config=config, rmsnorm=rmsnorm, init_tkg_module=True)
 
     def forward(self, hidden_states):
         """Forward pass for the MOE module"""
-        return self.moe(hidden_states)[0]
+        hidden_states = self.moe(hidden_states)[0]
+        return hidden_states
 
 
 class NeuronLlamaDecoderLayer(nn.Module):
@@ -367,8 +368,12 @@ class NeuronLlamaDecoderLayer(nn.Module):
             is_nope=self.is_nope_layer
         )
 
+        self.post_attention_layernorm = get_rmsnorm_cls()(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
         if (self.layer_idx + 1) % config.interleave_moe_layer_step == 0:
-            self.feed_forward = NeuronMoEDecoderLayer(config)
+            self.feed_forward = NeuronMoEDecoderLayer(config, rmsnorm=self.post_attention_layernorm)
         else:
             self.feed_forward = NeuronLlama4MLP(config)
 
@@ -384,10 +389,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
                 config.hidden_size,
                 eps=config.rms_norm_eps,
             )
-        self.post_attention_layernorm = get_rmsnorm_cls()(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-        )
+
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
         self.quantized_mlp_kernel_enabled = config.neuron_config.quantized_mlp_kernel_enabled
@@ -467,7 +469,6 @@ class NeuronLlamaDecoderLayer(nn.Module):
         else:
             hidden_states = residual + hidden_states
             residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
 
             hidden_states = self.feed_forward(hidden_states)
 
@@ -590,6 +591,8 @@ class NeuronLlama4TextModel(NeuronBaseModel):
         self.num_medusa_heads = config.neuron_config.num_medusa_heads
         self.medusa_speculation_length = config.neuron_config.medusa_speculation_length
         self.attention_chunk_size = getattr(config, "attention_chunk_size", None)
+        if self.attention_chunk_size and config.neuron_config.seq_len <= self.attention_chunk_size:
+            self.attention_chunk_size = None
         if self.attention_chunk_size:
             self.layer_to_cache_size_mapping = get_layer_to_kv_cache_size_mapping_for_mixed_attn(self.attention_chunk_size, self.config.neuron_config.seq_len, config.no_rope_layers)
         self.has_mixed_attn = True
@@ -666,6 +669,11 @@ class NeuronLlama4TextForCausalLM(NeuronBaseForCausalLM):
             "feed_forward.experts.down_proj.scale": "feed_forward.moe.expert_mlps.mlp_op.down_proj.scale",
         }
 
+        if not config.neuron_config.fused_shared_experts:
+            # if not fusing shared experts gate/up weights, we can directly rename the keys
+            key_map["feed_forward.shared_expert.gate_proj.weight"] = "feed_forward.moe.shared_experts.gate_proj.weight"
+            key_map["feed_forward.shared_expert.up_proj.weight"] = "feed_forward.moe.shared_experts.up_proj.weight"
+
         moe_intermediate_size = config.intermediate_size
         state_dict_keys = set(state_dict.keys())
         num_experts = config.num_local_experts
@@ -677,17 +685,18 @@ class NeuronLlama4TextForCausalLM(NeuronBaseForCausalLM):
                     num_experts, moe_intermediate_size, config.hidden_size
                 )
 
-                shared_new_key = prefix + "feed_forward.moe.shared_experts.gate_up_proj.weight"
-                shared_swig_key = prefix + "feed_forward.shared_expert.up_proj.weight"
-                shared_in_key = prefix + "feed_forward.shared_expert.gate_proj.weight"
+                if config.neuron_config.fused_shared_experts:
+                    shared_new_key = prefix + "feed_forward.moe.shared_experts.gate_up_proj.weight"
+                    shared_swig_key = prefix + "feed_forward.shared_expert.up_proj.weight"
+                    shared_in_key = prefix + "feed_forward.shared_expert.gate_proj.weight"
 
-                state_dict[shared_new_key] = torch.cat(
-                    [state_dict[shared_in_key], state_dict[shared_swig_key]], dim=0
-                )
-                state_dict_keys.add(shared_new_key)
+                    state_dict[shared_new_key] = torch.cat(
+                        [state_dict[shared_in_key], state_dict[shared_swig_key]], dim=0
+                    )
+                    state_dict_keys.add(shared_new_key)
 
-                del state_dict[shared_swig_key]
-                del state_dict[shared_in_key]
+                    del state_dict[shared_swig_key]
+                    del state_dict[shared_in_key]
 
             for old_key, new_key in key_map.items():
                 if prefix + old_key in state_dict_keys:

@@ -14,7 +14,7 @@
 """ Qwen3 MOE model for NXD inference."""
 import gc
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict, Any
 
 import torch
 
@@ -47,6 +47,51 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
+
+
+# Get the modules_to_not_convert from the neuron configs
+def get_modules_to_not_convert(neuron_config: MoENeuronConfig):
+    return getattr(neuron_config, "modules_to_not_convert", None)
+
+
+def _helper_concat_and_delete_qkv(qwen_state_dict: Dict[str, Any], layer_num: int, attr: str):
+    """
+    Helper function to concatenate and delete QKV attributes for fusedqkv (weight or scale).
+    Args:
+        qwen_state_dict: The state dictionary containing model weights
+        layer_num: The index of the layer to process
+        attr: The attribute to process ('weight' or 'scale')
+    """
+    qwen_state_dict[f"layers.{layer_num}.self_attn.Wqkv.{attr}"] = torch.cat(
+        [
+            qwen_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"],
+            qwen_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"],
+            qwen_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"],
+        ],
+    )
+    del qwen_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"]
+    del qwen_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"]
+    del qwen_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"]
+
+
+def convert_state_dict_to_fused_qkv(qwen_state_dict: Dict[str, Any], cfg: InferenceConfig):
+    """
+    This function concats the qkv weights and scales to a Wqkv weight and scale for fusedqkv, and deletes the qkv weights.
+    """
+    mods_to_not_conv = get_modules_to_not_convert(cfg.neuron_config)
+    if mods_to_not_conv is None:
+        mods_to_not_conv = []
+
+    for l in range(cfg.num_hidden_layers):  # noqa: E741
+        _helper_concat_and_delete_qkv(qwen_state_dict, l, "weight")
+        if (
+            cfg.neuron_config.quantized_mlp_kernel_enabled or cfg.neuron_config.quantized
+        ) and f"layers.{l}.self_attn" not in mods_to_not_conv:
+            _helper_concat_and_delete_qkv(qwen_state_dict, l, "scale")
+
+    gc.collect()
+
+    return qwen_state_dict
 
 
 def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
@@ -138,6 +183,9 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
         gc.collect()
+
+    if config.neuron_config.fused_qkv:
+        neuron_state_dict = convert_state_dict_to_fused_qkv(neuron_state_dict, config)
 
     return neuron_state_dict
 

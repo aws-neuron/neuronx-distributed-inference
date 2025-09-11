@@ -194,6 +194,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                     if output_logits:
                         raw_logits += (next_token_logits,)
 
+            if not self.on_device_sampling:
                 if self.sampler is None:
                     # Temporary placeholder to support CPU sampling with static batching
                     neuron_kwargs = {}

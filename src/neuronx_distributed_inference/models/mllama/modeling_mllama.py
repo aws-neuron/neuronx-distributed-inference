@@ -149,9 +149,6 @@ class MllamaInferenceConfig(InferenceConfig):
         ), f"Speculative Decoding is not yet supported in this Model. \
                 is_medusa was set to {self.neuron_config.is_medusa}. \
                 speculation_length was set to {self.neuron_config.speculation_length}"
-        assert (
-            int(self.neuron_config.logical_nc_config) == 1
-        ), "This model currently only support logical_nc_config=1"
 
     def to_json_string(self):
         config_copy = copy.deepcopy(self)

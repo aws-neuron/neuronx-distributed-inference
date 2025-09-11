@@ -5,7 +5,7 @@ import time
 import warnings
 from copy import deepcopy
 from functools import partial
-from typing import List, Type
+from typing import List, Optional, Type
 
 import neuronx_distributed.trace.hlo_utils as hlo_utils
 import torch
@@ -23,7 +23,10 @@ from neuronx_distributed.utils.model_utils import init_on_device
 from safetensors.torch import load_file
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
-from neuronx_distributed_inference.models.model_wrapper import ModelWrapper, CONTEXT_ENCODING_MODEL_TAG
+from neuronx_distributed_inference.models.model_wrapper import (
+    CONTEXT_ENCODING_MODEL_TAG,
+    ModelWrapper,
+)
 from neuronx_distributed_inference.modules.checkpoint import (
     load_state_dict,
     prune_state_dict,
@@ -34,6 +37,8 @@ from neuronx_distributed_inference.utils.snapshot import (
     ScriptModuleWrapper,
     SnapshotOutputFormat,
     get_snapshot_hook,
+    register_nxd_model_hook,
+    unregister_nxd_model_hooks,
 )
 
 COMPILED_MODEL_FILE_NAME = "model.pt"
@@ -89,6 +94,51 @@ class NeuronApplicationBase(torch.nn.Module):
         self.is_loaded_to_neuron = False
         self._builder = None
 
+    # Check if the given model is eligible for modular flow optimization and apply the necessary changes
+    def check_and_apply_modular_flow_optimization(
+        self, key, model_artifacts, bucket_rank, compiler_args
+    ):
+
+        # Check if we're dealing with context encoding model
+        if key != "context_encoding_model":
+            return compiler_args
+
+        # Check if neuron config is instantiated , else return without any changes
+        if not hasattr(model_artifacts.model_instance, "neuron_config"):
+            return compiler_args
+
+        bucket_length = model_artifacts.model_instance.neuron_config.buckets[bucket_rank]
+
+        # Check if model instance has the required attributes
+        if not hasattr(model_artifacts.model_instance.config, "num_hidden_layers") or not hasattr(
+            model_artifacts.model_instance.config, "model_type"
+        ):
+            return compiler_args
+
+        # Get neuron configuration
+        num_layers = model_artifacts.model_instance.config.num_hidden_layers
+
+        # Check layer conditions , this prevents branch overhead latency in shorter sequence lengths for Llama 3 dense models
+        # These compiler settings could have adverse effect such as high spill-reload and high compilation time on models that
+        # do not satisfy these constraints.
+        valid_layer_config = num_layers == 32 or (num_layers in (78, 80) and bucket_length <= 1024)
+
+        valid_model_type = model_artifacts.model_instance.config.model_type == "llama"
+
+        # Check compiler and optimization conditions
+        has_o1_flag = "-O1" in compiler_args
+
+        if (
+            valid_layer_config
+            and has_o1_flag
+            and not model_artifacts.model_instance.neuron_config.enable_cte_modular_flow
+            and valid_model_type
+        ):
+            # Flip compilation to prevent branch overhead latency in shorter sequence lengths
+            compiler_args = compiler_args.replace("-O1", "-O3")
+
+        return compiler_args
+
     def get_builder(self, debug=False):
         if self._builder is None:
             base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
@@ -112,6 +162,8 @@ class NeuronApplicationBase(torch.nn.Module):
                 init_custom_process_group_fn=custom_group_fn,
                 logical_nc_config=self.neuron_config.logical_nc_config,
                 weights_to_skip_layout_optimization=self.config.neuron_config.weights_to_skip_layout_optimization,
+                # Revert the change to turn off modular flow optimization by default as it's causing logits regression , ticket: V1849736968
+                # compiler_flag_hook=self.check_and_apply_modular_flow_optimization,
             )
             for model in self.models:
                 self._builder.add(
@@ -135,8 +187,13 @@ class NeuronApplicationBase(torch.nn.Module):
             raise ValueError("Config must include a NeuronConfig")
 
         if getattr(config, "fused_spec_config", None) is not None:
-            if (config.fused_spec_config.draft_config.neuron_config.torch_dtype != config.neuron_config.torch_dtype) and (config.neuron_config.cast_type == "config"):
-                raise ValueError("cast-type must be set to 'as-declared' to be able to run different precisions for draft and target model!")
+            if (
+                config.fused_spec_config.draft_config.neuron_config.torch_dtype
+                != config.neuron_config.torch_dtype
+            ) and (config.neuron_config.cast_type == "config"):
+                raise ValueError(
+                    "cast-type must be set to 'as-declared' to be able to run different precisions for draft and target model!"
+                )
 
     @classmethod
     def get_config_cls(cls) -> InferenceConfig:
@@ -167,9 +224,7 @@ class NeuronApplicationBase(torch.nn.Module):
             pre_shard_weights_hook(self)
 
         if self.neuron_config.skip_sharding:
-            logger.info(
-                "Pre-sharding the checkpoints is forced to be SKIPPED with skip_sharding."
-            )
+            logger.info("Pre-sharding the checkpoints is forced to be SKIPPED with skip_sharding.")
         elif not self.neuron_config.save_sharded_checkpoint:
             logger.info(
                 "SKIPPING pre-sharding the checkpoints. The checkpoints will be sharded during load time."
@@ -194,11 +249,17 @@ class NeuronApplicationBase(torch.nn.Module):
                 specific_config.neuron_config.buckets = [bucket_size]
 
                 if submodel.tag == CONTEXT_ENCODING_MODEL_TAG:
-                    specific_config.neuron_config.context_encoding_buckets = specific_config.neuron_config.buckets
+                    specific_config.neuron_config.context_encoding_buckets = (
+                        specific_config.neuron_config.buckets
+                    )
                 else:
-                    specific_config.neuron_config.token_generation_buckets = specific_config.neuron_config.buckets
+                    specific_config.neuron_config.token_generation_buckets = (
+                        specific_config.neuron_config.buckets
+                    )
 
-                submodel_path = os.path.join(base_compile_work_dir, submodel.tag, f"_tp0_bk{bucket_rank}")
+                submodel_path = os.path.join(
+                    base_compile_work_dir, submodel.tag, f"_tp0_bk{bucket_rank}"
+                )
                 specific_config.save(submodel_path)
 
     def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None, dry_run=False):
@@ -263,13 +324,8 @@ class NeuronApplicationBase(torch.nn.Module):
             for example in example_inputs:
                 try:
                     if self.neuron_config.async_mode:
-                        ranked_input = [
-                            example
-                            for _ in range(self.neuron_config.tp_degree)
-                        ]
-                        ranked_output = model.model.nxd_model.forward_async(
-                            ranked_input
-                        )
+                        ranked_input = [example for _ in range(self.neuron_config.tp_degree)]
+                        ranked_output = model.model.nxd_model.forward_async(ranked_input)
                         # block immediately
                         [[out_tensor.cpu() for out_tensor in output] for output in ranked_output]
                     else:
@@ -322,28 +378,24 @@ class NeuronApplicationBase(torch.nn.Module):
         """
         Registers snapshot hooks based on configuration from environment variables.
         """
-        assert "NXD_INFERENCE_CAPTURE_OUTPUT_PATH" in os.environ, (
-            "Must set NXD_INFERENCE_CAPTURE_OUTPUT_PATH to enable snapshots"
-        )
-        assert "NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT" in os.environ, (
-            "Must set NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT to enable snapshots"
-        )
-        assert "NXD_INFERENCE_CAPTURE_AT_REQUESTS" in os.environ, (
-            "Must set NXD_INFERENCE_CAPTURE_AT_REQUESTS to enable snapshots"
-        )
+        assert (
+            "NXD_INFERENCE_CAPTURE_OUTPUT_PATH" in os.environ
+        ), "Must set NXD_INFERENCE_CAPTURE_OUTPUT_PATH to enable snapshots"
+        assert (
+            "NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT" in os.environ
+        ), "Must set NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT to enable snapshots"
+        assert (
+            "NXD_INFERENCE_CAPTURE_AT_REQUESTS" in os.environ
+        ), "Must set NXD_INFERENCE_CAPTURE_AT_REQUESTS to enable snapshots"
 
         output_path = os.environ["NXD_INFERENCE_CAPTURE_OUTPUT_PATH"]
         output_format = os.environ["NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT"]
         capture_at_requests_str = os.environ["NXD_INFERENCE_CAPTURE_AT_REQUESTS"]
         capture_at_requests = [int(val_str) for val_str in capture_at_requests_str.split(",")]
-        save_transposed_priority_model_inputs = bool(
-            os.environ.get("NXD_INFERENCE_SAVE_TRANSPOSED_PRIORITY_MODEL_INPUTS", False)
-        )
         self.register_snapshot_hooks(
             output_path=output_path,
             output_format=SnapshotOutputFormat[output_format],
             capture_at_requests=capture_at_requests,
-            save_transposed_priority_model_inputs=save_transposed_priority_model_inputs,
         )
 
     def register_snapshot_hooks(
@@ -351,11 +403,13 @@ class NeuronApplicationBase(torch.nn.Module):
         output_path: str,
         output_format: SnapshotOutputFormat,
         capture_at_requests: List[int],
-        ranks: List[int] = [0],
-        save_transposed_priority_model_inputs: bool = False,
+        ranks: Optional[List[int]] = None,
     ):
         """
         Registers snapshot hooks to capture input snapshots for all submodels and bucket.
+
+        Note: Capturing input snapshots affects performance and should only be used for debugging
+        models.
 
         Args:
             output_path: The base path where input snapshots are saved.
@@ -367,24 +421,24 @@ class NeuronApplicationBase(torch.nn.Module):
                 submodel bucket.
             ranks: The list of ranks to snapshot. Each rank is a separate NeuronCore device.
                 Defauls to [0], which means to capture the snapshot for the rank0 device.
-            save_transposed_priority_model_inputs: Whether to save the transposed inputs for the
-                priority model, which means to apply the priority model's transposed layout to its
-                own inputs. When this is enabled, the snapshot includes two copies of the priority
-                model inputs: one default (which matches the HLO), and one transposed (which
-                matches the NEFF). The transposed inputs are saved in a subfolder named "transposed_inputs".
         """
         assert self.is_loaded_to_neuron, "Must load model before you register snapshot hooks"
+        if ranks is None:
+            ranks = [0]
+
         for submodel in self.models:
             submodel.model = ScriptModuleWrapper(submodel.model)
             snapshot_hook = get_snapshot_hook(
                 output_path,
                 output_format,
                 capture_at_requests,
-                self,
+                self.get_builder(),
                 ranks,
-                save_transposed_priority_model_inputs,
+                is_input_ranked=submodel.async_mode or submodel.pipeline_execution,
             )
             submodel.model.register_forward_hook(snapshot_hook)
+            register_nxd_model_hook(submodel.model, "forward_async", snapshot_hook)
+            register_nxd_model_hook(submodel.model, "forward_ranked", snapshot_hook)
             logger.info(f"Registered snapshot hooks for {submodel.tag=}")
 
     def unregister_snapshot_hooks(self):
@@ -394,6 +448,8 @@ class NeuronApplicationBase(torch.nn.Module):
         for submodel in self.models:
             if isinstance(submodel.model, ScriptModuleWrapper):
                 submodel.model = submodel.model.wrapped_module
+                unregister_nxd_model_hooks(submodel.model, "forward_async")
+                unregister_nxd_model_hooks(submodel.model, "forward_ranked")
                 logger.info(f"Unregistered snapshot hooks for {submodel.tag=}")
 
     def to_cpu(self):
@@ -453,8 +509,10 @@ class NeuronApplicationBase(torch.nn.Module):
             return neuron_model
 
         if self.config.neuron_config.is_continuous_batching:
-            warnings.warn(f"CPU inference with continuous batching uses {len(self.models)}x memory because submodels are created separately. \
-                If this extra memory usage causes the model to fail to load on CPU, disable continuous batching.")
+            warnings.warn(
+                f"CPU inference with continuous batching uses {len(self.models)}x memory because submodels are created separately. \
+                If this extra memory usage causes the model to fail to load on CPU, disable continuous batching."
+            )
             # TODO: implement weight sharing across submodels as implemented in neuron devices
             for model_wrapper in self.models:
                 # we should create ctx encoding model and token gen model separately with specific config when the configs are different
@@ -487,7 +545,9 @@ class NeuronApplicationBase(torch.nn.Module):
                     current_dtype = self.neuron_config.torch_dtype
                     # only cast floating types
                     if name.endswith("scale"):
-                        warnings.warn(f"Found {param.dtype} scales, skip converting to {current_dtype}")
+                        warnings.warn(
+                            f"Found {param.dtype} scales, skip converting to {current_dtype}"
+                        )
                     elif param.dtype != current_dtype:
                         warnings.warn(
                             f"Found {param.dtype} weights in checkpoint: {name}. Will convert to {current_dtype}"
@@ -507,7 +567,10 @@ class NeuronApplicationBase(torch.nn.Module):
         else:
             model_sd = self.get_state_dict(model_path, self.config)
 
-        if self.neuron_config.torch_dtype != torch.float32 and self.neuron_config.cast_type == "config":
+        if (
+            self.neuron_config.torch_dtype != torch.float32
+            and self.neuron_config.cast_type == "config"
+        ):
             _cast_helper(model_sd)
 
         return model_sd
@@ -540,7 +603,9 @@ class NeuronApplicationBase(torch.nn.Module):
 
         if config.neuron_config.is_medusa:
             if os.path.exists(model_name_or_path + "/medusa_heads.pt"):
-                medusa_head = torch.load(model_name_or_path + "/medusa_heads.pt", map_location="cpu")
+                medusa_head = torch.load(
+                    model_name_or_path + "/medusa_heads.pt", map_location="cpu"
+                )
                 model_sd.update(medusa_head)
             else:
                 raise FileNotFoundError(

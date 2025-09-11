@@ -1,7 +1,6 @@
 import torch
 import os
 import logging
-import base64
 
 from transformers import AutoTokenizer, AutoProcessor, GenerationConfig
 from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig as SmplConfig
@@ -21,8 +20,7 @@ TEXT_TP_DEGREE = 64
 VISION_TP_DEGERE = 16
 WORLD_SIZE = 64
 BATCH_SIZE  = 1
-SEQ_LENGTH = 8192
-# SEQ_LENGTH = 10240 for chunked attention
+SEQ_LENGTH = 16384
 TEXT_TO_TEXT = False
 # TEXT_TO_TEXT = True for text only generation
 DTYPE = torch.bfloat16
@@ -33,46 +31,65 @@ os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 os.environ['NEURON_RT_NUM_CORES']=f'{TEXT_TP_DEGREE}'
 os.environ['BASE_COMPILE_WORK_DIR'] = "./compiler_path/"
 
-model_path = "/home/ubuntu/models/Llama-4-Scout-17B-16E-Instruct/"
-traced_model_path = "/home/ubuntu/traced_model_Llama-4-Scout-17B-16E-Instruct"
+# Llama4 checkpoints can be downloaded from HuggingFace
+model_path = "/shared/models/Llama-4-Scout-17B-16E-Instruct/"
+# Path to the compiled model artifacts. If this directory exists, the next run will skip
+# the trace and compile steps, reducing test time.
+traced_model_path = "/shared/traced_models/Llama-4/scout_text_vision_baseline_bs1/"
 
 torch.manual_seed(0)
 
 def run_llama_generate_image_to_text():
-    # Initialize configs and tokenizer.
-    batch_size = 1
-    text_neuron_config = Llama4NeuronConfig(batch_size=1,
-                                seq_len=SEQ_LENGTH,
-                                torch_dtype=torch.bfloat16,
-                                skip_sharding=False,
-                                save_sharded_checkpoint=False,
-                                tp_degree=TEXT_TP_DEGREE,
-                                cp_degree=1,
-                                on_device_sampling_config=SmplConfig(dynamic=False, top_k=1),
-                                world_size=WORLD_SIZE,
-                                capacity_factor=None,
-                                fused_qkv=False,
-                                attention_dtype=torch.float16,
-                                rpl_reduce_dtype=torch.float32,
-                                cast_type="as-declared",
-                                logical_neuron_cores=2)
+    text_neuron_config = Llama4NeuronConfig(
+        batch_size=1,
+        is_continuous_batching=True,
+        seq_len=SEQ_LENGTH,
+        enable_bucketing=True,
+        context_encoding_buckets=[256, 512, 1024, 2048, 4096, 8192, 10240, 16384],
+        token_generation_buckets=[256, 512, 1024, 2048, 4096, 8192, 10240, 16384],
+        torch_dtype=torch.float16,
+        async_mode=True,
+        rpl_reduce_dtype=torch.float32,
+        tp_degree=TEXT_TP_DEGREE,
+        cp_degree=16,
+        on_device_sampling_config=SmplConfig(dynamic=True, top_k=1, top_k_kernel_enabled=True),
+        world_size=WORLD_SIZE,
+        fused_qkv=True,
+        cast_type="as-declared",
+        save_sharded_checkpoint=True,
+        cc_pipeline_tiling_factor=1,
+        sequence_parallel_enabled=True,
+        qkv_kernel_enabled=True,
+        attn_kernel_enabled=True,
+        attn_block_tkg_nki_kernel_enabled=True,
+        attn_block_tkg_nki_kernel_cache_update=True,
+        k_cache_transposed=False,
+        blockwise_matmul_config={
+            "block_size": 256,
+            "use_block_parallel": True,
+            "block_sharding_strategy": "HI_LO",
+            "skip_dma_token": True,
+            "skip_dma_weight": True,
+            "parallelize_token_to_block_mapping": True
+        },
+        logical_neuron_cores=2)
 
-    vision_neuron_config = Llama4NeuronConfig(batch_size=1,
-                                seq_len=SEQ_LENGTH, 
-                                torch_dtype=torch.float16,
-                                skip_sharding=False,
-                                save_sharded_checkpoint=False,
-                                tp_degree=VISION_TP_DEGERE,
-                                cp_degree=1,
-                                on_device_sampling_config=SmplConfig(dynamic=False, top_k=1),
-                                dp_degree=4, 
-                                world_size=WORLD_SIZE,
-                                fused_qkv=True,
-                                qkv_kernel_enabled=True,
-                                attn_kernel_enabled=True,
-                                mlp_kernel_enabled=True,
-                                enable_bucketing=False,                                
-                                logical_neuron_cores=2)
+    vision_neuron_config = Llama4NeuronConfig(
+        batch_size=1,
+        seq_len=SEQ_LENGTH,
+        torch_dtype=torch.float16,
+        tp_degree=VISION_TP_DEGERE,
+        cp_degree=1,
+        dp_degree=4,
+        world_size=WORLD_SIZE,
+        fused_qkv=True,
+        qkv_kernel_enabled=True,
+        attn_kernel_enabled=True,
+        mlp_kernel_enabled=True,
+        enable_bucketing=True,
+        buckets=[8, 28, 88],
+        save_sharded_checkpoint=True,
+        logical_neuron_cores=2)
 
     config = Llama4InferenceConfig(
         text_neuron_config=text_neuron_config,
@@ -85,10 +102,10 @@ def run_llama_generate_image_to_text():
 
     hf_llama4_processor = AutoProcessor.from_pretrained(model_path)
     # Prepare generate outputs.
-    text_prompt="If I had to write a haiku for this one"
+    text_prompt="Describe this image"
     image_path="./dog.jpg"
     role='user'
-    
+
     with torch.profiler.record_function("prepare_generation_inputs"):
         input_ids, attention_mask, pixel_values,  vision_mask = prepare_generation_inputs_hf(text_prompt, image_path, hf_llama4_processor, role, config)
     
@@ -97,7 +114,7 @@ def run_llama_generate_image_to_text():
         print("\nCompiling and saving model...")
         model = NeuronLlama4ForCausalLM(model_path, config)
         model.compile(traced_model_path)
-        tokenizer.save_pretrained(traced_model_path)
+    tokenizer.save_pretrained(traced_model_path)
 
     # Load from compiled checkpoint.
     
@@ -111,7 +128,7 @@ def run_llama_generate_image_to_text():
     generation_config = GenerationConfig.from_pretrained(model_path)
 
     # Test Sampling Parameters
-    sampling_params = prepare_sampling_params(batch_size=batch_size, top_k=[1], top_p=[1.0],  temperature=[1.0])
+    sampling_params = prepare_sampling_params(batch_size=1, top_k=[1], top_p=[1.0],  temperature=[1.0])
     outputs = generation_model.generate(
         input_ids,
         generation_config=generation_config,
@@ -134,7 +151,7 @@ def run_llama_generate_image_to_text():
     role='user'
 
     input_ids, attention_mask, _,  _ = prepare_generation_inputs_hf(text_prompt, image_path, hf_llama4_processor, role)
-    sampling_params = prepare_sampling_params(batch_size=batch_size, top_k=[1], top_p=[1.0],  temperature=[1.0])
+    sampling_params = prepare_sampling_params(batch_size=1, top_k=[1], top_p=[1.0],  temperature=[1.0])
     outputs = generation_model.generate(
         input_ids,
         generation_config=generation_config,
@@ -159,22 +176,20 @@ def run_llama_generate_image_to_text():
 def run_llama_generate_text_to_text():
     # Initialize configs and tokenizer.
     batch_size = 1
-    neuron_config = Llama4NeuronConfig(batch_size=1,
-                                seq_len=SEQ_LENGTH,
-                                torch_dtype=torch.bfloat16,
-                                skip_sharding=False,
-                                save_sharded_checkpoint=True,
-                                tp_degree=TEXT_TP_DEGREE,
-                                cp_degree=16,
-                                on_device_sampling_config=SmplConfig(dynamic=False, top_k=1),
-                                world_size=WORLD_SIZE,
-                                capacity_factor=None,
-                                fused_qkv=False,
-                                attention_dtype=torch.float16,
-                                rpl_reduce_dtype=torch.float32,
-                                cast_type="as-declared",
-                                logical_neuron_cores=2)
-
+    neuron_config = Llama4NeuronConfig(
+        batch_size=1,
+        is_continuous_batching=True,
+        seq_len=SEQ_LENGTH,
+        torch_dtype=torch.float16,
+        rpl_reduce_dtype=torch.float32,
+        tp_degree=TEXT_TP_DEGREE,
+        cp_degree=1,
+        on_device_sampling_config=SmplConfig(dynamic=True, top_k=1),
+        world_size=WORLD_SIZE,
+        fused_qkv=False,
+        cast_type="as-declared",
+        save_sharded_checkpoint=True,
+        logical_neuron_cores=2)
 
     config = LlamaInferenceConfig(
         neuron_config=neuron_config,
@@ -191,7 +206,7 @@ def run_llama_generate_text_to_text():
         print("\nCompiling and saving model...")
         model = NeuronLlama4TextForCausalLM(model_path, config.get_text_config())
         model.compile(traced_model_path)
-        tokenizer.save_pretrained(traced_model_path)
+    tokenizer.save_pretrained(traced_model_path)
     # Load from compiled checkpoint.
     
     print("\nLoading model from compiled checkpoint...")

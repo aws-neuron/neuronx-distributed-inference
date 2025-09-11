@@ -6,6 +6,8 @@ from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMl
 from neuronx_distributed_inference.models.mllama.utils import add_instruct
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
+from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+from neuronx_distributed_inference.models.pixtral.modeling_pixtral import NeuronPixtralForCausalLM
 
 END_TO_END_MODEL = "e2e_model"
 CONTEXT_ENCODING_MODEL = "context_encoding_model"
@@ -43,4 +45,5 @@ MODEL_TYPES = {
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
+    "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
 }

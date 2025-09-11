@@ -80,8 +80,12 @@ class ModelWrapper(torch.nn.Module):
             tensorizer_options = (
                 "--enable-ccop-compute-overlap "
                 f"--cc-pipeline-tiling-factor={self.neuron_config.cc_pipeline_tiling_factor} "
-                "--vectorize-strided-dma "
             )
+            # FIXME: NCC-6889. Do not add vectorize-strided-dma for 128k on trn2 as it causes high spillover.
+            exclude_vectorize_criterion = (self.neuron_config.logical_nc_config == 2
+                                           and tag == CONTEXT_ENCODING_MODEL_TAG and self.neuron_config.seq_len >= 128 * 1024)
+            if not exclude_vectorize_criterion:
+                tensorizer_options += "--vectorize-strided-dma "
 
             long_ctx_reqs = ""
 
@@ -798,6 +802,25 @@ class ModelWrapper(torch.nn.Module):
                 for arg, pad_val, pad_len in zip(to_pad, tensor_pad_vals, pad_lengths)
             ]
             args = (*padded_args, *args[3:])
+            if len(args) == 24 and len(args[23].shape) == 3 and args[23].shape[1] != pad_length:
+                # Re-generate dummy vision embeddings and mask
+                padded_seq_len = args[0].shape[1]
+                padded_args = []
+                padded_args.append(torch.zeros(
+                    1,
+                    padded_seq_len,
+                    self.config.hidden_size,
+                    dtype=self.config.neuron_config.torch_dtype,
+                ))  # vision embeddings
+                padded_args.append(torch.full(
+                    size=(
+                        1,
+                        padded_seq_len,
+                        1),
+                    fill_value=padded_seq_len - 1,
+                    dtype=torch.int32
+                ))  # vision mask
+                args = (*args[:22], *padded_args)
         else:
             input_ids, attention_mask, *rest_of_args = args
             pad_len = pad_length - attention_mask.shape[1]

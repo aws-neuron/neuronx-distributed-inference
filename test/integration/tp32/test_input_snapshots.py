@@ -1,6 +1,7 @@
 import os
 import pickle
 import tempfile
+import pytest
 import torch
 import uuid
 
@@ -8,13 +9,20 @@ from argparse import Namespace
 
 from transformers import AutoConfig, AutoModel, GenerationConfig
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.models.llama.modeling_llama import LlamaInferenceConfig, NeuronLlamaForCausalLM
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
 from neuronx_distributed_inference.utils.snapshot import SnapshotOutputFormat
 
 
-def test_input_snapshots(monkeypatch):
+@pytest.mark.parametrize(
+    "async_mode",
+    [
+        pytest.param(False, marks=[pytest.mark.key_config_test]),
+        pytest.param(True, marks=[pytest.mark.key_config_test]),
+    ]
+)
+def test_input_snapshots(monkeypatch, async_mode):
     # Set compiler workdir for the test.
     compiler_workdir = os.path.join(os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model"), str(uuid.uuid4()))
     monkeypatch.setenv("BASE_COMPILE_WORK_DIR", compiler_workdir)
@@ -22,13 +30,12 @@ def test_input_snapshots(monkeypatch):
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models/llama/llama3.2/1b/config.json")
     model_tempdir = save_checkpoint(config_path)
     model_path = model_tempdir.name
-    model = setup_model(model_path)
+    model = setup_model(model_path, async_mode)
 
     model.register_snapshot_hooks(
         output_path=compiler_workdir,
         output_format=SnapshotOutputFormat.NUMPY_PICKLE,
         capture_at_requests=[0, 1],
-        save_transposed_priority_model_inputs=True,
     )
 
     inputs = create_inputs(model.config, input_len=16)
@@ -42,9 +49,7 @@ def validate_input_snapshots(output_path):
     input_snapshot_paths = [
         (f"{output_path}/context_encoding_model/_tp0_bk0/request0/inp-000.p", 49, 2128384),
         (f"{output_path}/token_generation_model/_tp0_bk0/request0/inp-000.p", 50, 2128258),
-        (f"{output_path}/token_generation_model/_tp0_bk0/request0/transposed_inputs/inp-000.p", 50, 2128258),
         (f"{output_path}/token_generation_model/_tp0_bk0/request1/inp-000.p", 50, 2128258),
-        (f"{output_path}/token_generation_model/_tp0_bk0/request1/transposed_inputs/inp-000.p", 50, 2128258),
         (f"{output_path}/token_generation_model/_tp0_bk1/request0/inp-000.p", 50, 2128386),
         (f"{output_path}/token_generation_model/_tp0_bk1/request1/inp-000.p", 50, 2128386),
     ]
@@ -73,7 +78,7 @@ def save_checkpoint(config_path):
     return model_tempdir
 
 
-def setup_model(model_path):
+def setup_model(model_path, async_mode):
     compiled_model_path = os.path.join(model_path, "compiled_model")
     
     neuron_config = NeuronConfig(
@@ -82,7 +87,9 @@ def setup_model(model_path):
         max_context_length=128,
         seq_len=256,
         torch_dtype=torch.bfloat16,
+        on_device_sampling_config=OnDeviceSamplingConfig(),
         enable_bucketing=True,
+        async_mode=async_mode,
     )
     config = LlamaInferenceConfig(
         neuron_config,

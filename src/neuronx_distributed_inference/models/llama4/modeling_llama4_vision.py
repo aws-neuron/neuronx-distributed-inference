@@ -997,8 +997,8 @@ class NeuronLlama4VisionEmbeddings(torch.nn.Module):
         self.vision_encoder = VisionEncoder(config)
         self.vision_adapter = PixelShuffleMLP(config)
         self.vision_projection = nn.Linear(
-            in_features=self.vision_config.vision_output_dim,
-            out_features=self.config.text_config.hidden_size,
+            in_features=self.vision_config.vision_output_dim,   # 4096
+            out_features=self.config.text_config.hidden_size,   # 5120
             bias=False,
             dtype=self.vision_config.neuron_config.torch_dtype,
         )
@@ -1080,8 +1080,6 @@ class NeuronLlama4VisionEmbeddings(torch.nn.Module):
             )
 
         logger.info(f"h_image.shape {h_image_proj.shape}")
-
-        h_image_proj = h_image_proj.to(self.config.text_config.neuron_config.torch_dtype)
 
         return h_image_proj
 

@@ -56,6 +56,7 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     prepare_sampling_params,
     rand_like,
     validate_sampling_params,
+    infer_sampling_params,
 )
 from neuronx_distributed_inference.modules.generation.seq_parallel_logits_slice import (
     seq_parallel_slice_last_token,
@@ -68,6 +69,8 @@ from neuronx_distributed_inference.modules.lora_serving import LoraCheckpoint, w
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
 from neuronx_distributed_inference.utils.random import set_random_seed
+from neuronx_distributed_inference.modules.attention.utils import stride_tensor, chunk_and_reorder_tensor
+from neuronx_distributed_inference.modules.attention.attention_process_groups import get_flattened_inverted_tp_cp_group_mesh
 from neuronxcc.nki.language import nc
 try:
     from neuronxcc.nki._pre_prod_kernels.attention_token_gen import (
@@ -344,13 +347,15 @@ class NeuronBaseModel(nn.Module):
                 attention_mask, is_for_context_encoding, **kwargs
             )
 
+        # When we have mixed attention, we pass models both a global and local mask.
+        # This function always generates a global mask.
         if is_for_context_encoding:
-            if self.sliding_window:
+            if self.sliding_window and not self.has_mixed_attn:
                 return self._create_windowed_attn_mask_cte(attention_mask, self.sliding_window)
             else:
                 return self._create_context_attn_mask(attention_mask)
         else:
-            if self.sliding_window:
+            if self.sliding_window and not self.has_mixed_attn:
                 return self._create_windowed_attn_mask_tkg(attention_mask, self.sliding_window, position_ids)
 
         if self.neuron_config.attn_block_tkg_nki_kernel_enabled and self.is_prefix_caching:
@@ -788,6 +793,12 @@ class NeuronBaseModel(nn.Module):
                 else:
                     local_attn_mask = self._create_chunked_attn_mask_tkg(attention_mask, self.attention_chunk_size, position_ids)
 
+            elif self.sliding_window:
+                if is_for_context_encoding:
+                    local_attn_mask = self._create_windowed_attn_mask_cte(attention_mask, self.sliding_window)
+                else:
+                    local_attn_mask = self._create_windowed_attn_mask_tkg(attention_mask, self.sliding_window, position_ids)
+
         active_mask = None
         if self.is_prefix_caching:
             active_length = self.speculation_length if is_for_speculation else self.n_active_tokens
@@ -832,6 +843,22 @@ class NeuronBaseModel(nn.Module):
                     attention_mask_tmp, n_positions=cache_size, batch_size=self.batch_size
                 )
                 active_mask_2d = active_mask_tmp
+
+        if self.neuron_config.strided_context_parallel_kernel_enabled and is_for_context_encoding:
+            logging.debug("strided_context_parallel_kernel_enabled enabled, shuffling inputs")
+
+            # The strided CP FA kernel expected inputs to be strided, due to SP happening in model_base
+            # stride here rather than in attention to order it before we move the inputs to SP region
+            input_ids = stride_tensor(input_ids, 1, self.neuron_config.cp_degree)
+            position_ids = stride_tensor(position_ids, 1, self.neuron_config.cp_degree)
+
+        # When using SP with 8x8 CP, the mesh is non-contiguous, so we reorder the input to have a non-contiguous SP split
+        # When we AG in attention using 8x8, the resulting sequence is contiguous
+        if is_for_context_encoding and self.neuron_config.cp_degree > 1 and self.neuron_config.cp_degree == 8 and (self.neuron_config.tp_degree // self.neuron_config.cp_degree) == 8 and self.sequence_parallel_enabled:
+            ordering = get_flattened_inverted_tp_cp_group_mesh(self.neuron_config.tp_degree, self.neuron_config.cp_degree)
+
+            logging.debug("CP8 and SP enabled, reordering the input on S", ordering)
+            input_ids = chunk_and_reorder_tensor(input_ids, ordering, 1)
 
         hidden_states, updated_kv_cache = self.get_model_output(
             input_ids=input_ids,
@@ -927,6 +954,114 @@ class NeuronBaseModel(nn.Module):
                 outputs = outputs + [self.full_hidden_states]
 
         return outputs
+
+    def _find_first_captured_tensor_for_module(self, module_captured_tensors_dict, module_name, tensor_type, device):
+        """
+        Find the first tensor for a given module and tensor type (inputs/outputs).
+
+        Modules inputs/outputs registration can create nested tensor structures with various
+        suffixes (e.g., .0, .1, .hidden_states, .kwargs.arg_name, etc.).
+
+        Since module_captured_tensors_dict is an OrderedDict and registration happens
+        deterministically, we preserve the natural registration order without sorting.
+        The module hierarchy is properly separated by dots, so simple prefix matching
+        is sufficient to find the exact module's tensors.
+
+        Args:
+            module_captured_tensors_dict: OrderedDict of all captured module tensors
+            module_name: Name of the module to search for
+            tensor_type: Either "inputs" or "outputs"
+            device: Device to create fallback tensor on if no tensor is found
+
+        Returns:
+            torch.Tensor: The first tensor found for the module/type, or an empty tensor fallback
+        """
+        exact_prefix = f"{module_name}.{tensor_type}"
+
+        # Return the first tensor that matches our exact prefix
+        # Since we're using OrderedDict, iteration preserves registration order
+        for key, tensor in module_captured_tensors_dict.items():
+            if key.startswith(exact_prefix):
+                return tensor
+
+        # Fallback: create empty tensor if no tensor found
+        # This ensures consistent output structure for tracing
+        return torch.zeros(1, dtype=torch.bfloat16, device=device)
+
+    def _get_captured_tensors(
+        self,
+        device
+    ):
+        """
+        Returns tensors captured during model execution based on tensor_capture_config settings.
+
+        This function handles two types of tensor capture:
+        1. Module tensors: Captured from specific modules defined in modules_to_capture
+        2. Manual tensors: Manually registered tensors during execution
+
+        Args:
+            device: Device to create padding tensors on (typically the same as model outputs)
+
+        Returns:
+            List of captured tensors. For manual tensors, padding is added to ensure
+            the list has exactly max_intermediate_tensors elements for input/output aliasing.
+        """
+        registry = TensorRegistry.get_instance()
+        captured_tensors = []
+
+        # 1. Process module tensors - capture outputs and optionally inputs from specified modules
+        if self.neuron_config.tensor_capture_config.modules_to_capture:
+            module_captured_tensors_dict = registry.get_module_tensors()
+            for module_name in self.neuron_config.tensor_capture_config.modules_to_capture:
+                # Get first output tensor for this module
+                output_tensor = self._find_first_captured_tensor_for_module(
+                    module_captured_tensors_dict, module_name, "outputs", device
+                )
+                captured_tensors += [output_tensor]
+
+                # Get first input tensor if capture_inputs is enabled
+                if self.neuron_config.tensor_capture_config.capture_inputs:
+                    input_tensor = self._find_first_captured_tensor_for_module(
+                        module_captured_tensors_dict, module_name, "inputs", device
+                    )
+                    captured_tensors += [input_tensor]
+
+        # Gather the manually registered tensors
+        manual_captured_tensors = None
+        if self.neuron_config.tensor_capture_config.max_intermediate_tensors:
+            manual_captured_tensors_dict = registry.get_manual_tensors()
+            manual_captured_tensors = []
+
+            for key, tensor in manual_captured_tensors_dict.items():
+                manual_captured_tensors.append(tensor)
+
+            # Slice the manually captured tensors to max_intermediate_tensors
+            # This is necessary to maintain a fixed-size output structure for input/output aliasing
+            if len(manual_captured_tensors) > self.neuron_config.tensor_capture_config.max_intermediate_tensors:
+                discarded_count = len(manual_captured_tensors) - self.neuron_config.tensor_capture_config.max_intermediate_tensors
+                logging.warning(
+                    f"Number of manually captured tensors ({len(manual_captured_tensors)}) exceeds max_intermediate_tensors "
+                    f"({self.neuron_config.tensor_capture_config.max_intermediate_tensors}). "
+                    f"Discarding {discarded_count} tensors."
+                )
+                manual_captured_tensors = manual_captured_tensors[:self.neuron_config.tensor_capture_config.max_intermediate_tensors]
+
+            # Add padding tensors if we have fewer than max_intermediate_tensors
+            # This is necessary to maintain a fixed-size output structure for input/output aliasing
+            if len(manual_captured_tensors) < self.neuron_config.tensor_capture_config.max_intermediate_tensors:
+                padding_count = self.neuron_config.tensor_capture_config.max_intermediate_tensors - len(manual_captured_tensors)
+                for _ in range(padding_count):
+                    # Use a nan value to easily identify padding tensors
+                    padding_tensor = torch.full((1,), float('nan'), dtype=torch.bfloat16, device=device)
+                    manual_captured_tensors.append(padding_tensor)
+
+        # Add manual tensors to the output list
+        if manual_captured_tensors:
+            captured_tensors += manual_captured_tensors
+
+        # Clear the registry for the next model execution
+        registry.clear()
+        return captured_tensors
 
     def _sample_on_device(
         self,
@@ -1161,6 +1296,10 @@ class NeuronBaseModel(nn.Module):
             self.full_hidden_states = hidden_states  # (B, S/TP, H)
 
         if self.sequence_parallel_enabled:
+            if is_for_context_encoding and self.neuron_config.cp_degree > 1 and self.neuron_config.cp_degree == 8 and (self.neuron_config.tp_degree // self.neuron_config.cp_degree) == 8:
+                ordering = get_flattened_inverted_tp_cp_group_mesh(self.neuron_config.tp_degree, self.neuron_config.cp_degree)
+                position_ids = chunk_and_reorder_tensor(position_ids, ordering, 1)
+
             physical_position_ids = position_ids
             active_block_table = kwargs.get("active_block_table", None)
             has_prefix = active_block_table is not None and len(active_block_table.shape) > 1
@@ -2992,6 +3131,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             self.default_sampling_params if sampling_params is None else sampling_params
         )
         self.validate_sampling_params(sampling_params)
+        sampling_params = infer_sampling_params(sampling_params)
         self.sampling_params = sampling_params
 
         output_attentions, output_hidden_states, return_dict = self._setup_func_config(

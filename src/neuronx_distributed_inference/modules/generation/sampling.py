@@ -119,11 +119,13 @@ def validate_sampling_params(
         global_top_k = on_device_sampling_config["global_topk"]
 
     # Validate top-k value range
-    valid_top_k = (top_k == -1) | ((top_k > 0) & (top_k <= global_top_k))
+    valid_top_k = (top_k == -1) | ((top_k >= 0) & (top_k <= global_top_k))
     if not torch.all(valid_top_k):
         raise ValueError(
             f"Invalid top-k values found. top-k must be -1 or greater than 0 but less than or equal to {global_top_k=}. Found {top_k=}."
         )
+    if torch.any(top_k == -1) or torch.any(top_k == 0):
+        logger.warning("In NxDI, top_k = -1 or top_k = 0 means randomly picking a token from the vocabulary with a uniform distribution.")
 
     # checks if top-k values can be represented as integers
     if not torch.equal(top_k, top_k.floor()):
@@ -139,11 +141,39 @@ def validate_sampling_params(
         )
 
     # Validate temperature
-    valid_temp = temperature > 0.0
+    valid_temp = temperature >= 0.0
     if not torch.all(valid_temp):
         raise ValueError(
-            f"Invalid temperature values found. Temperature must be strictly greater than 0.0. Found {temperature=}."
+            f"Invalid temperature values found. Temperature must be greater than or equal to 0.0. Found {temperature=}."
         )
+    invalid_combination = (temperature == 0.0) & ((top_k == -1) | (top_k == 0))
+    if torch.any(invalid_combination):
+        raise ValueError(
+            "Invalid sampling parameters found. Temperature = 0 enables greedy sampling. Please set top_k to 1"
+        )
+
+
+def infer_sampling_params(
+    params: torch.Tensor
+) -> None:
+    """
+    Depending on certain special values of top_k, top_p and temperature, the other values are inferred.
+
+    Args:
+    params (torch.Tensor): Tensor of shape (batch_size, 3) containing sampling parameters
+                           in the order: top-k, top-p, temperature.
+
+    Return:
+    inferred params
+    """
+    bsz = params.shape[0]
+    for i in range(bsz):
+        temperature = params[i, 2]
+        if temperature == 0:
+            logger.warning("Temperature = 0 enables greedy sampling. Resetting top_k and top_p values to 1.")
+            params[i, 0] = 1
+            params[i, 1] = 1
+    return params
 
 
 def prepare_sampling_params(batch_size, top_k=[1], top_p=[1.0], temperature=[1.0]):
@@ -260,11 +290,9 @@ class Sampler(torch.nn.Module):
                 )
         else:
             sorted_logits, indices = torch.sort(input=logits, dim=dim, descending=True)
-
         vocab_size = sorted_logits.shape[-1]
         mask = torch.arange(vocab_size, device=logits.device)
         mask = mask.broadcast_to(*sorted_logits.shape)
-
         mask = torch.greater_equal(mask, top_k)
         sorted_logits = sorted_logits.masked_fill_(mask, self.IGNORED_LOGITS_VALUE)
         return sorted_logits, indices
@@ -324,6 +352,7 @@ class Sampler(torch.nn.Module):
         top_k = sampling_params[:, 0]
         top_p = sampling_params[:, 1]
         temperature = sampling_params[:, 2]
+
         if token_logits.dim() == 3:
             # Eagle TKG could pass token_logits of shape (batch_size, speculation_len, vocab_size)
             sampling_param_shape = (batch_size, 1, 1)
@@ -332,13 +361,11 @@ class Sampler(torch.nn.Module):
         top_k = top_k.reshape(*sampling_param_shape)
         top_p = top_p.reshape(*sampling_param_shape)
         temperature = temperature.reshape(*sampling_param_shape)
-
         top_k_logits_values, top_k_logits_indices = self._top_k_masked(
             token_logits, top_k, dim, rank_id
         )
         if self.is_medusa:
             return top_k_logits_indices
-
         if self.dynamic or torch.any(temperature != 1.0):
             top_k_logits_values = torch.divide(top_k_logits_values, temperature)
 

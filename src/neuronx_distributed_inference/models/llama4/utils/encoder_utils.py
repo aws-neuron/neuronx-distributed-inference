@@ -238,8 +238,8 @@ def pad_positions(positions, target_size, fill_value):
             (padding_size,), fill_value, dtype=positions.dtype, device=positions.device
         )
         positions_padded = torch.cat([positions, padding])
-    else:
-        positions_padded = positions[:target_size]
+    elif padding_size < 0:
+        raise RuntimeError("Text model sequence length is not enough to handle all vision embeddings")
 
     # Add batch dimension and an extra dimension at the end
     return positions_padded.unsqueeze(0).unsqueeze(-1)  # Shape: [1, x, 1]

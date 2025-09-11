@@ -1,7 +1,5 @@
 import logging
 import os
-import time
-import uuid
 import pytest
 import tempfile
 from argparse import Namespace
@@ -13,10 +11,14 @@ from transformers.models.llama4.modeling_llama4 import (
 )
 from transformers import GenerationConfig
 
-from neuronx_distributed_inference.utils.accuracy import check_accuracy_logits
+from neuronx_distributed_inference.utils.accuracy import (
+    generate_expected_logits,
+    check_accuracy_logits_v2,
+)
 from neuronx_distributed_inference.models.llama4.modeling_llama4 import NeuronLlama4ForCausalLM
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 from neuronx_distributed_inference.models.config import to_dict
+from neuronx_distributed_inference.utils.random import set_random_seed
 
 from .test_config import get_llama4_config
 from .test_utils import (
@@ -33,6 +35,7 @@ setup_debug_env()
 
 def get_inputs(config, dtype):
     # inputs
+    set_random_seed(0)
     text_token_len = 16
     num_vision_token_per_chunk = (config.vision_config.image_size // config.vision_config.patch_size) ** 2 * ((config.vision_config.pixel_shuffle_ratio) ** 2)
     vision_token_len = NUM_CHUNKS * int(num_vision_token_per_chunk)
@@ -88,7 +91,6 @@ def save_checkpoint(config_path):
     hf_model.save_pretrained(model_path)
     return model_tempdir
 
-@pytest.mark.xfail(reason="Expected and actual logit seq len are different. check_accuracy_logits needs fix.", strict=False)
 @pytest.mark.parametrize(
     "dtype, model_type, latency_threshold, throughput_threshold",
     [
@@ -133,17 +135,36 @@ def test_original_cpu_vs_nxdi_neuron(dtype, model_type, latency_threshold, throu
     print(f"Compiled Neuron model to {traced_path}")
 
     # Load model on Neuron
+    print(f"Loading Neuron model from {traced_path}")
     neuron_model.load(traced_path)
     print(f"Loaded Neuron model from {traced_path}")
 
-    # Validations
-    check_accuracy_logits(
+    additional_hf_input_args = {
+        "pixel_values": inputs.pixel_values.to(torch.float32),
+    }
+    expected_logits = generate_expected_logits(
         neuron_model,
+        inputs.input_ids,
+        inputs.attention_mask,
+        generation_config,
+        NUM_TOKENS_TO_CHECK,
+        additional_hf_input_args,
+    )
+
+    # Validations
+    additional_neuron_input_args = {
+        "pixel_values": inputs.pixel_values,
+        "vision_mask": inputs.vision_mask,
+    }
+    check_accuracy_logits_v2(
+        neuron_model,
+        expected_logits,
+        inputs.input_ids,
+        inputs.attention_mask,
         generation_config=generation_config,
         num_tokens_to_check=NUM_TOKENS_TO_CHECK,
-        inputs=inputs,
-        pad_token_id=config.text_config.pad_token_id,
         divergence_difference_tol=0.01,
+        additional_input_args=additional_neuron_input_args,
     )
     validate_perf(neuron_model, generation_config, latency_threshold, throughput_threshold)
 
