@@ -9,7 +9,7 @@ body:
     id: description
     attributes:
       label: Describe the bug
-      description: What is the problem? A clear and concise description of the bug.
+      description: What is the problem? Provide a clear description of your issue and the steps you took that produced it.
     validations:
       required: true
   - type: textarea
@@ -24,7 +24,7 @@ body:
     attributes:
       label: Instance Type
       description: |
-        Please provide instance type - Inf2.xlarge/trn1.16xlarge/trn2.48xlarge etc?
+       Provide the AWS EC2 instance type you used to run the workload (such as `inf2.xlarge`, `trn1.32xlarge`, `trn2.48xlarge` etc.)
     validations:
       required: true
   - type: textarea
@@ -32,17 +32,21 @@ body:
     attributes:
       label: Release version 
       description: |
-        Provide Neuron SDK release.        
+        Provide the Neuron SDK release version (such as `2.25.0`) you are using, and all relevant Neuron component versions. 
+        ```
+        apt list --installed | grep -i -e neuron
+        pip list | grep -i -e neuron -e torch -e transformers
+        ```
   - type: textarea
     id: reproduction
     attributes:
       label: Reproduction Steps
       description: |
-        Provide model name, Tutorial links for more context.
+        Provide the type of the model and links to any tutorials you may have used, as additional context.
         Provide a self-contained, concise snippet of code that can be used to reproduce the issue.
         For more complex issues provide a repo with the smallest sample that reproduces the bug.
         
-        Avoid including business logic or unrelated code, it makes diagnosis more difficult.
+        Avoid including business logic or unrelated code as it makes diagnosis more difficult.
         The code sample should be an SSCCE. See http://sscce.org/ for details. In short, please provide a code sample that we can copy/paste, run and reproduce.
     validations:
       required: true
@@ -50,8 +54,8 @@ body:
     id: regression
     attributes:
       label: Regression Issue
-      description: What is a regression? If it worked in a previous version but doesn't in the latest version, it's considered a
-        regression. In this case, please provide specific version number in the report.
+      description: Is this as regression (did it work in a previous version and not now)?
+        If this is a regression, provide the Neuron SDK release version where this configuration worked for you.
       options:
         - label: Select this option if this issue appears to be a regression.
           required: false
@@ -60,28 +64,15 @@ body:
     attributes:
       label: Possible Solution
       description: |
-        Suggest a fix/reason for the bug
+        Suggest a fix or reason for the bug, if you know:
     validations:
       required: false
   - type: textarea
     id: context
     attributes:
-      label: Additional Information/Context/Logs
+      label: Logs/Context/Additional Information
       description: |
-        Anything else that might be relevant for troubleshooting this bug. Providing context helps us come up with a solution that is most useful in the real world.
+        Anything else that might be relevant for troubleshooting this bug. Providing context helps us come up with a solution that is most useful in the real world. When applicable, please provide HLOs and compiler commands.
     validations:
       required: false
-  - type: input
-    id: neuronx-cc-version
-    attributes:
-      label: neuronx-cc version used
-      description: |
-        Please provide output of neuronx-cc --version 
-    validations:
-      required: false
-  - type: input
-    id: frameworks-used
-    attributes:
-      label: Framework(s) and their versions used ( Neuron Distributed Inference, pytorch etc..)
-    validations:
-      required: false
+
