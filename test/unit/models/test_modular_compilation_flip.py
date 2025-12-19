@@ -27,6 +27,7 @@ class MockNeuronConfig(NeuronConfig):
         self.enable_fused_speculation = False
         self.speculation_length = 0
         self.medusa_speculation_length = 0
+        self.lora_config = None
 
 
 class MockInferenceConfig(InferenceConfig):

@@ -1,4 +1,5 @@
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+from neuronx_distributed_inference.models.gpt_oss.modeling_gpt_oss import NeuronGptOssForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.llama4.modeling_llama4 import NeuronLlama4ForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
@@ -38,6 +39,7 @@ TEST_PROMPT = "Hello, I am a language model, and I am here to help,"
 MM_TEST_PROMPT = add_instruct("What is in this image? Tell me a story", has_image=[1])
 
 MODEL_TYPES = {
+    "gpt_oss": {"causal-lm": NeuronGptOssForCausalLM},
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
     "llama4": {"causal-lm": NeuronLlama4ForCausalLM},
     "mllama": {"causal-lm": NeuronMllamaForCausalLM},

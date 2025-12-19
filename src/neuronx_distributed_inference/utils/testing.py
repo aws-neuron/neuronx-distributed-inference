@@ -95,7 +95,9 @@ def validate_accuracy(
             cpu_output = cpu_callable(*input)
             logger.info(f"CPU output: {cpu_output}")
             if expected_output is not None:
-                torch_neuronx.testing.assert_close(expected_output, cpu_output, **assert_close_kwargs)
+                torch_neuronx.testing.assert_close(
+                    expected_output, cpu_output, **assert_close_kwargs
+                )
             else:
                 expected_output = cpu_output
 
@@ -153,7 +155,7 @@ def build_function(
         priority_model_idx=priority_model_idx,
         logical_nc_config=logical_nc_config,
         dry_run=dry_run,
-        checkpoint_loader_fn=checkpoint_loader_fn
+        checkpoint_loader_fn=checkpoint_loader_fn,
     )
 
 
@@ -162,6 +164,8 @@ def build_module(
     example_inputs: List[Tuple[torch.Tensor]],
     module_init_kwargs: Dict = {},
     tp_degree: int = 1,
+    world_size: Optional[int] = None,  # if you want to consider ep degree, you may need to set it
+    local_ranks_size: Optional[int] = None,  # if you set world_size, you also need to set it
     compiler_args: Optional[str] = None,
     compiler_workdir: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
@@ -215,7 +219,9 @@ def build_module(
     logger.info(f"Using checkpoint path: {checkpoint_path}")
 
     if not checkpoint_path.exists():
-        _save_checkpoint(module_cls, module_init_kwargs, checkpoint_path, tp_degree)
+        _save_checkpoint(
+            module_cls, module_init_kwargs, checkpoint_path, tp_degree, world_size if world_size else tp_degree
+        )
 
     if not compiler_workdir.exists():
         compiler_workdir.parent.mkdir(parents=True, exist_ok=True)
@@ -223,6 +229,8 @@ def build_module(
     model_builder = ModelBuilder(
         router=None,
         tp_degree=tp_degree,
+        world_size=world_size,
+        local_ranks_size=local_ranks_size,
         checkpoint_loader=partial(checkpoint_loader_fn, checkpoint_path),
         compiler_workdir=compiler_workdir,
         logical_nc_config=logical_nc_config,
@@ -281,12 +289,13 @@ def _get_module_name(module_cls, module_init_kwargs):
     return module_cls.__name__
 
 
-def _save_checkpoint(module_cls, module_init_kwargs, checkpoint_path, tp_degree=1):
+def _save_checkpoint(module_cls, module_init_kwargs, checkpoint_path, tp_degree, world_size):
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Parallel state is required to init modules that have distributed layers like RPL/CPL.
     destroy_mp()
-    torch.distributed.init_process_group(backend="xla", rank=0, world_size=tp_degree)
+
+    torch.distributed.init_process_group(backend="xla", rank=0, world_size=world_size)
     parallel_state.initialize_model_parallel(tp_degree)
 
     # Set the parallel state random seed to ensure random weights match modules initialized on CPU.
@@ -311,52 +320,52 @@ def _is_tensor_tuple(tensor_tuple):
 
 def _rand_interval(a: float, b: float, dtype: torch.dtype, *size: int) -> torch.Tensor:
     """
-        Generate random numbers uniformly distributed in the interval [a, b).
+    Generate random numbers uniformly distributed in the interval [a, b).
 
-        Args:
-            a (float): Lower bound of the interval (inclusive)
-            b (float): Upper bound of the interval (exclusive)
-            dtype (torch.dtype): Data type for the output tensor
-            *size (int): The shape dimensions of the output tensor
+    Args:
+        a (float): Lower bound of the interval (inclusive)
+        b (float): Upper bound of the interval (exclusive)
+        dtype (torch.dtype): Data type for the output tensor
+        *size (int): The shape dimensions of the output tensor
 
-        Returns:
-            torch.Tensor: A tensor of random numbers uniformly distributed between [a, b)
-                         with the specified size and dtype
+    Returns:
+        torch.Tensor: A tensor of random numbers uniformly distributed between [a, b)
+                     with the specified size and dtype
 
-        Example:
-            >>> _rand_interval(0, 1, torch.float16, 2, 3)  # Returns a 2x3 tensor with values between [0,1) in float16
-            >>> _rand_interval(-1, 1, torch.float32, 5)    # Returns a tensor of size (5,) with values between [-1,1) in float32
+    Example:
+        >>> _rand_interval(0, 1, torch.float16, 2, 3)  # Returns a 2x3 tensor with values between [0,1) in float16
+        >>> _rand_interval(-1, 1, torch.float32, 5)    # Returns a tensor of size (5,) with values between [-1,1) in float32
     """
     return Uniform(a, b).sample(torch.Size(size)).to(dtype)
 
 
 def _get_rand_weights(
-        model: torch.nn.Module,
-        ckpt_path: str,
-        dtype: torch.dtype = torch.float32,
-        weight_range: tuple[float, float] = (-0.05, 0.05),
-        bias_range: tuple[float, float] = (-0.25, 0.25)
+    model: torch.nn.Module,
+    ckpt_path: str,
+    dtype: torch.dtype = torch.float32,
+    weight_range: tuple[float, float] = (-0.05, 0.05),
+    bias_range: tuple[float, float] = (-0.25, 0.25),
 ) -> torch.nn.Module:
     """
-        Initialize model weights and biases with random values within specified ranges and save to checkpoint.
+    Initialize model weights and biases with random values within specified ranges and save to checkpoint.
 
-        Args:
-            model (torch.nn.Module): The PyTorch model to initialize
-            ckpt_path (str): Path to save the checkpoint file (.pt or .safetensors)
-            dtype (torch.dtype, optional): Data type for the model parameters. Defaults to torch.float32
-            weight_range (tuple, optional): A uniform distribution over interval [min, max) for random weight initialization.
-            bias_range (tuple, optional): A uniform distribution over interval [min, max) for random bias initialization.
+    Args:
+        model (torch.nn.Module): The PyTorch model to initialize
+        ckpt_path (str): Path to save the checkpoint file (.pt or .safetensors)
+        dtype (torch.dtype, optional): Data type for the model parameters. Defaults to torch.float32
+        weight_range (tuple, optional): A uniform distribution over interval [min, max) for random weight initialization.
+        bias_range (tuple, optional): A uniform distribution over interval [min, max) for random bias initialization.
 
-        Returns:
-            torch.nn.Module: The model with randomly initialized weights
+    Returns:
+        torch.nn.Module: The model with randomly initialized weights
 
-        Raises:
-            ValueError: If the checkpoint path format is not supported (.pt or .safetensors)
+    Raises:
+        ValueError: If the checkpoint path format is not supported (.pt or .safetensors)
 
-        Notes:
-            - LayerNorm layers are kept in FP32 precision regardless of the specified dtype
-            - Parameters not ending with 'weight' or 'bias' maintain their original values
-            - Supports saving in either .pt or .safetensors format
+    Notes:
+        - LayerNorm layers are kept in FP32 precision regardless of the specified dtype
+        - Parameters not ending with 'weight' or 'bias' maintain their original values
+        - Supports saving in either .pt or .safetensors format
     """
     randn_state_dict = {}
     for k, v in model.state_dict().items():

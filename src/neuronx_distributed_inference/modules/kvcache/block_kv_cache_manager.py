@@ -373,10 +373,10 @@ def generate_tokengen_slot_mapping(
     active_mask = (slot_mapping >= 0)
 
     row_indices = torch.arange(B, dtype=position_ids.dtype, device=position_ids.device)
-    block_indices = (position_ids // block_size).squeeze()
+    block_indices = (position_ids // block_size).squeeze(dim=1)
 
     block_number = block_table[row_indices, block_indices]
-    block_offset = (position_ids % block_size).squeeze()
+    block_offset = (position_ids % block_size).squeeze(dim=1)
     cur_slots = block_size * block_number + block_offset
     cur_slots = cur_slots.unsqueeze(dim=1)
 

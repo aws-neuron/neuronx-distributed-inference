@@ -32,10 +32,13 @@ from neuronx_distributed_inference.modules.checkpoint import (
     prune_state_dict,
     save_state_dict_safetensors,
 )
+from neuronx_distributed_inference.modules.lora_serving import LoraModelManager
 from neuronx_distributed_inference.utils.runtime_env import set_env_vars
+from neuronx_distributed_inference.utils.compile_env import set_compile_env_vars
 from neuronx_distributed_inference.utils.snapshot import (
     ScriptModuleWrapper,
     SnapshotOutputFormat,
+    SnapshotCaptureConfig,
     get_snapshot_hook,
     register_nxd_model_hook,
     unregister_nxd_model_hooks,
@@ -93,6 +96,9 @@ class NeuronApplicationBase(torch.nn.Module):
         self.is_compiled = is_compiled(model_path)
         self.is_loaded_to_neuron = False
         self._builder = None
+
+        if self.neuron_config.lora_config is not None:
+            self.lora_model_manager = LoraModelManager(self.neuron_config.lora_config)
 
     # Check if the given model is eligible for modular flow optimization and apply the necessary changes
     def check_and_apply_modular_flow_optimization(
@@ -176,6 +182,20 @@ class NeuronApplicationBase(torch.nn.Module):
                 )
         return self._builder
 
+    def get_cte_model(self):
+        cte_model = None
+        if self._builder and self._builder.model_collection and "context_encoding_model" in self._builder.model_collection:
+            cte_model_container = self._builder.model_collection["context_encoding_model"]
+            func_kwargs = (
+                {}
+                if cte_model_container.bucket_config is None
+                else cte_model_container.bucket_config.get_func_kwargs_for_bucket_rank(0)
+            )
+            if "bucket_rank" in func_kwargs:
+                func_kwargs.pop("bucket_rank")  # to avoid multiple definition of bucket_rank
+            cte_model, _ = cte_model_container.model_instance.get(0, **func_kwargs)
+        return cte_model
+
     def forward(self, **kwargs):
         """Forward pass for this model."""
         raise NotImplementedError("forward is not implemented")
@@ -230,7 +250,14 @@ class NeuronApplicationBase(torch.nn.Module):
                 "SKIPPING pre-sharding the checkpoints. The checkpoints will be sharded during load time."
             )
         else:
+            logger.info("Pre-sharding checkpoints.")
             self.get_builder(debug).shard_checkpoint(serialize_path=sharded_checkpoint_dir)
+
+            if self.neuron_config.lora_config and self.neuron_config.lora_config.dynamic_multi_lora:
+                logger.info("Pre-sharding CPU LoRA adapter checkpoints.")
+                cte_model = self.get_cte_model()
+                cte_model.lora_weight_manager.lora_checkpoint.update_weights_for_lora_cpu(cte_model)
+                cte_model.lora_weight_manager.lora_checkpoint.shard_cpu_checkpoints(self.neuron_config.start_rank_id, self.neuron_config.local_ranks_size, self.neuron_config.tp_degree, cte_model, serialize_path=sharded_checkpoint_dir)
 
             if hlo_utils.NXD_LAYOUT_TRANSFORMATION_OPTIONS in os.environ:
                 self.get_builder(debug).transform_weight_layout_with_overriden_option(
@@ -263,6 +290,9 @@ class NeuronApplicationBase(torch.nn.Module):
                 specific_config.save(submodel_path)
 
     def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None, dry_run=False):
+        # set compile-time env vars if needed
+        set_compile_env_vars(self.neuron_config)
+
         """Compiles this model and saves it to the given path."""
         compiled_model_path = normalize_path(compiled_model_path)
 
@@ -289,7 +319,7 @@ class NeuronApplicationBase(torch.nn.Module):
     ):
         compiled_model_path = normalize_path(compiled_model_path)
 
-        # set env vars for long context if needed
+        # set runtime env vars if needed
         set_env_vars(self.neuron_config)
 
         """Loads the compiled model checkpoint to the Neuron device."""
@@ -356,8 +386,8 @@ class NeuronApplicationBase(torch.nn.Module):
         weights = []
         start_time = time.monotonic()
         if self.neuron_config.save_sharded_checkpoint:
-            logging.info(
-                f"Loading presharded checkpoints for {start_rank_id}...{start_rank_id + local_ranks_size - 1}"
+            logger.info(
+                f"Loading presharded checkpoints for ranks: {start_rank_id}...{start_rank_id + local_ranks_size - 1}"
             )
             for rank in range(start_rank_id, start_rank_id + local_ranks_size):
                 ckpt = load_file(
@@ -366,17 +396,40 @@ class NeuronApplicationBase(torch.nn.Module):
                     )
                 )
                 weights.append(ckpt)
+
+            if self.neuron_config.lora_config and self.neuron_config.lora_config.dynamic_multi_lora:
+                lora_cpu_weights = self.lora_model_manager.lora_checkpoint.load_sharded_cpu_checkpoints(compiled_model_path, start_rank_id, local_ranks_size)
+
         else:
             logger.info("Sharding weights on load...")
             weights = self.get_builder().shard_checkpoint()
 
+            if self.neuron_config.lora_config and self.neuron_config.lora_config.dynamic_multi_lora:
+                logger.info("Sharding CPU LoRA adapter weights on load...")
+                cte_model = self.get_cte_model()
+                cte_model.lora_weight_manager.lora_checkpoint.update_weights_for_lora_cpu(cte_model)
+                lora_cpu_weights = cte_model.lora_weight_manager.lora_checkpoint.shard_cpu_checkpoints(start_rank_id, local_ranks_size, self.neuron_config.tp_degree, cte_model)
+
         start_rank_tensor = torch.tensor([start_rank_id], dtype=torch.int32, device="cpu")
         self.traced_model.nxd_model.initialize(weights, start_rank_tensor)
+
+        if self.neuron_config.lora_config and self.neuron_config.lora_config.dynamic_multi_lora:
+            self.lora_model_manager.init_dynamic_multi_lora(lora_cpu_weights)
+
         logger.info(f"Finished weights loading in {time.monotonic() - start_time} seconds")
 
     def _register_snapshot_hooks_from_env(self):
         """
         Registers snapshot hooks based on configuration from environment variables.
+
+        Expected format for NXD_INFERENCE_CAPTURE_AT_REQUESTS is a comma delimited list of integers greater than or equal to zero
+        Example: NXD_INFERENCE_CAPTURE_AT_REQUESTS="0,1,2,3"
+
+        Expected format for NXD_INFERENCE_CAPTURE_FOR_TOKENS is a comma delimited list of integers greater than or equal to zero,
+            and to add more batchlines, delimit each comma separated list with a semicolon.
+        Example 1: NXD_INFERENCE_CAPTURE_FOR_TOKENS="0,1,2,3"
+        Example 2: NXD_INFERENCE_CAPTURE_FOR_TOKENS="0,1,2,3;1,2"
+        Example 3: NXD_INFERENCE_CAPTURE_FOR_TOKENS="0,1,2,3;;1,5"
         """
         assert (
             "NXD_INFERENCE_CAPTURE_OUTPUT_PATH" in os.environ
@@ -385,17 +438,41 @@ class NeuronApplicationBase(torch.nn.Module):
             "NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT" in os.environ
         ), "Must set NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT to enable snapshots"
         assert (
-            "NXD_INFERENCE_CAPTURE_AT_REQUESTS" in os.environ
-        ), "Must set NXD_INFERENCE_CAPTURE_AT_REQUESTS to enable snapshots"
+            "NXD_INFERENCE_CAPTURE_AT_REQUESTS" in os.environ or "NXD_INFERENCE_CAPTURE_FOR_TOKENS" in os.environ
+        ), "Must set NXD_INFERENCE_CAPTURE_AT_REQUESTS or NXD_INFERENCE_CAPTURE_FOR_TOKENS to enable snapshots"
 
         output_path = os.environ["NXD_INFERENCE_CAPTURE_OUTPUT_PATH"]
         output_format = os.environ["NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT"]
-        capture_at_requests_str = os.environ["NXD_INFERENCE_CAPTURE_AT_REQUESTS"]
-        capture_at_requests = [int(val_str) for val_str in capture_at_requests_str.split(",")]
+        capture_at_requests = []
+        if (capture_at_requests_str := os.getenv("NXD_INFERENCE_CAPTURE_AT_REQUESTS", None)) is not None:
+            try:
+                capture_at_requests_str = capture_at_requests_str.replace(" ", "")
+                capture_at_requests = [int(val_str) for val_str in capture_at_requests_str.split(",")]
+            except ValueError as e:
+                err_msg = f"Could not parse NXD_INFERENCE_CAPTURE_AT_REQUESTS={capture_at_requests_str}. Please check that it follows a comma separated list format with integers only (ex 0,1,2)."
+                raise ValueError(err_msg) from e
+
+        capture_for_tokens = []
+        if (capture_for_tokens_str := os.getenv("NXD_INFERENCE_CAPTURE_FOR_TOKENS", None)) is not None:
+            try:
+                capture_for_tokens_str = capture_for_tokens_str.replace(" ", "")
+                capture_for_tokens = [
+                    [
+                        int(val_str)
+                        for val_str in batch_line.split(",")
+                        if val_str
+                    ]
+                    for batch_line in capture_for_tokens_str.split(";")
+                ]
+            except ValueError as e:
+                err_msg = f"Could not parse NXD_INFERENCE_CAPTURE_FOR_TOKENS={capture_for_tokens_str}. Please check that it follows a comma separated list format with integers only, which are then delimited by semicolons (ex '1,2;3,4,5;;6')."
+                raise ValueError(err_msg) from e
+
         self.register_snapshot_hooks(
             output_path=output_path,
             output_format=SnapshotOutputFormat[output_format],
             capture_at_requests=capture_at_requests,
+            capture_for_tokens=capture_for_tokens
         )
 
     def register_snapshot_hooks(
@@ -403,6 +480,7 @@ class NeuronApplicationBase(torch.nn.Module):
         output_path: str,
         output_format: SnapshotOutputFormat,
         capture_at_requests: List[int],
+        capture_for_tokens: Optional[List[List[int]]] = None,
         ranks: Optional[List[int]] = None,
     ):
         """
@@ -419,6 +497,10 @@ class NeuronApplicationBase(torch.nn.Module):
             capture_at_requests: The request numbers at which this hook captures input snapshots for
                 each submodel bucket. For example, [0] means to capture the first request to each
                 submodel bucket.
+            capture_for_tokens: Optional List of lists corresponding to tokens to snapshot for a given batchline.
+                Default is None, meaning, no token snapshotting.
+                Example [[10,12],[],[15]], would mean for the 0th batchline capture the inputs generating the 10th and 12th token,
+                and for the 2nd batchline, capture the inputs generating the 15th token.
             ranks: The list of ranks to snapshot. Each rank is a separate NeuronCore device.
                 Defauls to [0], which means to capture the snapshot for the rank0 device.
         """
@@ -426,12 +508,29 @@ class NeuronApplicationBase(torch.nn.Module):
         if ranks is None:
             ranks = [0]
 
+        if capture_for_tokens is None:
+            capture_for_tokens = []
+
+        max_tokens_generated = max(
+            1,
+            self.neuron_config.speculation_length,
+            self.neuron_config.medusa_speculation_length
+        )
+        snapshot_config = SnapshotCaptureConfig(max_tokens_generated).capture_at_request(
+            capture_at_requests
+        )
+        for batch_line, tokens_to_capture in enumerate(capture_for_tokens):
+            snapshot_config.capture_for_token(
+                token_indices=tokens_to_capture,
+                batch_line=batch_line,
+            )
+
         for submodel in self.models:
             submodel.model = ScriptModuleWrapper(submodel.model)
             snapshot_hook = get_snapshot_hook(
                 output_path,
                 output_format,
-                capture_at_requests,
+                snapshot_config,
                 self.get_builder(),
                 ranks,
                 is_input_ranked=submodel.async_mode or submodel.pipeline_execution,
@@ -529,7 +628,9 @@ class NeuronApplicationBase(torch.nn.Module):
     def checkpoint_loader_fn(self, mmap: bool = False):
         """This function loads the model's state dictionary and weights from the hf model"""
 
-        model_path = getattr(self.config, "_name_or_path", self.model_path)
+        model_path = getattr(self.config, "_name_or_path", None)
+        if model_path is None or not os.path.exists(model_path):
+            model_path = self.model_path
 
         if self.config.neuron_config.quantized:
             existing_checkpoint_path = self.config.neuron_config.quantized_checkpoints_path
@@ -556,14 +657,18 @@ class NeuronApplicationBase(torch.nn.Module):
 
         if self.config.neuron_config.enable_fused_speculation:
             assert self.fused_spec_config is not None
-
-            self.__class__._FUSED_PREFIX = "draft_model"
-            model_sd = self.get_state_dict(
-                self.fused_spec_config.draft_model_path, self.fused_spec_config.draft_config
-            )
+            if self.fused_spec_config.draft_model_cls:
+                self.fused_spec_config.draft_model_cls._FUSED_PREFIX = "draft_model"
+                model_sd = self.fused_spec_config.draft_model_cls.get_state_dict(
+                    self.fused_spec_config.draft_model_path, self.fused_spec_config.draft_config
+                )
+            else:
+                self.__class__._FUSED_PREFIX = "draft_model"
+                model_sd = self.get_state_dict(
+                    self.fused_spec_config.draft_model_path, self.fused_spec_config.draft_config
+                )
             self.__class__._FUSED_PREFIX = "target_model"
             model_sd.update(self.get_state_dict(model_path, self.config))
-
         else:
             model_sd = self.get_state_dict(model_path, self.config)
 
@@ -574,6 +679,13 @@ class NeuronApplicationBase(torch.nn.Module):
             _cast_helper(model_sd)
 
         return model_sd
+
+    def set_tensor_capture_step(self, step=0):
+        # Set / Reset tensor capture step counter for new input
+        if hasattr(self, '_tensor_capture_step'):
+            self._tensor_capture_step = step
+        else:
+            logging.warning("Tensor capture not enabled. Can not set the step.")
 
     @classmethod
     def get_state_dict(cls, model_name_or_path: str, config: InferenceConfig) -> dict:
@@ -640,7 +752,7 @@ class NeuronApplicationBase(torch.nn.Module):
         # Prune None values in the quantized_state_dict. torch.save crashes if None values exist.
         quantized_state_dict = prune_state_dict(quantized_state_dict)
         if os.path.isdir(config.neuron_config.quantized_checkpoints_path):
-            logging.info(
+            logger.info(
                 "Saving quantized state dict as safetensors to: %s",
                 config.neuron_config.quantized_checkpoints_path,
             )
@@ -649,7 +761,7 @@ class NeuronApplicationBase(torch.nn.Module):
                 state_dict_dir=config.neuron_config.quantized_checkpoints_path,
             )
         else:
-            logging.info(
+            logger.info(
                 "Saving quantized state dict as torch pt file to: %s",
                 config.neuron_config.quantized_checkpoints_path,
             )

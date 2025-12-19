@@ -22,6 +22,7 @@ import logging
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Type
 
+from neuronx_distributed_inference.models.llama4.utils.patch_llama4 import patch_llama4_text_moe_forward
 from neuronx_distributed_inference.modules.kvcache.utils import get_layer_to_kv_cache_size_mapping_for_mixed_attn
 import torch
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
@@ -39,6 +40,7 @@ from neuronx_distributed_inference.models.config import (  # noqa: E402
     to_dict,
 )
 from neuronx_distributed_inference.models.llama4.utils.encoder_utils import scatter_by_index_put
+from neuronx_distributed_inference.models.llama4.utils.layer_utils import is_before_nope_layer, is_after_nope_layer
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaMLP
 from neuronx_distributed_inference.models.model_base import (  # noqa: E402
     NeuronBaseForCausalLM,
@@ -296,8 +298,19 @@ class NeuronLlama4Attention(NeuronAttentionBase):
         tensor_model_parallel_group=None,
         use_qk_norm=True,
         is_nope=False,
+        is_post_global_attn_layer=False,
+        is_pre_global_attn_layer=False,
     ):
+
         attn_chunk_size = None if is_nope else getattr(config, "attention_chunk_size", None)
+        if attn_chunk_size and attn_chunk_size >= config.neuron_config.seq_len:
+            attn_chunk_size = None
+        optimize_interleave_attn = False
+        if attn_chunk_size:
+            optimize_interleave_attn = True
+
+        # P314730317
+        config.neuron_config.attn_block_tkg_nki_kernel_use_online_softmax = False
         super().__init__(
             config=config,
             hidden_size=config.hidden_size,
@@ -314,6 +327,9 @@ class NeuronLlama4Attention(NeuronAttentionBase):
             o_bias=getattr(config, "attention_bias", False),
             tensor_model_parallel_group=tensor_model_parallel_group,
             attention_chunk_size=attn_chunk_size,
+            is_post_global_attn_layer=is_post_global_attn_layer,
+            is_pre_global_attn_layer=is_pre_global_attn_layer,
+            optimize_interleave_attn=optimize_interleave_attn
         )
         # TODO: NeuronAttentionBase uses RMSNorm but LLama4 needs L2Norm
         self.qk_norm = L2Norm(config.rms_norm_eps) if use_qk_norm else None
@@ -360,12 +376,21 @@ class NeuronLlamaDecoderLayer(nn.Module):
         attention_config = copy.deepcopy(config)
 
         use_qk_norm = getattr(config, "use_qk_norm", False) and not self.is_nope_layer
-
+        self.attention_chunk_size = getattr(config, "attention_chunk_size", None)
+        if self.attention_chunk_size and self.attention_chunk_size >= config.neuron_config.seq_len or self.is_nope_layer:
+            self.attention_chunk_size = None
+        self.is_before_nope = False
+        self.is_after_nope = False
+        if self.attention_chunk_size:
+            self.is_before_nope = is_before_nope_layer(config, layer_idx)
+            self.is_after_nope = is_after_nope_layer(config, layer_idx)
         self.self_attn = NeuronLlama4Attention(
             config=attention_config,
             tensor_model_parallel_group=get_tp_group(config),
             use_qk_norm=use_qk_norm,
-            is_nope=self.is_nope_layer
+            is_nope=self.is_nope_layer,
+            is_post_global_attn_layer=self.is_after_nope,
+            is_pre_global_attn_layer=self.is_before_nope,
         )
 
         self.post_attention_layernorm = get_rmsnorm_cls()(
@@ -416,9 +441,8 @@ class NeuronLlamaDecoderLayer(nn.Module):
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
-
         # RMSNorm (fused with QKV kernel when SP is disabled)
-        if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm:
+        if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm and (self.config.neuron_config.cp_degree == 1 or self.attention_chunk_size is None):
             hidden_states = self.input_layernorm(hidden_states)
 
         mask = local_mask
@@ -426,7 +450,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
             mask = attention_mask
 
         # Self Attention
-        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+        attn_ouput_tuple = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=mask,
             position_ids=position_ids,
@@ -436,6 +460,12 @@ class NeuronLlamaDecoderLayer(nn.Module):
             use_polar_compatible_rope=not self.is_nope_layer,
             **kwargs,
         )
+        hidden_states, present_key_value, cos_cache, sin_cache = attn_ouput_tuple
+        if self.is_prefill_stage and self.attention_chunk_size and self.config.neuron_config.cp_degree > 1:
+            if self.is_before_nope:
+                residual = torch.zeros_like(residual)  # residual add is already performed inside attn
+            elif self.is_after_nope and attn_ouput_tuple.attn_input_hidden_states is not None:
+                residual = attn_ouput_tuple.attn_input_hidden_states
 
         # MLP Flow (From NeuronLlamaDecoderLayer)
         if isinstance(self.feed_forward, NeuronLlama4MLP):
@@ -500,7 +530,6 @@ class ResBlock(nn.Module):
     def forward(self, x):
         """
         Forward pass of the ResBlock.
-
         Args:
             x (torch.Tensor): Input tensor.
 
@@ -636,7 +665,12 @@ class NeuronLlama4TextForCausalLM(NeuronBaseForCausalLM):
     def load_hf_model(model_path):
         from transformers import Llama4ForCausalLM
 
-        return Llama4ForCausalLM.from_pretrained(model_path)
+        model = Llama4ForCausalLM.from_pretrained(model_path)
+
+        # Patch an accuracy issue that affects transformers v4.54-4.56.
+        patch_llama4_text_moe_forward(model.model)
+
+        return model
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:

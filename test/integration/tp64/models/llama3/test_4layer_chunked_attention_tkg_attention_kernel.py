@@ -58,17 +58,17 @@ def model_path():
 @pytest.mark.tp64
 @pytest.mark.chunked_attention
 @pytest.mark.parametrize(
-    "input_start_offsets, cp_degree, input_len, check_perf, latency_threshold, throughput_threshold",
+    "input_start_offsets, cp_degree, input_len, check_perf, latency_threshold, throughput_threshold, divergence_difference_tol",
     # fmt: off
-    [
-        ([ATTN_CHUNK_SIZE], 1, 16, False, float('inf'), 0),
-        ([ATTN_CHUNK_SIZE], 16, 16, False, float('inf'), 0),
-        ([0], 16, 16, False, float('inf'), 0),
-        ([0], 16, 16, True, 1733, 1134),
+    [      
+        pytest.param([ATTN_CHUNK_SIZE], 1, 16, False, float('inf'), 0, 0.003),
+        pytest.param([ATTN_CHUNK_SIZE], 16, 16, False, float('inf'), 0, 0.002, marks=[pytest.mark.key_config_test]),
+        pytest.param([0], 16, 16, False, float('inf'), 0, 0.002),
+        pytest.param([0], 16, 16, True, 1733, 1134, 0.002),
     ],
     # fmt: on
 )
-def test_llama_4layer_chunked_attention_flash_attention_kernel(model_path, input_start_offsets, cp_degree, input_len, check_perf, latency_threshold, throughput_threshold):
+def test_llama_4layer_chunked_attention_flash_attention_kernel(model_path, input_start_offsets, cp_degree, input_len, check_perf, latency_threshold, throughput_threshold, divergence_difference_tol):
     # Load model from config, and save with random weights.
     neuron_config = copy.deepcopy(PERF_CONFIG) if check_perf else copy.deepcopy(NEURON_CONFIG)
     neuron_config.cp_degree = cp_degree
@@ -80,7 +80,7 @@ def test_llama_4layer_chunked_attention_flash_attention_kernel(model_path, input
     if check_perf:
         validate_performance(model_path, config, generation_config, latency_threshold, throughput_threshold)
     else:
-        validate_accuracy(model_path, config, generation_config, input_start_offsets=input_start_offsets, input_len=input_len)
+        validate_accuracy(model_path, config, generation_config, input_start_offsets=input_start_offsets, input_len=input_len, divergence_difference_tol=divergence_difference_tol)
 
 
 def save_checkpoint(config_path):
@@ -94,7 +94,7 @@ def save_checkpoint(config_path):
     return model_tempdir
 
 
-def validate_accuracy(model_path, config, generation_config, input_start_offsets = [0], input_len = 16):
+def validate_accuracy(model_path, config, generation_config, input_start_offsets=[0], input_len=16, divergence_difference_tol=None):
     input_ids = torch.rand((config.neuron_config.batch_size, input_len)) * config.vocab_size
     input_ids = input_ids.to(dtype=torch.int32)
     attention_mask = torch.ones((config.neuron_config.batch_size, input_len), dtype=torch.int32)
@@ -111,6 +111,7 @@ def validate_accuracy(model_path, config, generation_config, input_start_offsets
         inputs=inputs,
         input_start_offsets=input_start_offsets,
         pad_token_id=128009,
+        divergence_difference_tol=divergence_difference_tol,
     )
 
 

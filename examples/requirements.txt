@@ -1,4 +1,4 @@
-transformers==4.51.*
+transformers==4.56.*
 huggingface-hub
 diffusers==0.32.0
 sentencepiece
@@ -7,3 +7,4 @@ pytest-forked
 tiktoken
 blobfile
 torchvision
+omegaconf

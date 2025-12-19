@@ -5,11 +5,13 @@ import shutil
 import pickle
 import numpy as np
 import torch
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from neuronx_distributed_inference.utils.snapshot import (
     ScriptModuleWrapper,
     SnapshotOutputFormat,
+    SnapshotCaptureConfig,
     get_snapshot_hook,
     _get_all_input_tensors,
     _get_weights_tensors,
@@ -19,9 +21,12 @@ from neuronx_distributed_inference.utils.snapshot import (
     register_nxd_model_hook,
     unregister_nxd_model_hooks,
     _original_func_map,
+    discover_bucket_request_mapping,
 )
 from torch_neuronx.proto import metaneff_pb2
 
+class FlattenerMapMock:
+    pass
 
 @pytest.fixture
 def temp_dir():
@@ -123,10 +128,11 @@ class TestGetSnapshotHook:
     
     def test_get_snapshot_hook_creation(self, mock_model_builder, temp_dir):
         """Test snapshot hook creation."""
+        snapshot_config = SnapshotCaptureConfig().capture_at_request([0])
         hook = get_snapshot_hook(
             output_path=temp_dir,
             output_format=SnapshotOutputFormat.NUMPY_IMAGES,
-            capture_at_requests=[0],
+            snapshot_config=snapshot_config,
             model_builder=mock_model_builder,
             ranks=[0]
         )
@@ -148,11 +154,13 @@ class TestGetSnapshotHook:
         mock_get_tensors.return_value = [[torch.tensor([1, 2, 3])]]
         mock_save_tensors.return_value = "test_path"
         
+        snapshot_config = SnapshotCaptureConfig().capture_at_request([0])
+
         # Create hook
         hook = get_snapshot_hook(
             output_path=temp_dir,
             output_format=SnapshotOutputFormat.NUMPY_IMAGES,
-            capture_at_requests=[0],
+            snapshot_config=snapshot_config,
             model_builder=mock_model_builder,
             ranks=[0]
         )
@@ -178,11 +186,13 @@ class TestGetSnapshotHook:
         """Test snapshot hook skips non-capture requests."""
         mock_traced_model = Mock()
         mock_traced_model.nxd_model.router.return_value = ("test_model", 0)
+
+        snapshot_config = SnapshotCaptureConfig().capture_at_request([1]) # Only capture request 1
         
         hook = get_snapshot_hook(
             output_path=temp_dir,
             output_format=SnapshotOutputFormat.NUMPY_IMAGES,
-            capture_at_requests=[1],  # Only capture request 1
+            snapshot_config=snapshot_config,  
             model_builder=mock_model_builder,
             ranks=[0]
         )
@@ -194,11 +204,83 @@ class TestGetSnapshotHook:
         # Verify no tensors were saved
         mock_get_tensors.assert_not_called()
         mock_save_tensors.assert_not_called()
+    
+    @patch('neuronx_distributed_inference.utils.snapshot._get_all_input_tensors')
+    @patch('neuronx_distributed_inference.utils.snapshot._save_tensors')
+    def test_snapshot_hook_execution_token_capture(
+        self,
+        mock_save_tensors,
+        mock_get_tensors,
+        mock_model_builder,
+        temp_dir
+    ):
+        """Test snapshot hook execution."""
+        # Setup mocks
+        mock_traced_model = Mock()
+        mock_traced_model.nxd_model.router.return_value = ("test_model", 0)
+        mock_get_tensors.return_value = [[torch.tensor([1, 2, 3]), torch.tensor([1]), torch.tensor([[0, 1, 2]])]]
+        mock_save_tensors.return_value = "test_path"
+        
+        snapshot_config = SnapshotCaptureConfig().capture_for_token([3], batch_line=0)
+
+        # Create hook
+        hook = get_snapshot_hook(
+            output_path=temp_dir,
+            output_format=SnapshotOutputFormat.NUMPY_IMAGES,
+            snapshot_config=snapshot_config,
+            model_builder=mock_model_builder,
+            ranks=[0]
+        )
+        
+        # Execute hook
+        args = (torch.tensor([1, 2, 3]), torch.tensor([1]), torch.tensor([[0, 1, 2]]))
+        hook(mock_traced_model, args, None)
+        
+        # Verify calls
+        mock_traced_model.nxd_model.router.assert_called_once_with(args)
+        mock_get_tensors.assert_called_once()
+        mock_save_tensors.assert_called_once()
+
+    @patch('neuronx_distributed_inference.utils.snapshot._get_all_input_tensors')
+    @patch('neuronx_distributed_inference.utils.snapshot._save_tensors')
+    def test_snapshot_hook_execution_non_token_capture(
+        self,
+        mock_save_tensors,
+        mock_get_tensors,
+        mock_model_builder,
+        temp_dir
+    ):
+        """Test snapshot hook execution."""
+        # Setup mocks
+        mock_traced_model = Mock()
+        mock_traced_model.nxd_model.router.return_value = ("test_model", 0)
+        mock_get_tensors.return_value = [[torch.tensor([1, 2, 3]), torch.tensor([1]), torch.tensor([[2]])]]
+        mock_save_tensors.return_value = "test_path"
+        
+        snapshot_config = SnapshotCaptureConfig().capture_for_token([1], batch_line=0)
+
+        # Create hook
+        hook = get_snapshot_hook(
+            output_path=temp_dir,
+            output_format=SnapshotOutputFormat.NUMPY_IMAGES,
+            snapshot_config=snapshot_config,
+            model_builder=mock_model_builder,
+            ranks=[0]
+        )
+        
+        # Execute hook
+        args = (torch.tensor([1, 2, 3]), torch.tensor([1]), torch.tensor([[2]]))
+        hook(mock_traced_model, args, None)
+        
+        # Verify no tensors were saved
+        mock_get_tensors.assert_not_called()
+        mock_save_tensors.assert_not_called()
+
 
 class TestGetAllInputTensors:
     """Test cases for _get_all_input_tensors function."""
     
-    def test_get_all_input_tensors(self):
+    def test_get_all_input_tensors_old(self):
         """Test _get_all_input_tensors function."""
         input_args = [torch.tensor([1]),]
         flattened_args = [torch.tensor([1, 2]),]
@@ -210,7 +292,45 @@ class TestGetAllInputTensors:
         mock_app_model = Mock()
         mock_traced_model = Mock()
         mock_flattener = Mock(return_value=flattened_args)
-        mock_traced_model.nxd_model.flattener_map.test_model = mock_flattener
+        mock_traced_model.nxd_model.flattener_map = FlattenerMapMock()
+        setattr(mock_traced_model.nxd_model.flattener_map, 'test_model', mock_flattener) # old torchscript models just use the tag
+        mock_traced_model.nxd_model.state = {0: {"state0": state}}
+        mock_traced_model.nxd_model.weights = {0: {"weight0": weights}}
+        
+        with patch('neuronx_distributed_inference.utils.snapshot._get_weights_tensors') as mock_get_weights:
+            mock_get_weights.return_value = [transformed_weights]
+            
+            result = _get_all_input_tensors(
+                mock_app_model,
+                mock_traced_model,
+                "test_model",
+                bucket_idx=0, 
+                input_args=input_args,
+                ranks=[0],
+            )
+            
+            assert len(result) == 1  # One rank
+            assert len(result[0]) == 3  # input + state + weights tensors
+            expected_result_rank0 = flattened_args + [state, transformed_weights]
+            assert result[0] == expected_result_rank0
+
+            mock_flattener.assert_called_once()
+            mock_get_weights.assert_called_once()
+    
+    def test_get_all_input_tensors_new(self):
+        """Test _get_all_input_tensors function."""
+        input_args = [torch.tensor([1]),]
+        flattened_args = [torch.tensor([1, 2]),]
+        state = torch.tensor([3, 4])
+        weights = torch.tensor([5, 6])
+        transformed_weights = torch.tensor([7, 8])
+
+        # Setup mocks
+        mock_app_model = Mock()
+        mock_traced_model = Mock()
+        mock_flattener = Mock(return_value=flattened_args)
+        mock_traced_model.nxd_model.flattener_map = FlattenerMapMock()
+        setattr(mock_traced_model.nxd_model.flattener_map, 'test_model_0', mock_flattener) # new torchscript models use f"{key}_{bucket_idx}"
         mock_traced_model.nxd_model.state = {0: {"state0": state}}
         mock_traced_model.nxd_model.weights = {0: {"weight0": weights}}
         
@@ -374,18 +494,20 @@ class TestIntegration:
         mock_traced_model = Mock()
         mock_traced_model.nxd_model.router.return_value = ("test_model", 0)
         mock_flattener = Mock(return_value=[torch.tensor([1, 2, 3])])
-        mock_traced_model.nxd_model.flattener_map.test_model = mock_flattener
+        mock_traced_model.nxd_model.flattener_map = FlattenerMapMock()
+        setattr(mock_traced_model.nxd_model.flattener_map, 'test_model', mock_flattener) # old torchscript model use only the key
         mock_traced_model.nxd_model.state = {
             0: {"state1": torch.tensor([0, 1, 2])},
             1: {"state1": torch.tensor([4, 5, 6])}
         }
         mock_traced_model.nxd_model.weights = {0: {}, 1: {}}
         
+        snapshot_config = SnapshotCaptureConfig().capture_at_request([0])
         # Create and execute hook
         hook = get_snapshot_hook(
             output_path=temp_dir,
             output_format=SnapshotOutputFormat.NUMPY_IMAGES,
-            capture_at_requests=[0],
+            snapshot_config=snapshot_config,
             model_builder=mock_builder,
             ranks=[0, 1]
         )
@@ -678,6 +800,181 @@ class TestHookIntegration:
         result2 = restored_func("arg2")
         assert result2 == "original"
         hook_func.assert_not_called()
+
+class TestDiscoverBucketRequestMapping:
+    """Test cases for discover_bucket_request_mapping function."""
+    
+    def test_discover_bucket_request_mapping_without_gaps(self, temp_dir):
+        """Test discovery with multiple buckets and requests."""
+        model_name = "test_model"
+        
+        os.makedirs(os.path.join(temp_dir, model_name, "_tp0_bk0", "request0"))
+        os.makedirs(os.path.join(temp_dir, model_name, "_tp0_bk0", "request1"))
+        os.makedirs(os.path.join(temp_dir, model_name, "_tp0_bk1", "request0"))
+        
+        result = discover_bucket_request_mapping(Path(temp_dir), model_name)
+        
+        expected = [(0, 0), (0, 1), (1, 0)]
+        assert result == expected
+    
+    def test_discover_bucket_request_mapping_with_gaps(self, temp_dir):
+        """Test discovery with missing buckets (bk0 and bk2 exist, bk1 missing)."""
+        model_name = "test_model"
+        
+        os.makedirs(os.path.join(temp_dir, model_name, "_tp0_bk0", "request0"))
+        os.makedirs(os.path.join(temp_dir, model_name, "_tp0_bk2", "request0"))
+        os.makedirs(os.path.join(temp_dir, model_name, "_tp0_bk2", "request1"))
+        
+        result = discover_bucket_request_mapping(Path(temp_dir), model_name)
+        
+        expected = [(0, 0), (2, 0), (2, 1)]
+        assert result == expected
+
+class TestSnapshotCapturerConfig:
+    def test_initialization(self):
+        """Test that the config initializes with default values."""
+        config = SnapshotCaptureConfig()
+        assert config.request_indices == set()
+        assert config.token_indices == set()
+        assert config.capture_all_requests is False
+        assert config.capture_all_tokens is False
+        assert config._capture_types == set()
+        assert config.max_tokens_generated_per_request == 1
+
+    def test_initialization_with_max_tokens(self):
+        """Test initialization with custom max tokens."""
+        config = SnapshotCaptureConfig(max_tokens_generated_per_request=4)
+        assert config.max_tokens_generated_per_request == 4
+
+    def test_capture_at_request_single(self):
+        """Test capturing at a single request index."""
+        config = SnapshotCaptureConfig().capture_at_request(0)
+        assert config.request_indices == {0}
+        assert 'request' in config._capture_types
+        assert config.is_capturing_requests() is True
+
+    def test_capture_at_request_multiple(self):
+        """Test capturing at multiple request indices."""
+        config = SnapshotCaptureConfig().capture_at_request([0, 1, 5])
+        assert config.request_indices == {0, 1, 5}
+        assert 'request' in config._capture_types
+
+    def test_capture_at_all_requests(self):
+        """Test capturing at all requests."""
+        config = SnapshotCaptureConfig().capture_at_request(-1)
+        assert config.capture_all_requests is True
+        assert 'request' in config._capture_types
+
+    def test_capture_for_token_single(self):
+        """Test capturing at a single token index."""
+        config = SnapshotCaptureConfig().capture_for_token(token_indices=244)
+        assert (0, 244) in config.token_indices  # Default batch_line is 0
+        assert 'token' in config._capture_types
+        assert config.is_capturing_tokens() is True
+
+    def test_capture_for_token_multiple(self):
+        """Test capturing at multiple token indices."""
+        config = SnapshotCaptureConfig().capture_for_token(token_indices=[244, 245, 246])
+        assert (0, 244) in config.token_indices
+        assert (0, 245) in config.token_indices
+        assert (0, 246) in config.token_indices
+        assert 'token' in config._capture_types
+
+    def test_capture_for_token_specific_batch(self):
+        """Test capturing at a specific batch line."""
+        config = SnapshotCaptureConfig().capture_for_token(batch_line=2, token_indices=244)
+        assert (2, 244) in config.token_indices
+        assert (0, 244) not in config.token_indices
+
+    def test_capture_at_all_tokens(self):
+        """Test capturing all tokens."""
+        config = SnapshotCaptureConfig().capture_for_token(token_indices=-1)
+        assert config.capture_all_tokens is True
+        assert 'token' in config._capture_types
+
+    def test_which_token_found(self):
+        """Test which_token finds the correct token to capture."""
+        config = SnapshotCaptureConfig().capture_for_token(token_indices=244)
+        result = config.which_token([243])
+        assert result == (0, 244)  # Should find token 244 at batch line 0
+
+    def test_which_token_not_found(self):
+        """Test which_token returns None when no token matches."""
+        config = SnapshotCaptureConfig().capture_for_token(token_indices=244)
+        result = config.which_token([242])
+        assert result is None
+
+    def test_which_token_multiple_batch_lines(self):
+        """Test which_token with multiple batch lines."""
+        config = SnapshotCaptureConfig().capture_for_token(batch_line=1, token_indices=244)
+        result = config.which_token([242, 243, 245])
+        assert result == (1, 244)
+
+    def test_which_token_speculative_decoding(self):
+        """Test which_token with max_tokens_generated_per_request > 1."""
+        config = SnapshotCaptureConfig(max_tokens_generated_per_request=3)
+        config.capture_for_token(token_indices=246)
+        result = config.which_token([243])
+        assert result == (0, 246)  # Should find token 246 when we're at 243 and generating 3 tokens
+
+    def test_should_capture_request(self):
+        """Test should_capture with request-based capturing."""
+        config = SnapshotCaptureConfig().capture_at_request(2)
+        assert config.should_capture([10, 11], 2) is True
+        assert config.should_capture([10, 11], 3) is False
+
+    def test_should_capture_token(self):
+        """Test should_capture with token-based capturing."""
+        config = SnapshotCaptureConfig().capture_for_token(token_indices=244)
+        assert config.should_capture([243], 0) is True  # Current token is 243, will generate 244
+        assert config.should_capture([242], 0) is False  # Current token is 242, will generate 243
+
+    def test_should_capture_all_tokens(self):
+        """Test should_capture with all tokens option."""
+        config = SnapshotCaptureConfig().capture_for_token(token_indices=-1)
+        assert config.should_capture([100], 5) is True
+        assert config.should_capture([200], 10) is True
+
+    def test_should_capture_all_requests(self):
+        """Test should_capture with all requests option."""
+        config = SnapshotCaptureConfig().capture_at_request(-1)
+        assert config.should_capture([100], 5) is True
+        assert config.should_capture([200], 10) is True
+
+    def test_should_capture_combined(self):
+        """Test should_capture with both request and token conditions."""
+        config = (SnapshotCaptureConfig()
+                  .capture_at_request(2)
+                  .capture_for_token(token_indices=244))
+        
+        # Should capture at request 2 regardless of token
+        assert config.should_capture([100], 2) is True
+        
+        # Should capture when generating token 244 regardless of request
+        assert config.should_capture([243], 5) is True
+        
+        # Should not capture when neither condition is met
+        assert config.should_capture([100], 3) is False
+
+    def test_empty_token_list(self):
+        """Test capture_for_token with an empty list."""
+        config = SnapshotCaptureConfig().capture_for_token(token_indices=[])
+        assert config.token_indices == set()
+        assert 'token' not in config._capture_types
+
+    def test_method_chaining(self):
+        """Test method chaining functionality."""
+        config = (SnapshotCaptureConfig()
+                  .capture_at_request(0)
+                  .capture_for_token(token_indices=244)
+                  .capture_for_token(batch_line=1, token_indices=255))
+        
+        assert 0 in config.request_indices
+        assert (0, 244) in config.token_indices
+        assert (1, 255) in config.token_indices
+        assert 'request' in config._capture_types
+        assert 'token' in config._capture_types
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

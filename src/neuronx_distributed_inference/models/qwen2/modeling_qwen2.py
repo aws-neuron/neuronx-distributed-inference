@@ -19,6 +19,7 @@ PyTorch Qwen2 model for NXD inference
 from typing import List, Optional, Tuple, Type
 
 import torch
+import gc
 from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     ColumnParallelLinear,
     ParallelEmbedding,
@@ -215,6 +216,10 @@ class NeuronQwen2ForCausalLM(NeuronBaseForCausalLM):
             state_dict[f"layers.{i}.self_attn.rank_util.rank"] = torch.arange(
                 0, tp_degree, dtype=torch.int32
             )
+
+        if neuron_config.fused_qkv:
+            state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
+
         # to facilitate rank usage in base model
         state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
         return state_dict
@@ -233,3 +238,44 @@ class NeuronQwen2ForCausalLM(NeuronBaseForCausalLM):
         compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2 --vectorize-strided-dma'"
         compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         return compiler_args
+
+
+def _helper_concat_and_delete_qkv(qwen_state_dict, layer_num, attr):
+    """
+    Helper function to concatenate and delete QKV attributes for fusedqkv (weight or scale).
+    Args:
+        qwen_state_dict: The state dictionary containing model weights
+        layer_num: The index of the layer to process
+        attr: The attribute to process ('weight' or 'scale')
+    """
+    qwen_state_dict[f"layers.{layer_num}.self_attn.Wqkv.{attr}"] = torch.cat(
+        [
+            qwen_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"],
+            qwen_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"],
+            qwen_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"],
+        ],
+    )
+    del qwen_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"]
+    del qwen_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"]
+    del qwen_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"]
+
+
+def convert_state_dict_to_fused_qkv(qwen_state_dict, cfg: InferenceConfig):
+    """
+    This function concats the qkv weights and scales to a Wqkv weight and scale for fusedqkv, and deletes the qkv weights.
+    """
+    mods_to_not_conv = getattr(cfg.neuron_config, "modules_to_not_convert", None)
+    if mods_to_not_conv is None:
+        mods_to_not_conv = []
+
+    for l in range(cfg.num_hidden_layers):  # noqa: E741
+        _helper_concat_and_delete_qkv(qwen_state_dict, l, "weight")
+        _helper_concat_and_delete_qkv(qwen_state_dict, l, "bias")
+        if (
+            cfg.neuron_config.quantized_mlp_kernel_enabled or cfg.neuron_config.quantized
+        ) and f"layers.{l}.self_attn" not in mods_to_not_conv:
+            _helper_concat_and_delete_qkv(qwen_state_dict, l, "scale")
+
+    gc.collect()
+
+    return qwen_state_dict

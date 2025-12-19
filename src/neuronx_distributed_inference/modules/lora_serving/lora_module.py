@@ -26,15 +26,15 @@ class MultiLoraModule(nn.Module):
 
         super().__init__()
         self.lora_max_rank = lora_config.max_lora_rank
-        # the first LoRA adapter is dummy for serving without LoRA
-        self.max_loras = lora_config.max_loras + 1
-        self.max_real_loras = lora_config.max_loras
+        self.max_loras = lora_config.max_loras
+        self.max_loras_active = lora_config.batch_size
         self.base_layer = base_layer
         self.lora_dtype = base_layer.weight.dtype
         self.lora_config = lora_config
         self.skip_dtype_convert = False
         self.lora_memory_transpose = lora_config.lora_memory_transpose
         self.shard_linear_layer = lora_config.lora_shard_linear_layer
+        self.is_context_encoding = lora_config.is_context_encoding
 
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
@@ -72,8 +72,7 @@ class MultiLoraModule(nn.Module):
         previous_dtype = x.dtype
         base_layer = self.get_base_layer()
         result = base_layer(x, *args, **kwargs)
-        result = result + self.lora_B(self.lora_A(x, adapter_ids), adapter_ids)
-
+        result = result + self.lora_B(self.lora_A(x, adapter_ids, self.is_context_encoding), adapter_ids, self.is_context_encoding)
         if not self.skip_dtype_convert:
             result = result.to(previous_dtype)
         return result
@@ -87,6 +86,7 @@ class MultiLoraModuleLinear(MultiLoraModule):
     def create_lora(self):
         self.lora_A = MultiLoraLinear(
             self.max_loras,
+            self.max_loras_active,
             self.in_features,
             self.lora_max_rank,
             self.lora_dtype,
@@ -94,6 +94,7 @@ class MultiLoraModuleLinear(MultiLoraModule):
         )
         self.lora_B = MultiLoraLinear(
             self.max_loras,
+            self.max_loras_active,
             self.lora_max_rank,
             self.out_features,
             self.lora_dtype,
@@ -107,6 +108,7 @@ class MultiLoraModuleConv2d(MultiLoraModule):
 
         self.lora_A = MultiLoraConv2d(
             self.max_loras,
+            self.max_loras_active,
             self.in_features,
             self.lora_max_rank,
             base_layer.kernel_size,
@@ -116,6 +118,7 @@ class MultiLoraModuleConv2d(MultiLoraModule):
         )
         self.lora_B = MultiLoraConv2d(
             self.max_loras,
+            self.max_loras_active,
             self.lora_max_rank,
             self.out_features,
             (1, 1),
@@ -130,6 +133,7 @@ class MultiLoraModuleEmbedding(MultiLoraModule):
         base_layer = self.get_base_layer()
         self.lora_A = MultiLoraEmbedding(
             self.max_loras,
+            self.max_loras_active,
             self.in_features,
             self.lora_max_rank,
             base_layer.padding_idx,
@@ -142,6 +146,7 @@ class MultiLoraModuleEmbedding(MultiLoraModule):
         )
         self.lora_B = MultiLoraLinear(
             self.max_loras,
+            self.max_loras_active,
             self.lora_max_rank,
             self.out_features,
             self.lora_dtype,
@@ -163,6 +168,7 @@ class MultiLoraModuleColumnParallelLinear(MultiLoraModule):
         )
         self.lora_A = multi_lora_linear(
             self.max_loras,
+            self.max_loras_active,
             self.in_features,
             self.lora_max_rank,
             self.lora_dtype,
@@ -170,6 +176,7 @@ class MultiLoraModuleColumnParallelLinear(MultiLoraModule):
         )
         self.lora_B = MultiLoraColumnParallelLinear(
             self.max_loras,
+            self.max_loras_active,
             self.lora_max_rank,
             self.out_features,
             self.lora_dtype,
@@ -182,6 +189,7 @@ class MultiLoraModuleRowParallelLinear(MultiLoraModule):
     def create_lora(self):
         self.lora_A = MultiLoraRowParallelLinear(
             self.max_loras,
+            self.max_loras_active,
             self.in_features,
             self.lora_max_rank,
             self.lora_dtype,
@@ -192,6 +200,7 @@ class MultiLoraModuleRowParallelLinear(MultiLoraModule):
         )
         self.lora_B = multi_lora_linear(
             self.max_loras,
+            self.max_loras_active,
             self.lora_max_rank,
             self.out_features,
             self.lora_dtype,

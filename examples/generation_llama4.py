@@ -253,4 +253,3 @@ if __name__ == "__main__":
         run_llama_generate_text_to_text()
     else:
         run_llama_generate_image_to_text()
-    

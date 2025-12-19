@@ -85,6 +85,7 @@ class MllamaInferenceConfig(InferenceConfig):
             if isinstance(self.text_config, SimpleNamespace):
                 self.text_config = vars(self.text_config)
             # replicating what's done in hf_adapter's load_config()
+            self.text_config.pop("dtype", None)
             self.text_config.pop("torch_dtype", None)
             self.text_config = InferenceConfig(self.neuron_config, **self.text_config)
 
@@ -92,6 +93,7 @@ class MllamaInferenceConfig(InferenceConfig):
             if isinstance(self.vision_config, SimpleNamespace):
                 self.vision_config = vars(self.vision_config)
             # replicating what's done in hf_adapter's load_config()
+            self.vision_config.pop("dtype", None)
             self.vision_config.pop("torch_dtype", None)
             self.vision_config = InferenceConfig(self.neuron_config, **self.vision_config)
 
@@ -460,11 +462,11 @@ class NeuronLlamaCrossAttention(torch.nn.Module):
         assert (
             vision_tokens.shape[2] == cross_attention_masks.shape[3]
         ), f"Vision tokens shape {vision_tokens.shape} mismatch with xattn shape {cross_attention_masks.shape}"
-        assert (
-            num_tokens == cross_attention_masks.shape[1]
-        ), f"Mismatch in text sequence length and cross attention mask sequence length {num_tokens} {cross_attention_masks.shape}"
         _, _, _, num_image_tokens, image_token_dim = tuple(vision_tokens.shape)
         bsz, ntext, nimg, nchunks = cross_attention_masks.shape
+        assert (
+            int(num_tokens) == int(ntext)
+        ), f"Mismatch in text sequence length and cross attention mask sequence length {num_tokens} {cross_attention_masks.shape}"
         cross_attention_masks = (
             cross_attention_masks.repeat_interleave(vision_seqlen, dim=3)
             .view(bsz, ntext, -1)

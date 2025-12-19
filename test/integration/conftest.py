@@ -1,6 +1,6 @@
 import os
 import pytest
-import torch
+from neuronx_distributed_inference.utils.random import set_random_seed
 
 @pytest.fixture(autouse=True)
 def set_constant_seed():
@@ -11,7 +11,7 @@ def set_constant_seed():
     validation failing due to varying precision loss accumulation from one run to the next.
     Therefore, a constant seed improves test stability.
     """
-    torch.manual_seed(0)
+    set_random_seed(0)
 
 
 @pytest.fixture(autouse=True)

@@ -393,7 +393,7 @@ class TestKVCacheManager(unittest.TestCase):
         latest_k = torch.zeros((batch_size, num_kv_heads, 1, head_dim))
 
         # Test the _get_index_to_update_new_position method 
-        scatter_indices = kv_cache_manager._get_index_to_update_new_position(None, position_ids, latest_k, False, 0)
+        scatter_indices = kv_cache_manager._get_index_to_update_new_position(None, None, position_ids, latest_k, False, 0)
 
         # Check that scatter_indices have the correct shape
         self.assertEqual(scatter_indices.shape, (batch_size, num_kv_heads, 1, head_dim))
@@ -406,8 +406,53 @@ class TestKVCacheManager(unittest.TestCase):
         # Check that scatter_indices have the correct values
         self.assertTrue(torch.all(scatter_indices == expected_indices),
                        f"Mismatch for test {test_name}")
-           
-    
+
+    def test_windowed_context_encoding_get_and_update_cache(self):
+        # Setup
+        os.environ["NXD_CPU_MODE"] = "1"
+
+        batch_size = 1
+        head_dim = 8
+        num_kv_heads = 4
+        wce_size = 4
+        seq_len = 16
+        layer_idx = 0
+        is_for_context_encoding = True
+        seq_ids = torch.zeros(1, 1)
+        pos_ids = torch.arange(seq_len).unsqueeze(0)
+
+        self.config.neuron_config.tp_degree = 1
+        self.config.neuron_config.cp_degree = 1
+        self.config.neuron_config.is_prefill_stage = True
+        self.config.neuron_config.kv_cache_batch_size = batch_size
+        self.config.neuron_config.max_batch_size = batch_size
+        self.config.neuron_config.batch_size = batch_size
+        self.config.neuron_config.is_continuous_batching = False
+        self.config.neuron_config.kv_cache_padding_size  = 0
+        self.config.neuron_config.max_length = 16
+        self.config.neuron_config.attn_tkg_builtin_kernel_enabled = False
+        self.config.neuron_config.attn_tkg_nki_kernel_enabled = False
+        self.config.neuron_config.attn_block_tkg_nki_kernel_enabled = False
+
+        kv_cache_manager = KVCacheManager(config=self.config, num_kv_head=num_kv_heads, windowed_context_encoding_size=wce_size)
+
+        # 1. Get Test
+        # Check retrieved kv is of correct shape, determined by current window i.e. window_idx
+        for window_idx in range(1, seq_len // wce_size):  # start from 1 bc get_cache won't be called for first window
+            actual_k, actual_v = kv_cache_manager.get_kv_by_layer_id(layer_idx, seq_len, windowed_context_encoding_window_idx=window_idx)
+            expected_kv_shape = (batch_size, num_kv_heads, window_idx * wce_size, head_dim)
+            self.assertEqual(actual_k.shape, expected_kv_shape)
+            self.assertEqual(actual_v.shape, expected_kv_shape)
+
+        # 2. Update Test        
+        # Check proper slice of kv is updated
+        for window_idx in range(seq_len // wce_size):
+            latest_k, latest_v = torch.ones(batch_size, num_kv_heads, wce_size, head_dim), torch.ones(batch_size, num_kv_heads, wce_size, head_dim)
+            kv = (latest_k, latest_v)
+            updated_k, updated_v = kv_cache_manager.update_kv_by_layer_id(layer_idx, is_for_context_encoding, seq_ids, pos_ids, kv, seq_len, windowed_context_encoding_window_idx=window_idx)
+            self.assertTrue(torch.equal(updated_k[:, :, window_idx * wce_size : (window_idx + 1) * wce_size, :], latest_k))
+            self.assertTrue(torch.equal(updated_v[:, :, window_idx * wce_size : (window_idx + 1) * wce_size, :], latest_v))
+
 
 if __name__ == "__main__":
     unittest.main()

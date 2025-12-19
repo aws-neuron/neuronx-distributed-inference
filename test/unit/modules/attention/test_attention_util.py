@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from neuronx_distributed_inference.modules.attention.utils import (move_heads_front, 
+from neuronx_distributed_inference.modules.attention.utils import (get_kernel_cache_size_bucket, move_heads_front, 
                                                                    get_context_parallel_reordered_tp_mapping, 
                                                                    get_kv_head_indices_context_parallel_full_tp_decode, 
                                                                    validate_tp_prefill_to_dp_decode, 
@@ -61,7 +61,7 @@ class TestMoveHeadsFront(unittest.TestCase):
     # fmt: on
 )
 def test_get_context_parallel_reordered_tp_mapping(tp_degree, cp_degree, num_kv_heads, cte_rank_ordering, expected_ordering):
-    ordering = get_context_parallel_reordered_tp_mapping(tp_degree, cp_degree, num_kv_heads, torch.device("cpu"), cte_rank_ordering=cte_rank_ordering)
+    ordering = get_context_parallel_reordered_tp_mapping(tp_degree, cp_degree, num_kv_heads, cte_rank_ordering=cte_rank_ordering)
 
     assert ordering == expected_ordering
 
@@ -124,7 +124,8 @@ def test_reshape_qkv_for_chunked_flash_attention_kernel(n_heads, seq_len, head_d
 @pytest.mark.parametrize(
     "test_name, position_ids, expected_position_ids",
     # fmt: off
-    [    
+    [   
+        # attn_chunk_size = 4 
         # Test case 1: seq 0 in chunk 0, seq 1 in chunk 1
         ('test case 1', torch.tensor([[0, 1, 2, 3, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32), torch.tensor([[0, 4], [4, 8]], dtype=torch.int32)),
         # Test case 2: both seqs in chunk 1
@@ -133,6 +134,8 @@ def test_reshape_qkv_for_chunked_flash_attention_kernel(n_heads, seq_len, head_d
         ('test case 3', torch.tensor([[0, 1, 2, 3, 1, 1, 1, 1]], dtype=torch.int32), torch.tensor([[0, 4]], dtype=torch.int32)),
         # Test case 4: seq_len indivisible by chunk size (4)
         ('test case 4', torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.int32), torch.tensor([[4, 8]], dtype=torch.int32)),
+        # Test case 5: seq_len indivisible by chunk size (4) seq_len < chunk_size
+        ('test case 5', torch.tensor([[0, 1]], dtype=torch.int32), torch.tensor([[0, 4]], dtype=torch.int32)),
     ]
     # fmt: on
 )    
@@ -173,8 +176,7 @@ def test_get_lask_kv_chunk(test_name, position_ids, expected_position_ids):
     # fmt: on
 )
 def test_get_context_parallel_reordered_dp_mapping(tp_degree, cp_degree, dp_degree, num_kv_heads, cte_rank_ordering, expected_ordering):
-    ordering = get_context_parallel_reordered_dp_mapping(tp_degree, cp_degree, dp_degree, num_kv_heads, torch.device("cpu"), cte_rank_ordering=cte_rank_ordering)
-
+    ordering = get_context_parallel_reordered_dp_mapping(tp_degree, cp_degree, dp_degree, num_kv_heads, device = torch.device("cpu"), cte_rank_ordering=cte_rank_ordering)
     assert ordering == expected_ordering
 
 
@@ -198,28 +200,31 @@ def test_get_kv_head_indices_context_parallel_dp_decode(num_kv_heads, tp_degree,
 
 
 @pytest.mark.parametrize(
-    "test_name, position_ids, expected_position_ids",
+    "test_name, position_ids, expected_position_ids, spec_len",
     # fmt: off
     [    
         # Test case 1: first seq's pos ends at window size border, second seq's pos ends in middle of window
-        ('test case 1', torch.tensor([[0, 1, 2, 3, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5, 6, 1]], dtype=torch.int32), torch.tensor([[0,1,2,3], [4,5,6,3]], dtype=torch.int32)),
+        ('test case 1', torch.tensor([[0, 1, 2, 3, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5, 6, 1]], dtype=torch.int32), torch.tensor([[3, 1, 2], [6, 4, 5]], dtype=torch.int32), 0),
         # Test case 2: first seq's pos ends before the first window, second seq's pos ends at last window border
-        ('test case 2', torch.tensor([[0, 1, 2, 1, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32), torch.tensor([[0,1,2,3], [4,5,6,7]], dtype=torch.int32)),
+        ('test case 2', torch.tensor([[0, 1, 2, 1, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32), torch.tensor([[0, 1, 2], [6, 7, 5]], dtype=torch.int32), 0),
+        # Test case 3: with speculation len = 2
+        ('test case 3', torch.tensor([[0, 1, 2, 3, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32), torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32), 2),
     ]
     # fmt: on
 )    
-def test_get_last_kv_window(test_name, position_ids, expected_position_ids):
+def test_get_last_kv_window(test_name, position_ids, expected_position_ids, spec_len):
     # Test parameters
     batch_size, seq_len = position_ids.shape
     num_kv_heads, head_dim = 8, 4
     latest_k = torch.randn(batch_size, num_kv_heads, seq_len, head_dim)
     latest_v = torch.randn(batch_size, num_kv_heads, seq_len, head_dim)
     window_size = 4
-    last_k_window, last_v_window = get_last_kv_window(window_size, position_ids, latest_k, latest_v)
+    last_k_window, last_v_window = get_last_kv_window(window_size, position_ids, latest_k, latest_v, spec_len=spec_len)
 
     # Check that the actual outputs updated_k and updated_v have the correct shape
-    assert last_k_window.shape == (batch_size, num_kv_heads, window_size, head_dim), f"k shape mismatch for test {test_name}"
-    assert last_v_window.shape == (batch_size, num_kv_heads, window_size, head_dim), f"v shape mismatch for test {test_name}"
+    adjusted_window_size = window_size - 1 if spec_len == 0 else window_size - 1 + spec_len - 1
+    assert last_k_window.shape == (batch_size, num_kv_heads, adjusted_window_size, head_dim), f"k shape mismatch for test {test_name}"
+    assert last_v_window.shape == (batch_size, num_kv_heads, adjusted_window_size, head_dim), f"v shape mismatch for test {test_name}"
     for b in range(batch_size):
         for i, j in enumerate(expected_position_ids[b]):
             assert torch.allclose(last_k_window[b, :, i, :], latest_k[b, :, j, :]), f"k values mismatch for test {test_name}"
@@ -292,3 +297,10 @@ def test_chunk_and_reorder_tensor(tensor, order, dim, expected):
     result = chunk_and_reorder_tensor(tensor, order, dim)
     
     assert torch.all(torch.eq(result, expected))
+
+def test_find_kernel_cache_size_bucket():
+    # Test case 1: Small value that needs rounding up
+    assert get_kernel_cache_size_bucket(5) == 128
+    
+    # Test case 2: Value that exceeds one bucket and needs next bucket
+    assert get_kernel_cache_size_bucket(142) == 256

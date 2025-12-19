@@ -30,6 +30,7 @@ def test_input_snapshots(monkeypatch):
         output_path=compiler_workdir,
         output_format=SnapshotOutputFormat.NUMPY_PICKLE,
         capture_at_requests=[0, 1],
+        capture_for_tokens=[],
     )
 
     inputs = create_inputs(model.config)

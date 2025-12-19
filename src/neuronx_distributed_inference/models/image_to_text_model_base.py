@@ -22,6 +22,7 @@ from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_
 from neuronx_distributed_inference.utils.snapshot import (
     ScriptModuleWrapper,
     SnapshotOutputFormat,
+    SnapshotCaptureConfig,
     get_snapshot_hook,
     register_nxd_model_hook,
     unregister_nxd_model_hooks,
@@ -55,9 +56,6 @@ class ImageToTextInferenceConfig(InferenceConfig):
         # Llama4 needs to disable chunked attention
         # since kernels are not yet supported with chunked attention
         # TODO: Remove below pop once chunked attention is supported with kernels
-        if ("attention_chunk_size" in self.text_config):
-            self.text_config.pop("attention_chunk_size")
-
         self.text_config = InferenceConfig(text_neuron_config, **self.text_config)
 
         # We need to save the model's _name_or_path in text_config to be able to bring up the HF text only model
@@ -295,15 +293,17 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         os.makedirs(vision_compiled_model_path, exist_ok=True)
 
         # Trace text and vision models
-        text_traced_model = self.get_text_builder(debug).trace(initialize_model_weights=False)
-        torch.jit.save(text_traced_model, text_compiled_model_path + COMPILED_MODEL_FILE_NAME)
-        del text_traced_model
-        logger.info("Finished compiling text model!")
+        text_traced_model = self.get_text_builder(debug).trace(initialize_model_weights=False, dry_run=dry_run)
+        if not dry_run:
+            torch.jit.save(text_traced_model, text_compiled_model_path + COMPILED_MODEL_FILE_NAME)
+            del text_traced_model
+            logger.info("Finished compiling text model!")
 
-        vision_traced_model = self.get_vision_builder(debug).trace(initialize_model_weights=False)
-        torch.jit.save(vision_traced_model, vision_compiled_model_path + COMPILED_MODEL_FILE_NAME)
-        del vision_traced_model
-        logger.info("Finished compiling vision model!")
+        vision_traced_model = self.get_vision_builder(debug).trace(initialize_model_weights=False, dry_run=dry_run)
+        if not dry_run:
+            torch.jit.save(vision_traced_model, vision_compiled_model_path + COMPILED_MODEL_FILE_NAME)
+            del vision_traced_model
+            logger.info("Finished compiling vision model!")
 
         self._save_configs_to_compiler_workdir()
 
@@ -449,7 +449,9 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         output_path: str,
         output_format: SnapshotOutputFormat,
         capture_at_requests: List[int],
+        *_,  # capture unused positional args to not crash overriden method
         ranks: Optional[List[int]] = None,
+        **kwargs,  # make sure new kwargs don't crash overriden method
     ):
         """
         Registers snapshot hooks to capture input snapshots for all submodels and bucket.
@@ -462,11 +464,14 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
             ranks = [0]
 
         def _register_submodel(submodel, output_path, model_builder):
+            snapshot_config = SnapshotCaptureConfig().capture_at_request(
+                capture_at_requests
+            )
             submodel.model = ScriptModuleWrapper(submodel.model)
             snapshot_hook = get_snapshot_hook(
                 output_path,
                 output_format,
-                capture_at_requests,
+                snapshot_config,
                 model_builder,
                 ranks,
                 is_input_ranked=submodel.async_mode or submodel.pipeline_execution,
