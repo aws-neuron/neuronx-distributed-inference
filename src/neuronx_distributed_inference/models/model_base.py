@@ -2,6 +2,7 @@ import copy
 import inspect
 import logging
 import os
+import torch.nn.functional as F
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import neuronx_distributed as nxd
@@ -56,6 +57,7 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     prepare_sampling_params,
     rand_like,
     validate_sampling_params,
+    infer_sampling_params,
 )
 from neuronx_distributed_inference.modules.generation.seq_parallel_logits_slice import (
     seq_parallel_slice_last_token,
@@ -64,10 +66,11 @@ from neuronx_distributed_inference.modules.kvcache import utils as kvcache_utils
 from neuronx_distributed_inference.modules.kvcache.block_kv_cache_manager import BlockKVCacheManager, generate_tokengen_slot_mapping, generate_fusedspec_slot_mapping
 from neuronx_distributed_inference.modules.kvcache.data_parallel_kv_cache_manager import DataParallelKVCacheManager
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
-from neuronx_distributed_inference.modules.lora_serving import LoraCheckpoint, wrap_model_with_lora
-from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
+from neuronx_distributed_inference.modules.lora_serving import wrap_model_with_lora, is_lora_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
 from neuronx_distributed_inference.utils.random import set_random_seed
+from neuronx_distributed_inference.modules.attention.utils import get_kernel_cache_size_bucket, stride_tensor, chunk_and_reorder_tensor
+from neuronx_distributed_inference.modules.attention.attention_process_groups import get_flattened_inverted_tp_cp_group_mesh
 from neuronxcc.nki.language import nc
 try:
     from neuronxcc.nki._pre_prod_kernels.attention_token_gen import (
@@ -113,6 +116,8 @@ class NeuronBaseModel(nn.Module):
         self.sliding_window = None
         self.layer_to_cache_size_mapping = None
         self.has_mixed_attn = False
+        self.windowed_context_encoding_size = config.neuron_config.windowed_context_encoding_size
+        self.is_eagle3_draft = self.config.neuron_config.is_eagle_draft and self.config.neuron_config.is_eagle3
 
         self.setup_attr_for_model(config)
         self.init_model(config)
@@ -126,8 +131,7 @@ class NeuronBaseModel(nn.Module):
 
         lora_config = self.neuron_config.lora_config
         if lora_config is not None:
-            wrap_model_with_lora(self, lora_config)
-            self.lora_checkpoint = LoraCheckpoint(lora_config)
+            self.lora_weight_manager = wrap_model_with_lora(self, lora_config)
         self.sliced_hidden = False
 
     def setup_attr_for_model(self, config: InferenceConfig):
@@ -185,6 +189,7 @@ class NeuronBaseModel(nn.Module):
                                          global_rank=self.rank_util,
                                          attention_chunk_size=self.attention_chunk_size,
                                          sliding_window=self.sliding_window,
+                                         windowed_context_encoding_size=self.windowed_context_encoding_size,
                                          layer_to_cache_size_mapping=self.layer_to_cache_size_mapping)
 
     def _is_context_encoding(self, input_ids: torch.Tensor):
@@ -314,22 +319,80 @@ class NeuronBaseModel(nn.Module):
     def _create_windowed_attn_mask_tkg(
         self, attention_mask, window_size, position_ids
     ):
-        # Create tkg mask for sliding window. E.g.:
+        # Create tkg mask for sliding window. Cache size in fact only needs to be window_size - 1
+        # We will leave the last slot blank so that attn kernel can use it for putting KV active.
+        # E.g.:
+        # position = 2, window_size = 4 -> mask = [1,1,0,0]
         # position = 3, window_size = 4 -> mask = [1,1,1,0]
-        # position = 5, window_size = 4 -> mask = [1,0,1,1]
+        # position = 5, window_size = 4 -> mask = [1,1,1,0]
         batch_size, _ = attention_mask.shape
         pos = position_ids[:, 0]
         idx = torch.arange(window_size, device=attention_mask.device).unsqueeze(0)
-        base_mask = idx < pos.unsqueeze(1)  # for input_len <= window_size
+        base_mask = (idx < pos.unsqueeze(1)) & (idx < window_size - 1)
 
+        # For longer sequences, use all first window_size-1 positions
         full_mask = torch.ones((batch_size, window_size), dtype=torch.bool, device=attention_mask.device)
-        zero_pos = pos % window_size
-        zero_mask = idx == zero_pos.unsqueeze(1)
-        full_mask = torch.where(zero_mask, False, full_mask)  # for input_len > window_size
+        full_mask[:, -1] = False  # Always mask last position
 
-        seq_less_than_window = pos < window_size
+        seq_less_than_window = pos < window_size - 1
         final_mask = torch.where(seq_less_than_window.unsqueeze(1), base_mask, full_mask)
         return final_mask[:, None, None, :]
+
+    def _create_windowed_attn_mask_spec_decode(self, window_size: int, position_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Returns:
+            mask: [B, spec_len, C] boolean cache-only mask, where C = select_bucket(w + spec_len - 2).
+            The actual prior cache we need is w + spec_len - 2, but we need to pad to multiples of 128 because the TKG kernel likes it this way.
+        Logic overview:
+          - We are only generating the cache mask for prior tokens. The active triangular causal mask is generated separately by the kernel.
+          - Sliding-window attention with window size w: a query at i can attend keys j with 0 < (i - j) <= (w - 1).
+          - If we do not have speculation, we will need to have w - 1 slots for cache size
+          - Since we have speculation as well, we need to add spec_len - 1 draft tokens to the cache size so that in the scenario where the target model does not accept any tokens,
+          we will still keep the relevant prior cache instead of overwriting them.
+          - We will write cache in a rolling way. The windowed mask will have to roll as well.
+          - Edge case during TKG when we have not filled up the cache yet: columns mapping to negative logical positions are considered empty and masked out.
+
+        Example: Assume we have a window size of 11, spec_len of 3 and the target model is verifying tokens from 12 to 14. The mask will look like:
+        physical ids:    0   1   2   3   4   5   6   7   8   9   10   11
+        logical ids:    k0  k1  k2  k3  k4  k5  k6  k7  k8  k9  k10  k11
+                    q12  0   0   1   1   1   1   1   1   1   1   1    1
+                    q13  0   0   0   1   1   1   1   1   1   1   1    1
+                    q14  0   0   0   0   1   1   1   1   1   1   1    1
+        After this pass, we will write k12 to k14 to physical positions 0 1 2. Lets say we only accept tokens 12 and 13 and target generates token 14.
+        So our next position ids to verify are going to be 14, 15 and 16.
+        physical ids:    0   1   2   3   4   5   6   7   8   9   10   11
+        logical ids:    k12  k13  k14  k3  k4  k5  k6  k7  k8  k9  k10  k11
+                    q14  1    1    0    0   1   1   1   1   1   1   1    1
+                    q15  1    1    0    0   0   1   1   1   1   1   1    1
+                    q16  1    1    0    0   0   0   1   1   1   1   1    1
+        The mask has rolled over.
+        """
+        bs, spec_len = position_ids.shape
+        assert spec_len > 1, f"Speculative has to be greater than 1, getting {spec_len}."
+        assert spec_len == self.neuron_config.speculation_length, f"actual spec_len is not the same as specified config spec_len {spec_len} vs {self.neuron_config.speculation_length}"
+        assert self.neuron_config.attn_block_tkg_nki_kernel_enabled and self.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention, 'Currently we only support speculative decoding with sliding window attention when the cascaded tkg attention kernel is enabled'
+        cache_size = window_size + spec_len - 2
+
+        # For each batch b, s_b is the first (smallest) logical position being verified now
+        first_logical_pos_ids = position_ids[:, 0].unsqueeze(1)  # [B, 1]
+        first_physical_pos_ids = torch.remainder(first_logical_pos_ids, cache_size)  # [B, 1]
+
+        # Compute logical position for each cache physical id in a rolling way
+        col = torch.arange(cache_size, device=position_ids.device).unsqueeze(0).expand(bs, -1)  # [B, C]
+        offset = torch.remainder(col - first_physical_pos_ids, cache_size)                     # [B, C]
+        cache_logical_mapping = (first_logical_pos_ids - cache_size) + offset   # [B, C] cache_logical_mapping[j] = logical_idx at cache physical id j
+
+        # Edge case during first several tkg iterations when we havent filled up the cache yet.
+        # We need to mask out columns that correspond to negative logical positions (empty cache slots)
+        valid_col = cache_logical_mapping >= 0  # [B, C]
+
+        # Sliding-window causal rule: 0 < (i - j) <= w - 1
+        delta = position_ids.unsqueeze(2) - cache_logical_mapping.unsqueeze(1)  # [B, T, C]
+        mask = (delta > 0) & (delta <= (window_size - 1)) & valid_col.unsqueeze(1)  # [B, T, C]
+
+        padded_cache_size = get_kernel_cache_size_bucket(cache_size)
+        padded_mask = F.pad(mask, (0, padded_cache_size - cache_size), value=False)  # [B, T, padded_C]
+        return padded_mask.unsqueeze(1)  # [B, 1, T, padded_C]
 
     def create_attn_mask(
         self,
@@ -344,13 +407,17 @@ class NeuronBaseModel(nn.Module):
                 attention_mask, is_for_context_encoding, **kwargs
             )
 
+        # When we have mixed attention, we pass models both a global and local mask.
+        # This function always generates a global mask.
         if is_for_context_encoding:
-            if self.sliding_window:
+            if self.sliding_window and not self.has_mixed_attn:
                 return self._create_windowed_attn_mask_cte(attention_mask, self.sliding_window)
             else:
                 return self._create_context_attn_mask(attention_mask)
-        else:
-            if self.sliding_window:
+        if self.sliding_window and not self.has_mixed_attn:
+            if self.neuron_config.enable_fused_speculation:
+                return self._create_windowed_attn_mask_spec_decode(self.sliding_window, position_ids)
+            else:
                 return self._create_windowed_attn_mask_tkg(attention_mask, self.sliding_window, position_ids)
 
         if self.neuron_config.attn_block_tkg_nki_kernel_enabled and self.is_prefix_caching:
@@ -383,6 +450,21 @@ class NeuronBaseModel(nn.Module):
         if is_for_speculation:
             return self._create_spec_attn_mask(attention_mask)
         return self._create_simple_attn_mask(attention_mask)
+
+    def create_padding_mask(self, position_ids):
+        # if neuron_config.moe_mask_padded_tokens:
+        #   Create mask of shape [B, S], with values 1's, 0's
+        #   where 1 represent actual tokens and 0 represent padded tokens.
+        # else:
+        #   padding_mask = None
+        if not getattr(self.neuron_config, "moe_mask_padded_tokens", False):
+            return None
+
+        # Per-batch max and create padding mask with index > max -> 0 else 1
+        max_positions = torch.argmax(position_ids, dim=1)
+        seq_indices = torch.arange(position_ids.shape[1], device=position_ids.device).unsqueeze(0)
+        padding_mask = (seq_indices <= max_positions.unsqueeze(1)).float()
+        return padding_mask
 
     def _medusa_forward(
         self,
@@ -745,6 +827,7 @@ class NeuronBaseModel(nn.Module):
         # TODO: This will not work for a context encoding model with bucket size
         # equal to the speculation length
         is_for_context_encoding = self._is_context_encoding(input_ids)
+        is_for_windowed_context_encoding = self.windowed_context_encoding_size is not None
         is_for_speculation = self._is_for_speculation(input_ids)
 
         # For non-speculative prefix caching, generate the slot mapping within the traced model.
@@ -787,6 +870,13 @@ class NeuronBaseModel(nn.Module):
                     local_attn_mask = self._create_chunked_attn_mask_cte(attention_mask, self.attention_chunk_size)
                 else:
                     local_attn_mask = self._create_chunked_attn_mask_tkg(attention_mask, self.attention_chunk_size, position_ids)
+            elif self.sliding_window:
+                if is_for_context_encoding:
+                    local_attn_mask = self._create_windowed_attn_mask_cte(attention_mask, self.sliding_window)
+                elif self.neuron_config.enable_fused_speculation:
+                    local_attn_mask = self._create_windowed_attn_mask_spec_decode(self.sliding_window, position_ids)
+                else:
+                    local_attn_mask = self._create_windowed_attn_mask_tkg(attention_mask, self.sliding_window, position_ids)
 
         active_mask = None
         if self.is_prefix_caching:
@@ -833,30 +923,117 @@ class NeuronBaseModel(nn.Module):
                 )
                 active_mask_2d = active_mask_tmp
 
-        hidden_states, updated_kv_cache = self.get_model_output(
-            input_ids=input_ids,
-            seq_ids=seq_ids,
-            attention_mask=attn_mask,
-            position_ids=position_ids,
-            active_mask=active_mask,
-            inputs_embeds=inputs_embeds,
-            adapter_ids=adapter_ids,
-            prev_hidden=prev_hidden,
-            tile_q_indices=tile_q_indices,
-            tile_block_tables=tile_block_tables,
-            tile_masks=tile_masks,
-            num_queries=num_queries,
-            is_for_context_encoding=is_for_context_encoding,
-            scatter_index=slot_mapping if self.is_block_kv_layout else scatter_index,
-            kvcache_buffer=kv_cache,
-            is_for_speculation=is_for_speculation,
-            active_block_table=active_block_table,
-            kv_active_mask=active_mask_2d,
-            update_cache=True,
-            vision_embeddings=vision_embeddings,
-            vision_mask=vision_mask,
-            local_attn_mask=local_attn_mask,
-        )
+        # Create padding mask
+        padding_mask = self.create_padding_mask(position_ids)
+
+        if self.neuron_config.strided_context_parallel_kernel_enabled and is_for_context_encoding:
+            logging.debug("strided_context_parallel_kernel_enabled enabled, shuffling inputs")
+
+            # The strided CP FA kernel expected inputs to be strided, due to SP happening in model_base
+            # stride here rather than in attention to order it before we move the inputs to SP region
+            input_ids = stride_tensor(input_ids, 1, self.neuron_config.cp_degree)
+            position_ids = stride_tensor(position_ids, 1, self.neuron_config.cp_degree)
+            if padding_mask is not None:
+                padding_mask = stride_tensor(padding_mask, 1, self.neuron_config.cp_degree)
+
+        # When using SP with 8x8 CP, the mesh is non-contiguous, so we reorder the input to have a non-contiguous SP split
+        # When we AG in attention using 8x8, the resulting sequence is contiguous
+        if is_for_context_encoding and self.neuron_config.cp_degree > 1 and self.neuron_config.cp_degree == 8 and (self.neuron_config.tp_degree // self.neuron_config.cp_degree) == 8 and self.sequence_parallel_enabled:
+            ordering = get_flattened_inverted_tp_cp_group_mesh(self.neuron_config.tp_degree, self.neuron_config.cp_degree, self.neuron_config.switch_cc)
+
+            logging.debug("CP8 and SP enabled, reordering the input on S", ordering)
+            input_ids = chunk_and_reorder_tensor(input_ids, ordering, 1)
+            if padding_mask is not None:
+                padding_mask = chunk_and_reorder_tensor(padding_mask, ordering, 1)
+
+        if self.neuron_config.lora_config is not None:
+            lora_weights, adapter_ids = self.lora_weight_manager.update_lora_tensors(
+                adapter_ids,
+                seq_ids,
+                is_for_context_encoding,
+                self.neuron_config.is_continuous_batching
+            )
+
+        if is_for_context_encoding and is_for_windowed_context_encoding:
+            pos_pad_id = 1
+            wce_size = self.windowed_context_encoding_size
+            updated_kv_cache = None
+            batch_size = input_ids.shape[0]
+            prev_max_hidden_states = torch.empty(batch_size, 1, self.hidden_size, device=input_ids.device)
+
+            for window_idx in range(self.n_positions // wce_size):
+                # Slice the original input_ids into `self.n_positions // wce_size` windows i.e. shard on seq_len
+                windowed_input_ids = input_ids[:, window_idx * wce_size : (window_idx + 1) * wce_size]  # (B, W)
+                windowed_pos_ids = position_ids[:, window_idx * wce_size : (window_idx + 1) * wce_size]  # (B, W)
+                windowed_attn_mask = attn_mask[:, :, window_idx * wce_size : (window_idx + 1) * wce_size, 0 : (window_idx + 1) * wce_size]  # (1, 1, W, widx * W)
+                active_mask = torch.ones(1, 1, wce_size, wce_size, dtype=torch.bool, device=input_ids.device).tril(diagonal=0)
+
+                is_valid_window = torch.any(windowed_pos_ids != pos_pad_id, dim=1)  # False only if all pos_ids are paddings.
+                is_valid_window_kv = is_valid_window.view(-1, 1, 1, 1).expand(batch_size, 1, wce_size, self.hidden_size // self.num_attention_heads)
+                is_valid_window_hidden_states = is_valid_window.unsqueeze(1).unsqueeze(2).expand(batch_size, 1, self.hidden_size)
+
+                hidden_states, updated_kv_cache = self.get_model_output(
+                    input_ids=windowed_input_ids,
+                    seq_ids=seq_ids,
+                    attention_mask=windowed_attn_mask,
+                    position_ids=windowed_pos_ids,
+                    active_mask=active_mask,
+                    inputs_embeds=inputs_embeds,
+                    adapter_ids=adapter_ids,
+                    prev_hidden=prev_hidden,
+                    tile_q_indices=tile_q_indices,
+                    tile_block_tables=tile_block_tables,
+                    tile_masks=tile_masks,
+                    num_queries=num_queries,
+                    is_for_context_encoding=is_for_context_encoding,
+                    scatter_index=slot_mapping if self.is_block_kv_layout else scatter_index,
+                    kvcache_buffer=updated_kv_cache,
+                    is_for_speculation=is_for_speculation,
+                    active_block_table=active_block_table,
+                    kv_active_mask=active_mask_2d,
+                    update_cache=True,
+                    vision_embeddings=vision_embeddings,
+                    vision_mask=vision_mask,
+                    local_attn_mask=local_attn_mask,
+                    windowed_context_encoding_window_idx=window_idx,
+                    is_valid_window_kv=is_valid_window_kv
+                )
+
+                if self.sequence_parallel_enabled:  # hidden_states is already max (B,1,H)
+                    current_max_hidden_states = hidden_states
+                else:
+                    arg_max_index = torch.max(windowed_pos_ids, dim=1, keepdim=True).indices  # compute max pos_id idx per batch, in window
+                    arg_max_index = arg_max_index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
+                    current_max_hidden_states = torch.gather(hidden_states, dim=1, index=arg_max_index)
+                prev_max_hidden_states = torch.where(is_valid_window_hidden_states, current_max_hidden_states, prev_max_hidden_states)
+
+            hidden_states = prev_max_hidden_states  # (B,1,H) - set final hidden_state after windowed context encoding is over
+        else:
+            hidden_states, updated_kv_cache = self.get_model_output(
+                input_ids=input_ids,
+                seq_ids=seq_ids,
+                attention_mask=attn_mask,
+                position_ids=position_ids,
+                active_mask=active_mask,
+                inputs_embeds=inputs_embeds,
+                adapter_ids=adapter_ids,
+                prev_hidden=prev_hidden,
+                tile_q_indices=tile_q_indices,
+                tile_block_tables=tile_block_tables,
+                tile_masks=tile_masks,
+                num_queries=num_queries,
+                is_for_context_encoding=is_for_context_encoding,
+                scatter_index=slot_mapping if self.is_block_kv_layout else scatter_index,
+                kvcache_buffer=kv_cache,
+                is_for_speculation=is_for_speculation,
+                active_block_table=active_block_table,
+                kv_active_mask=active_mask_2d,
+                update_cache=True,
+                vision_embeddings=vision_embeddings,
+                vision_mask=vision_mask,
+                local_attn_mask=local_attn_mask,
+                padding_mask=padding_mask,
+            )
 
         batch_size = input_ids.shape[0]
         if not self.sliced_hidden:
@@ -876,12 +1053,22 @@ class NeuronBaseModel(nn.Module):
                 if not (
                     position_ids.shape[-1] == self.speculation_length or position_ids.shape[-1] == 1
                 ):
-                    # context encoding
-                    index = torch.max(position_ids, dim=1, keepdim=True).indices
-                    index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
-                    hidden_states = torch.gather(hidden_states, dim=1, index=index)
+                    if not is_for_windowed_context_encoding:
+                        # context encoding
+                        index = torch.max(position_ids, dim=1, keepdim=True).indices
+                        index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
+                        hidden_states = torch.gather(hidden_states, dim=1, index=index)
 
-        logits = self.lm_head(hidden_states)
+        lm_head_hidden_states = hidden_states
+
+        if self.is_eagle3_draft:
+            hidden_states = self.norm(hidden_states)
+            lm_head_hidden_states = hidden_states
+        if self.config.neuron_config.is_eagle3 and not self.is_eagle3_draft:
+            lm_head_hidden_states = hidden_states[:, :, 3 * self.hidden_size:4 * self.hidden_size]
+            hidden_states = hidden_states[:, :, :3 * self.hidden_size]  # target hidden states from 3 different layers
+
+        logits = self.lm_head(lm_head_hidden_states)
         logits = logits.float()
 
         if hasattr(self.lm_head, "pad_size"):
@@ -925,8 +1112,118 @@ class NeuronBaseModel(nn.Module):
                 outputs = outputs + [hidden_states] + [self.full_hidden_states]
             else:
                 outputs = outputs + [self.full_hidden_states]
+        if self.neuron_config.lora_config is not None:
+            outputs += lora_weights
 
         return outputs
+
+    def _find_first_captured_tensor_for_module(self, module_captured_tensors_dict, module_name, tensor_type, device):
+        """
+        Find the first tensor for a given module and tensor type (inputs/outputs).
+
+        Modules inputs/outputs registration can create nested tensor structures with various
+        suffixes (e.g., .0, .1, .hidden_states, .kwargs.arg_name, etc.).
+
+        Since module_captured_tensors_dict is an OrderedDict and registration happens
+        deterministically, we preserve the natural registration order without sorting.
+        The module hierarchy is properly separated by dots, so simple prefix matching
+        is sufficient to find the exact module's tensors.
+
+        Args:
+            module_captured_tensors_dict: OrderedDict of all captured module tensors
+            module_name: Name of the module to search for
+            tensor_type: Either "inputs" or "outputs"
+            device: Device to create fallback tensor on if no tensor is found
+
+        Returns:
+            torch.Tensor: The first tensor found for the module/type, or an empty tensor fallback
+        """
+        exact_prefix = f"{module_name}.{tensor_type}"
+
+        # Return the first tensor that matches our exact prefix
+        # Since we're using OrderedDict, iteration preserves registration order
+        for key, tensor in module_captured_tensors_dict.items():
+            if key.startswith(exact_prefix):
+                return tensor
+
+        # Fallback: create empty tensor if no tensor found
+        # This ensures consistent output structure for tracing
+        return torch.zeros(1, dtype=torch.bfloat16, device=device)
+
+    def _get_captured_tensors(
+        self,
+        device
+    ):
+        """
+        Returns tensors captured during model execution based on tensor_capture_config settings.
+
+        This function handles two types of tensor capture:
+        1. Module tensors: Captured from specific modules defined in modules_to_capture
+        2. Manual tensors: Manually registered tensors during execution
+
+        Args:
+            device: Device to create padding tensors on (typically the same as model outputs)
+
+        Returns:
+            List of captured tensors. For manual tensors, padding is added to ensure
+            the list has exactly max_intermediate_tensors elements for input/output aliasing.
+        """
+        registry = TensorRegistry.get_instance()
+        captured_tensors = []
+
+        # 1. Process module tensors - capture outputs and optionally inputs from specified modules
+        if self.neuron_config.tensor_capture_config.modules_to_capture:
+            module_captured_tensors_dict = registry.get_module_tensors()
+            for module_name in self.neuron_config.tensor_capture_config.modules_to_capture:
+                # Get first output tensor for this module
+                output_tensor = self._find_first_captured_tensor_for_module(
+                    module_captured_tensors_dict, module_name, "outputs", device
+                )
+                captured_tensors += [output_tensor]
+
+                # Get first input tensor if capture_inputs is enabled
+                if self.neuron_config.tensor_capture_config.capture_inputs:
+                    input_tensor = self._find_first_captured_tensor_for_module(
+                        module_captured_tensors_dict, module_name, "inputs", device
+                    )
+                    captured_tensors += [input_tensor]
+
+        # Gather the manually registered tensors
+        manual_captured_tensors = None
+        if self.neuron_config.tensor_capture_config.max_intermediate_tensors:
+            manual_captured_tensors_dict = registry.get_manual_tensors()
+            manual_captured_tensors = []
+
+            for key, tensor in manual_captured_tensors_dict.items():
+                manual_captured_tensors.append(tensor)
+
+            # Slice the manually captured tensors to max_intermediate_tensors
+            # This is necessary to maintain a fixed-size output structure for input/output aliasing
+            if len(manual_captured_tensors) > self.neuron_config.tensor_capture_config.max_intermediate_tensors:
+                discarded_count = len(manual_captured_tensors) - self.neuron_config.tensor_capture_config.max_intermediate_tensors
+                logging.warning(
+                    f"Number of manually captured tensors ({len(manual_captured_tensors)}) exceeds max_intermediate_tensors "
+                    f"({self.neuron_config.tensor_capture_config.max_intermediate_tensors}). "
+                    f"Discarding {discarded_count} tensors."
+                )
+                manual_captured_tensors = manual_captured_tensors[:self.neuron_config.tensor_capture_config.max_intermediate_tensors]
+
+            # Add padding tensors if we have fewer than max_intermediate_tensors
+            # This is necessary to maintain a fixed-size output structure for input/output aliasing
+            if len(manual_captured_tensors) < self.neuron_config.tensor_capture_config.max_intermediate_tensors:
+                padding_count = self.neuron_config.tensor_capture_config.max_intermediate_tensors - len(manual_captured_tensors)
+                for _ in range(padding_count):
+                    # Use a nan value to easily identify padding tensors
+                    padding_tensor = torch.full((1,), float('nan'), dtype=torch.bfloat16, device=device)
+                    manual_captured_tensors.append(padding_tensor)
+
+        # Add manual tensors to the output list
+        if manual_captured_tensors:
+            captured_tensors += manual_captured_tensors
+
+        # Clear the registry for the next model execution
+        registry.clear()
+        return captured_tensors
 
     def _sample_on_device(
         self,
@@ -940,7 +1237,7 @@ class NeuronBaseModel(nn.Module):
         res = logits
         # perform sampling on Neuron to get tokens
         # FIXME, logits[:, -1, :] is not correct for speculation model, this is a tempory fix.
-        if is_for_speculation and not self.neuron_config.on_device_sampling_config.do_sample:
+        if (is_for_speculation or self.neuron_config.is_eagle_draft) and not self.neuron_config.on_device_sampling_config.do_sample:
             res = nxd_argmax(tensor=logits, dim=2, gather_dim=2, keepdim=False)
             res = res.to(torch.int32)
         elif (
@@ -992,6 +1289,8 @@ class NeuronBaseModel(nn.Module):
         vision_embeddings: Optional[torch.FloatTensor] = None,
         vision_mask: Optional[torch.BoolTensor] = None,
         local_attn_mask: Optional[torch.Tensor] = None,
+        windowed_context_encoding_window_idx: int = -1,
+        padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         batch_size, seq_length = input_ids.shape[:2]
@@ -1074,17 +1373,20 @@ class NeuronBaseModel(nn.Module):
         )
         if self.attention_chunk_size:
             cache_size = self.attention_chunk_size
+        elif self.sliding_window:
+            cache_size = self.sliding_window
         get_kv_per_layer = False
         active_block_table = None if 'active_block_table' not in kwargs else kwargs['active_block_table']
         empty_active_block_table = True if active_block_table is None else len(active_block_table.shape) == 1
         may_have_prefix = self.is_prefix_caching and is_for_context_encoding and not empty_active_block_table
         is_for_chunked_prefill = self.is_block_kv_layout and self.neuron_config.is_chunked_prefill
-        if may_have_prefix or is_for_chunked_prefill or not is_for_context_encoding:
+        if may_have_prefix or is_for_chunked_prefill or not is_for_context_encoding or windowed_context_encoding_window_idx >= 1:
             if not self.config.neuron_config.layer_boundary_markers:
                 past_key_values = self.kv_mgr.get_cache(
                     seq_ids=seq_ids,
                     seq_len=cache_size,
                     is_for_context_encoding=is_for_context_encoding,
+                    windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
                     **kwargs,
                 )
             else:
@@ -1094,6 +1396,8 @@ class NeuronBaseModel(nn.Module):
         if self.attention_chunk_size and not self.has_mixed_attn:
             attention_mask = local_attn_mask
             local_attn_mask = None
+        if self.config.neuron_config.is_eagle3:
+            eagle3_target_hidden_states = []
         for idx, decoder_layer in enumerate(self.layers):
             if self.config.neuron_config.layer_boundary_markers:
                 hidden_states = ModuleMarkerStartWrapper()(hidden_states)
@@ -1118,6 +1422,8 @@ class NeuronBaseModel(nn.Module):
                 seq_len=cache_size,
                 residual=residual,
                 local_mask=local_attn_mask,
+                windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+                padding_mask=padding_mask,
                 **kwargs,
             )
 
@@ -1135,6 +1441,11 @@ class NeuronBaseModel(nn.Module):
                 kv = (k, v)
                 cos_cache, sin_cache = None, None
 
+            if self.neuron_config.is_eagle3 and not self.is_eagle3_draft:
+                num_target_layers = len(self.layers)
+                if idx in (1, num_target_layers // 2 - 1, num_target_layers - 4):
+                    eagle3_target_hidden_states.append(hidden_states)
+
         if update_cache and not update_kv_per_layer:
             next_decoder_cache = self.kv_mgr.update_cache(
                 is_for_context_encoding=is_for_context_encoding,
@@ -1142,6 +1453,7 @@ class NeuronBaseModel(nn.Module):
                 position_ids=position_ids,
                 new_key_values=next_decoder_cache,
                 seq_len=cache_size,
+                windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
                 **kwargs,
             )
 
@@ -1155,24 +1467,37 @@ class NeuronBaseModel(nn.Module):
 
         if not self.neuron_config.is_eagle_draft:
             hidden_states = self.norm(hidden_states)
+            if self.neuron_config.is_eagle3:
+                eagle3_target_hidden_states.append(hidden_states)  # append last layer hidden states
+                hidden_states = torch.cat(eagle3_target_hidden_states, dim=2)  # (B, S, 4H)
 
         self.full_hidden_states = None
         if self.neuron_config.enable_eagle_speculation:
-            self.full_hidden_states = hidden_states  # (B, S/TP, H)
+            if self.neuron_config.is_eagle3 and not self.neuron_config.is_eagle_draft:
+                self.full_hidden_states = hidden_states[:, :, :3 * self.hidden_size]
+            else:
+                self.full_hidden_states = hidden_states
 
         if self.sequence_parallel_enabled:
+            if is_for_context_encoding and self.neuron_config.cp_degree > 1 and self.neuron_config.cp_degree == 8 and (self.neuron_config.tp_degree // self.neuron_config.cp_degree) == 8:
+                ordering = get_flattened_inverted_tp_cp_group_mesh(self.neuron_config.tp_degree, self.neuron_config.cp_degree, self.neuron_config.switch_cc)
+                position_ids = chunk_and_reorder_tensor(position_ids, ordering, 1)
+
             physical_position_ids = position_ids
             active_block_table = kwargs.get("active_block_table", None)
             has_prefix = active_block_table is not None and len(active_block_table.shape) > 1
             if has_prefix and self.neuron_config.is_eagle_draft:
                 physical_position_ids += 1
 
+            hidden_size = self.hidden_size
+            if self.neuron_config.is_eagle3 and not self.is_eagle3_draft:
+                hidden_size = self.hidden_size * 4
             hidden_states = seq_parallel_slice_last_token(
                 hidden_states,
                 physical_position_ids,
                 self.sequence_dimension,
                 self.batch_size,
-                self.hidden_size,
+                hidden_size,
                 kwargs["num_queries"],
                 self.neuron_config,
                 self.config,
@@ -1249,6 +1574,13 @@ class NeuronBaseModel(nn.Module):
             hidden_states = inputs_embeds
         return hidden_states
 
+    def _should_gather_weight(self, seq_length):
+        # TODO EAGLE3: Adjust when integrating with APC
+        if self.sequence_parallel_enabled and seq_length >= self.neuron_config.weight_gather_seq_len_threshold:
+            return True
+        else:
+            return False
+
     def process_eagle_draft_hidden_states(
         self,
         hidden_states: torch.FloatTensor,
@@ -1295,8 +1627,10 @@ class NeuronBaseModel(nn.Module):
                     prev_hidden[:, self.neuron_config.pa_block_size - 1:, :],
                     prev_hidden[:, :self.neuron_config.pa_block_size - 1, :]
                 ), dim=1)
-        concat_states = torch.cat((hidden_states, prev_hidden), dim=2)
-        hidden_states = self.fc.forward_wg(concat_states, weight_gather)
+        if not self.neuron_config.is_eagle3:
+            hidden_states = self._process_non_eagle3_hidden_states(hidden_states, prev_hidden, weight_gather)
+        else:
+            hidden_states = self._process_eagle3_hidden_states(hidden_states, prev_hidden, weight_gather)
         if not weight_gather and self.sequence_parallel_enabled:
             hidden_states = _reduce_scatter_along_dim(
                 hidden_states,
@@ -1306,8 +1640,17 @@ class NeuronBaseModel(nn.Module):
             )
         return hidden_states
 
+    def _process_non_eagle3_hidden_states(self, hidden_states, prev_hidden, weight_gather):
+        concat_states = torch.cat((hidden_states, prev_hidden), dim=2)
+        return self.fc.forward_wg(concat_states, weight_gather)
+
+    def _process_eagle3_hidden_states(self, hidden_states, prev_hidden, weight_gather):
+        if prev_hidden.shape[2] == hidden_states.shape[2] * 3:
+            prev_hidden = self.fc.forward_wg(prev_hidden, weight_gather)
+        return torch.cat((hidden_states, prev_hidden), dim=2)
+
     def update_weights_for_lora(self, model_sd):
-        return self.lora_checkpoint.update_weights_for_lora(self, model_sd)
+        return self.lora_weight_manager.lora_checkpoint.update_weights_for_lora(self, model_sd)
 
 
 class NeuronFusedSpecModel(nn.Module):
@@ -1321,22 +1664,26 @@ class NeuronFusedSpecModel(nn.Module):
         self.neuron_config = config.neuron_config
         self.draft_neuron_config = config.fused_spec_config.draft_config.neuron_config
         self.worker_cls = config.fused_spec_config.worker_cls
+        self.draft_model_cls = config.fused_spec_config.draft_model_cls
         self.n_positions = config.neuron_config.n_positions
         self.batch_size = config.neuron_config.batch_size
         self.hidden_size = config.hidden_size
+        self.rolling_buffer_hidden_size = self.hidden_size * 3 if config.neuron_config.is_eagle3 else self.hidden_size
         if config.neuron_config.enable_eagle_speculation:
             self.hidden_state_rolling_buffer = HiddenStateRollingBuffer(
                 config.neuron_config.max_batch_size,
                 config.neuron_config.speculation_length * 2,
-                self.hidden_size,
+                self.rolling_buffer_hidden_size,
                 dtype=config.neuron_config.torch_dtype,
                 apply_seq_ids_mask=self.neuron_config.apply_seq_ids_mask,
             )
 
         config.fused_spec_config.draft_config.neuron_config.use_draft_group = True
         config.fused_spec_config.draft_config.neuron_config.quantized_mlp_kernel_enabled = False
-
-        self.draft_model = self.worker_cls(config.fused_spec_config.draft_config)
+        if self.draft_model_cls:
+            self.draft_model = self.draft_model_cls._model_cls(config.fused_spec_config.draft_config)
+        else:
+            self.draft_model = self.worker_cls(config.fused_spec_config.draft_config)
         self.target_model = self.worker_cls(config)
 
         # currently we enforce draft to be greedy
@@ -1353,6 +1700,11 @@ class NeuronFusedSpecModel(nn.Module):
 
         # Prefix caching check
         self.is_prefix_caching = config.neuron_config.is_prefix_caching
+
+        # eagle3 related checks
+        if self.neuron_config.is_eagle3:
+            assert not self.config.neuron_config.enable_token_tree, "We do not yet support integration of EAGLE3 and token tree"
+            assert not self.is_prefix_caching, "We do not yet support integration of EAGLE3 and prefix caching"
 
         if self.config.neuron_config.enable_token_tree:
             assert self.config.neuron_config.token_tree_config
@@ -1740,6 +2092,7 @@ class NeuronFusedSpecModel(nn.Module):
         )
         last_hidden_state = target_outputs[-2]
         hidden_state = target_outputs[-1]
+
         # Create draft args from target args
         # Draft is always running 1 position behind the target
         # So if target input is ABCDE, draft input will be BCDE
@@ -1756,6 +2109,7 @@ class NeuronFusedSpecModel(nn.Module):
             scatter_index.shape, dtype=attention_mask.dtype, device=attention_mask.device
         )
         draft_position_ids = torch.scatter(draft_position_ids, 1, scatter_index, zeros)
+
         draft_outputs = self.draft_model(
             draft_input_ids,
             attention_mask,
@@ -2217,12 +2571,12 @@ class NeuronFusedSpecModel(nn.Module):
         num_queries=None,
         computed_context_lens=None,
     ):
+
         spec_len = self.neuron_config.speculation_length
         bs = input_ids.shape[0]
         hidden_state = self.hidden_state_rolling_buffer.get_state(seq_ids, position_ids)
 
         assert self.neuron_config.on_device_sampling_config
-
         # 1. Generate k-1 candidate tokens
         draft_position_ids = position_ids.expand(bs, spec_len) - 1  # [1, 5]
         candidate_input_ids = input_ids
@@ -2235,7 +2589,6 @@ class NeuronFusedSpecModel(nn.Module):
             device=draft_attention_mask.device,
         )
         draft_attention_mask = torch.scatter(draft_attention_mask, 1, scatter_index, zeros)
-
         orig_hidden = hidden_state
         draft_cache = None
         draft_probs = []
@@ -2343,6 +2696,7 @@ class NeuronFusedSpecModel(nn.Module):
             target_tokens = outputs[0]
         target_cache = outputs[num_outputs:-1]
         hidden_state = outputs[-1]
+
         prev_hidden = torch.cat([orig_hidden, hidden_state[:, : spec_len - 1, :]], dim=1)
 
         if not self.is_prefix_caching:
@@ -2420,7 +2774,7 @@ class NeuronFusedSpecModel(nn.Module):
                 .view(self.batch_size, -1)
             )
 
-        index = index.reshape(self.batch_size, -1, 1).expand(self.batch_size, 1, self.hidden_size)
+        index = index.reshape(self.batch_size, -1, 1).expand(self.batch_size, 1, self.rolling_buffer_hidden_size)
         hidden_state = torch.gather(hidden_state, dim=1, index=index)
 
         if self.neuron_config.output_logits:
@@ -2743,7 +3097,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         self.model_wrapper = self.get_model_wrapper_cls()
 
         if self.neuron_config.enable_fused_speculation:
-            self.__class__._model_cls = NeuronFusedSpecModel
+            self._model_cls = NeuronFusedSpecModel
             self.enable_context_encoding()
             self.enable_fused_spec()
         else:
@@ -2992,6 +3346,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             self.default_sampling_params if sampling_params is None else sampling_params
         )
         self.validate_sampling_params(sampling_params)
+        sampling_params = infer_sampling_params(sampling_params)
         self.sampling_params = sampling_params
 
         output_attentions, output_hidden_states, return_dict = self._setup_func_config(
@@ -3038,6 +3393,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         block_table: Optional[torch.LongTensor] = None,
         full_context_lens: Optional[torch.LongTensor] = None,
         computed_context_lens: Optional[torch.LongTensor] = None,
+        tf_args: Optional[List[torch.Tensor]] = None
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
         Args:
@@ -3046,6 +3402,16 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
                 (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
         """
+
+        is_context_encoding = input_ids.shape[-1] > 1 and not position_ids.min().item()
+        if (
+            self.neuron_config.lora_config
+            and self.neuron_config.lora_config.dynamic_multi_lora
+            and is_context_encoding
+        ):
+            adapter_ids = self.lora_model_manager.dynamic_update_weights_for_lora(
+                self.context_encoding_model.model.nxd_model.weights, adapter_ids
+            )
 
         input_ids, attention_mask, position_ids, seq_ids, sampling_params = self.preprocess_inputs(
             input_ids=input_ids,
@@ -3126,6 +3492,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 adapter_ids,
                 medusa_args,
                 llava_args,
+                tf_args=tf_args
             )
 
         generation_model = self.get_generation_model()
@@ -3301,6 +3668,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         block_table=None,
         full_context_lens=None,
         computed_context_lens=None,
+        tf_args=None
     ):
         if self.neuron_config.is_prefix_caching:
             num_queries = full_context_lens - computed_context_lens
@@ -3393,6 +3761,20 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     adapter_ids,
                     *medusa_args,
                 )
+            elif self.neuron_config.tensor_replacement_config:
+                empties = [torch.empty(0) for i in range(17)]
+                outputs = self.context_encoding_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                    *empties,
+                    *llava_args,
+                    *tf_args
+                )
             else:
                 outputs = self.context_encoding_model(
                     input_ids,
@@ -3442,16 +3824,31 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             )
             is_run_on_neuron = self.medusa_speculation_model.is_neuron()
         else:
-            outputs = self.token_generation_model(
-                input_ids,
-                attention_mask,
-                position_ids,
-                seq_ids,
-                sampling_params,
-                prev_hidden,
-                adapter_ids,
-                *llava_args,
-            )
+            if self.neuron_config.tensor_replacement_config:
+                empties = [torch.empty(0) for i in range(17)]
+                outputs = self.token_generation_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                    *empties,
+                    *llava_args,
+                    *tf_args
+                )
+            else:
+                outputs = self.token_generation_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                    *llava_args,
+                )
             is_run_on_neuron = self.token_generation_model.is_neuron()
 
         return outputs, is_run_on_neuron
@@ -3611,10 +4008,12 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 )
         else:
             if self.neuron_config.output_logits and self.neuron_config.on_device_sampling_config:
+                captured_tensors_offset = self._get_captured_tensors_offset()
                 # preserve tokens and logits (first 2 tensors)
-                new_past_key_values = outputs[2:]
+                new_past_key_values = outputs[2 + captured_tensors_offset:]
             else:
-                new_past_key_values = outputs[1:]
+                captured_tensors_offset = self._get_captured_tensors_offset()
+                new_past_key_values = outputs[1 + captured_tensors_offset:]
 
             for i, new_past_key_value in enumerate(new_past_key_values):
                 self.token_generation_model.model.kv_mgr.past_key_values[i].data = (

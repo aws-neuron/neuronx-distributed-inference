@@ -9,6 +9,17 @@ LONG_CONTEXT_RUNTIME_ENV_VARS = {
 }
 
 
+def get_env_vars(neuron_config: NeuronConfig) -> dict[str, str]:
+    env_vars = collections.defaultdict()
+    if neuron_config.enable_long_context_mode:
+        env_vars.update(LONG_CONTEXT_RUNTIME_ENV_VARS)
+
+    if neuron_config.scratchpad_page_size:
+        env_vars.update({"NEURON_SCRATCHPAD_PAGE_SIZE": f"{neuron_config.scratchpad_page_size}"})
+
+    return env_vars
+
+
 def set_env_vars(neuron_config: NeuronConfig) -> None:
     """
     Set environment variables if they're not already set.
@@ -17,13 +28,7 @@ def set_env_vars(neuron_config: NeuronConfig) -> None:
         neuron_config (NeuronConfig): config contains env var info
     """
 
-    env_vars = collections.defaultdict()
-    if neuron_config.enable_long_context_mode:
-        env_vars.update(LONG_CONTEXT_RUNTIME_ENV_VARS)
-
-    if neuron_config.scratchpad_page_size:
-        env_vars.update({"NEURON_SCRATCHPAD_PAGE_SIZE": f"{neuron_config.scratchpad_page_size}"})
-
+    env_vars = get_env_vars(neuron_config)
     for var, value in env_vars.items():
         if var not in os.environ:
             os.environ[var] = str(value)

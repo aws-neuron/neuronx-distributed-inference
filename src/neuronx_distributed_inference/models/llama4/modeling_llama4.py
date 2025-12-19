@@ -50,6 +50,7 @@ from neuronx_distributed_inference.models.llama4.utils.encoder_utils import (
     pad_vision_embeddings,
 )
 from neuronx_distributed_inference.models.image_to_text_model_base import ImageToTextInferenceConfig, NeuronBaseForImageToText
+from neuronx_distributed_inference.models.llama4.utils.patch_llama4 import patch_llama4_text_moe_forward
 from neuronx_distributed_inference.models.model_wrapper import (CONTEXT_ENCODING_MODEL_TAG,
                                                                 TOKEN_GENERATION_MODEL_TAG,
                                                                 VISION_ENCODER_MODEL_TAG)
@@ -222,11 +223,25 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
 
         return tuple(args)
 
-    def get_padding_length(self, buckets, input_ids):
+    def _select_buckets_for_padding_length(self, position_ids):
+        neuron_config = self.config.neuron_config
+        context_encoding_buckets = neuron_config.context_encoding_buckets if neuron_config.context_encoding_buckets is not None \
+            else neuron_config.buckets
+        token_generation_buckets = neuron_config.token_generation_buckets if neuron_config.token_generation_buckets is not None \
+            else neuron_config.buckets
+
+        selected_buckets = token_generation_buckets
+        if self._is_prefill(position_ids):
+            selected_buckets = context_encoding_buckets
+
+        return selected_buckets
+
+    def get_padding_length(self, buckets, position_ids):
+        max_position_id = torch.max(position_ids).item()
         for val in buckets:
-            if val >= input_ids.shape[1]:
+            if val > max_position_id:
                 return val
-        raise Exception("No bucket found for provided input_ids!")
+        raise ValueError("No bucket found for provided input_ids!")
 
     def get_required_kwargs(self) -> List[str]:
         """The list of additional input arguments to be prepared in HuggingFaceGenerationAdapter.prepare_inputs_for_generation()"""
@@ -253,6 +268,8 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         batch_size, _ = input_ids.shape
+        buckets = self._select_buckets_for_padding_length(position_ids)
+        pad_limit = self.get_padding_length(buckets, position_ids)
         if (
             (pixel_values is not None)
             and (vision_mask is not None)
@@ -263,9 +280,6 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
                 vision_mask.dtype == torch.bool
             ), f"Parameter `vision_mask` must be of type bool, recieved {vision_mask.dtype}"
             vision_mask = generate_positions_from_mask(vision_mask.squeeze())
-            pad_limit = self.get_padding_length(self.config.neuron_config.buckets, input_ids)
-            # Pad vision mask to VISION_MAX_NUM_CHUNKS
-
             vision_mask = pad_positions(
                 vision_mask, pad_limit, (pad_limit - 1)
             )
@@ -280,8 +294,6 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
 
             vision_embeddings = pad_vision_embeddings(vision_embeddings, pad_limit)
         else:
-            pad_limit = self.get_padding_length(self.config.neuron_config.buckets, input_ids)
-
             vision_embeddings, vision_mask = self.text_model_wrapper.get_dummy_vision_inputs(
                 config=self.text_config,
                 input_ids=input_ids,
@@ -308,7 +320,12 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
     def load_hf_model(model_path, **kwargs):
         from transformers import Llama4ForConditionalGeneration
 
-        return Llama4ForConditionalGeneration.from_pretrained(model_path, **kwargs)
+        model = Llama4ForConditionalGeneration.from_pretrained(model_path, **kwargs)
+
+        # Patch an accuracy issue that affects transformers v4.54-4.56.
+        patch_llama4_text_moe_forward(model.language_model.model)
+
+        return model
 
     def to_cpu(self):
         """
@@ -425,7 +442,7 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
         else:
             raise ValueError(f"get_compiler_args() Invalid compile tag encountered: {self.compile_tag}")
 
-        args = f"--auto-cast=none --model-type=transformer '--tensorizer-options=--enable-ccop-compute-overlap " \
+        args = f"--auto-cast=none --model-type=transformer --tensorizer-options='--enable-ccop-compute-overlap " \
                f"--cc-pipeline-tiling-factor=1 --vectorize-strided-dma --enable-scalar-dge-vectorization' " \
                f"--lnc={logical_nc_config} {optimization_level} "
         return args

@@ -8,6 +8,7 @@ from typing import Type
 from unittest.mock import patch
 
 from neuronx_distributed_inference.models.config import LONG_CONTEXT_SCRATCHPAD_PAGE_SIZE
+from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 import pytest
 import torch
 from transformers import AutoConfig
@@ -39,6 +40,14 @@ def test_validate_config():
     neuron_config = NeuronConfig()
     with pytest.raises(AssertionError, match=r"Config must define"):
         _ = ValidatingInferenceConfig(neuron_config)
+
+def test_validate_windowed_context_encoding_config():
+    neuron_config = NeuronConfig(windowed_context_encoding_size=4)
+    config = InferenceConfig(neuron_config=neuron_config, sliding_window=4)  # test that this doesn't throw assertionError
+
+    config.sliding_window = 8
+    with pytest.raises(AssertionError, match=r"Windowed context encoding size must equal sliding window size, if using both. Got windowed_context_encoding_size = 4, sliding_window = 8"):
+        _ = config._validate_windowed_context_encoding_support()
 
 def test_validate_chunked_attention_config():
     neuron_config = NeuronConfig(cp_degree=2, tp_degree=2, padding_side="left")
@@ -150,6 +159,36 @@ def test_serialize_deserialize_inference_config_with_fused_spec_config():
     assert type(deserialized_config.fused_spec_config.worker_cls) is type(NeuronBaseModel)
 
 
+def test_serialize_deserialize_inference_config_with_fused_spec_config_draft_model_cls():
+    
+    neuron_config = NeuronConfig()
+    draft_config = InferenceConfig(
+        neuron_config=neuron_config,
+        hidden_size=1024,
+        num_attention_heads=32,
+        num_hidden_layers=1,
+        num_key_value_heads=8,
+        pad_token_id=0,
+        vocab_size=128256,
+        max_position_embeddings=131072,
+        rope_theta=500000,
+        rms_norm_eps=1e-5,
+        hidden_act="silu"
+    )
+    fused_spec_config = FusedSpecNeuronConfig(
+        NeuronBaseModel, draft_config=draft_config, draft_model_path="draft_model_path", draft_model_cls=NeuronLlamaForCausalLM
+    )
+    config = InferenceConfig(
+        neuron_config=neuron_config,
+        fused_spec_config=fused_spec_config,
+        hidden_size=4096,
+    )
+    assert config.fused_spec_config.draft_model_cls == NeuronLlamaForCausalLM
+
+    deserialized_config = verify_serialize_deserialize(config)
+    assert deserialized_config.fused_spec_config.draft_model_cls == NeuronLlamaForCausalLM
+
+
 def test_neuron_config_lnc():
     # Capture original env var so that it can be reset at end of test
     original_env_value = os.environ.get("NEURON_LOGICAL_NC_CONFIG")
@@ -232,12 +271,14 @@ def test_serialize_deserialize_pretrained_config_adapter():
     assert config.transformers_version == "4.31.0"
 
     # Assert that torch_dtype is copied to neuron_config correctly.
+    assert not hasattr(config, "dtype")
     assert not hasattr(config, "torch_dtype")
     assert neuron_config.torch_dtype == torch.bfloat16
     assert not neuron_config.overrides_torch_dtype
 
     deserialized_config = verify_serialize_deserialize(config)
     assert deserialized_config.model_type == "llama"
+    assert not hasattr(deserialized_config, "dtype")
     assert not hasattr(deserialized_config, "torch_dtype")
     assert deserialized_config.neuron_config.torch_dtype == torch.bfloat16
 
@@ -310,6 +351,9 @@ def test_multi_modal_preloaded_pretrained_config():
     assert isinstance(config.vision_config, InferenceConfig)
 
     # Assert that torch_dtype is copied to neuron_config correctly.
+    assert not hasattr(config, "dtype")
+    assert not hasattr(config.text_config, "dtype")
+    assert not hasattr(config.vision_config, "dtype")
     assert not hasattr(config, "torch_dtype")
     assert not hasattr(config.text_config, "torch_dtype")
     assert not hasattr(config.vision_config, "torch_dtype")
@@ -387,7 +431,10 @@ class TestGetPlatformLNC(unittest.TestCase):
         get_platform_target_mock.return_value = "trn2"
         assert get_platform_lnc() == 2
 
-        assert get_platform_target_mock.call_count == 3
+        get_platform_target_mock.return_value = "trn3"
+        assert get_platform_lnc() == 2
+
+        assert get_platform_target_mock.call_count == 4
 
 
 def test_kv_cache_tiling_disabling():
@@ -451,4 +498,20 @@ def test_invalid_cp_dp_configuration():
         NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 2, batch_size = 2, ctx_batch_size = 1, tkg_batch_size = 2) # CB = True not set
         NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 2, batch_size = 2, ctx_batch_size = 2, tkg_batch_size = 5, is_continuous_batching = True) # tkg batch size % dp != 0
         NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 3, batch_size = 3, ctx_batch_size = 1, tkg_batch_size = 3, is_continuous_batching = True) # cp % dp != 0
+        NeuronConfig(tp_degree = 32, cp_degree = 4, attention_dp_degree = 4, batch_size = 2, ctx_batch_size = 1, tkg_batch_size = 2, is_continuous_batching = True, attn_block_tkg_nki_kernel_cache_update=True) # attn_block_tkg_nki_kernel_cache_update set to True
 
+def test_get_draft_neuron_class():
+    # Test with valid draft_model_cls
+    fused_spec_config_dict = {
+        "draft_model_cls": {
+            "__name__": "NeuronLlamaForCausalLM",
+            "__module__": "neuronx_distributed_inference.models.llama.modeling_llama"
+        }
+    }
+    result = InferenceConfig.get_draft_neuron_class(fused_spec_config_dict)
+    assert result == NeuronLlamaForCausalLM
+    
+    # Test with None draft_model_cls
+    fused_spec_config_dict = {"draft_model_cls": None}
+    result = InferenceConfig.get_draft_neuron_class(fused_spec_config_dict)
+    assert result is None

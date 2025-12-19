@@ -2,6 +2,7 @@ import copy
 import os
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Union
+from neuronx_distributed_inference.utils.tensor_replacement.registry import TensorReplacementRegister
 import torch
 from neuronx_distributed.utils.medusa_utils import (
     evaluate_posterior,
@@ -9,7 +10,7 @@ from neuronx_distributed.utils.medusa_utils import (
     generate_medusa_buffers,
     update_inference_inputs,
 )
-from transformers import AutoConfig, GenerationConfig, PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, GenerationConfig, GenerationMixin, PretrainedConfig, PreTrainedModel
 from transformers.generation import GenerateDecoderOnlyOutput, SampleDecoderOnlyOutput
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
@@ -27,7 +28,6 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     Sampler,
     prepare_sampling_params,
 )
-from neuronx_distributed_inference.modules.lora_serving import LoraCheckpoint
 
 
 def load_pretrained_config(
@@ -53,13 +53,15 @@ def load_pretrained_config(
             config_dict["transformers_version"] = config.transformers_version
 
         # Set torch_dtype in NeuronConfig.
-        if "torch_dtype" in config_dict:
+        hf_dtype = config_dict.get("dtype", config_dict.get("torch_dtype", None))
+        if hf_dtype is not None:
             if self.neuron_config is not None and not self.neuron_config.overrides_torch_dtype:
                 # Update neuron_config's torch_dtype if not overriden by the user.
-                self.neuron_config.torch_dtype = config_dict["torch_dtype"]
+                self.neuron_config.torch_dtype = hf_dtype
                 if isinstance(self.neuron_config.torch_dtype, str):
                     self.neuron_config.torch_dtype = to_torch_dtype(self.neuron_config.torch_dtype)
-            del config_dict["torch_dtype"]
+            config_dict.pop("dtype", None)
+            config_dict.pop("torch_dtype", None)
 
         # Convert nested configs to namespaces.
         for k, v in config_dict.items():
@@ -86,7 +88,7 @@ def _convert_modality_config_to_pretrained_config(config_dict: Dict, modality: s
 def to_pretrained_config(config: InferenceConfig):
     """Convert an InferenceConfig into a PretrainedConfig."""
     config_dict = copy.deepcopy(to_dict(config))
-    config_dict["torch_dtype"] = config.neuron_config.torch_dtype
+    config_dict["dtype"] = config.neuron_config.torch_dtype
     del config_dict["neuron_config"]
 
     # handle nested configs for multi-modal models
@@ -96,8 +98,8 @@ def to_pretrained_config(config: InferenceConfig):
     return PretrainedConfig(**config_dict)
 
 
-class HuggingFaceGenerationAdapter(PreTrainedModel):
-    def __init__(self, model: NeuronApplicationBase, input_start_offsets=None):
+class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
+    def __init__(self, model: NeuronApplicationBase, input_start_offsets=None, capture_draft_logits=False):
         hf_config = to_pretrained_config(model.config)
         super().__init__(hf_config)
         if self.generation_config is not None:
@@ -118,8 +120,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         self.padding_side = self.neuron_config.padding_side
         self.sampler = None
         self.prev_kv_cache_populated = False
-        self.lora_checkpoint = LoraCheckpoint(self.neuron_config.lora_config)
         self.input_start_offsets = input_start_offsets
+        self.capture_draft_logits = capture_draft_logits
 
         # WARNING: Neuron Forward is needed by any models with additional input args
         self.forward = self.neuron_model.forward
@@ -169,9 +171,10 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             input_ids.shape[0], dtype=torch.long, device=input_ids.device
         )
         # convert adapter_ids from strings to indices
-        model_kwargs["adapter_ids"] = self.lora_checkpoint.convert_adapter_ids_to_indices(
-            model_kwargs.get("adapter_ids"), unfinished_sequences.numel()
-        )
+        if self.neuron_config.lora_config:
+            model_kwargs["adapter_ids"] = self.neuron_model.lora_model_manager.convert_adapter_ids_to_indices(
+                model_kwargs.get("adapter_ids"), unfinished_sequences.numel()
+            )
         this_peer_finished = False
         # auto-regressive generation
         while not this_peer_finished:
@@ -194,6 +197,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                     if output_logits:
                         raw_logits += (next_token_logits,)
 
+            if not self.on_device_sampling:
                 if self.sampler is None:
                     # Temporary placeholder to support CPU sampling with static batching
                     neuron_kwargs = {}
@@ -276,7 +280,6 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             if self.neuron_model.kv_cache_populated:
                 position_ids = torch.amax(position_ids, 1, keepdim=True)
                 position_ids = position_ids + 1
-
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
@@ -292,9 +295,24 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
                 "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
                 "sampling_params": sampling_params,
                 "input_capture_hook": input_capture_hook,
-                "adapter_ids": adapter_ids,
+                "tensor_capture_hook": tensor_capture_hook,
+                "adapter_ids": adapter_ids
             }
         )
+
+        tf_args = []
+        if self.neuron_config.tensor_replacement_config:
+            if hasattr(self, 'generation_step'):
+                self.generation_step += 1
+            else:
+                self.generation_step = 1
+            reg = TensorReplacementRegister.get_instance()
+            tf , masks = reg.step_args(self.generation_step)
+            tf_args = tf + masks
+
+        # Only add tf_args if not empty
+        if tf_args:
+            model_inputs["tf_args"] = tf_args
 
         # WARNING: This is needed for propagating additional kwargs to the neuron model
         additional_kwargs = self.neuron_model.get_required_kwargs()
@@ -512,7 +530,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
         if return_dict_in_generate:
             if output_scores:
                 # TODO: Process raw logits with logits processor when needed
-                scores += (outputs.fused_outputs[-1][:, -1, :],)
+                scores += (outputs.fused_outputs[-2][:, -1, :],) if self.capture_draft_logits else (outputs.fused_outputs[-1][:, -1, :],)
             if output_logits:
                 raw_logits += (outputs.fused_outputs[-1],)
 
@@ -532,6 +550,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             n_matches = next_pos_ids - model_inputs["position_ids"]
             n_matches = torch.ops.aten.Int(n_matches)
             incremental_len = n_matches
+            if self.capture_draft_logits:
+                print(f'n matches: {n_matches}')
 
             # 3. retrieve accepted tokens using n_matches
             if len(accepted_tokens_with_padding.shape) == 1:
@@ -555,7 +575,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel):
             if return_dict_in_generate:
                 if output_scores:
                     # TODO: Process raw logits with logits processor when needed
-                    scores += tuple(outputs.fused_outputs[-1][:, i, :] for i in range(n_matches))
+                    if self.capture_draft_logits:
+                        scores += tuple(outputs.fused_outputs[-2][:, :, :])
+                    else:
+                        scores += tuple(outputs.fused_outputs[-1][:, i, :] for i in range(n_matches))
+
                 if output_logits:
                     raw_logits += (outputs.fused_outputs[-1],)
 

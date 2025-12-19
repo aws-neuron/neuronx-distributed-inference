@@ -5,7 +5,8 @@ from unittest.mock import patch, MagicMock
 
 from neuronx_distributed_inference.utils.distributed import (
     get_init_world_size, get_init_rank, get_tp_group, 
-    get_dp_rank_spmd, get_cp_rank, get_dp_rank, split_along_dim
+    get_dp_rank_spmd, get_cp_rank, get_dp_rank, split_along_dim,
+    get_rank_8_by_8, get_kv_head_group_number
 )
 
 # Tests for environment variable functions
@@ -110,6 +111,22 @@ def test_get_cp_rank(global_rank, tp_degree, expected_result):
     assert result.item() == expected_result.item()
     assert result.dtype == torch.int32
 
+
+@pytest.mark.parametrize(
+    "global_rank,tp_degree,expected_result", 
+    [
+        (torch.tensor(0), 3, torch.tensor(0)),
+        (torch.tensor(1), 3, torch.tensor(1)),
+        (torch.tensor(2), 3, torch.tensor(2)),
+        (torch.tensor(3), 3, torch.tensor(0)),
+        (torch.tensor(4), 3, torch.tensor(1)),
+    ]
+)
+def test_get_kv_head_group_number(global_rank, tp_degree, expected_result):
+    result = get_kv_head_group_number(global_rank, tp_degree)
+    assert result.item() == expected_result.item()
+    assert result.dtype == torch.int32
+
 @pytest.mark.parametrize(
     "global_rank,tp_degree,expected_result", 
     [
@@ -177,3 +194,27 @@ def test_split_along_dim_3d():
 def test_split_along_dim_none_tensor():
     result = split_along_dim(None, 0, 0, 2)
     assert result is None
+
+def test_get_rank_8_by_8():
+    tp = 8
+    cp_8_by_8_mesh = [0, 1, 2, 3, 12, 13, 14, 15, 4, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 28, 29, 30, 31, 20, 21, 22, 23, 24, 25, 26, 27, 32, 33, 34, 35, 44, 45, 46, 47, 36, 37, 38, 39, 40, 41, 42, 43, 48, 49, 50, 51, 60, 61, 62, 63, 52, 53, 54, 55, 56, 57, 58, 59]
+    
+    expected_result = sum([[i] * tp for i in range(tp)], [])
+    actual_result = []
+
+    for rank in cp_8_by_8_mesh:
+        result = get_rank_8_by_8(torch.tensor(rank))
+        actual_result.append(result.item())
+    assert actual_result == expected_result
+
+def test_get_rank_8_by_8_with_switch():
+    tp = 8
+    pds_mesh = [0, 8, 18, 26, 32, 40, 50, 58, 1, 9, 19, 27, 33, 41, 51, 59, 2, 10, 16, 24, 34, 42, 48, 56, 3, 11, 17, 25, 35, 43, 49, 57, 4, 12, 22, 30, 36, 44, 54, 62, 5, 13, 23, 31, 37, 45, 55, 63, 6, 14, 20, 28, 38, 46, 52, 60, 7, 15, 21, 29, 39, 47, 53, 61]
+    
+    expected_result = sum([[i] * tp for i in range(tp)], [])
+    actual_result = []
+
+    for rank in pds_mesh:
+        result = get_rank_8_by_8(torch.tensor(rank), switch_cc=True)
+        actual_result.append(result.item())
+    assert actual_result == expected_result

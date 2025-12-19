@@ -28,11 +28,13 @@ from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlam
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
+from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.accuracy import (
     check_accuracy,
     check_accuracy_logits,
     get_generate_outputs,
+    run_accuracy_draft_logit_test_flow,
 )
 from neuronx_distributed_inference.utils import argparse_utils
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
@@ -52,6 +54,7 @@ MODEL_TYPES = {
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
+    "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
 }
 
 
@@ -59,6 +62,7 @@ class CheckAccuracyMode(Enum):
     SKIP_ACCURACY_CHECK = "skip-accuracy-check"
     TOKEN_MATCHING = "token-matching"
     LOGIT_MATCHING = "logit-matching"
+    DRAFT_LOGIT_MATCHING = "draft-logit-matching"
 
 
 def parse_args():
@@ -99,12 +103,11 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         choices=list(CheckAccuracyMode),
         default=CheckAccuracyMode.SKIP_ACCURACY_CHECK,
     )
-    run_parser.add_argument("--expected-outputs-path", type=validate_file_exists)
+    run_parser.add_argument("--expected-outputs-path", type=str)
     run_parser.add_argument("--divergence-difference-tol", type=float, default=0.001)
     run_parser.add_argument("--tol-map", type=str)
     run_parser.add_argument("--num-tokens-to-check", type=int)
 
-    # Generation
     run_parser.add_argument("--prompt", dest="prompts", type=str, action="append", required=True)
     run_parser.add_argument("--top-k", type=int, default=1)
     run_parser.add_argument("--top-p", type=float, default=1.0)
@@ -206,9 +209,12 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # Parallelism
     run_parser.add_argument("--tp-degree", type=int)
     run_parser.add_argument("--cp-degree", type=int)
+    run_parser.add_argument("--mlp-cp-degree", type=int)
     run_parser.add_argument("--attention-dp-degree", type=int)
     run_parser.add_argument("--pp-degree", type=int)
     run_parser.add_argument("--ep-degree", type=int)
+    run_parser.add_argument("--moe-tp-degree", type=int, default=1)
+    run_parser.add_argument("--moe-ep-degree", type=int, default=1)
     run_parser.add_argument("--world-size", type=int)
     run_parser.add_argument("--start_rank_id", type=int)
     run_parser.add_argument("--local_ranks_size", type=int)
@@ -247,20 +253,34 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     # Async
     run_parser.add_argument("--async-mode", action="store_true")
 
+    # Windowed Context Encoding
+    run_parser.add_argument("--windowed-context-encoding-size", type=int)
+
+    # TTFT Optimizations
+    # Revert the change to turn off modular flow optimization by default as it's causing logits regression , ticket: V1849736968
+    # run_parser.add_argument("--enable-cte-modular-flow", action="store_true")
+
     # Lora
     run_parser.add_argument("--enable-lora", action="store_true")
+    run_parser.add_argument("--enable-dynamic-multi-lora", action="store_true")
     run_parser.add_argument("--max-loras", type=int, default=1)
     run_parser.add_argument("--max-lora-rank", type=int, default=16)
     run_parser.add_argument("--target-modules", nargs="+")
-    run_parser.add_argument("--max-loras-on-cpu", type=int)
+    run_parser.add_argument("--max-cpu-loras", type=int, default=1)
     run_parser.add_argument("--lora-ckpt-path", dest="lora_ckpt_paths", type=str, action="append")
+    run_parser.add_argument("--lora-ckpt-path-cpu", dest="lora_ckpt_paths_cpu", type=str, action="append")
+    run_parser.add_argument("--lora-ckpt-json", dest="lora_ckpt_json", type=str, default=None)
     run_parser.add_argument("--adapter-id", dest="adapter_ids", type=str, action="append")
 
     # Kernels
     run_parser.add_argument("--qkv-kernel-enabled", action="store_true")
+    run_parser.add_argument("--qkv-nki-kernel-enabled", action="store_true")
+    run_parser.add_argument("--qkv-cte-nki-kernel-fuse-rope", action="store_true")
     run_parser.add_argument("--qkv-kernel-nbsd-layout", action="store_true")
     run_parser.add_argument("--attn-kernel-enabled", action=argparse.BooleanOptionalAction, default=None)
+    run_parser.add_argument("--strided-context-parallel-kernel-enabled", action="store_true")
     run_parser.add_argument("--mlp-kernel-enabled", action="store_true")
+    run_parser.add_argument("--mlp-tkg-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--quantized-mlp-kernel-enabled", action="store_true")
     run_parser.add_argument("--fused-rmsnorm-skip-gamma", action="store_true")
     run_parser.add_argument(
@@ -275,9 +295,11 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--attn-tkg-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--attn-tkg-builtin-kernel-enabled", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-enabled", action="store_true")
+    run_parser.add_argument("--attn-block-tkg-nki-kernel-cascaded-attention", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-cache-update", action="store_true")
     run_parser.add_argument("--attn-block-cte-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--k-cache-transposed", action="store_true")
+    run_parser.add_argument("--is-eagle3", action="store_true")
 
     # Logical NeuronCore Configuration (LNC)
     lnc_group = run_parser.add_mutually_exclusive_group()
@@ -415,13 +437,18 @@ def create_neuron_config(model_cls, args):
         if draft_modules is not None:
             config_kwargs["draft_model_modules_to_not_convert"] = draft_modules
     adapter_ids = None
-    if args.enable_lora:
+    if args.enable_lora or args.enable_dynamic_multi_lora:
         config_kwargs["lora_config"] = LoraServingConfig(
             max_loras=args.max_loras,
             max_lora_rank=args.max_lora_rank,
+            batch_size=args.batch_size,
             target_modules=args.target_modules,
-            max_loras_on_cpu=args.max_loras_on_cpu,
+            max_cpu_loras=args.max_cpu_loras,
             lora_ckpt_paths=args.lora_ckpt_paths,
+            lora_ckpt_paths_cpu=args.lora_ckpt_paths_cpu,
+            lora_ckpt_json=args.lora_ckpt_json,
+            dynamic_multi_lora=args.enable_dynamic_multi_lora,
+            base_model_quantized=args.quantized,
         )
         adapter_ids = args.adapter_ids
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
@@ -670,7 +697,7 @@ def run_accuracy_check(
         return
 
     expected_outputs = None
-    if expected_outputs_path is not None:
+    if expected_outputs_path is not None and os.path.isfile(expected_outputs_path):
         expected_outputs = torch.load(expected_outputs_path)
 
     if check_accuracy_mode == CheckAccuracyMode.TOKEN_MATCHING:
@@ -707,6 +734,12 @@ def run_accuracy_check(
             num_tokens_to_check=num_tokens_to_check,
             input_start_offsets=input_start_offsets,
         )
+    elif check_accuracy_mode == CheckAccuracyMode.DRAFT_LOGIT_MATCHING:
+        if num_tokens_to_check is not None:
+            num_draft_loops_to_check = num_tokens_to_check // (model.config.neuron_config.speculation_length - 1)
+        else:
+            num_draft_loops_to_check = 6
+        run_accuracy_draft_logit_test_flow(model, generation_config, tokenizer, expected_outputs_path, num_draft_loops_to_check)
     else:
         raise ValueError(f"Unsupported check accuracy mode: {check_accuracy_mode}")
 

@@ -39,7 +39,8 @@ setup(
     package_data={"": []},
     install_requires=[
         "neuronx_distributed",
-        "transformers==4.51.*",
+        "torch_neuronx>=2.5",
+        "transformers==4.56.*",
         "huggingface-hub",
         "sentencepiece",
         "torchvision",
@@ -47,7 +48,10 @@ setup(
         "blobfile",
     ],
     extras_require={
-        "test": ["pytest", "pytest-forked", "pytest-cov", "pytest-xdist", "accelerate"],
+        "test": ["pytest", "pytest-forked", "pytest-cov", "pytest-xdist", "pytest-rerunfailures==15.1", "accelerate", "diffusers==0.32.0", "openai-whisper==20250625"],
+        "flux": ["accelerate", "diffusers==0.32.0"],
+        "whisper": ["openai-whisper==20250625"],
+        "experimental": ["omegaconf"],
     },
     python_requires=">=3.7",
     package_dir={"": "src"},
@@ -55,6 +59,7 @@ setup(
         "console_scripts": [
             "inference_demo=neuronx_distributed_inference.inference_demo:main",
             "nxdi_distributed_launcher=neuronx_distributed_inference.scripts.nxdi_distributed_launcher:main",
+            "nxdi_cli=neuronx_distributed_inference.experimental.cli:main",
         ],
     },
 )

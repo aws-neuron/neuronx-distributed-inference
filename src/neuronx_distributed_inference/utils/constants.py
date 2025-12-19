@@ -1,4 +1,5 @@
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+from neuronx_distributed_inference.models.gpt_oss.modeling_gpt_oss import NeuronGptOssForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.llama4.modeling_llama4 import NeuronLlama4ForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
@@ -6,6 +7,8 @@ from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMl
 from neuronx_distributed_inference.models.mllama.utils import add_instruct
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
+from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+from neuronx_distributed_inference.models.pixtral.modeling_pixtral import NeuronPixtralForCausalLM
 
 END_TO_END_MODEL = "e2e_model"
 CONTEXT_ENCODING_MODEL = "context_encoding_model"
@@ -36,6 +39,7 @@ TEST_PROMPT = "Hello, I am a language model, and I am here to help,"
 MM_TEST_PROMPT = add_instruct("What is in this image? Tell me a story", has_image=[1])
 
 MODEL_TYPES = {
+    "gpt_oss": {"causal-lm": NeuronGptOssForCausalLM},
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
     "llama4": {"causal-lm": NeuronLlama4ForCausalLM},
     "mllama": {"causal-lm": NeuronMllamaForCausalLM},
@@ -43,4 +47,5 @@ MODEL_TYPES = {
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
+    "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
 }

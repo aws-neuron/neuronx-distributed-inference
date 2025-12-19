@@ -3,14 +3,18 @@ import os
 import warnings
 from functools import partial
 
+from neuronx_distributed.utils.tensor_replacement.model_modification import modify_model_for_tensor_replacement
+from neuronx_distributed_inference.utils.tensor_replacement.registry import TensorReplacementRegister
 import torch
 import torch.nn.functional as F
 from neuronx_distributed.quantization.quantization_config import (
     ActivationQuantizationType,
     QuantizationType,
     QuantizedDtype,
+    ScaleDtype,
     get_default_custom_qconfig_dict,
     get_default_per_channel_custom_qconfig_dict,
+    get_default_blockwise_custom_qconfig_dict,
     get_default_expert_wise_per_channel_custom_qconfig_dict,
 )
 from neuronx_distributed.quantization.quantize import convert
@@ -80,13 +84,18 @@ class ModelWrapper(torch.nn.Module):
             tensorizer_options = (
                 "--enable-ccop-compute-overlap "
                 f"--cc-pipeline-tiling-factor={self.neuron_config.cc_pipeline_tiling_factor} "
-                "--vectorize-strided-dma "
             )
+            # FIXME: NCC-6889. Do not add vectorize-strided-dma for 128k on trn2 as it causes high spillover.
+            exclude_vectorize_criterion = (self.neuron_config.logical_nc_config == 2
+                                           and tag == CONTEXT_ENCODING_MODEL_TAG and self.neuron_config.seq_len >= 128 * 1024)
+            if not exclude_vectorize_criterion:
+                tensorizer_options += "--vectorize-strided-dma "
 
             long_ctx_reqs = ""
 
             if self.neuron_config.enable_long_context_mode:
-                long_ctx_reqs = " --internal-disable-fma-on-ios "  # reduce dma rings io by disabling FMA that doesn't use DGE
+                long_ctx_reqs += " --internal-disable-fma-on-ios "  # reduce dma rings io by disabling FMA that doesn't use DGE
+                long_ctx_reqs += " --disable-mixed-precision-accumulation "  # avoid additional copy/cast that affects perf at long context lengths
 
             self.compiler_args = (
                 f"--auto-cast=none --model-type=transformer {long_ctx_reqs} "
@@ -236,6 +245,9 @@ class ModelWrapper(torch.nn.Module):
                 position_ids = position_ids.repeat(batch_size, 1)
             seq_ids = torch.arange(0, batch_size, dtype=torch.int32)
             adapter_ids = torch.zeros((batch_size), dtype=torch.int32)
+            if self.neuron_config.lora_config is not None:
+                # pass the model flag to lora config for performance optimizations
+                self.neuron_config.lora_config.is_context_encoding = self.tag == CONTEXT_ENCODING_MODEL_TAG
 
             # Get the count of sampling params currently supported.
             sampling_params_len = prepare_sampling_params(1).shape[1]
@@ -321,6 +333,24 @@ class ModelWrapper(torch.nn.Module):
                     prefix_size,
                 )
                 inputs.append(input_shape)
+            elif self.neuron_config.tensor_replacement_config:
+                reg = TensorReplacementRegister.get_instance()
+                tf_tensors, tf_masks = reg.example_args(step=1) if self.tag == CONTEXT_ENCODING_MODEL_TAG else reg.example_args(step=2)
+                empties = [torch.empty(0) for i in range(17)]
+                inputs.append(
+                    (
+                        input_ids,
+                        attention_mask,
+                        position_ids,
+                        seq_ids,
+                        sampling_params,
+                        hidden_states,
+                        adapter_ids,
+                        *empties,
+                        *tf_tensors,
+                        *tf_masks
+                    )
+                )
             else:
                 inputs.append(
                     (
@@ -798,6 +828,25 @@ class ModelWrapper(torch.nn.Module):
                 for arg, pad_val, pad_len in zip(to_pad, tensor_pad_vals, pad_lengths)
             ]
             args = (*padded_args, *args[3:])
+            if len(args) == 24 and len(args[23].shape) == 3 and args[23].shape[1] != pad_length:
+                # Re-generate dummy vision embeddings and mask
+                padded_seq_len = args[0].shape[1]
+                padded_args = []
+                padded_args.append(torch.zeros(
+                    1,
+                    padded_seq_len,
+                    self.config.hidden_size,
+                    dtype=self.config.neuron_config.torch_dtype,
+                ))  # vision embeddings
+                padded_args.append(torch.full(
+                    size=(
+                        1,
+                        padded_seq_len,
+                        1),
+                    fill_value=padded_seq_len - 1,
+                    dtype=torch.int32
+                ))  # vision mask
+                args = (*args[:22], *padded_args)
         else:
             input_ids, attention_mask, *rest_of_args = args
             pad_len = pad_length - attention_mask.shape[1]
@@ -1425,10 +1474,15 @@ class ModelWrapper(torch.nn.Module):
             )
 
         args = self._process_args(*args)
-        input_ids = args[0]
-        args = tuple([arg for arg in args if isinstance(arg, torch.Tensor)])
-        if is_ranked_io(input_ids):
-            args = list([input_ids] + list(args))
+        if self.pipeline_execution:
+            # Handle mixed cpu and ranked inputs, as first arg may not be ranked
+            args = tuple([arg for arg in args if isinstance(arg, torch.Tensor) or is_ranked_io(arg)])
+        else:
+            # Handle async ranked case, only input_ids[0] is ranked
+            input_ids = args[0]
+            args = tuple([arg for arg in args if isinstance(arg, torch.Tensor)])
+            if is_ranked_io(input_ids):
+                args = list([input_ids] + list(args))
 
         # convert int64 to int32 to improve compatibility with compiler; need to apply to cpu case
         args = self.convert_int64_to_int32(*args)
@@ -1562,10 +1616,20 @@ class DecoderModelInstance(BaseModelInstance):
                 q_config = get_default_expert_wise_per_channel_custom_qconfig_dict()
             elif quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
                 q_config = get_default_custom_qconfig_dict()
+            elif quantization_type == QuantizationType.BLOCKWISE_SYMMETRIC:
+                q_config = get_default_blockwise_custom_qconfig_dict()
+                q_config["block_axis"] = self.neuron_config.quantization_block_axis
+                q_config["block_size"] = self.neuron_config.quantization_block_size
+                if isinstance(self.neuron_config.quantization_scale_dtype, str):
+                    q_config["scale_dtype"] = ScaleDtype.get_dtype(self.neuron_config.quantization_scale_dtype)
+                elif isinstance(self.neuron_config.quantization_scale_dtype, ScaleDtype):
+                    q_config["scale_dtype"] = self.neuron_config.quantization_scale_dtype
             else:
                 raise RuntimeError(f"{self.neuron_config.quantization_type} is not supported")
-            if self.neuron_config.quantization_dtype == "f8e4m3":
-                q_config["quantized_dtype"] = QuantizedDtype.F8E4M3
+            if isinstance(self.neuron_config.quantization_dtype, str):
+                q_config["quantized_dtype"] = QuantizedDtype.get_dtype(self.neuron_config.quantization_dtype)
+            elif isinstance(self.neuron_config.quantization_dtype, QuantizedDtype):
+                q_config["quantized_dtype"] = self.neuron_config.quantization_dtype
 
             q_config["activation_quantization_type"] = ActivationQuantizationType(
                 self.neuron_config.activation_quantization_type
@@ -1600,6 +1664,11 @@ class DecoderModelInstance(BaseModelInstance):
 
         else:
             self.module = float_model
+        # Enable tensor replacement if configured
+        if self.neuron_config.tensor_replacement_config:
+            self.module, hooks = modify_model_for_tensor_replacement(self.module,)
+            reg = TensorReplacementRegister.get_instance()
+            reg.hooks = hooks.values()
 
     def get(self, bucket_rank, **kwargs):
         if bucket_rank is not None:
@@ -1664,6 +1733,13 @@ class DecoderModelInstance(BaseModelInstance):
                 past_key_values = self.module.past_key_values
             for i in range(len(past_key_values)):
                 self.input_output_aliases[past_key_values[i]] = num_output_from_trace + i
+
+            # Add LoRA tensors to the aliases
+            if self.neuron_config.lora_config is not None:
+                num_output_from_trace += len(past_key_values)
+                lora_tensors = self.module.lora_weight_manager.get_lora_tensors()
+                for i, tensor in enumerate(lora_tensors):
+                    self.input_output_aliases[tensor] = num_output_from_trace + i
         return self.module, self.input_output_aliases
 
 

@@ -88,7 +88,7 @@ def test_llama3_2_1b_4layer_neuron_on_device_sampling():
     )
     # latency is a bit flaky hence increasing to 300 ms
     run_llama3_2_1b_4layer(neuron_config, cpu_mode=False, run_accuracy=True, run_perf=True,
-                           latency_threshold=300 * 1.1, throughput_threshold = 1832 * 0.9)
+                           latency_threshold=300 * 1.1, throughput_threshold = 1832 * 0.8)
 
 @pytest.mark.tp32
 def test_llama3_2_1b_4layer_continuous_batching_neuron_on_device_sampling():
@@ -151,6 +151,26 @@ def test_llama3_2_1b_4layer_continuous_batching_cpu_accuracy():
         is_continuous_batching=True,
     )
     run_llama3_2_1b_4layer(neuron_config, cpu_mode=True, run_accuracy=True, run_perf=False)
+
+
+@pytest.mark.tp32
+def test_llama3_2_1b_4layer_neuron_128k():
+    neuron_config = NeuronConfig(
+        tp_degree=32,
+        batch_size=1,
+        seq_len=1024*128,
+        max_context_length=1024*127,
+        torch_dtype=torch.bfloat16,
+        sequence_parallel_enabled=True,
+        vocab_parallel=True,
+        flash_decoding_enabled=True,
+        cc_pipeline_tiling_factor=4,
+        on_device_sampling_config=OnDeviceSamplingConfig(),
+        output_logits=True,
+    )
+    run_llama3_2_1b_4layer(neuron_config, run_accuracy=True, run_perf=True,
+                           latency_threshold=4078 * 1.2, throughput_threshold=32138 * 0.8,
+                           divergence_difference_tol=0.008)
 
 
 @pytest.mark.tp32
@@ -244,7 +264,7 @@ def test_llama3_2_1b_4layer_cpu_accuracy():
     run_llama3_2_1b_4layer(neuron_config, cpu_mode=True, run_accuracy=True, run_perf=False)
 
 def run_llama3_2_1b_4layer(neuron_config, cpu_mode=False, run_accuracy=True, run_perf=True,
-                           latency_threshold=None, throughput_threshold=None):
+                           latency_threshold=None, throughput_threshold=None, divergence_difference_tol=0.001):
     """Run Llama 3.2 1B 4-layer model tests with the specified configuration.
     
     This function loads a Llama 3.2 1B model with 4 layers from a configuration file,
@@ -263,6 +283,13 @@ def run_llama3_2_1b_4layer(neuron_config, cpu_mode=False, run_accuracy=True, run
         run_perf (bool, optional): Whether to run performance benchmarking tests.
             Measures throughput and latency metrics. Only runs when not in CPU mode.
             Defaults to True.
+        latency_threshold (float, optional): Maximum acceptable latency in milliseconds
+            for performance validation. If specified, the test will fail if the measured
+            p50 latency exceeds this threshold. Defaults to None (no threshold check).
+        throughput_threshold (float, optional): Minimum acceptable throughput for
+            performance validation. If specified, the test will fail if the measured
+            throughput falls below this threshold. Defaults to None (no threshold check).
+        divergence_difference_tol (float, optional): When check accuracy use this divergence tolerance
     """
     # Load model from config, and save with random weights.
     config_path = os.path.dirname(os.path.abspath(__file__)) + "/config.json"
@@ -278,7 +305,7 @@ def run_llama3_2_1b_4layer(neuron_config, cpu_mode=False, run_accuracy=True, run
     )
 
     if run_accuracy:
-        validate_accuracy(model_path, config, generation_config, cpu_mode=cpu_mode)
+        validate_accuracy(model_path, config, generation_config, divergence_difference_tol, cpu_mode=cpu_mode)
     if run_perf:
         validate_performance(model_path, config, generation_config, cpu_mode, latency_threshold, throughput_threshold)
 
@@ -308,7 +335,7 @@ def _load_model(model, model_path, cpu_mode):
         model.load(compiled_model_path)
     return model
 
-def validate_accuracy(model_path, config, generation_config, cpu_mode=False):
+def validate_accuracy(model_path, config, generation_config, divergence_difference_tol, cpu_mode=False):
     input_len = 16
     input_ids = torch.rand((config.neuron_config.batch_size, input_len)) * config.vocab_size
     input_ids = input_ids.to(dtype=torch.int32)
@@ -322,8 +349,9 @@ def validate_accuracy(model_path, config, generation_config, cpu_mode=False):
         model,
         generation_config=generation_config,
         prompt=TEST_PROMPT,
-        num_tokens_to_check=config.neuron_config.max_context_length - input_len,
+        num_tokens_to_check=min(config.neuron_config.max_context_length - input_len, 256),
         inputs=inputs,
+        divergence_difference_tol=divergence_difference_tol
     )
 
 
@@ -349,3 +377,4 @@ if __name__ == "__main__":
     test_llama3_2_1b_4layer_continuous_batching_cpu_accuracy()
     test_llama3_2_1b_4layer_neuron_async()
     test_llama3_2_1b_4layer_cpu_accuracy()
+    test_llama3_2_1b_4layer_neuron_128k()

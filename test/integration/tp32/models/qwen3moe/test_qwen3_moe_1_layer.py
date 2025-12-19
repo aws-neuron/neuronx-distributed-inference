@@ -11,9 +11,15 @@ from neuronx_distributed_inference.utils.accuracy import check_accuracy_logits
 from neuronx_distributed_inference.utils.constants import TEST_PROMPT
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 
-
 @pytest.mark.tp32
-def test_1_layer_accuracy():
+@pytest.mark.parametrize(
+    "tp_degree, batch_size, max_context_length, seq_len, torch_dtype, fused_qkv",
+    [
+        pytest.param(32,1,512,5120,"float32",True),
+        pytest.param(32,1,512,5120,"float32",False),
+    ],
+)
+def test_1_layer_accuracy(tp_degree, batch_size, max_context_length, seq_len, torch_dtype, fused_qkv):
     # Load model from config, and save with random weights.
     config_path = os.path.dirname(os.path.abspath(__file__)) + "/config.json"
 
@@ -22,11 +28,12 @@ def test_1_layer_accuracy():
 
     generation_config = GenerationConfig(do_sample=False, pad_token_id=0)
     neuron_config = MoENeuronConfig(
-        tp_degree=32,
-        batch_size=1,
-        max_context_length=512,
-        seq_len=512*10,
-        torch_dtype="float32",
+        tp_degree=tp_degree,
+        batch_size=batch_size,
+        max_context_length=max_context_length,
+        seq_len=seq_len, 
+        torch_dtype=torch_dtype,
+        fused_qkv=fused_qkv,
     )
     config = Qwen3MoeInferenceConfig(
         neuron_config,
@@ -75,4 +82,6 @@ def validate_accuracy(model_path, config, generation_config):
 
 
 if __name__ == "__main__":
-    test_1_layer_accuracy()
+    #For easy `python test_qwen3_moe_1_layer.py` testing rather than using pytest
+    test_1_layer_accuracy(32,1,512,5120,"float32",True)
+    test_1_layer_accuracy(32,1,512,5120,"float32",False)

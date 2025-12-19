@@ -18,6 +18,15 @@ from neuronx_distributed_inference.models.application_base import (
     COMPILED_MODEL_FILE_NAME,
     normalize_path,
 )
+from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG
+from neuronx_distributed_inference.utils.snapshot import (
+    ScriptModuleWrapper,
+    SnapshotOutputFormat,
+    SnapshotCaptureConfig,
+    get_snapshot_hook,
+    register_nxd_model_hook,
+    unregister_nxd_model_hooks,
+)
 
 logger = logging.getLogger("Neuron")
 
@@ -47,9 +56,6 @@ class ImageToTextInferenceConfig(InferenceConfig):
         # Llama4 needs to disable chunked attention
         # since kernels are not yet supported with chunked attention
         # TODO: Remove below pop once chunked attention is supported with kernels
-        if ("attention_chunk_size" in self.text_config):
-            self.text_config.pop("attention_chunk_size")
-
         self.text_config = InferenceConfig(text_neuron_config, **self.text_config)
 
         # We need to save the model's _name_or_path in text_config to be able to bring up the HF text only model
@@ -171,7 +177,7 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
     def get_text_builder(self, debug=False):
         if self.text_builder is None:
             base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
-            base_compile_work_dir += "/text_model/"
+            base_compile_work_dir = normalize_path(base_compile_work_dir) + "text_model/"
             # Use this function to initialize non-standard TP/PP/DP distributed
             # process groups.
             self.text_builder = ModelBuilder(
@@ -204,7 +210,7 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
     def get_vision_builder(self, debug=False):
         if self.vision_builder is None:
             base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
-            base_compile_work_dir += "/vision_model/"
+            base_compile_work_dir = normalize_path(base_compile_work_dir) + "vision_model/"
             # Use this function to initialize non-standard TP/PP/DP distributed
             # process groups.
             self.vision_builder = ModelBuilder(
@@ -287,15 +293,22 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         os.makedirs(vision_compiled_model_path, exist_ok=True)
 
         # Trace text and vision models
-        text_traced_model = self.get_text_builder(debug).trace(initialize_model_weights=False)
-        torch.jit.save(text_traced_model, text_compiled_model_path + COMPILED_MODEL_FILE_NAME)
-        del text_traced_model
-        logger.info("Finished compiling text model!")
+        text_traced_model = self.get_text_builder(debug).trace(initialize_model_weights=False, dry_run=dry_run)
+        if not dry_run:
+            torch.jit.save(text_traced_model, text_compiled_model_path + COMPILED_MODEL_FILE_NAME)
+            del text_traced_model
+            logger.info("Finished compiling text model!")
 
-        vision_traced_model = self.get_vision_builder(debug).trace(initialize_model_weights=False)
-        torch.jit.save(vision_traced_model, vision_compiled_model_path + COMPILED_MODEL_FILE_NAME)
-        del vision_traced_model
-        logger.info("Finished compiling vision model!")
+        vision_traced_model = self.get_vision_builder(debug).trace(initialize_model_weights=False, dry_run=dry_run)
+        if not dry_run:
+            torch.jit.save(vision_traced_model, vision_compiled_model_path + COMPILED_MODEL_FILE_NAME)
+            del vision_traced_model
+            logger.info("Finished compiling vision model!")
+
+        self._save_configs_to_compiler_workdir()
+
+        if dry_run:
+            return
 
         # Shard the weights
         self.shard_text_weights(text_compiled_model_path, debug, pre_shard_weights_hook)
@@ -306,6 +319,38 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
 
         self.is_compiled = True
         logger.info("Compilation complete for E2E model!")
+
+    def _save_configs_to_compiler_workdir(self):
+        # save full model neuron config
+        base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
+        self.config.save(base_compile_work_dir)
+
+        # save sub-appmodel configs
+        text_model_compile_work_dir = os.path.join(base_compile_work_dir, "text_model")
+        vision_model_compile_work_dir = os.path.join(base_compile_work_dir, "vision_model")
+        self.config.text_config.save(text_model_compile_work_dir)
+        self.config.vision_config.save(vision_model_compile_work_dir)
+
+        # generate a new config for each submodel and bucket size
+        for submodel in self.text_models:
+            for bucket_rank, bucket_size in enumerate(submodel.config.neuron_config.buckets):
+                specific_config = copy.deepcopy(submodel.config)
+                specific_config.neuron_config.buckets = [bucket_size]
+
+                if submodel.tag == CONTEXT_ENCODING_MODEL_TAG:
+                    specific_config.neuron_config.context_encoding_buckets = specific_config.neuron_config.buckets
+                else:
+                    specific_config.neuron_config.token_generation_buckets = specific_config.neuron_config.buckets
+
+                submodel_path = os.path.join(text_model_compile_work_dir, submodel.tag, f"_tp0_bk{bucket_rank}")
+                specific_config.save(submodel_path)
+
+        for submodel in self.vision_models:
+            for bucket_rank, bucket_size in enumerate(submodel.config.neuron_config.buckets):
+                specific_config = copy.deepcopy(submodel.config)
+                specific_config.neuron_config.buckets = [bucket_size]
+                submodel_path = os.path.join(vision_model_compile_work_dir, submodel.tag, f"_tp0_bk{bucket_rank}")
+                specific_config.save(submodel_path)
 
     def load(
         self, compiled_model_path, start_rank_id=None, local_ranks_size=None, skip_warmup=False
@@ -398,6 +443,72 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         start_rank_tensor = torch.tensor([start_rank_id], dtype=torch.int32, device="cpu")
         self.vision_traced_model.nxd_model.initialize(vision_weights, start_rank_tensor)
         logger.info(f"Finished vision weights loading in {time.monotonic() - start_time} seconds")
+
+    def register_snapshot_hooks(
+        self,
+        output_path: str,
+        output_format: SnapshotOutputFormat,
+        capture_at_requests: List[int],
+        *_,  # capture unused positional args to not crash overriden method
+        ranks: Optional[List[int]] = None,
+        **kwargs,  # make sure new kwargs don't crash overriden method
+    ):
+        """
+        Registers snapshot hooks to capture input snapshots for all submodels and bucket.
+
+        This overrides the NeuronApplicationBase implementation to register snapshots for the independent
+        text and vision models. See the NeuronApplicationBase docstrings for details.
+        """
+        assert self.is_loaded_to_neuron, "Must load model before you register snapshot hooks"
+        if ranks is None:
+            ranks = [0]
+
+        def _register_submodel(submodel, output_path, model_builder):
+            snapshot_config = SnapshotCaptureConfig().capture_at_request(
+                capture_at_requests
+            )
+            submodel.model = ScriptModuleWrapper(submodel.model)
+            snapshot_hook = get_snapshot_hook(
+                output_path,
+                output_format,
+                snapshot_config,
+                model_builder,
+                ranks,
+                is_input_ranked=submodel.async_mode or submodel.pipeline_execution,
+            )
+            submodel.model.register_forward_hook(snapshot_hook)
+            register_nxd_model_hook(submodel.model, "forward_async", snapshot_hook)
+            register_nxd_model_hook(submodel.model, "forward_ranked", snapshot_hook)
+            logger.info(f"Registered snapshot hooks for {submodel.tag=}")
+
+        text_output_path = os.path.join(output_path, "text_model")
+        for submodel in self.text_models:
+            _register_submodel(submodel, text_output_path, self.get_text_builder())
+
+        vision_output_path = os.path.join(output_path, "vision_model")
+        for submodel in self.vision_models:
+            _register_submodel(submodel, vision_output_path, self.get_vision_builder())
+
+    def unregister_snapshot_hooks(self):
+        """
+        Unregisters snapshot hooks for this model.
+
+        This overrides the NeuronApplicationBase implementation to unregister snapshots for the independent
+        text and vision models. See the NeuronApplicationBase docstrings for details.
+        """
+
+        def _unregister_submodel(submodel):
+            if isinstance(submodel.model, ScriptModuleWrapper):
+                submodel.model = submodel.model.wrapped_module
+                unregister_nxd_model_hooks(submodel.model, "forward_async")
+                unregister_nxd_model_hooks(submodel.model, "forward_ranked")
+                logger.info(f"Unregistered snapshot hooks for {submodel.tag=}")
+
+        for submodel in self.text_models:
+            _unregister_submodel(submodel)
+
+        for submodel in self.vision_models:
+            _unregister_submodel(submodel)
 
     def forward(
         self,
@@ -496,7 +607,40 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         if not generation_model.is_neuron():
             self._copy_past_key_values(outputs)
 
-        # process outputs
+        # Process outputs
+        constructed_outputs = self._get_constructed_outputs(outputs, is_run_on_neuron)
+
+        # Apply tensor_capture_hook if provided and tensors are captured
+        if tensor_capture_hook and constructed_outputs.captured_tensors:
+            # Apply the hook if captured tensors are found
+            tensor_capture_hook(self, constructed_outputs.captured_tensors)
+
+        return constructed_outputs
+
+    def _get_captured_tensors_offset(self):
+        """
+        Returns the number of tensors that were captured based on tensor_capture_config.
+        This is used to determine the offset in the output tensors.
+
+        Returns:
+            int: The total number of tensors to be captured
+        """
+        if self.text_config.neuron_config.tensor_capture_config:
+            return self.text_config.neuron_config.tensor_capture_config.get_offset()
+        return 0
+
+    def _get_constructed_outputs(self, outputs, is_run_on_neuron):
+        """
+        Process model outputs and handle tensor capture.
+
+        Args:
+            outputs: Raw outputs from the model
+            is_run_on_neuron: Whether the model was run on Neuron device
+
+        Returns:
+            CausalLMOutputWithPast: Processed outputs with captured tensors if available
+        """
+        # Process outputs
         if self.on_device_sampling and self.text_config.neuron_config.output_logits and not \
                 (self.text_config.neuron_config.enable_fused_speculation or self.text_config.neuron_config.is_medusa):
             logits_or_next_tokens = outputs[:2]

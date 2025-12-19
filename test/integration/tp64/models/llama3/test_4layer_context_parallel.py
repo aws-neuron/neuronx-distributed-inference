@@ -29,6 +29,9 @@ SP_NEURON_CONFIG_CP16_TP4 = NeuronConfig(
 SP_NEURON_CONFIG_CP4_TP16 = copy.deepcopy(SP_NEURON_CONFIG_CP16_TP4)
 SP_NEURON_CONFIG_CP4_TP16.cp_degree = 4
 
+SP_NEURON_CONFIG_CP8_TP8 = copy.deepcopy(SP_NEURON_CONFIG_CP16_TP4)
+SP_NEURON_CONFIG_CP8_TP8.cp_degree = 8
+
 SP_DISABLED_NEURON_CONFIG_CP16_TP4 = NeuronConfig(
     tp_degree=64,
     cp_degree=16,
@@ -43,6 +46,9 @@ SP_DISABLED_NEURON_CONFIG_CP16_TP4 = NeuronConfig(
 
 SP_DISABLED_NEURON_CONFIG_CP4_TP16 = copy.deepcopy(SP_DISABLED_NEURON_CONFIG_CP16_TP4)
 SP_DISABLED_NEURON_CONFIG_CP4_TP16.cp_degree = 4
+
+SP_DISABLED_NEURON_CONFIG_CP8_TP8 = copy.deepcopy(SP_DISABLED_NEURON_CONFIG_CP4_TP16)
+SP_DISABLED_NEURON_CONFIG_CP8_TP8.cp_degree = 8
 
 PERF_CONFIG_CP16_TP4 = NeuronConfig(
     tp_degree=64,
@@ -74,6 +80,38 @@ KERNEL_CONFIG_CP16_TP4 = NeuronConfig(
 KERNEL_CONFIG_CP4_TP16 = copy.deepcopy(KERNEL_CONFIG_CP16_TP4)
 KERNEL_CONFIG_CP4_TP16.cp_degree = 4
 
+KERNEL_CONFIG_CP8_TP8 = copy.deepcopy(KERNEL_CONFIG_CP16_TP4)
+KERNEL_CONFIG_CP8_TP8.cp_degree = 8
+
+STRIDED_KERNEL_CP_SP_CONFIG_CP16_TP4 = NeuronConfig(
+    tp_degree=64,
+    cp_degree=16,
+    batch_size=1,
+    max_context_length=4096,
+    seq_len=4096,
+    sequence_parallel_enabled=True,
+    logical_nc_config=2,
+    torch_dtype=torch.float32,
+    strided_context_parallel_kernel_enabled=True,
+)
+STRIDED_KERNEL_CP_SP_CONFIG_CP4_TP16 = copy.deepcopy(STRIDED_KERNEL_CP_SP_CONFIG_CP16_TP4)
+STRIDED_KERNEL_CP_SP_CONFIG_CP4_TP16.cp_degree = 4
+
+STRIDED_KERNEL_CP_SP_CONFIG_CP8_TP8 = copy.deepcopy(STRIDED_KERNEL_CP_SP_CONFIG_CP16_TP4)
+STRIDED_KERNEL_CP_SP_CONFIG_CP8_TP8.cp_degree = 8
+
+STRIDED_KERNEL_CP_CONFIG_CP16_TP4 = NeuronConfig(
+    tp_degree=64,
+    cp_degree=16,
+    batch_size=1,
+    max_context_length=4096,
+    seq_len=4096,
+    sequence_parallel_enabled=False,
+    logical_nc_config=2,
+    torch_dtype=torch.float32,
+    strided_context_parallel_kernel_enabled=True,
+)
+
 @pytest.fixture(scope="module", autouse=True)
 def model_path():
     # Load model from config, and save with random weights.
@@ -85,7 +123,8 @@ def model_path():
 
     model_tempdir.cleanup()
 
-# TODO: The divergence is a higher than expected error for fp32 in the kernel case, investigate why the kernel causes this increase.
+# Currently, the FA kernel uses bf16 by default, even if the input tensors are fp32. 
+# Hence, even when the test runs in fp32, we see a higher than expected divergence tolerance for fp32.
 @pytest.mark.tp64
 @pytest.mark.context_parallel
 @pytest.mark.parametrize(
@@ -95,11 +134,18 @@ def model_path():
         pytest.param(SP_NEURON_CONFIG_CP16_TP4, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=[pytest.mark.key_config_test]),
         pytest.param(SP_DISABLED_NEURON_CONFIG_CP16_TP4, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE),
         pytest.param(PERF_CONFIG_CP16_TP4, 410.25, 645.02, True, None),
-        pytest.param(KERNEL_CONFIG_CP16_TP4, float('inf'), 0, True, 0.015),
+        pytest.param(KERNEL_CONFIG_CP16_TP4, float('inf'), 0, False, 0.024),
         pytest.param(SP_NEURON_CONFIG_CP4_TP16, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE),
         pytest.param(SP_DISABLED_NEURON_CONFIG_CP4_TP16, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE),
         pytest.param(PERF_CONFIG_CP4_TP16, 311.78, 803.67, True, None),
-        pytest.param(KERNEL_CONFIG_CP4_TP16, float('inf'), 0, True, 0.01),
+        pytest.param(KERNEL_CONFIG_CP4_TP16, float('inf'), 0, False, 0.024),
+        pytest.param(KERNEL_CONFIG_CP8_TP8, float('inf'), 0, False, 0.024, marks=pytest.mark.xfail),
+        pytest.param(STRIDED_KERNEL_CP_SP_CONFIG_CP16_TP4, float('inf'), 0, False, 0.024),
+        pytest.param(STRIDED_KERNEL_CP_SP_CONFIG_CP4_TP16, float('inf'), 0, False, 0.024),
+        pytest.param(STRIDED_KERNEL_CP_CONFIG_CP16_TP4, float('inf'), 0, False, 0.024),
+        pytest.param(STRIDED_KERNEL_CP_SP_CONFIG_CP8_TP8, float('inf'), 0, False, 0.024, marks=pytest.mark.xfail),
+        pytest.param(SP_NEURON_CONFIG_CP8_TP8, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
+        pytest.param(SP_DISABLED_NEURON_CONFIG_CP8_TP8, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
     ],
     # fmt: on
 )

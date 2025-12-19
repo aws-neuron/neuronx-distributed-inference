@@ -17,7 +17,11 @@ from torch import nn
 import torch.nn.functional as F
 from torch_neuronx.utils import get_platform_target
 from neuronx_distributed_inference.models.config import get_platform_lnc
-
+from neuronx_distributed.modules.moe.moe_process_group import (
+    init_tensor_expert_parallel_moe_process_groups,
+    get_moe_tp_ep_group,
+    get_moe_ep_group,
+)
 torch.manual_seed(42)
 
 class TestConfig:
@@ -33,6 +37,11 @@ class TestConfig:
         intermediate_size: int,
         hidden_act: str = 'silu',
         norm_topk_prob: bool = True,
+        moe_tp_degree = 1,
+        moe_ep_degree = 1,
+        is_prefill = True,
+        enabled_hybrid_sharding = False,
+
     ):
         self.hidden_size = hidden_size
         self.hidden_act = hidden_act
@@ -45,6 +54,10 @@ class TestConfig:
         self.tp_degree = tp_degree
         self.ep_degree = ep_degree
         self.rpl_reduce_dtype = rpl_reduce_dtype
+        self.moe_tp_degree=moe_tp_degree
+        self.moe_ep_degree=moe_ep_degree
+        self.is_prefill = is_prefill
+        self.enabled_hybrid_sharding = enabled_hybrid_sharding
 
 class CPUExpertMLP(nn.Module):
     def __init__(
@@ -91,6 +104,18 @@ class ExpertMLPWrapper(torch.nn.Module):
         self.tp_degree=config.tp_degree
         self.world_size=world_size
         super().__init__()
+        if config.moe_ep_degree > 1:
+            init_tensor_expert_parallel_moe_process_groups(config.moe_tp_degree, config.moe_ep_degree, config.moe_tp_degree, config.moe_ep_degree)
+            self.cte_tensor_model_parallel_group=get_moe_tp_ep_group(prefill = True)
+            self.cte_expert_model_parallel_group=get_moe_ep_group(prefill = True)
+            self.tkg_tensor_model_parallel_group=get_moe_tp_ep_group(prefill = False)
+            self.tkg_expert_model_parallel_group=get_moe_ep_group(prefill = False)
+        else:
+            self.cte_tensor_model_parallel_group=parallel_state.get_tensor_model_parallel_group()
+            self.cte_expert_model_parallel_group=parallel_state.get_expert_model_parallel_group()
+            self.tkg_tensor_model_parallel_group=parallel_state.get_tensor_model_parallel_group()
+            self.tkg_expert_model_parallel_group=parallel_state.get_expert_model_parallel_group()
+
         self.expert_mlp = ExpertMLPs(
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -103,6 +128,10 @@ class ExpertMLPWrapper(torch.nn.Module):
             dtype=config.torch_dtype,
             logical_nc_config = get_platform_lnc(),
             enable_spmd_rank=True,
+            cte_tensor_model_parallel_group = self.cte_tensor_model_parallel_group,
+            cte_expert_model_parallel_group = self.cte_expert_model_parallel_group,
+            tkg_tensor_model_parallel_group = self.tkg_tensor_model_parallel_group,
+            tkg_expert_model_parallel_group = self.tkg_expert_model_parallel_group,
         )
     
     def forward(self, hidden_states, expert_affinities, expert_indices , seq_len):
@@ -128,13 +157,15 @@ class ExpertMLPWrapper(torch.nn.Module):
         return output
     
     def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
-        fuse_experts_weights(model_state_dict, self.config.n_routed_experts)
+        prefix = prefix.removesuffix("weight")
+        assert self.config.n_routed_experts == self.expert_mlp.routed_experts_mlp_config.num_experts
+        fuse_experts_weights(model_state_dict,self.config.n_routed_experts)
         create_spmd_ranks(
             model_state_dict=model_state_dict,
             prefix=prefix,
-            world_size=self.world_size,
-            n_routed_experts=self.config.n_routed_experts,
-            expert_model_parallel_size=parallel_state.get_expert_model_parallel_size(),
+            world_size=parallel_state.get_world_group().size(),
+            n_routed_experts=self.expert_mlp.routed_experts_mlp_config.num_experts,
+            expert_model_parallel_group=self.cte_expert_model_parallel_group,
         )
 
 def fuse_experts_weights(
@@ -173,35 +204,37 @@ def create_spmd_ranks(
     prefix: str,
     world_size,
     n_routed_experts: int,
-    expert_model_parallel_size: int,
+    expert_model_parallel_group,
 ):
-    model_state_dict["expert_mlp.spmd_rank.rank"] = torch.arange(
+    # add weight for spmd rank
+    model_state_dict[f"{prefix}expert_mlp.spmd_rank.rank"] = torch.arange(
         0, world_size, dtype=torch.int32
     )
-
-    if parallel_state.get_expert_model_parallel_size() > 1:
+    if expert_model_parallel_group.size() > 1:
         expert_indices = []
         for rank in range(world_size):
             curr_expert_rank = parallel_state.get_expert_parallel_rank_from_global_rank(
-                rank=rank, expert_parallel_group=parallel_state.get_expert_model_parallel_group()
+                rank=rank, expert_parallel_group=expert_model_parallel_group
             )
             curr_expert_indices = parallel_state.get_experts_for_expert_parallel_rank(
                 curr_expert_rank,
                 total_number_of_experts=n_routed_experts,
-                expert_model_parallel_size=expert_model_parallel_size,
+                expert_model_parallel_size=expert_model_parallel_group.size(),
             )
             expert_indices.append(curr_expert_indices)
 
-        model_state_dict["expert_mlp.spmd_rank.local_expert_indices"] = torch.tensor(
+        model_state_dict[f"{prefix}expert_mlp.spmd_rank.local_expert_indices"] = torch.tensor(
             expert_indices, dtype=torch.int32
         )
 
 
-def compile_neuron_expert_mlp_model(sample_inputs, checkpoint, load_module, tp_degree=1, ep_degree=1, world_size=32, torch_dtype=torch.bfloat16, **inference_config):
+def compile_neuron_expert_mlp_model(sample_inputs, checkpoint, load_module, tp_degree=1, ep_degree=1, moe_tp_degree=1,moe_ep_degree=1, world_size=32, torch_dtype=torch.bfloat16, **inference_config):
         inference_config = TestConfig(
             torch_dtype= torch_dtype,
             tp_degree = tp_degree,
             ep_degree=ep_degree,
+            moe_tp_degree = moe_tp_degree,
+            moe_ep_degree = moe_ep_degree,
             rpl_reduce_dtype=torch.float32,
             **inference_config,
         )
@@ -210,6 +243,7 @@ def compile_neuron_expert_mlp_model(sample_inputs, checkpoint, load_module, tp_d
 
         builder = ModelBuilder(
             router=None,
+            logical_nc_config=get_platform_lnc(),
             tp_degree=tp_degree,
             ep_degree=ep_degree,
             checkpoint_loader=lambda: checkpoint,
@@ -259,8 +293,8 @@ class TestExpertMLP(unittest.TestCase):
     def setUp(self):
         # Common test parameters
         self.seq_len = 1024
-        self.hidden_size = 7168
-        self.intermediate_size = 2048
+        self.hidden_size = 2048
+        self.intermediate_size = 1024
         self.n_routed_experts = 64
         self.num_experts_per_tok = 4
         
@@ -302,6 +336,8 @@ class TestExpertMLP(unittest.TestCase):
             _load_module_expert_mlp,
             tp_degree=tp_degree_1,
             ep_degree=ep_degree_1,
+            moe_tp_degree = tp_degree_1,
+            moe_ep_degree = ep_degree_1,
             world_size=world_size,
             torch_dtype=dtype,
             **common_params
@@ -312,8 +348,10 @@ class TestExpertMLP(unittest.TestCase):
             nxdi_sample_inputs,
             neuron_checkpoint,
             _load_module_expert_mlp,
-            tp_degree=tp_degree_2,
-            ep_degree=ep_degree_2,
+            tp_degree=tp_degree_1,
+            ep_degree=ep_degree_1,
+            moe_tp_degree = tp_degree_2,
+            moe_ep_degree = ep_degree_2,
             world_size=world_size,
             torch_dtype=dtype,
             **common_params

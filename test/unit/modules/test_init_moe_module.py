@@ -58,6 +58,7 @@ class TestInitializeMoEModule(unittest.TestCase):
                         torch_dtype=torch.bfloat16,
                         blockwise_matmul_config={"block_size" : configs.block_size,"use_block_parallel" : configs.use_block_parallel,"use_torch_block_wise" : configs.use_torch_block_wise, "skip_dma_token" : configs.skip_token, "skip_dma_weight": configs.skip_weight},
                         router_config={"act_fn": configs.router_act_fn,"dtype": configs.router_dtype},
+                        use_index_calc_kernel=configs.use_index_calc_kernel,
                         early_expert_affinity_modulation=configs.early_expert_affinity_modulation,
                         disable_normalize_top_k_affinities=configs.disable_normalize_top_k_affinities,
                         return_expert_index=configs.return_expert_index,
@@ -76,6 +77,7 @@ class TestInitializeMoEModule(unittest.TestCase):
         
         test_configs = [
             {
+                "use_index_calc_kernel": True,
                 "early_expert_affinity_modulation": True,
                 "disable_normalize_top_k_affinities": True,
                 "block_size": 64,
@@ -95,6 +97,7 @@ class TestInitializeMoEModule(unittest.TestCase):
                 "skip_weight": True
             },
             {
+                "use_index_calc_kernel": False,
                 "early_expert_affinity_modulation": False,
                 "disable_normalize_top_k_affinities": False,
                 "block_size": 32,
@@ -114,6 +117,7 @@ class TestInitializeMoEModule(unittest.TestCase):
                 "skip_weight": True
             },
             {
+                "use_index_calc_kernel": True,
                 "early_expert_affinity_modulation": False,
                 "disable_normalize_top_k_affinities": True,
                 "block_size": 128,
@@ -160,6 +164,7 @@ class TestInitializeMoEModule(unittest.TestCase):
             assert module.router.dtype == module_config.neuron_config.router_config.dtype, f"Expected router dtype to be {module_config.neuron_config.router_config.dtype} but got {module.router.dtype}"
             
             # Test routed expert configs
+            assert module.expert_mlps.routed_experts_mlp_config.use_index_calc_kernel == module_config.neuron_config.use_index_calc_kernel, f"Expected use_index_calc_kernel to be {module_config.neuron_config.use_index_calc_kernel} but got {module.expert_mlps.routed_experts_mlp_config.use_index_calc_kernel}"
             assert module.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation == module_config.neuron_config.early_expert_affinity_modulation, f"Expected early_expert_affinity_modulation to be {module_config.neuron_config.early_expert_affinity_modulation} but got {module.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation}"
             assert module.expert_mlps.routed_experts_mlp_config.normalize_top_k_affinities == module_config.neuron_config.normalize_top_k_affinities, f"Expected normalize_top_k_affinities to be {module_config.neuron_config.normalize_top_k_affinities} but got {module.expert_mlps.routed_experts_mlp_config.normalize_top_k_affinities}"
             assert module.expert_mlps.blockwise_matmul_config.block_size == module_config.neuron_config.blockwise_matmul_config.block_size, f"Expected block_size to be {module_config.neuron_config.blockwise_matmul_config.block_size} but got {module.expert_mlps.blockwise_matmul_config.block_size}"
