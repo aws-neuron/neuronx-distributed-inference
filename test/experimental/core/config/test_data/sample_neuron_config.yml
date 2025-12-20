@@ -1,0 +1,23 @@
+model:
+  vocab_size: 128256
+  hidden_size: 2048
+
+build:
+  batch_size: 1
+  compiler_args: ["--model-type=transformer -O1", "--auto-cast=none", "--verbose=35"]
+
+# Component level configuration
+attention:
+  kv_cache_tiling: True
+  cp_degree: 1
+
+# Override the config values based on model_tag
+config_override:
+  - model_tags: ["prefill_1k"]
+    build:
+      compiler_args: ["--cc_tiling_factor=4"]
+    attention:
+      kv_cache:
+        tiling_batch_size: 6
+    new_module_for_prefill_1k:
+      attribute_name: value

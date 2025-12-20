@@ -59,6 +59,7 @@ def get_custom_clip_text_config():
             "num_attention_heads": 12,
             "num_hidden_layers": 12,
             "max_position_embeddings": 77,
+            "_attn_implementation": "eager",
         }
     )
     return text_config

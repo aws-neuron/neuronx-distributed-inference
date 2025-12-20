@@ -64,7 +64,10 @@ class AsyncTensorWrapper:
             return torch.index_select(synced_result, 0, seq_ids)
 
         index_select = lambda x: torch.index_select(x, 0, seq_ids)  # noqa: E731
-        return list(map(index_select, synced_result))
+        try:
+            return list(map(index_select, synced_result))
+        except Exception as e:
+            raise type(e)(f"Detected failure case: {str(e)}, tensor to select {synced_result}, seq_ids {seq_ids}") from e
 
 
 def execute_model_prefix_caching(

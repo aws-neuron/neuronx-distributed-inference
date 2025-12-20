@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch, call
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.utils.snapshot import (
+    SnapshotCaptureConfig,
     ScriptModuleWrapper,
     SnapshotOutputFormat,
 )
@@ -16,14 +17,19 @@ class TestRegisterSnapshotHooksFromEnv:
         """Create a NeuronApplicationBase instance for testing."""
         with patch.object(NeuronApplicationBase, '__init__', lambda x, *args, **kwargs: None):
             app = NeuronApplicationBase.__new__(NeuronApplicationBase)
+            mock_neuron_config = Mock()
+            mock_neuron_config.speculation_length = 0
+            mock_neuron_config.medusa_speculation_length = 0
+            app.neuron_config = mock_neuron_config
             return app
     
-    def test_register_snapshot_hooks_from_env_success(self, neuron_app, monkeypatch):
+    def test_register_snapshot_hooks_from_env_for_requests_success(self, neuron_app, monkeypatch):
         """Test successful registration of snapshot hooks from environment variables."""
         # Arrange
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', '/output/path')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', 'NUMPY_IMAGES')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', '0,1,2')
+        monkeypatch.delenv('NXD_INFERENCE_CAPTURE_FOR_TOKENS', raising=False)
 
         mock_register = Mock()
         neuron_app.register_snapshot_hooks = mock_register
@@ -36,11 +42,79 @@ class TestRegisterSnapshotHooksFromEnv:
             output_path='/output/path',
             output_format=SnapshotOutputFormat.NUMPY_IMAGES,
             capture_at_requests=[0, 1, 2],
+            capture_for_tokens=[]
         )
-    
+
+    def test_register_snapshot_hooks_from_env_for_tokens_success(self, neuron_app, monkeypatch):
+        """Test successful registration of snapshot hooks from environment variables."""
+        # Arrange
+        monkeypatch.delenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', raising=False)
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', '/output/path')
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', 'NUMPY_IMAGES')
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_FOR_TOKENS', '0,1')
+
+        mock_register = Mock()
+        neuron_app.register_snapshot_hooks = mock_register
+        
+        # Act
+        neuron_app._register_snapshot_hooks_from_env()
+        
+        # Assert
+        mock_register.assert_called_once_with(
+            output_path='/output/path',
+            output_format=SnapshotOutputFormat.NUMPY_IMAGES,
+            capture_at_requests=[],
+            capture_for_tokens=[[0,1]]
+        )
+
+    def test_register_snapshot_hooks_from_env_for_tokens_multibatch_success(self, neuron_app, monkeypatch):
+        """Test successful registration of snapshot hooks from environment variables."""
+        # Arrange
+        monkeypatch.delenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', raising=False)
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', '/output/path')
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', 'NUMPY_IMAGES')
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_FOR_TOKENS', '0,1;1,2;;1')
+
+        mock_register = Mock()
+        neuron_app.register_snapshot_hooks = mock_register
+        
+        # Act
+        neuron_app._register_snapshot_hooks_from_env()
+        
+        # Assert
+        mock_register.assert_called_once_with(
+            output_path='/output/path',
+            output_format=SnapshotOutputFormat.NUMPY_IMAGES,
+            capture_at_requests=[],
+            capture_for_tokens=[[0,1],[1,2],[],[1]]
+        )
+
+    def test_register_snapshot_hooks_from_env_for_requests_and_tokens_success(self, neuron_app, monkeypatch):
+        """Test successful registration of snapshot hooks from environment variables."""
+        # Arrange
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', '/output/path')
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', 'NUMPY_IMAGES')
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', '0,1,2')
+        monkeypatch.setenv('NXD_INFERENCE_CAPTURE_FOR_TOKENS', '0,1;1,2;;1')
+
+        mock_register = Mock()
+        neuron_app.register_snapshot_hooks = mock_register
+        
+        # Act
+        neuron_app._register_snapshot_hooks_from_env()
+        
+        # Assert
+        mock_register.assert_called_once_with(
+            output_path='/output/path',
+            output_format=SnapshotOutputFormat.NUMPY_IMAGES,
+            capture_at_requests=[0, 1, 2],
+            capture_for_tokens=[[0, 1], [1, 2], [], [1]]
+        )
+
     def test_register_snapshot_hooks_from_env_default_transposed_inputs(self, neuron_app, monkeypatch):
         """Test registration with default transposed inputs setting."""
         # Arrange
+        monkeypatch.delenv('NXD_INFERENCE_CAPTURE_FOR_TOKENS', raising=False)
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', '/output/path')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', 'NUMPY_PICKLE')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', '0,1,2')
@@ -56,11 +130,13 @@ class TestRegisterSnapshotHooksFromEnv:
             output_path='/output/path',
             output_format=SnapshotOutputFormat.NUMPY_PICKLE,
             capture_at_requests=[0, 1, 2],
+            capture_for_tokens=[],
         )
     
     def test_register_snapshot_hooks_from_env_missing_output_path(self, neuron_app, monkeypatch):
         """Test assertion when output path is missing."""
         # Arrange
+        monkeypatch.delenv('NXD_INFERENCE_CAPTURE_FOR_TOKENS', raising=False)
         monkeypatch.delenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', raising=False)
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', 'NUMPY_IMAGES')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', '0')
@@ -72,6 +148,7 @@ class TestRegisterSnapshotHooksFromEnv:
     def test_register_snapshot_hooks_from_env_missing_output_format(self, neuron_app, monkeypatch):
         """Test assertion when output format is missing."""
         # Arrange
+        monkeypatch.delenv('NXD_INFERENCE_CAPTURE_FOR_TOKENS', raising=False)
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', '/output/path')
         monkeypatch.delenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', raising=False)
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', '0')
@@ -80,12 +157,13 @@ class TestRegisterSnapshotHooksFromEnv:
         with pytest.raises(AssertionError, match="Must set NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT"):
             neuron_app._register_snapshot_hooks_from_env()
     
-    def test_register_snapshot_hooks_from_env_missing_capture_requests(self, neuron_app, monkeypatch):
+    def test_register_snapshot_hooks_from_env_missing_either_requests_or_tokens(self, neuron_app, monkeypatch):
         """Test assertion when capture requests is missing."""
         # Arrange
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_PATH', '/output/path')
         monkeypatch.setenv('NXD_INFERENCE_CAPTURE_OUTPUT_FORMAT', 'NUMPY_IMAGES')
         monkeypatch.delenv('NXD_INFERENCE_CAPTURE_AT_REQUESTS', raising=False)
+        monkeypatch.delenv('NXD_INFERENCE_CAPTURE_FOR_TOKENS', raising=False)
         
         # Act & Assert
         with pytest.raises(AssertionError, match="Must set NXD_INFERENCE_CAPTURE_AT_REQUESTS"):
@@ -101,7 +179,11 @@ class TestRegisterSnapshotHooks:
         with patch.object(NeuronApplicationBase, '__init__', lambda x, *args, **kwargs: None):
             app = NeuronApplicationBase.__new__(NeuronApplicationBase)
             app.is_loaded_to_neuron = True
-            
+            mock_neuron_config = Mock()
+            mock_neuron_config.speculation_length = 0
+            mock_neuron_config.medusa_speculation_length = 0
+            app.neuron_config = mock_neuron_config
+
             # Create mock models
             mock_model1 = Mock()
             mock_model1.tag = 'model1'
@@ -144,6 +226,7 @@ class TestRegisterSnapshotHooks:
             output_path='/test/path',
             output_format=SnapshotOutputFormat.NUMPY_IMAGES,
             capture_at_requests=[0, 1, 2],
+            capture_for_tokens=[[1]],
             ranks=[0, 1],
         )
         
@@ -155,10 +238,27 @@ class TestRegisterSnapshotHooks:
         ])
         
         assert mock_get_snapshot_hook.call_count == 2
-        mock_get_snapshot_hook.assert_has_calls([
-            call('/test/path', SnapshotOutputFormat.NUMPY_IMAGES, [0, 1, 2], mock_builder, [0, 1], is_input_ranked=False),
-            call('/test/path', SnapshotOutputFormat.NUMPY_IMAGES, [0, 1, 2], mock_builder, [0, 1], is_input_ranked=False)
-        ])
+        for call_item in mock_get_snapshot_hook.call_args_list:
+            args, kwargs = call_item
+            assert args[0] == '/test/path'
+            assert args[1] == SnapshotOutputFormat.NUMPY_IMAGES
+            # check requests
+            assert (
+                isinstance(args[2], SnapshotCaptureConfig) and
+                args[2].is_capturing_requests() and
+                all(
+                    request in args[2].request_indices
+                    for request in [0, 1, 2]
+                )
+            )
+            # check tokens
+            assert (
+                isinstance(args[2], SnapshotCaptureConfig) and
+                args[2].is_capturing_tokens() and
+                args[2].which_token([0]) == (0, 1)
+            )
+            assert args[3] == mock_builder
+            assert kwargs['is_input_ranked'] is False
 
         assert mock_register_hook.call_count == 4
         mock_register_hook.assert_has_calls([
@@ -183,7 +283,8 @@ class TestRegisterSnapshotHooks:
             neuron_app.register_snapshot_hooks(
                 output_path='/test/path',
                 output_format=SnapshotOutputFormat.NUMPY_IMAGES,
-                capture_at_requests=[0]
+                capture_at_requests=[0],
+                capture_for_tokens=[]
             )
 
 
@@ -296,3 +397,20 @@ class TestUnregisterSnapshotHooks:
         ]
         mock_unregister_hooks.assert_has_calls(expected_calls, any_order=False)
         assert mock_unregister_hooks.call_count == 2
+
+
+    def test_set_tensor_capture_step(self, neuron_app):
+        """Test set_tensor_capture_step method."""
+        with patch.object(NeuronApplicationBase, '__init__', lambda x, *args, **kwargs: None):
+            neuron_app = NeuronApplicationBase.__new__(NeuronApplicationBase)
+            
+            # Test with tensor capture enabled
+            neuron_app._tensor_capture_step = 5
+            neuron_app.set_tensor_capture_step(10)
+            assert neuron_app._tensor_capture_step == 10
+            
+            # Test with tensor capture disabled
+            neuron_app.__dict__.pop('_tensor_capture_step', None)
+            with patch('neuronx_distributed_inference.models.application_base.logging') as mock_logging:
+                neuron_app.set_tensor_capture_step(5)
+                mock_logging.warning.assert_called_once_with("Tensor capture not enabled. Can not set the step.")

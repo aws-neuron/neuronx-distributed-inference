@@ -19,6 +19,8 @@ import os
 import copy
 from typing import List, Optional, Tuple
 
+from neuronx_distributed.utils import cpu_mode
+from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 import torch
 from safetensors.torch import save_file
 from neuronx_distributed.parallel_layers.layers import (
@@ -33,13 +35,21 @@ import neuronx_distributed_inference.modules.autobucketing as autobucketing
 from neuronx_distributed_inference.modules.padding import pad_tensor, unpad_tensor
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.config import InferenceConfig
-from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaMLP, get_rmsnorm_cls
+from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaMLP
 from neuronx_distributed_inference.models.llama4.modeling_llama4_vision import get_hw
 from neuronx_distributed_inference.models.model_wrapper import EncoderModelInstance, ModelWrapper
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+
+def get_rmsnorm_cls():
+    # Initialize to the appropriate implementation of RMSNorm
+    # If infer on NXD -> CustomRMSNorm
+    # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
+    return LlamaRMSNorm if cpu_mode() else CustomRMSNorm
 
 
 class PixtralRotaryEmbedding(nn.Module):

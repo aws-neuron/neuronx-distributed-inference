@@ -25,7 +25,7 @@ from neuronx_distributed.modules.moe.moe_process_group import (
 
 os.environ['NEURON_PLATFORM_TARGET_OVERRIDE'] = 'trn2'
 os.environ['NEURON_LOGICAL_NC_CONFIG'] = '2'
-os.environ['NEURON_RT_VIRTUAL_CORE_SIZE']='2' 
+os.environ['NEURON_RT_VIRTUAL_CORE_SIZE']='2'
 os.environ['NEURON_RT_NUM_CORES']='64'
 
 os.environ["UNSAFE_FP8FNCAST"]="1"
@@ -60,7 +60,7 @@ def destroy_cpu_env():
 
 # Class to Initialize the ExpertMLPs model for the test
 class ExpertMoEClass(torch.nn.Module):
-    def __init__(self, config: InferenceConfig):
+    def __init__(self, config: InferenceConfig, use_experts_bias: bool):
         super().__init__()
         # model = torch.nn.ModuleList([
         if config.neuron_config.moe_ep_degree > 1:
@@ -80,6 +80,7 @@ class ExpertMoEClass(torch.nn.Module):
                     num_experts=config.num_experts,
                     hidden_size=config.hidden_size,
                     intermediate_size=config.intermediate_size,
+                    bias=use_experts_bias,
                     top_k=config.top_k,
                     hidden_act=config.hidden_act,
                     glu_mlp=config.neuron_config.glu_mlp,
@@ -104,11 +105,11 @@ class ExpertMoEClass(torch.nn.Module):
         # for layer in self.module:
         hidden_states = self.module(hidden_states, expert_affinities, expert_index, seq_len)
         hidden_states = mappings.reduce_from_tensor_model_parallel_region(hidden_states, process_group=parallel_state.get_world_group())
-        
+
         return hidden_states
 
-def _load_module_expert_mlps(config):
-    return ExpertMoEClass(config).eval()
+def _load_module_expert_mlps(config, use_experts_bias):
+    return ExpertMoEClass(config, use_experts_bias).eval()
 
 def rand_interval(a, b, *size, dtype):
     return ((b - a) * torch.rand(*size) + a).to(dtype)
@@ -118,7 +119,7 @@ def quantize_fp8_per_channel(num_experts, dim1, dim2):
     tensor = torch.nn.Parameter(rand_interval(-0.03, 0.03,(num_experts, dim1, dim2),dtype=torch.bfloat16))
     fp8_max, fp8_min = 240.0, -240.0
     max_values = torch.amax(torch.abs(tensor), dim=(1,), keepdim=True)
-    
+
     scales = max_values / fp8_max
     scales = torch.max(scales, torch.ones(scales.shape, device=scales.device) * 1e-05)
     quantized_tensor = tensor / scales
@@ -135,17 +136,18 @@ def _add_compiler_args(quant):
     compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
     compiler_args += " --tensorizer-options='--vectorize-strided-dma'"
     compiler_args += " --auto-cast=none"
-    if quant: 
+    compiler_args += " --internal-backend-options='--enable-branch-hint=false'"
+    if quant:
         compiler_args += " --internal-hlo2tensorizer-options=' --modular-flow-mac-threshold=10 --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 --verify-hlo=true'"
-    else: 
+    else:
         compiler_args += " --internal-hlo2tensorizer-options=' --modular-flow-mac-threshold=10  --verify-hlo=true'"
     return compiler_args
 
 # Generate random weights for the model
-def _generate_random_quant_weights(hidden_size, intermediate_size, n_routed_experts):
+def _generate_random_quant_weights(hidden_size, intermediate_size, n_routed_experts, bias: bool = False):
     # Generate weights once and reuse for all layers
     checkpoint = {}
-    
+
     layer_prefix = "module."
     down_weight, down_scale = quantize_fp8_per_channel(n_routed_experts, intermediate_size, hidden_size)
     fuse_weight, fuse_scale = quantize_fp8_per_channel(n_routed_experts, hidden_size, intermediate_size * 2)
@@ -153,12 +155,15 @@ def _generate_random_quant_weights(hidden_size, intermediate_size, n_routed_expe
     checkpoint[f"{layer_prefix}mlp_op.gate_up_proj.weight"] = fuse_weight
     checkpoint[f"{layer_prefix}mlp_op.down_proj.scale"] = down_scale
     checkpoint[f"{layer_prefix}mlp_op.gate_up_proj.scale"] = fuse_scale
-    
+    if bias:
+        checkpoint[f"{layer_prefix}mlp_op.down_proj.bias"] = (torch.rand(n_routed_experts, hidden_size, dtype=torch.bfloat16) * 2 - 1) * 0.025
+        checkpoint[f"{layer_prefix}mlp_op.gate_up_proj.bias"] = (torch.rand(n_routed_experts, 2 * intermediate_size, dtype=torch.bfloat16) * 2 - 1) * 0.025
+
     return checkpoint
 
 def dequantize_checkpoint_to_bf16(checkpoint):
     dequantized_checkpoint = {}
-    
+
     for key, value in checkpoint.items():
         if key.endswith('.weight'):
             # Get the corresponding scale
@@ -169,7 +174,7 @@ def dequantize_checkpoint_to_bf16(checkpoint):
                 value = value.to(torch.float32)
                 dequantized_weight = (value * scale).to(torch.bfloat16)
                 dequantized_checkpoint[key] = dequantized_weight
-        
+
     return dequantized_checkpoint
 
 # Test class for the ExpertMLPs model
@@ -183,10 +188,11 @@ class TestRoutedExpertsFP8(unittest.TestCase):
     def set_test_args(self, path, goldens):
         """Set the path for loading checkpoints"""
 
-        assert os.path.exists(path), f"Checkpoint path does not exist: {path}"
+        if path:
+            assert os.path.exists(path), f"Checkpoint path does not exist: {path}"
+            self.checkpoint_path = path
         assert goldens in ["cpu", "neuron"], f"goldens must be one of ['cpu', 'neuron'], got: {goldens}"
 
-        self.checkpoint_path = path
         self.goldens = goldens
 
     def get_quant_config(self, on_cpu, quant, seq_len, **kwargs):
@@ -198,7 +204,7 @@ class TestRoutedExpertsFP8(unittest.TestCase):
             "top_k": configs.top_k,
             "intermediate_size": configs.intermediate_size,
             "dtype": self.dtype,}
-        
+
         neuron_config = MoENeuronConfig(
             torch_dtype=self.dtype,
             tp_degree=self.tp_degree,
@@ -226,14 +232,14 @@ class TestRoutedExpertsFP8(unittest.TestCase):
             **inference_config,
         )
         return inference_config
-    
+
     def _initialize_test_data(self, seq_len, config):
         expert_affinities = torch.rand(seq_len, config.num_experts, dtype=self.dtype)
         _, expert_index = torch.topk(expert_affinities, config.top_k)
         hidden_states = torch.rand(seq_len, config.hidden_size, dtype=self.dtype)
         return hidden_states, expert_affinities, expert_index
 
-    def compile_neuron_expert_mlps_model(self, inference_config, checkpoint, load_module, seq_len):
+    def compile_neuron_expert_mlps_model(self, inference_config, checkpoint, load_module, seq_len, use_experts_bias):
         hidden_states, expert_affinities, expert_index = self._initialize_test_data(seq_len, inference_config)
         builder = ModelBuilder(
             router=None,
@@ -245,7 +251,7 @@ class TestRoutedExpertsFP8(unittest.TestCase):
         builder.add(
             key="main",
             model_instance=BaseModelInstance(
-                module_cls=partial(load_module, inference_config),
+                module_cls=partial(load_module, inference_config, use_experts_bias),
                 input_output_aliases={},
             ),
             example_inputs=[(hidden_states, expert_affinities, expert_index, torch.tensor(seq_len)),],
@@ -254,8 +260,8 @@ class TestRoutedExpertsFP8(unittest.TestCase):
         neuron_model = builder.trace(initialize_model_weights=True)
         return neuron_model
 
-    def compile_cpu_expert_mlps_model(self, inference_config, checkpoint, load_module):
-        module = load_module(inference_config)
+    def compile_cpu_expert_mlps_model(self, inference_config, checkpoint, load_module, use_experts_bias):
+        module = load_module(inference_config, use_experts_bias)
         module.load_state_dict(checkpoint)
         return module
 
@@ -277,19 +283,22 @@ class TestRoutedExpertsFP8(unittest.TestCase):
         block_sizes = [256]
         block_strategies = [ "PING_PONG"]
         skip_dma_configs = [[False, False]]
-        
+        use_experts_bias = [False, True]
+
         # Generate all possible combinations for blockwise_matmul_config
         blockwise_configs = []
         for base_config in test_configs:
             param_combinations = itertools.product(
                 block_sizes,
-                block_strategies,
-                skip_dma_configs
+                use_shard_on_intermediate_kernel,
+                skip_dma_configs,
+                use_experts_bias,
             )
             
             # for block_size, strategy, skip_token, skip_weight in param_combinations:
-            for block_size, strategy, skip_dma in param_combinations:
+            for block_size, use_shard_on_intermediate_kernel, skip_dma, use_experts_bias in param_combinations:
                 config = base_config.copy()
+                config["use_experts_bias"] = use_experts_bias
                 config["blockwise_matmul_config"] = {
                     "block_size": block_size,
                     "use_block_parallel": False,
@@ -318,25 +327,28 @@ class TestRoutedExpertsFP8(unittest.TestCase):
                 hidden_states, expert_affinities, expert_index = self._initialize_test_data(seq_len, SimpleNamespace(**config))
                 checkpoint  = None
                 # Check if this is llama4 config and path is provided
-                if config["model_type"] == "llama4" and self.checkpoint_path:
+                # No current model checkpoints have bias, so if bias=True we must use random weights
+                if config["model_type"] == "llama4" and self.checkpoint_path and not config["use_experts_bias"]:
                     print(f"\nLoading checkpoint from given path: {self.checkpoint_path}")
                     checkpoint = load_state_dict(self.checkpoint_path)
 
                 if checkpoint is None:
                     # For all other configs or if model path is not provided, use random weights
                     checkpoint = _generate_random_quant_weights(
-                        hidden_size=config["hidden_size"], 
+                        hidden_size=config["hidden_size"],
                         intermediate_size=config["intermediate_size"],
-                        n_routed_experts=config["num_experts"]
+                        n_routed_experts=config["num_experts"],
+                        bias=config["use_experts_bias"],
                     )
 
                 if self.goldens == "cpu":
                     print("\nRunning FP8 CPU Model.....")
                     init_cpu_env()
                     cpu_module = self.compile_cpu_expert_mlps_model(
-                        self.get_quant_config(on_cpu=True, quant=True, seq_len=seq_len, **config), 
-                        checkpoint, 
-                        _load_module_expert_mlps
+                        self.get_quant_config(on_cpu=True, quant=True, seq_len=seq_len, **config),
+                        checkpoint,
+                        _load_module_expert_mlps,
+                        config["use_experts_bias"],
                     )
                     cpu_output = cpu_module(hidden_states, expert_affinities, expert_index, seq_len)
                     destroy_cpu_env()
@@ -344,20 +356,22 @@ class TestRoutedExpertsFP8(unittest.TestCase):
                     dequant_checkpoint = dequantize_checkpoint_to_bf16(checkpoint)
                     print("\nRunning with dequant BF16 Model weights.....")
                     cpu_module = self.compile_neuron_expert_mlps_model(
-                        self.get_quant_config(on_cpu=False, quant=False, seq_len=seq_len, **config), 
-                        dequant_checkpoint, 
+                        self.get_quant_config(on_cpu=False, quant=False, seq_len=seq_len, **config),
+                        dequant_checkpoint,
                         _load_module_expert_mlps,
-                        seq_len
+                        seq_len,
+                        config["use_experts_bias"],
                     )
                     cpu_output = cpu_module(hidden_states, expert_affinities, expert_index, torch.tensor(seq_len))
 
-                
+
                 print("\nRunning FP8 Neuron Model.....")
                 neuron_model_original = self.compile_neuron_expert_mlps_model(
-                    self.get_quant_config(on_cpu=False, quant=True, seq_len=seq_len, **config), 
-                    checkpoint, 
-                    _load_module_expert_mlps, 
-                    seq_len
+                    self.get_quant_config(on_cpu=False, quant=True, seq_len=seq_len, **config),
+                    checkpoint,
+                    _load_module_expert_mlps,
+                    seq_len,
+                    config["use_experts_bias"],
                 )
                 neuron_output = neuron_model_original(hidden_states, expert_affinities, expert_index, torch.tensor(seq_len))
                 print(neuron_output)
@@ -371,7 +385,7 @@ class TestRoutedExpertsFP8(unittest.TestCase):
                 except AssertionError as e:
                     results.append((config_str, f"FAIL: {str(e)}"))
                     print(f"Test FAILED: {str(e)}")
-        
+
         # Print summary of results
         print("\n\n===== TEST RESULTS SUMMARY =====")
         passed = sum(1 for _, status in results if status == "PASS")
@@ -387,7 +401,7 @@ class TestRoutedExpertsFP8(unittest.TestCase):
         for config, status in results:
             if status != "PASS":
                 print(f"{config}: {status}")
-        
+
         # If any test failed, make the test fail
         if failed > 0:
             self.fail(f"{passed} configurations passed, {failed} configurations failed")
@@ -400,4 +414,4 @@ if __name__ == "__main__":
     test = TestRoutedExpertsFP8()
     if args.model_path or args.golden_type:
         test.set_test_args(args.model_path, args.golden_type)
-    test.test_expert_mlp_fp8_quantization()
+        test.test_expert_mlp_fp8_quantization()

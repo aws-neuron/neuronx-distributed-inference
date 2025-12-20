@@ -8,13 +8,16 @@ Some of the utitlies functions need to be redo or removed.
 
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 import math
+import packaging
 
 import torch
-from torch_neuronx.testing.validation import custom_allclose, logit_validation
+import os
+from torch_neuronx.testing.validation import custom_allclose, logit_validation, neuron_allclose, AllCloseSummary
 from transformers import GenerationConfig, PreTrainedModel, PreTrainedTokenizer
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
+import re
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.mllama.utils import create_vision_mask, get_image_tensors
@@ -25,6 +28,7 @@ from neuronx_distributed_inference.models.llama4.utils.input_processor import pr
 from neuronx_distributed_inference.utils.constants import *
 from neuronx_distributed_inference.utils.exceptions import LogitMatchingValidationError
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
+from neuronx_distributed_inference.utils.version_utils import get_torch_neuronx_build_version
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -484,6 +488,7 @@ def check_accuracy_logits(
     input_start_offsets=None,
     pad_token_id=0,
     image_processor=None,
+    tensor_capture_hook=None
 ):
     """
     DEPRECATED: Please use the function check_accuracy_logits_v2 instead.
@@ -628,6 +633,7 @@ def check_accuracy_logits(
             output_scores=True,
             generation_config=generation_config,
             **neuron_vision_input_args,
+            tensor_capture_hook=tensor_capture_hook
         )
 
         actual_logits = torch.stack(model_outputs.scores)
@@ -636,7 +642,7 @@ def check_accuracy_logits(
             vocab_size = expected_logits.shape[-1]
             actual_logits = actual_logits[:, :, :vocab_size]
             
-        actual_token_ids = actual_logits.argmax(dim=2).T
+        actual_token_ids = model_outputs.sequences[:, input_length:]
         if tokenizer is not None:
             actual_tokens = tokenizer.batch_decode(
                 actual_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
@@ -645,7 +651,14 @@ def check_accuracy_logits(
         else:
             logger.info(f"Actual Output: {actual_token_ids}")
         logger.info(f"Actual Logits Shape: {actual_logits.shape}")
-        return actual_logits
+        if (
+            neuron_model.neuron_config.on_device_sampling_config is not None
+            and get_torch_neuronx_build_version() >= packaging.version.parse("2.11.14773")
+        ):
+            # Logit validation expects actual_logits: [S, B, V], actual_token_ids: [B, S]
+            return actual_logits, actual_token_ids
+        else:
+            return actual_logits
 
     def generate_fn_with_chunked_prefill(input_ids):
         return generate_with_chunked_prefill(neuron_model, tokenizer, input_ids)
@@ -816,7 +829,7 @@ def check_accuracy_logits_v2(
         if isinstance(neuron_model, NeuronLlama4ForCausalLM) and actual_logits.shape[-1] > expected_logits.shape[-1]:
             actual_logits = actual_logits[..., :expected_logits.shape[-1]]
 
-        actual_token_ids = actual_logits.argmax(dim=2).T
+        actual_token_ids = model_outputs.sequences[:, input_length:]
         if tokenizer is not None:
             actual_tokens = tokenizer.batch_decode(
                 actual_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
@@ -824,7 +837,14 @@ def check_accuracy_logits_v2(
             logger.info(f"Actual Output(tokens with the max logits): {actual_tokens}")
         logger.info(f"Actual Output (token ids with the max logits): {actual_token_ids}")
         logger.info(f"Actual Logits Shape: {actual_logits.shape}")
-        return actual_logits
+        if (
+            neuron_model.neuron_config.on_device_sampling_config is not None
+            and get_torch_neuronx_build_version() >= packaging.version.parse("2.11.14773")
+        ):
+            # Logit validation expects actual_logits: [S, B, V], actual_token_ids: [B, S]
+            return actual_logits, actual_token_ids
+        else:
+            return actual_logits
 
     def generate_fn_with_chunked_prefill(input_ids):
         return generate_with_chunked_prefill(neuron_model, tokenizer, input_ids)
@@ -1126,3 +1146,111 @@ def _prepare_llama4_vision_args(neuron_model, prompt, image, inputs, image_proce
     }
 
     return neuron_vision_input_args, hf_vision_input_args
+
+def _prepare_pixtral_vision_args(neuron_model, prompt, image, inputs, image_processor):
+    # Pixtral vision inputs
+    if prompt is not None:
+        assert image_processor is not None, \
+            f"Image processor input is required to check logit accuracy for a Pixtral model.\
+                    Alternatively you can pass in processed `inputs` with `pixel_values` and `vision_mask` directly."
+        input_ids, attention_mask, pixel_values, vision_mask, image_sizes = pixtral_prepare_generation_inputs_hf(prompt, image,
+                                                                                            image_processor,
+                                                                                            role="user",
+                                                                                            config=neuron_model.config)
+        input_ids, attention_mask, pixel_values, vision_mask, image_sizes = pixtral_prepare_generation_inputs_hf(prompt, image,image_processor,role="user",config=neuron_model.config)
+        neuron_vision_input_args = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "vision_mask": vision_mask.to(torch.bool),
+            "image_sizes": image_sizes,
+        }
+    else:
+        if inputs is None or getattr(inputs, 'pixel_values', None) is None or getattr(inputs, 'vision_mask',
+                                                                                      None) is None:
+            assert (image is not None) and (image_processor is not None), \
+                f"Image input and image processor input are required to check logit accuracy for a Pixtral model.\
+            Alternatively you can pass in processed `inputs` with `pixel_values` and `vision_mask` directly."
+            _, _, pixel_values, vision_mask, image_sizes = pixtral_prepare_generation_inputs_hf(prompt, image, image_processor,
+                                                                           role="user", config=neuron_model.config)
+        else:
+            pixel_values = inputs.pixel_values
+            vision_mask = inputs.vision_mask
+            image_sizes = inputs.image_sizes
+
+        neuron_vision_input_args = {
+            "pixel_values": pixel_values,
+            "vision_mask": vision_mask,
+            "image_sizes": image_sizes,
+        }
+
+    # HF model calculates vision_mask in LlavaForConditionalGeneration.forward():
+    # so HF model does not take vision_mask as an input
+    hf_vision_input_args = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pixel_values": pixel_values,
+        "image_sizes": image_sizes,
+    }
+
+    return neuron_vision_input_args, hf_vision_input_args
+
+MAX_DRAFT_LOOP_TO_CHECK = 64    
+
+def run_accuracy_draft_logit_test_flow(model: NeuronApplicationBase, generation_config: GenerationConfig, tokenizer: PreTrainedTokenizer, draft_golden_path: str, num_draft_loops_to_check: int):
+    assert model.config.neuron_config.output_logits, "output_logits hos to be enabled to use this functionality"
+    assert num_draft_loops_to_check < MAX_DRAFT_LOOP_TO_CHECK, f'We only support checking accuracy up to {MAX_DRAFT_LOOP_TO_CHECK} draft loops'
+    generation_config.do_sample = False
+    generation_config.prompt_lookup_num_tokens = model.config.neuron_config.speculation_length
+    prompt = ["What is annapurna labs?"]
+    inputs = tokenizer(prompt, return_tensors="pt")
+    hfmodel = HuggingFaceGenerationAdapter(model, capture_draft_logits=True)
+    model_outputs = hfmodel.generate(
+            input_ids=inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            max_new_tokens=100,
+            min_new_tokens=100,
+            return_dict_in_generate=True,
+            output_scores=True,
+            generation_config=generation_config,
+        )
+    check_accuracy_draft_logit(model_outputs.scores, draft_golden_path, num_draft_loops_to_check)
+
+def check_accuracy_draft_logit(actual: List[torch.Tensor], draft_golden_path: str, num_draft_loops_to_check: int = 6) -> Optional[dict]:
+    assert actual is not None, "Please provide actual logits"
+    assert draft_golden_path is not None, "Please provide a draft golden path"
+    draft_golden_file_numbers = get_sorted_draft_file_number_list(draft_golden_path)
+    draft_golden_file_numbers = draft_golden_file_numbers[: num_draft_loops_to_check]
+    for i, file_number in zip(range(1, num_draft_loops_to_check + 1), draft_golden_file_numbers):
+        file_path = os.path.join(draft_golden_path, f'draft_logits_{file_number}.pt')
+        draft_logits = torch.load(file_path).squeeze()
+        print(f"Checking draft loop {i}, draft golden file number {file_number}...")
+        result, test_pass, draft_iter = check_logits_per_draft_loop(actual[i], draft_logits, i)
+        assert test_pass, f'Draft logit validation fails in draft_loop {i} during draft iteration {draft_iter}. Top k logit result: {result}.'
+    print('Draft logit test passes!')
+
+def get_sorted_draft_file_number_list(draft_goldens_dir: str) -> List[str]:
+    file_list = os.listdir(draft_goldens_dir)
+    return sorted([int(re.search(r'draft_logits_(\d+)\.pt', f).group(1)) for f in file_list if re.match(r'draft_logits_\d+\.pt$', f)])
+
+def check_logits_per_draft_loop(actual: torch.Tensor, expected: torch.Tensor, draft_loop: int) -> Tuple[AllCloseSummary, bool]:
+    expected_draft_token_ids = list(torch.argmax(expected, dim=1).squeeze())
+    results = []
+    test_pass = True
+    for i, expected_token_id in enumerate(expected_draft_token_ids):
+        result = check_draft_logits(actual[i], expected[i], top_k=2)
+        results.append(result)
+        test_pass &= result.allclose
+        if not test_pass:
+            return results, test_pass, i
+        actual_token_id  = torch.argmax(actual[i, :])
+        if actual_token_id != expected_token_id:
+            ## TODO EAGLE3 add teacher forcing to keep validating here
+            print(f'Draft token ids diverge! Neuron: {actual_token_id} - Expected: {expected_token_id}, we can only validate up to draft iter {i} at draft loop {draft_loop}')
+            return results, test_pass, i
+    return results, test_pass, i
+
+def check_draft_logits(actual: torch.Tensor, expected: torch.Tensor, top_k: int) -> AllCloseSummary:
+    topk_expected_logits = torch.topk(expected, k=top_k)
+    topk_neuron_logits = actual[topk_expected_logits.indices]
+    return neuron_allclose(topk_neuron_logits, topk_expected_logits.values)

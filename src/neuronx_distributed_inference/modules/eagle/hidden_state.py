@@ -62,6 +62,7 @@ class HiddenStateRollingBuffer(torch.nn.Module):
             seq_ids = torch.where(seq_ids_mask, seq_ids, pad_seq_ids)
         hidden_state = hidden_state.squeeze(1)
         index = (seq_ids, position_ids % self.buffer_length)
+
         result = torch.index_put(self.hidden_states, index, hidden_state)
         if self.inplace:
             self.hidden_states.data = result

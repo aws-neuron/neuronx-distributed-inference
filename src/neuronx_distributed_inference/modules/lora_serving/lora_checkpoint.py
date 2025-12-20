@@ -4,26 +4,36 @@ import os
 
 import torch
 
+from neuronx_distributed.trace.trace import shard_children
 from neuronx_distributed_inference.modules.checkpoint import _torch_load, load_file
+from neuronx_distributed_inference.modules.attention.gqa import replicate_kv
+from safetensors.torch import save_file
+from typing import Optional
 
 from .config import LoraServingConfig
 from .lora_layer import MultiLoraColumnParallelLinear
+
+logger = logging.getLogger("Neuron")
 
 
 class LoraCheckpoint:
     def __init__(self, config: LoraServingConfig):
         self.lora_config = config
         self.lora_ckpts = None
-        self.lora_adapter_id_mapping = None
+        self.lora_ckpts_cpu = None
         if config is not None:
             self.ckpt_paths = config.lora_ckpt_paths
-            self.get_adapter_id_mapping()
+            self.ckpt_paths_cpu = config.lora_ckpt_paths_cpu
+
+        self.lora_weights = {}
+        self.lora_weights_active = {}
+        self.lora_weights_cpu = {}
 
     def is_lora_module(self, name):
         keywords = ["lora_A", "lora_B"]
         return any(keyword in name for keyword in keywords)
 
-    def load_lora_state_dicts(self):
+    def load_lora_state_dicts(self, ckpt_paths):
         r"""
         We support two checkpoint formats for LoRA adapters:
 
@@ -32,17 +42,19 @@ class LoraCheckpoint:
 
         2. LoRA checkpoint format from NxD. Each checkpoint path is a checkpoint file (.pt) that includes both LoRA adapter weights and the configuration.
         """
-        if self.ckpt_paths is None or self.lora_ckpts is not None:
+        if ckpt_paths is None:
             return
 
-        self.lora_ckpts = {}
-        for key, path in self.ckpt_paths.items():
+        lora_ckpts = {}
+        for key, path in ckpt_paths.items():
             assert os.path.exists(path)
             if os.path.isdir(path):
                 lora_scaling, state_dict = self._load_lora_state_dict_from_folder(path)
             else:
                 lora_scaling, state_dict = self._load_lora_state_dict_from_file(path)
-            self.lora_ckpts[key] = {"lora_scaling": lora_scaling, "state_dict": state_dict}
+            lora_ckpts[key] = {"lora_scaling": lora_scaling, "state_dict": state_dict}
+
+        return lora_ckpts
 
     def _extract_lora_scaling(self, lora_adapter_config):
         if lora_adapter_config is not None:
@@ -124,7 +136,7 @@ class LoraCheckpoint:
                                     else lora_alpha / lora_rank**0.5
                                 )
                         except (ValueError, TypeError) as e:
-                            logging.warning(f"Error processing lora_scaling: {e}")
+                            logger.warning(f"Error processing lora_scaling: {e}")
                             # Keep default scaling of 1.0
 
                     # Apply scaling to the weights of LoRA A
@@ -160,10 +172,10 @@ class LoraCheckpoint:
         else:
             return None
 
-    def _get_module_checkpoints(self, name):
+    def _get_module_checkpoints(self, name, ckpt_paths, lora_ckpts):
         ret = []
-        for key in self.ckpt_paths:
-            matched_ckpt = self._get_module_checkpoint(name, self.lora_ckpts[key])
+        for key in ckpt_paths:
+            matched_ckpt = self._get_module_checkpoint(name, lora_ckpts[key])
             ret.append(matched_ckpt)
         return ret
 
@@ -179,39 +191,48 @@ class LoraCheckpoint:
                 source_heads, repeats = kv_replicate
                 # we refer to gqa.py for the following
                 if repeats > 1:
-                    shape = (source_heads, tensor.shape[0] // source_heads) + tensor.shape[1:]
-                    tensor = tensor.view(shape)
-                    tensor = torch.repeat_interleave(tensor, repeats=repeats, dim=0)
-                    shape = (tensor.shape[0] * tensor.shape[1],) + tensor.shape[2:]
-                    tensor = tensor.view(shape)
+                    tensor, _ = replicate_kv(tensor, source_heads, repeats)
         if self.lora_config.lora_memory_transpose:
             tensor = tensor.t()
         return tensor.to(weight_dtype)
 
-    def _load_lora_weights(self, model, lora_weights):
-        if self.lora_ckpts is None:
+    def _load_lora_weights(self, model, ckpt_paths, lora_ckpts, lora_weights):
+        if lora_ckpts is None:
             return
 
         for name, module in model.named_modules():
             if self.is_lora_module(name):
-                checkpoints = self._get_module_checkpoints(name)
+                checkpoints = self._get_module_checkpoints(name, ckpt_paths, lora_ckpts)
                 weight_name = f"{name}.weight"
                 weights = lora_weights[weight_name]
                 weight_dtype = module.get_weight_dtype()
 
                 for i, ckpt in enumerate(checkpoints):
                     if ckpt is not None:
-                        # the first lora adapter is dummy
-                        lora_weight = self._get_lora_weight(weights, i + 1)
+                        lora_weight = self._get_lora_weight(weights, i)
                         ckpt = self._convert_lora_weight(ckpt, module, weight_dtype)
                         shape = ckpt.size()
                         # pad LoRA checkpoint into LoRA weights
                         lora_tensor = lora_weight[: shape[0], : shape[1]]
                         lora_tensor.copy_(ckpt)
 
+    def _update_scale_for_quantized_model(self, model_sd):
+        names = list(model_sd.keys())
+        for name in names:
+            r"""
+            For quantized models, the scale parameter name includes ".scale", e.g., "model.layers.0.self_attn.qkv_proj.q_proj.scale".
+            After adding LoRA module, the scale parameter name should be "model.layers.0.self_attn.qkv_proj.q_proj.base_layer.scale".
+            If the weight of the module with the scale is still in the model state dict, it implies this module has no LoRA module and there is no need to update its name.
+            """
+            if ".scale" in name and name.replace(".scale", ".weight") not in model_sd:
+                new_name = name.replace(".scale", ".base_layer.scale")
+                model_sd[new_name] = model_sd.pop(name)
+        return model_sd
+
     def update_weights_for_lora(self, model, model_sd):
         # step 1: load state dicts from ckpt paths
-        self.load_lora_state_dicts()
+        if not self.lora_ckpts:
+            self.lora_ckpts = self.load_lora_state_dicts(self.ckpt_paths)
 
         # step 2: update the weight name for base modules because the module name are modified by LoRA
         for name, _ in model.named_modules():
@@ -223,46 +244,116 @@ class LoraCheckpoint:
                 if lora_weight_name not in model_sd:
                     model_sd[lora_weight_name] = model_sd.pop(weight_name)
 
+        # update the scale parameter names for quantized base modules
+        model_sd = self._update_scale_for_quantized_model(model_sd)
+
         # step 3: initialize LoRA adapter weights
-        lora_weights = {}
         for name, module in model.named_modules():
             if self.is_lora_module(name):
                 weight_shape = module.get_checkpoint_shape()
+                weight_shape_active = module.get_checkpoint_shape_active()
                 weight_dtype = module.get_weight_dtype()
                 weight_name = f"{name}.weight"
                 if weight_name not in model_sd:
-                    lora_weights[weight_name] = torch.zeros(
+                    self.lora_weights[weight_name] = torch.zeros(
                         *weight_shape, dtype=weight_dtype, device="cpu"
+                    )
+                    self.lora_weights_active[weight_name + "_active"] = torch.zeros(
+                        *weight_shape_active, dtype=weight_dtype, device="cpu"
                     )
 
         # step 4: load LoRA checkpoints into the LoRA weights
-        self._load_lora_weights(model, lora_weights)
+        self._load_lora_weights(model, self.ckpt_paths, self.lora_ckpts, self.lora_weights)
 
         # step 5: add LoRA adapter weights into model_sd
-        model_sd.update(lora_weights)
+        model_sd.update(self.lora_weights)
+        model_sd.update(self.lora_weights_active)
+
         return model_sd
 
-    # methods to convert adapter_ids in string to indices
-    def get_adapter_id_mapping(self):
-        # the weights of the first LoRA adapter are all zeros.
-        self.lora_adapter_id_mapping = {"0": 0}
-        if self.ckpt_paths is not None:
-            adapter_ids = self.ckpt_paths.keys()
-            for index, adapter_ids in enumerate(adapter_ids):
-                self.lora_adapter_id_mapping[adapter_ids] = index + 1
+    def update_weights_for_lora_cpu(self, model):
+        # step 1: load state dicts from ckpt paths
+        if not self.lora_ckpts_cpu:
+            self.lora_ckpts_cpu = self.load_lora_state_dicts(self.ckpt_paths_cpu)
 
-    # LoRA adapter id conversion
-    def convert_adapter_ids_to_indices(self, adapter_ids, batch_size):
-        if adapter_ids is None:
-            return torch.zeros((batch_size), dtype=torch.int32)
+        # step 2: initialize LoRA CPU adapter weights
+        for name, module in model.named_modules():
+            if self.is_lora_module(name):
+                weight_shape = module.get_checkpoint_shape()
+                weight_shape_cpu = (self.lora_config.max_cpu_loras, ) + weight_shape[1:]
+                weight_dtype = module.get_weight_dtype()
+                weight_name = f"{name}.weight"
+                self.lora_weights_cpu[weight_name] = torch.zeros(
+                    *weight_shape_cpu, dtype=weight_dtype, device="cpu"
+                )
 
-        if len(adapter_ids) != batch_size:
-            raise ValueError(
-                f"The number of LoRA adapter IDs is {len(adapter_ids)}, "
-                f"but it should equal the prompts number {batch_size},"
+        # step 3: load CPU LoRA checkpoints into the CPU LoRA weights
+        self._load_lora_weights(model, self.ckpt_paths_cpu, self.lora_ckpts_cpu, self.lora_weights_cpu)
+
+    def shard_cpu_checkpoints(self, start_rank_id, local_ranks_size, tp_deg, model, serialize_path=None):
+        sharded_lora_cpu_checkpoints = []
+
+        for rank in range(start_rank_id, start_rank_id + local_ranks_size):
+            sharded_lora_cpu_checkpoints.append(self._shard_cpu_weights(rank, tp_deg, model, self.lora_weights_cpu, self.ckpt_paths_cpu.keys(), serialize_path))
+
+        return sharded_lora_cpu_checkpoints
+
+    def _shard_cpu_weights(self, rank, tp_deg, model, checkpoint, adapter_names, serialize_path: Optional[str] = None) -> None:
+        sharded_checkpoint = checkpoint.copy()
+
+        # Shards the checkpoint to the right weight for the rank
+        shard_children(model, sharded_checkpoint, "", None, rank, tp_deg, True)
+
+        if serialize_path is not None:
+            assert len(adapter_names) > 0
+            for i, adapter_name in enumerate(adapter_names):
+                filename = f"{adapter_name}_tp{rank}_sharded_lora_cpu_checkpoint.safetensors"
+                save_dict = {}
+                for k, v in sharded_checkpoint.items():
+                    if "lora_A" in k or "lora_B" in k:
+                        save_dict[k] = v.contiguous()
+                save_file(save_dict, os.path.join(serialize_path, filename))
+
+        return sharded_checkpoint
+
+    def load_sharded_cpu_checkpoints(self, compiled_model_path, start_rank_id, local_ranks_size):
+        logger.info(
+            f"Loading presharded CPU LoRA adapter checkpoints for ranks: {start_rank_id}...{start_rank_id + local_ranks_size - 1}"
+        )
+
+        sharded_lora_cpu_weights = []
+
+        for rank in range(start_rank_id, start_rank_id + local_ranks_size):
+            sharded_lora_cpu_weights.append(self._load_rank_checkpoint(compiled_model_path, rank))
+
+        return sharded_lora_cpu_weights
+
+    def _load_rank_checkpoint(self, compiled_model_path, rank):
+        load_dict = {}
+        for _, adapter_name in enumerate(self.ckpt_paths_cpu.keys()):
+            lora_cpu_ckpt = load_file(
+                os.path.join(
+                    compiled_model_path,
+                    f"weights/{adapter_name}_tp{rank}_sharded_lora_cpu_checkpoint.safetensors",
+                )
             )
-        ret = [self.convert_adapter_id_to_index(id) for id in adapter_ids]
-        return torch.tensor(ret, dtype=torch.int32)
+            for k, v in lora_cpu_ckpt.items():
+                if "lora_A" in k or "lora_B" in k:
+                    if k not in load_dict:
+                        load_dict[k] = []
+                    load_dict[k].append(v)
+                else:
+                    load_dict[k] = v
 
-    def convert_adapter_id_to_index(self, adapter_ids):
-        return self.lora_adapter_id_mapping[adapter_ids]
+        for k, v in load_dict.items():
+            if "lora_A" in k or "lora_B" in k:
+                for _ in range(
+                    len(load_dict[k]),
+                    self.lora_config.max_cpu_loras,
+                ):
+                    load_dict[k].append(
+                        torch.zeros(load_dict[k][0].shape, dtype=load_dict[k][0].dtype)
+                    )
+                load_dict[k] = torch.stack(load_dict[k])
+
+        return load_dict

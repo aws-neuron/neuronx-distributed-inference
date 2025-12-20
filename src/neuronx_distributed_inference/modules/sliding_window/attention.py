@@ -32,6 +32,7 @@ class FlashConfig:
     attn_core_tile_size: int = 256
     should_transpose_v: bool = False
     lse_dtype: str = ""
+    windowed_context_encoding: bool = False  # if True, uses offset-ed mask for WCTE window = sliding window
 
 
 @nki.jit(mode="trace")
@@ -96,9 +97,14 @@ def _flash_attention_core(
             (par_dim(B_P_SIZE), B_F_SIZE), dtype=np.float32, buffer=nl.psum
         )  # (128, 512)
         if use_causal_mask:
-            multiplication_required_selection = (
-                q_tile_idx * B_P_SIZE >= local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE
-            )
+            if flash_config.windowed_context_encoding:
+                multiplication_required_selection = (
+                    q_tile_idx * B_P_SIZE + sliding_window >= local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE
+                )
+            else:
+                multiplication_required_selection = (
+                    q_tile_idx * B_P_SIZE >= local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE
+                )
         else:
             multiplication_required_selection = True
 
@@ -119,6 +125,9 @@ def _flash_attention_core(
             k_pos = local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE + i_q_f
             pred_causal = q_pos >= k_pos  # casual mask
             pred_sliding = k_pos > q_pos - sliding_window  # sliding window mask
+            if flash_config.windowed_context_encoding:
+                pred_causal = q_pos + sliding_window >= k_pos  # causal mask
+                pred_sliding = q_pos < k_pos  # sliding window mask
 
             # Apply causal mask
             qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
@@ -323,6 +332,9 @@ def flash_fwd(
     use_causal_mask = (
         True if left_window_size > 0 else use_causal_mask
     )  # setting sliding window assumes causal
+    # WCTE can only be used SWA
+    if config.windowed_context_encoding:
+        assert left_window_size > 0, "SWA must be turned on if WCTE is turned on."
     sliding_window = left_window_size + 1  # sliding_window includes current token
     kernel_dtype = nl.bfloat16 if mixed_precision else q.dtype
     acc_type = np.dtype(np.float32) if mixed_precision else kernel_dtype
@@ -412,10 +424,14 @@ def flash_fwd(
                         causal_mask = i * B_P_SIZE >= j * LARGE_TILE_SZ
                         sliding_mask = True
                     elif sliding_window > 0:
-                        causal_mask = i * B_P_SIZE >= j * LARGE_TILE_SZ
-                        sliding_mask = ((j + 1) * LARGE_TILE_SZ - 1) > (
-                            (i * B_P_SIZE) - sliding_window
-                        )
+                        if config.windowed_context_encoding:
+                            causal_mask = i * B_P_SIZE + sliding_window >= j * LARGE_TILE_SZ
+                            sliding_mask = ((j + 1) * LARGE_TILE_SZ - 1) > ((i * B_P_SIZE))
+                        else:
+                            causal_mask = i * B_P_SIZE >= j * LARGE_TILE_SZ
+                            sliding_mask = ((j + 1) * LARGE_TILE_SZ - 1) > (
+                                (i * B_P_SIZE) - sliding_window
+                            )
                     else:
                         casual_mask = True  # noqa: F841
                         sliding_mask = True

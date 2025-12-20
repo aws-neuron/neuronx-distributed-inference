@@ -259,6 +259,7 @@ def check_accuracy(
 class TestQwen3Moe(unittest.TestCase):
     def setUp(self):
         self.model_config = Qwen3MoeConfig(
+            _attn_implementation="eager",
             attention_bias=False,
             attention_dropout=0.0,
             decoder_sparse_step=1,
@@ -399,7 +400,7 @@ class TestQwen3Moe(unittest.TestCase):
         # Decode phase positions and masks
         decode_position_ids = torch.tensor([[context_length]], dtype=torch.int32)
         decode_attention_mask = build_4d_causal_mask(torch.tensor([[1]]))
-        decode_attention_mask_neuron = create_context_attn_mask(torch.tensor([[1]]))
+        decode_attention_mask_neuron = torch.ones(batch_size, 1, 1, context_length)
 
         # Run CPU inference for decode phase
         logger.info("Running inference on CPU model - decode phase")

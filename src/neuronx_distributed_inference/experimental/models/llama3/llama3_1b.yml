@@ -1,0 +1,18 @@
+model:
+  vocab_size: 128256
+  hidden_size: 2048
+  n_layers: 16
+  n_heads: 32
+  n_kv_heads: 8
+  head_dim: 64
+  intermediate_size: 8192
+  dtype: '${torch_dtype:bfloat16}'  # Use the torch_dtype resolver
+  rms_norm_eps: 1e-05
+  rope_theta: 500000.0
+  pad_token: 128004
+build:
+  batch_size: 1
+  sequence_length: 128
+  world_size: 32
+attention:
+  cp_degree: 4

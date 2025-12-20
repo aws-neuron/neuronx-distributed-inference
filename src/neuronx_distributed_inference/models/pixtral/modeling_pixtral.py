@@ -44,6 +44,9 @@ class PixtralInferenceConfig(ImageToTextInferenceConfig):
             metadata=metadata,
             **kwargs,
         )
+        # validate text and vision supported configs
+        self.validate_vision_model_supported_configs()
+
         if self.text_config.neuron_config.is_block_kv_layout:
             raise ValueError("Pixtral does not yet support block_kv_layout.")
         if self.text_config.neuron_config.is_prefix_caching:
@@ -63,6 +66,23 @@ class PixtralInferenceConfig(ImageToTextInferenceConfig):
             self.text_config.num_cores_per_group = calculate_num_cores_per_group(
                 num_attn_heads, num_kv_heads, self.neuron_config.tp_degree
             )
+
+    def validate_vision_model_supported_configs(self):
+        PIXTRAl_VISION_MODEL_UNSUPPORTED_NEURON_CONFIG = [
+            "sequence_parallel_enabled",
+            "flash_decoding_enabled",
+            "attn_kernel_enabled",
+            "fused_qkv",
+            "qkv_kernel_enabled",
+            "mlp_kernel_enabled",
+            "attn_block_tkg_nki_kernel_cache_update",
+            "attn_block_tkg_nki_kernel_enabled",
+        ]
+        for unsupported_config in PIXTRAl_VISION_MODEL_UNSUPPORTED_NEURON_CONFIG:
+            # attn_kernel_enabled defaults to None, and None means enabled
+            if getattr(self.vision_config.neuron_config, unsupported_config, False) is not False:
+                setattr(self.vision_config.neuron_config, unsupported_config, False)
+                logger.warning(f"Pixtral vision model does not yet support '{unsupported_config}'. Will be disabled.")
 
     def get_required_attributes(self) -> List[str]:
         # To validate if the config.json include all the configs we need in model.
@@ -308,6 +328,32 @@ class NeuronPixtralForCausalLM(NeuronBaseForImageToText):
             vision_mask=vision_mask,
         )
 
+    def get_batch_line_mm_input(self, mm_input, index):
+        if mm_input is None:
+            return None
+        elif isinstance(mm_input, list):
+            return mm_input[index]
+        elif isinstance(mm_input, torch.Tensor):
+            return mm_input[index].unsqueeze(0)
+        else:
+            raise ValueError(f"Unsupported type for mm_input:{type(mm_input)}, expecting list, tensor, or None.")
+
+    def check_empty_pixel_values(self, pixel_values):
+        print(f"supported type for pixel_values {type(pixel_values)}.")
+        if pixel_values is None:
+            return True
+        elif isinstance(pixel_values, torch.Tensor):
+            return (pixel_values.sum() == 0)
+        elif isinstance(pixel_values, list):
+            # return False (not empty) if any pixel_value has sum != 0
+            for pixel_value in pixel_values:
+                if (pixel_value.sum() != 0):
+                    return False
+            # return True (empty) if all pixel_values are empty
+            return True
+        else:
+            raise ValueError(f"Unsupported type for pixel_values {type(pixel_values)}, expecting list, tensor, or None.")
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -315,7 +361,7 @@ class NeuronPixtralForCausalLM(NeuronBaseForImageToText):
         position_ids: Optional[torch.LongTensor] = None,
         seq_ids: Optional[torch.LongTensor] = None,
         sampling_params: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[Union[torch.FloatTensor, List[torch.FloatTensor]]] = None,
         vision_mask: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[torch.FloatTensor] = None,
         adapter_ids: Optional[torch.LongTensor] = None,
@@ -327,28 +373,27 @@ class NeuronPixtralForCausalLM(NeuronBaseForImageToText):
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if (
-            (pixel_values is not None)
-            and input_ids.shape[-1] > 1
-            and pixel_values.sum() != 0
+            input_ids.shape[-1] > 1
+            and not self.check_empty_pixel_values(pixel_values)
         ):  # call vision encoder
             outputs = []
-            for i in range(input_ids.shape[0]):
+            for index in range(input_ids.shape[0]):
                 outputs.append(
                     self.forward_atomic_prefill(
-                        input_ids[i].unsqueeze(0),
-                        attention_mask[i].unsqueeze(0) if (attention_mask is not None) else attention_mask,
-                        position_ids[i].unsqueeze(0) if (position_ids is not None) else position_ids,
-                        seq_ids[i].unsqueeze(0) if (seq_ids is not None) else seq_ids,
-                        sampling_params[i].unsqueeze(0) if (sampling_params is not None) else sampling_params,
-                        pixel_values[i].unsqueeze(0) if (pixel_values is not None) else pixel_values,
-                        vision_mask[i].unsqueeze(0) if (vision_mask is not None) else vision_mask,
-                        image_sizes[i].unsqueeze(0) if (image_sizes is not None) else image_sizes,
+                        input_ids[index].unsqueeze(0),
+                        attention_mask[index].unsqueeze(0) if (attention_mask is not None) else attention_mask,
+                        position_ids[index].unsqueeze(0) if (position_ids is not None) else position_ids,
+                        seq_ids[index].unsqueeze(0) if (seq_ids is not None) else seq_ids,
+                        sampling_params[index].unsqueeze(0) if (sampling_params is not None) else sampling_params,
+                        self.get_batch_line_mm_input(pixel_values, index),
+                        self.get_batch_line_mm_input(vision_mask, index),
+                        self.get_batch_line_mm_input(image_sizes, index),
                     )
                 )
             return self.concat_causal_lm_outputs(outputs)
         else:
             pad_limit = self.get_padding_length(input_ids)
-            vision_embeddings, vision_mask = self.context_encoding_model.get_dummy_vision_inputs(
+            vision_embeddings, vision_mask = self.text_model_wrapper.get_dummy_vision_inputs(
                 config=self.text_config,
                 input_ids=input_ids,
                 n_active_tokens=pad_limit,

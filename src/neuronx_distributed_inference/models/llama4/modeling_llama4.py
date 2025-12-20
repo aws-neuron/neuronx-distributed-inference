@@ -50,6 +50,7 @@ from neuronx_distributed_inference.models.llama4.utils.encoder_utils import (
     pad_vision_embeddings,
 )
 from neuronx_distributed_inference.models.image_to_text_model_base import ImageToTextInferenceConfig, NeuronBaseForImageToText
+from neuronx_distributed_inference.models.llama4.utils.patch_llama4 import patch_llama4_text_moe_forward
 from neuronx_distributed_inference.models.model_wrapper import (CONTEXT_ENCODING_MODEL_TAG,
                                                                 TOKEN_GENERATION_MODEL_TAG,
                                                                 VISION_ENCODER_MODEL_TAG)
@@ -293,7 +294,7 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
 
             vision_embeddings = pad_vision_embeddings(vision_embeddings, pad_limit)
         else:
-            vision_embeddings, vision_mask = self.context_encoding_model.get_dummy_vision_inputs(
+            vision_embeddings, vision_mask = self.text_model_wrapper.get_dummy_vision_inputs(
                 config=self.text_config,
                 input_ids=input_ids,
                 n_active_tokens=pad_limit,
@@ -319,7 +320,12 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
     def load_hf_model(model_path, **kwargs):
         from transformers import Llama4ForConditionalGeneration
 
-        return Llama4ForConditionalGeneration.from_pretrained(model_path, **kwargs)
+        model = Llama4ForConditionalGeneration.from_pretrained(model_path, **kwargs)
+
+        # Patch an accuracy issue that affects transformers v4.54-4.56.
+        patch_llama4_text_moe_forward(model.language_model.model)
+
+        return model
 
     def to_cpu(self):
         """

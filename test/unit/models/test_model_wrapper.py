@@ -146,6 +146,7 @@ def test_long_context_mode():
     config.neuron_config.enable_long_context_mode = True
     wrapper = ModelWrapper(config, MockModel)
     assert "--internal-disable-fma-on-ios" in wrapper.compiler_args
+    assert "--disable-mixed-precision-accumulation" in wrapper.compiler_args
 
 
 def test_scratchpad_page_size():

@@ -17,6 +17,7 @@ import warnings
 from typing import List, Optional, Tuple, Union, Dict, Any
 
 import torch
+import math
 
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.modules.attention.gqa import GQA
@@ -37,10 +38,15 @@ from transformers import Qwen3MoeForCausalLM
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP, MOE_TKG_MK_INTERMEDIATE_PER_TP
+from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
-from neuronx_distributed_inference.modules.moe import initialize_moe_module
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
+from neuronx_distributed_inference.models.layer_boundary_marker import (
+    ModuleMarkerEndWrapper,
+    ModuleMarkerStartWrapper,
+)
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
@@ -94,11 +100,32 @@ def convert_state_dict_to_fused_qkv(qwen_state_dict: Dict[str, Any], cfg: Infere
     return qwen_state_dict
 
 
+def maybe_dequantize_layer(neuron_state_dict, config):
+    scale_layers = []
+    for layer_key in neuron_state_dict.keys():
+        if "_scale_inv" in layer_key:
+            scales = neuron_state_dict[layer_key]
+            scale_layers.append(layer_key)
+            fp8_layer_name = layer_key.replace("_scale_inv", "")
+            fp8_layer = neuron_state_dict[fp8_layer_name]
+            block_size = config.quantization_config["weight_block_size"]
+            scales_expanded = scales.repeat_interleave(block_size[0], dim=0).repeat_interleave(block_size[1], dim=1)
+            scaled_layer = fp8_layer.to(torch.float32) * scales_expanded.to(torch.float32)
+            neuron_state_dict[fp8_layer_name] = scaled_layer.to(config.neuron_config.torch_dtype)
+
+    # delete scale layers
+    for scale_layer in scale_layers:
+        del neuron_state_dict[scale_layer]
+
+
 def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
     """
     Helper function which converts the huggingface checkpoints to state dictionary compatible with the stucture of the neuron MoE model.
     """
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
+
+    # dequantize layers if needed
+    maybe_dequantize_layer(neuron_state_dict, config)
 
     # to facilitate rank usage in base model
     neuron_state_dict["rank_util.rank"] = torch.arange(
@@ -106,6 +133,11 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
     )
 
     for l in range(config.num_hidden_layers):  # noqa: E741
+        # To facilitate rank usage in attention
+        neuron_state_dict[f"layers.{l}.self_attn.rank_util.rank"] = torch.arange(
+            0, config.neuron_config.tp_degree, dtype=torch.int32
+        )
+
         # Rename the q_norm, k_norm names
         neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
             neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"].detach().clone()
@@ -161,6 +193,14 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
 
             del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.gate_proj.weight"]
             del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.up_proj.weight"]
+
+        # padding gate_up_proj on intermediate size
+        pad_size = getattr(config, "moe_intermediate_pad_size", 0)
+        if pad_size > 0:
+            gate_up_proj = gate_up_proj.reshape(config.num_experts, hidden_size, 2, -1)
+            # padding right on gate_up_proj: (num_experts, hidden_size, 2, intermediate_size)
+            gate_up_proj = torch.nn.functional.pad(gate_up_proj, (0, pad_size))
+            gate_up_proj = gate_up_proj.reshape(config.num_experts, hidden_size, -1)
         neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
 
         down_proj = torch.empty(
@@ -180,6 +220,11 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
             down_proj_slice = torch.narrow(down_proj, 0, e, 1)
             down_proj_slice.copy_(down_proj_weights)
             del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.down_proj.weight"]
+
+        # padding down_proj on intermediate size
+        if pad_size > 0:
+            # padding bottom on down_proj: (num_experts, intermediate_size, hidden_size)
+            down_proj = torch.nn.functional.pad(down_proj, (0, 0, 0, pad_size))
         neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
         gc.collect()
@@ -198,6 +243,50 @@ def get_rmsnorm_cls():
 
 
 class Qwen3MoeInferenceConfig(InferenceConfig):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Qwen3-MoE config has `num_experts` instead of `num_local_experts`
+        # We need to add `num_local_experts` as it is expected by `initialize_moe_module`
+        self.num_local_experts = self.num_experts
+        # Qwen3-MoE has no shared experts
+        self.n_shared_experts = 0
+        # ExpertMLPsV2 reads moe_intermediate from config.intermediate_size
+
+        # check whether need to pad intermediate size
+        self.maybe_pad_intermediate()
+
+        # enable moe_fused_nki_kernel
+        self.enable_moe_fused_nki_kernel()
+
+        self.intermediate_size = self.moe_intermediate_size
+        # We need router dtype to be FP32 for accuracy
+        self.neuron_config.router_config.dtype = torch.float32
+        # HF uses softmax (non-configurable) act for Qwen3-MoE
+        self.neuron_config.router_config.act_fn = "softmax"
+        # Set DISABLE_NUMERIC_CC_TOKEN=1 for Qwen3 MoE as a workaround
+        # for the extra add/multiple in all-gather/reduce-scatter CC ops
+        # https://github.com/pytorch/xla/pull/3825 (openxla PR https://github.com/openxla/xla/pull/7677 not accepted)
+        self.neuron_config.disable_numeric_cc_token = True
+        # Qwen3 normalizes top k affinities
+        self.neuron_config.normalize_top_k_affinities = True
+
+    def maybe_pad_intermediate(self):
+        moe_tp_degree = self.neuron_config.moe_tp_degree
+        I_TP = self.moe_intermediate_size // moe_tp_degree
+        if getattr(self.neuron_config.blockwise_matmul_config, "use_shard_on_intermediate_dynamic_while", False):
+            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP
+            if I_TP % SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP != 0:
+                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP * moe_tp_degree
+                self.moe_intermediate_pad_size = max(padded_moe_intermediate_size - self.moe_intermediate_size, 0)
+                # set moe_intermediate_size to padded size
+                self.moe_intermediate_size = padded_moe_intermediate_size
+
+    def enable_moe_fused_nki_kernel(self):
+        I_TP = self.moe_intermediate_size // self.neuron_config.moe_tp_degree
+        # if moe_fused_nki_kernel_enabled is enabled and the intermeidiate_size_per_tp is divisible by MOE_TKG_MK_INTERMEDIATE_PER_TP
+        if getattr(self.neuron_config, "moe_fused_nki_kernel_enabled", False) and I_TP % MOE_TKG_MK_INTERMEDIATE_PER_TP == 0:
+            self.moe_fused_nki_kernel_enabled = True
+
     def get_required_attributes(self) -> List[str]:
         return [
             "head_dim",
@@ -263,15 +352,7 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronQwen3MoEAttention(config=config)
-
-        self.mlp = initialize_moe_module(
-            config=config,
-            num_experts=config.num_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            hidden_act=config.hidden_act,
-        )
+        self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
@@ -282,12 +363,27 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
         )
 
+        if self.moe_fused_nki_kernel_enabled:
+            self.mlp = initialize_moe_module(
+                config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
+            )
+        else:
+            self.mlp = initialize_moe_module(
+                config=config,
+            )
+
+        self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
+        self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+        self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
+        self.moe_mask_padded_tokens = config.neuron_config.moe_mask_padded_tokens
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -307,7 +403,16 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
 
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        qkv_fused_rmsnorm = None
+        # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
+        # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
+        hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+        print("ModuleMarkerStartWrapper set!!! ")
+        if self.input_layernorm:
+            if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
+                qkv_fused_rmsnorm = self.input_layernorm
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
@@ -315,16 +420,20 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
+            rmsnorm=qkv_fused_rmsnorm,
             **kwargs,
         )
         hidden_states = residual + hidden_states
 
         # MoE
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)[0]
+        if not self.moe_fused_nki_kernel_enabled:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states, padding_mask)[0]
         hidden_states = residual + hidden_states
 
+        # End module marker
+        hidden_states = ModuleMarkerEndWrapper()(hidden_states)
         outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
 
         return outputs
@@ -390,8 +499,24 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: Qwen3MoeInferenceConfig) -> dict:
         return convert_qwen3_moe_hf_to_neuron_state_dict(state_dict, config)
 
+    # Wraps NeuronBaseForCausalLM.enable_context_encoding() to add compile_tag.
+    def enable_context_encoding(self):
+        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
+        super().enable_context_encoding()
+
+    # Wraps NeuronBaseForCausalLM.enable_token_generation() to add compile_tag.
+    def enable_token_generation(self):
+        self.compile_tag = TOKEN_GENERATION_MODEL_TAG
+        super().enable_token_generation()
+
     def get_compiler_args(self):
-        compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
+        # Set compiler optimization level based on model tag
+        if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
+            optimization_level = "-O1"
+        elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
+            # Disable Modular flow for TKG graph with EP enabled as it causes perf degradation
+            optimization_level = "-O3" if self.neuron_config.moe_ep_degree > 1 else "-O1"
+        compiler_args = f"--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer {optimization_level}"
         # Add flags for cc-overlap
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
@@ -400,4 +525,18 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
         # Enable vector-offset DGE
         compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
+        if self.neuron_config.scratchpad_page_size:
+            compiler_args += (
+                f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size} "
+            )
+
+        if self.neuron_config.attn_block_tkg_nki_kernel_enabled:
+            assert (
+                self.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention
+            ), "If using attn_block_tkg_nki_kernel_enabled for Qwen3MoE you must also use attn_block_tkg_nki_kernel_cascaded_attention"
+            # Enabled RMSNorm pre-RoPE in the Attn TKG MK
+            self.neuron_config.pre_rope_rmsnorm = True
+            # When enabling the Cascaded Attn TKG MK we will run over 5 million instructions on E2E
+            compiler_args += " --internal-max-instruction-limit=15000000"
+
         return compiler_args

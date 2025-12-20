@@ -31,13 +31,19 @@ def window_mask(batch_size: int, seq_len: int, window_size: int):
     mask = mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
     return mask
 
-def attn(q, k, v, causal, sliding_window=None):
+def attn(q, k, v, causal, sliding_window=None, wce=False):
     b, _, s, _ = q.shape
     attn = torch.einsum('bnsd,bntd->bnst', q / math.sqrt(q.shape[-1]), k)
-    if causal:
-        attn = attn.masked_fill(~causal_mask(b,s), float('-inf'))
-    if sliding_window > 0:
-        attn = attn.masked_fill(~window_mask(b,s,sliding_window), float('-inf'))
+    if wce:
+        pmask = torch.ones(sliding_window,sliding_window).triu(diagonal=1)[None, None, :, :].expand(b, 1, sliding_window, sliding_window).bool()
+        amask = torch.ones(sliding_window,sliding_window).tril(diagonal=0)[None, None, :, :].expand(b, 1, sliding_window, sliding_window).bool()
+        fmask = torch.concat((pmask,amask), dim=3)
+        attn = attn.masked_fill(~fmask, float('-inf'))
+    else:
+        if causal:
+            attn = attn.masked_fill(~causal_mask(b,s), float('-inf'))
+        if sliding_window > 0:
+            attn = attn.masked_fill(~window_mask(b,s,sliding_window), float('-inf'))
     attn = torch.nn.functional.softmax(attn, dim=-1)
     attn = torch.einsum('bnts,bnsd->bntd', attn, v)
     return attn
@@ -74,21 +80,22 @@ class TestAttention:
     
     @pytest.mark.simulation
     @pytest.mark.parametrize("bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask, \
-                              sliding_window, tile_size, kv_heads, should_transpose_v", [
-    [1, 1, 4096, 4096, 128, torch.bfloat16, True, -1, 2048, None, False],  # causal correctness
-    [1, 1, 4096, 4096, 128, torch.bfloat16, True, 1024, 2048, None, False],  # sliding correctness
-    [1, 1, 4096, 4096, 128, torch.bfloat16, False, 1024, 2048, None, False],  # test that causal flag is ignored. set to true and do sliding
+                              sliding_window, tile_size, kv_heads, should_transpose_v, wce", [
+    [1, 1, 4096, 4096, 128, torch.bfloat16, True, -1, 2048, None, False, False],  # causal correctness
+    [1, 1, 4096, 4096, 128, torch.bfloat16, True, 1024, 2048, None, False, False],  # sliding correctness
+    [1, 1, 4096, 4096, 128, torch.bfloat16, False, 1024, 2048, None, False, False],  # test that causal flag is ignored. set to true and do sliding
+    [1, 1, 1024, 2048, 128, torch.bfloat16, True, 1024, 2048, None, False, True],  # for wcte and swa
     ])
     def test_flash_attn_fwd_numerical(self, bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask, 
-                                      sliding_window, tile_size, kv_heads, should_transpose_v):
+                                      sliding_window, tile_size, kv_heads, should_transpose_v, wce):
         q = torch.randn(bs, nheads, seqlen_q, d, dtype=dtype)
         k = torch.randn(bs, nheads, seqlen_k, d, dtype=dtype)
         v = torch.randn(bs, nheads, seqlen_k, d, dtype=dtype)
 
-        config = FlashConfig(**{'seq_tile_size':tile_size, 'should_transpose_v':should_transpose_v})
+        config = FlashConfig(**{'seq_tile_size':tile_size, 'should_transpose_v':should_transpose_v, 'windowed_context_encoding':wce})
         heads = nheads if kv_heads is None else kv_heads
 
-        attn_gold = attn(q, k, v, use_causal_mask, sliding_window) # (bnsd)
+        attn_gold = attn(q, k, v, use_causal_mask, sliding_window, wce) # (bnsd)
 
         device = xm.xla_device()
         q = q.permute(0, 1, 3, 2).to(device) # (bnds)

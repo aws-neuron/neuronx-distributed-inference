@@ -11,29 +11,49 @@ class LoraServingConfig:
         self,
         max_loras: int = 1,
         max_lora_rank: int = 16,
-        max_loras_on_cpu: int = 2,
+        max_cpu_loras: int = 100,
+        batch_size: int = 1,
         target_modules: List[str] = None,
         lora_bias: str = "none",
         lora_ckpt_paths: Union[List[str], Dict[str, str]] = None,
+        lora_ckpt_paths_cpu: Union[List[str], Dict[str, str]] = None,
+        lora_ckpt_json: str = None,
         lora_memory_transpose: bool = True,
-        lora_shard_linear_layer: bool = False,
+        lora_shard_linear_layer: bool = True,
+        is_context_encoding: bool = False,
+        dynamic_multi_lora: bool = False,
+        eviction_policy: str = "lru",
+        lfu_decay_period: int = 128,
+        base_model_quantized: bool = False,
     ):
         # The maximum number of concurrent LoRA adapters in device memory
         self.max_loras = max_loras
         # The highest LoRA rank that needs to be supported
         self.max_lora_rank = max_lora_rank
         # The maximum number of LoRA adapters stored in CPU memory
-        self.max_loras_on_cpu = max_loras_on_cpu
+        self.max_cpu_loras = max_cpu_loras
+        self.batch_size = batch_size
         # List of module names or regex expression of the module names to replace with LoRA.
         self.target_modules = target_modules
         # Bias type for LoRA. Can be 'none', 'all'
         self.lora_bias = lora_bias
+        # Enable dynamic loading/unloading of LoRA adapters
+        self.dynamic_multi_lora = dynamic_multi_lora
+        self.eviction_policy = eviction_policy
+        self.lfu_decay_period = lfu_decay_period
         # Checkpoint paths for LoRA adapters
+        self.lora_ckpt_json = lora_ckpt_json
         self.lora_ckpt_paths = self.convert_ckpt_paths_to_dict(lora_ckpt_paths)
+        self.lora_ckpt_paths_cpu = (self.convert_ckpt_paths_to_dict(lora_ckpt_paths_cpu, is_cpu=True) | self.lora_ckpt_paths) if self.dynamic_multi_lora else {}
+        self._check_ckpt_config()
         # Transpose memory layout to optimize inference performance
         self.lora_memory_transpose = lora_memory_transpose
         # Shard the linear layer across TP group to reduce memory consumption
         self.lora_shard_linear_layer = lora_shard_linear_layer
+        # Tag for context_encoding_model
+        self.is_context_encoding = is_context_encoding
+        # Whether the base model is quantized
+        self.base_model_quantized = base_model_quantized
 
         lora_config_from_ckpt = self.get_lora_config_from_ckpt_paths()
         target_modules = lora_config_from_ckpt["target_modules"]
@@ -52,41 +72,91 @@ class LoraServingConfig:
             )
             self.max_lora_rank = lora_rank
 
-    def convert_ckpt_paths_to_dict(self, lora_ckpt_paths):
-        def _check_valid_ckpt_path(adapter_id, path, ckpt_path_dict):
-            # the adapter_id must be unique
-            if adapter_id in ckpt_path_dict:
-                raise ValueError(
-                    f"The adapter ID {adapter_id} appears more than once in lora_ckpt_paths. "
-                    f"Please check lora_ckpt_path and try again."
-                )
-            path = os.path.expanduser(path)
-            # we assume the LoRA adapter checkpoints are stored at local
-            if not os.path.exists(path):
-                raise FileNotFoundError(
-                    f"LoRA adapter path {path} for adapter ID {adapter_id} is not found. "
-                    f"Please check lora_ckpt_path and try again."
-                )
-            return path
+    def _expand_user_path(self, path):
+        return os.path.expanduser(path)
+
+    def _check_valid_path(self, path, adapter_id=None):
+        path = self._expand_user_path(path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"LoRA adapter path {path} for adapter ID {adapter_id} is not found. "
+                f"Please check lora_ckpt_path and try again."
+            )
+        return path
+
+    def _check_valid_dir(self, dir):
+        if not os.path.isdir(dir):
+            raise FileNotFoundError(
+                f"The LoRA checkpoint directory {dir} specified in {self.lora_ckpt_json} doesn't exist. "
+                f"Please check lora-ckpt-dir and try again."
+            )
+
+    def _check_valid_adapter_id(self, adapter_id, ckpt_path_dict):
+        # the adapter_id must be unique
+        if adapter_id in ckpt_path_dict:
+            raise ValueError(
+                f"The adapter ID {adapter_id} appears more than once in lora_ckpt_paths. "
+                f"Please check lora_ckpt_path and try again."
+            )
+
+    def _check_valid_adapter_id_path(self, adapter_id, path, ckpt_path_dict):
+        path = self._check_valid_path(path, adapter_id)
+        self._check_valid_adapter_id(adapter_id, ckpt_path_dict)
+        return path
+
+    def parse_lora_ckpts_from_json(self, is_cpu):
+        lora_ckpt_json = self.lora_ckpt_json
+        if lora_ckpt_json is None:
+            return {}
+        lora_ckpt_json = self._check_valid_path(lora_ckpt_json)
+        with open(lora_ckpt_json) as f:
+            content = json.load(f)
+            lora_ckpt_dir = content.get("lora-ckpt-dir", os.getcwd())
+            self._check_valid_dir(lora_ckpt_dir)
+            lora_ckpt_paths = content["lora-ckpt-paths-cpu"] if is_cpu else content["lora-ckpt-paths"]
 
         ckpt_path_dict = {}
+        for adapter_id, path in lora_ckpt_paths.items():
+            lora_ckpt_path = os.path.join(lora_ckpt_dir, path)
+            ckpt_path_dict[adapter_id] = self._check_valid_adapter_id_path(adapter_id, lora_ckpt_path, ckpt_path_dict)
+        return ckpt_path_dict
+
+    def convert_ckpt_paths_to_dict(self, lora_ckpt_paths, is_cpu=False):
+        ckpt_path_dict = self.parse_lora_ckpts_from_json(is_cpu)
         if lora_ckpt_paths is None:
-            logging.warning("No LoRA adapter IDs and checkpoint paths are initialized.")
+            if len(ckpt_path_dict) == 0:
+                if is_cpu:
+                    logging.warning("No LoRA CPU adapter IDs and checkpoint paths are initialized.")
+                else:
+                    logging.warning("No LoRA adapter IDs and checkpoint paths are initialized.")
             return ckpt_path_dict
 
         if isinstance(lora_ckpt_paths, dict):
             for adapter_id, path in lora_ckpt_paths.items():
-                path = _check_valid_ckpt_path(adapter_id, path, ckpt_path_dict)
-                ckpt_path_dict[adapter_id] = path
+                ckpt_path_dict[adapter_id] = self._check_valid_adapter_id_path(adapter_id, path, ckpt_path_dict)
             return ckpt_path_dict
 
         for ckpt_path in lora_ckpt_paths:
             keyvalue = ckpt_path.split(":")
             adapter_id = keyvalue[0].strip()
             path = keyvalue[1].strip()
-            path = _check_valid_ckpt_path(adapter_id, path, ckpt_path_dict)
-            ckpt_path_dict[adapter_id] = path
+            ckpt_path_dict[adapter_id] = self._check_valid_adapter_id_path(adapter_id, path, ckpt_path_dict)
         return ckpt_path_dict
+
+    def _check_ckpt_config(self):
+        num_ckpts = len(self.lora_ckpt_paths)
+        num_ckpts_cpu = len(self.lora_ckpt_paths_cpu)
+
+        # adjust number of loras based on number of checkpoints
+        if self.max_loras < num_ckpts:
+            logging.warning(f"Setting the number of LoRA adapters in HBM to {num_ckpts}.")
+            self.max_loras = num_ckpts
+
+        if self.dynamic_multi_lora and num_ckpts_cpu > self.max_cpu_loras:
+            raise ValueError(
+                f"The total number of LoRA checkpoints specified in {self.lora_ckpt_json} is {num_ckpts_cpu}, "
+                f"but the maximum number of adapters that can be hosted on CPU is {self.max_cpu_loras}."
+            )
 
     def _extract_lora_config(self, lora_adapter_config):
         if lora_adapter_config is None:
@@ -120,12 +190,18 @@ class LoraServingConfig:
         return self._extract_lora_config(lora_adapter_config)
 
     def get_lora_config_from_ckpt_paths(self):
-        if self.lora_ckpt_paths is None:
+        if self.lora_ckpt_paths is None and self.lora_ckpt_paths_cpu is None:
             raise ValueError("No LoRA checkpoint paths are set.")
+
+        if not self.dynamic_multi_lora and self.lora_ckpt_paths is None:
+            logging.warning("No LoRA adapters will be loaded into device memory.")
 
         adapters_target_modules = []
         lora_ranks = [self.max_lora_rank]
-        for path in self.lora_ckpt_paths.values():
+        lora_ckpt_paths = list(self.lora_ckpt_paths.values()) + list(
+            self.lora_ckpt_paths_cpu.values()
+        )
+        for path in lora_ckpt_paths:
             if os.path.isdir(path):
                 target_modules, lora_rank = self._extract_lora_config_from_folder(path)
             else:

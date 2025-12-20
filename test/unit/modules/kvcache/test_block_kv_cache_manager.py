@@ -537,6 +537,37 @@ def test_generate_tokengen_slot_mapping():
     assert torch.allclose(cpu_result, device_result)
 
 
+def test_generate_tokengen_slot_mapping_bs1():
+    batch_size = 1
+    num_blocks = 4
+    block_size = 32
+
+    example_inputs = [(
+        torch.zeros((batch_size, 1), dtype=torch.int32),
+        torch.zeros((batch_size, 1), dtype=torch.int32),
+        torch.zeros((batch_size, num_blocks), dtype=torch.int32),
+        torch.tensor(block_size, dtype=torch.int32)
+    )]
+
+    device_fn = build_function(generate_tokengen_slot_mapping, example_inputs)
+
+    target_slot_mapping = torch.tensor([33], dtype=torch.int32).unsqueeze(dim=1)
+    position_ids = torch.tensor([33], dtype=torch.int32).unsqueeze(dim=1)
+    block_table = torch.tensor([[0, 1, 0, 0]], dtype=torch.int32)
+
+    # Generate CPU result
+    cpu_result = generate_tokengen_slot_mapping(position_ids, target_slot_mapping, block_table, block_size)
+
+    # Generate device result
+    device_result = device_fn(position_ids, target_slot_mapping, block_table, torch.tensor(block_size, dtype=torch.int32))
+
+    assert isinstance(cpu_result, torch.Tensor)
+    assert isinstance(device_result, torch.Tensor)
+    assert cpu_result.shape == device_result.shape
+    assert cpu_result.dtype == device_result.dtype
+    assert torch.allclose(cpu_result, device_result)
+
+
 def test_generate_fusedspec_slot_mapping():
     batch_size = 4
     speculation_length = 5

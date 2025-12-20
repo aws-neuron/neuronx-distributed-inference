@@ -13,9 +13,12 @@ class DataParallelKVCacheManager(KVCacheManager):
         self.config = config
 
     def get_cache_update_index_for_seq_ids(self, seq_ids):
-        assert self.kv_cache_padding_size > 0, "kv_cache_padding_size must be > 0 for data-parallel tokengen"
-        # handle out-of-bound seq_ids
-        garbage_pos = self.kv_cache_batch_size + self.kv_cache_padding_size - 1
+        if self.kv_cache_padding_size == 0:
+            # For trn2 the KV cache kernel writes out-of-bound seq_ids to a OOBs address (self.kv_cache_batch_size)
+            garbage_pos = self.kv_cache_batch_size
+        else:
+            # handle out-of-bound seq_ids
+            garbage_pos = self.kv_cache_batch_size + self.kv_cache_padding_size - 1
 
         dp_rank = torch.div(
             self.get_rank(device=seq_ids.device),

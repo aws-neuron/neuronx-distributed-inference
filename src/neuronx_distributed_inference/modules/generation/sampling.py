@@ -249,7 +249,7 @@ class Sampler(torch.nn.Module):
     def _get_top_k_num_stages(self):
         hardware_type = hardware(get_platform_target())
         if (
-            hardware_type == hardware.TRN2
+            (hardware_type == hardware.TRN2 or hardware_type == hardware.TRN3)
             and self.neuron_config.tp_degree == self.neuron_config.world_size == 64
             and self.neuron_config.logical_nc_config == 2
         ):

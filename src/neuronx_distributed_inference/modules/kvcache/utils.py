@@ -8,6 +8,36 @@ from torch_neuronx.xla_impl.ops import xla_hlo_call
 
 from neuronx_distributed_inference.modules.custom_calls import neuron_cumsum
 
+import neuronxcc.nki.isa as nisa
+import neuronxcc.nki.language as nl
+import neuronxcc.nki as nki
+import neuronxcc.nki.typing as nt
+from neuronxcc.nki._pre_prod_kernels.util.kernel_helpers import get_program_sharding_info
+
+
+@nki.compiler.skip_middle_end_transformations
+@nki.jit(platform_target='trn2', experimental_flags='enable-mutable-parameter')
+def write_kv_cache_at_batch_kernel(K: nt.tensor, V: nt.tensor, K_prior: nt.tensor[nt.mutable], V_prior: nt.tensor[nt.mutable], batch_idx):
+    batch_idx = nl.load(batch_idx)
+
+    _, _, s, _ = K.shape
+    _, _, v_s, _ = V.shape
+    _, h, _, d = K_prior.shape
+    _, v_h, _, v_d = V_prior.shape
+    _, n_prgs, prg_id = get_program_sharding_info()
+
+    assert n_prgs == 2 or n_prgs == 1, "LNC sharding not specified"
+
+    _, i_h, i_s, i_d = nl.mgrid[:1, :h, :s, :d]
+    _, v_i_h, v_i_s, v_i_d = nl.mgrid[:1, :v_h, :v_s, :v_d]
+
+    if prg_id == 0:
+        nisa.dma_copy(src=K, dst=K_prior[batch_idx, i_h, i_s, i_d], oob_mode=nisa.oob_mode.skip)
+    if prg_id == n_prgs - 1:
+        nisa.dma_copy(src=V, dst=V_prior[batch_idx, v_i_h, v_i_s, v_i_d], oob_mode=nisa.oob_mode.skip)
+
+    return K_prior, V_prior
+
 
 def fill_prefix(cache, prefix_cache):
     if cpu_mode():

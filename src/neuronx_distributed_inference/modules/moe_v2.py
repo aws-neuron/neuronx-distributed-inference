@@ -47,10 +47,19 @@ def initialize_moe_module(
         apply_act_fn_over_topk=apply_act_fn_over_topk,
         store_transposed_weights=init_tkg_module,  # register transposed weights for TKG kernel
     )
+
+    # applies to padded checkpoints
+    hidden_size_actual = getattr(config, "original_hidden_size", None)
+    intermediate_size_actual = getattr(config, "original_intermediate_size", None)
+
     expert_mlps = ExpertMLPsV2(
         routed_experts_mlp_config=RoutedExpertsMLPOpsConfig(num_experts=config.num_local_experts,
                                                             hidden_size=config.hidden_size,
                                                             intermediate_size=config.intermediate_size,
+                                                            hidden_size_actual=hidden_size_actual,
+                                                            intermediate_size_actual=intermediate_size_actual,
+                                                            is_hidden_dim_shuffled=config.neuron_config.is_hidden_dim_shuffled,
+                                                            is_intermediate_dim_shuffled=config.neuron_config.is_intermediate_dim_shuffled,
                                                             top_k=config.num_experts_per_tok,
                                                             hidden_act=config.hidden_act,
                                                             bias=experts_bias,
@@ -58,6 +67,11 @@ def initialize_moe_module(
                                                             glu_type=config.neuron_config.glu_type,
                                                             hidden_act_scaling_factor=config.neuron_config.hidden_act_scaling_factor,
                                                             hidden_act_bias=config.neuron_config.hidden_act_bias,
+                                                            use_index_calc_kernel=config.neuron_config.use_index_calc_kernel,
+                                                            gate_clamp_upper_limit=config.neuron_config.gate_clamp_upper_limit,
+                                                            gate_clamp_lower_limit=config.neuron_config.gate_clamp_lower_limit,
+                                                            up_clamp_upper_limit=config.neuron_config.up_clamp_upper_limit,
+                                                            up_clamp_lower_limit=config.neuron_config.up_clamp_lower_limit,
                                                             early_expert_affinity_modulation=config.neuron_config.early_expert_affinity_modulation,
                                                             normalize_top_k_affinities=config.neuron_config.normalize_top_k_affinities,
                                                             enable_spmd_rank=config.neuron_config.blockwise_matmul_config.parallelize_token_to_block_mapping
@@ -94,6 +108,8 @@ def initialize_moe_module(
             router_topk_kernel_enabled=config.neuron_config.router_topk_nki_kernel_enabled,
             expert_mlp_kernel_enabled=config.neuron_config.expert_mlp_nki_kernel_enabled,
             shared_mlp_kernel_enabled=config.neuron_config.shared_mlp_nki_kernel_enabled,
+            norm_topk_prob=config.neuron_config.normalize_top_k_affinities,
+            is_mxfp4_compute=config.neuron_config.is_mxfp4_compute,
         )
     else:
         tkg_config = None
@@ -104,6 +120,7 @@ def initialize_moe_module(
         rmsnorm=rmsnorm,
         sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
         return_expert_index=config.neuron_config.return_expert_index,
+        return_router_logits=config.neuron_config.return_router_logits,
         sequence_dimension=1,
         init_tkg_module=init_tkg_module,
         tkg_config=tkg_config,

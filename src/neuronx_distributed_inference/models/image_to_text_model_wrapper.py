@@ -50,24 +50,6 @@ class ImageToTextModelWrapper(ModelWrapper):
             model_init_kwargs=model_init_kwargs,
         )
 
-        # init dummy vision inputs embeddings cache
-        self.dummy_vision_inputs_cache = {}
-        for bucket in self.neuron_config.buckets:
-            n_active_tokens = (
-                bucket
-                if self.neuron_config.bucket_n_active_tokens
-                else self.neuron_config.n_active_tokens
-            )
-            input_ids = torch.zeros(
-                (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
-            )
-            self.get_dummy_vision_inputs(
-                config=self.config,
-                input_ids=input_ids,
-                n_active_tokens=n_active_tokens,
-                fill_value=(n_active_tokens - 1)
-            )
-
     # pad the inputs up to the compiled batch size in the end
     def pad_helper(self, tensor, pad_type="fill_0", batch_sort_indices=None):
         """
@@ -230,32 +212,10 @@ class ImageToTextModelWrapper(ModelWrapper):
             logits, *kv_cache = outputs
             return [torch.index_select(logits, 0, seq_ids), *kv_cache]
 
-    def get_dummy_vision_inputs(self, config, input_ids, n_active_tokens, fill_value):
-        """Creates dummy vision embeddings and masks for image-to-text models.
-        The cache will perform the following:
-            1. Given a key of (input_batch_size, n_active_tokens, fill_value)
-            2. If key already in cache, return corresponding (vision_embeddings, vision_mask)
-            3. If not in cache, construct (vision_embeddings, vision_mask) and store in the cach to reuse
-
-        Note: n_active_tokens are expected to be already padded to the nearest text bucket. Therefore, the cache will contain an entry for every bucket.
-
-        Args:
-            config: Model configuration containing hidden size and neuron config.
-            input_ids: Input tensor with shape [batch_size, sequence_length].
-            n_active_tokens: Number of active vision tokens to generate, padded to the nearest text bucket.
-            fill_value: Value to fill the vision mask with.
-
-        Returns:
-            Tuple of (vision_embeddings, vision_mask) where:
-            - vision_embeddings: Tensor of zeros with appropriate shape and dtype.
-            - vision_mask: Tensor filled with fill_value or zeros based on input sequence length.
-        """
+    @staticmethod
+    def get_dummy_vision_inputs(config, input_ids, n_active_tokens, fill_value):
         input_batch_size, input_sequence_len = input_ids.shape[0], input_ids.shape[-1]
         if input_sequence_len > 1:
-            dummy_vision_inputs_key = (input_batch_size, n_active_tokens, fill_value)
-            if dummy_vision_inputs_key in self.dummy_vision_inputs_cache:
-                return self.dummy_vision_inputs_cache[dummy_vision_inputs_key]
-            # Re-generate dummy vision embeddings cache
             vision_embeddings = torch.zeros(
                 input_batch_size,
                 n_active_tokens,
@@ -271,8 +231,6 @@ class ImageToTextModelWrapper(ModelWrapper):
                 fill_value=fill_value,
                 dtype=torch.int32
             )
-            # Populate dummy vision embeddings cache
-            self.dummy_vision_inputs_cache[dummy_vision_inputs_key] = (vision_embeddings, vision_mask)
         else:
             vision_embeddings = torch.zeros((0), dtype=config.neuron_config.torch_dtype)
             vision_mask = torch.zeros((0), dtype=torch.bool)

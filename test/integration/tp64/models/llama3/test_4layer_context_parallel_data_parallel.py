@@ -116,23 +116,6 @@ NEURON_CONFIG_CP8_DP4 = NeuronConfig(
     torch_dtype=torch.float32,
 )
 
-NEURON_CONFIG_CP8_DP8 = NeuronConfig(
-    tp_degree=64,
-    cp_degree=16,
-    attention_dp_degree=8,
-    batch_size=8,
-    ctx_batch_size=1,
-    tkg_batch_size=8,
-    max_context_length=128,
-    seq_len=128,
-    sequence_parallel_enabled=True,
-    logical_nc_config=2,
-    attn_kernel_enabled=False,
-    is_continuous_batching=True,
-    fused_qkv=True,
-    torch_dtype=torch.float32,
-)
-
 NEURON_CONFIG_CP16_DP8 = NeuronConfig(
     tp_degree=64,
     cp_degree=16,
@@ -200,6 +183,7 @@ NEURON_CONFIG_CP4_DP4_TKG_ATTN_KERNEL = NeuronConfig(
         (NEURON_CONFIG_CP16_DP4, 8, 288, 1494, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE),
         (NEURON_CONFIG_CP16_DP4, 4, 308, 1254, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE), # TP 4 CTE, TP 16 Decode, 16 copies of KV in prefill, 16 copies needed in decode
         pytest.param(NEURON_CONFIG_CP8_DP8, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
+        pytest.param(NEURON_CONFIG_CP8_DP8_WITHOUT_SP, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
         pytest.param(NEURON_CONFIG_CP8_DP4, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
         pytest.param(NEURON_CONFIG_CP16_DP8, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
         pytest.param(NEURON_CONFIG_CP16_DP8_MULTI_BATCH, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
