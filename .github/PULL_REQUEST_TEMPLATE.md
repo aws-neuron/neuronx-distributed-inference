@@ -1,12 +1,14 @@
 ## Description
 
-<!-- Provide a brief description of your contribution -->
+*Provide a brief description of your contribution*
 
 ## Model Information
 
-**Model Name:** <!-- e.g., Llama 3.3 -->
-**Model Architecture:** <!-- e.g., Decoder-only transformer -->
-**Purpose:** <!-- e.g., Text generation, image-to-text, etc. -->
+**Model Name:** *e.g., Llama 3.3*
+
+**Model Architecture:** *e.g., Decoder-only transformer*
+
+**Purpose:** *e.g., Text generation, image-to-text, etc.*
 
 ## Checklist
 
@@ -54,34 +56,33 @@ Confirm your contribution follows this structure:
 
 **How did you test this model?**
 
-<!-- Describe your testing approach, instance types used, and any specific configurations -->
+*Describe your testing approach, instance types used, and any specific configurations*
 
 **Test Results:**
 
-<!-- Paste relevant test output or link to test runs -->
+*Paste relevant test output or link to test runs*
 
 ## Compatibility
 
 **Tested with:**
-- **Neuron SDK Version(s):** <!-- e.g., 2.24 -->
-- **Instance Type(s):** <!-- e.g., Trn1, Inf2 -->
-- **PyTorch Version:** <!-- if applicable -->
+- **Neuron SDK Version(s):** *e.g., 2.24*
+- **Instance Type(s):** *e.g., Trn1, Inf2*
+- **PyTorch Version:** *if applicable*
 
 ## Additional Information
 
-<!-- Any other relevant information about the model, known limitations, performance characteristics, or special requirements -->
+*Any other relevant information about the model, known limitations, performance characteristics, or special requirements*
 
 ## Related Issues
 
-<!-- Link any related issues or discussions -->
-Closes #
+*Link any related issues or discussions*
 
 ## vLLM Integration
 
 - [ ] This model is intended for use with vLLM
 - [ ] Documentation includes vLLM registration instructions
 
-<!-- For vLLM integration details, see: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/developer_guides/onboarding-models.html#nxdi-onboarding-models-vllm -->
+*For vLLM integration details, see: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/developer_guides/onboarding-models.html#nxdi-onboarding-models-vllm*
 
 ---
 
