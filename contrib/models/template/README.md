@@ -70,7 +70,7 @@ This matrix shows which Neuron SDK versions and instance types are tested with t
 
 ## Testing
 
-The following command runs a set of end-to-end integration tests that compile the model and run it on Neuron to validate that it’s accurate and performant.
+The following command runs a set of end-to-end integration tests that compile the model and run it on Neuron to validate that it’s accurate.
 
 ```
 pytest contrib/models/template/test/test_model.py --capture=tee-sys

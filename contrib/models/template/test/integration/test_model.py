@@ -1,17 +1,13 @@
 """
-This sample test script demonstrates how to validate model accuracy and performance for Neuron
+This sample test script demonstrates how to validate model accuracy for Neuron
 modeling code that works with a Huggingface checkpoint (such as Llama3.2 1B).
 
 To validate accuracy, this test script uses logit validation, which compares output logits against
 expected logits. You can provide expected logits from generating on GPU, or you can let the logit
 validation tool generate expected logits on CPU.
 
-To validate performance, this test script runs the NxDI benchmarking API, which reports the latency
-and throughput for the model and each sub-model (such as context encoding and token generation).
-The test script validates that the time-to-first-token (TTFT) and throughput meet given thresholds.
-
 Note that for larger models and larger sequence lengths, this script takes a longer amount of time
-to check accuracy and performance. By default, during logit validation, NxDI runs the HuggingFace
+to check accuracy. By default, during logit validation, NxDI runs the HuggingFace
 transformers model on CPU, which takes awhile for larger models. To save time, you can save the
 and reuse the expected outputs by passing `expected_logits` to `check_accuracy_logits`.
 
@@ -28,7 +24,6 @@ from transformers import AutoTokenizer, GenerationConfig
 from neuronx_distributed_inference.models.config import NeuronConfig
 from neuronx_distributed_inference.models.llama.modeling_llama import LlamaInferenceConfig, NeuronLlamaForCausalLM
 from neuronx_distributed_inference.utils.accuracy import check_accuracy_logits
-from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 from neuronx_distributed_inference.utils.exceptions import LogitMatchingValidationError
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 
@@ -40,18 +35,18 @@ NUM_TOKENS_TO_CHECK = 256
 torch.manual_seed(0)
 
 @pytest.mark.parametrize(
-    "batch_size, seq_len, ttft_threshold, throughput_threshold",
+    "batch_size, seq_len,"
     [
-        (1, 128, 4.94, 524),
-        (4, 128, 10.68, 1203),
-        (8, 128, 17.16, 1866),
-        (1, 8192, 71.06, 388),
-        (4, 8192, 257.86, 736),
-        (1, 32768, 363.20, 247),
+        (1, 128),
+        (4, 128),
+        (8, 128),
+        (1, 8192),
+        (4, 8192),
+        (1, 32768),
     ]
 )
-def test_model_accuracy_and_performance(batch_size, seq_len, ttft_threshold, throughput_threshold):
-    print(f"Testing model with parameters: {batch_size=}, {seq_len=}, {ttft_threshold=}, {throughput_threshold=}")
+def test_model_accuracy(batch_size, seq_len):
+    print(f"Testing model with parameters: {batch_size=}, {seq_len=}")
 
     # Initialize configs and tokenizer.
     generation_config = GenerationConfig.from_pretrained(
@@ -92,8 +87,4 @@ def test_model_accuracy_and_performance(batch_size, seq_len, ttft_threshold, thr
         print(e)
         raise e
 
-    # Check that the performance is within 10% of defined thresholds.
-    benchmark_report = benchmark_sampling(model, generation_config=generation_config)
-    assert benchmark_report["context_encoding_model"]["latency_ms_p50"] < ttft_threshold * 1.1
-    assert benchmark_report["token_generation_model"]["throughput"] < throughput_threshold * 1.1
-    print(f"Test passed for parameters: {batch_size=}, {seq_len=}, {ttft_threshold=}, {throughput_threshold=}")
+    print(f"Test passed for parameters: {batch_size=}, {seq_len=}")

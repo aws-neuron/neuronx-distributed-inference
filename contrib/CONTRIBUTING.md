@@ -28,7 +28,8 @@ Each model has a README, a source folder, and a test folder. The README has info
 
 We encourage you to create a PR to contribute modeling code. This PR should include the following:
 
-1. At least one test that evaluates the accuracy and performance of the model. We provide a sample test script (`test_model.py`) that you can use as a starting point. This sample test script uses logit validation to validate accuracy. This test script also benchmarks the model and compares the time-to-first-token (TTFT) and throughput against given thresholds.
+1. At least one test that evaluates the accuracy of the model. We provide a sample test script (`test_model.py`) that you can use as a starting point. This sample test script uses logit validation to validate accuracy.
+
 2. A README that includes information about the model. This README must include the following:
     1. A usage example.
     2. A compatibility matrix that shows what Neuron instance types and Neuron SDK versions that this model is tested with.
