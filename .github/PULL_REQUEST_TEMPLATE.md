@@ -1,3 +1,5 @@
+*Note: The below template includes items meant for model contributions only. For other contributions such as bug fixes, features, etc., only fill out the relevant portions of the form.*
+
 ## Description
 
 *Provide a brief description of your contribution*
@@ -54,7 +56,7 @@ Confirm your contribution follows this structure:
 
 ## Testing
 
-**How did you test this model?**
+**How did you test this change?**
 
 *Describe your testing approach, instance types used, and any specific configurations*
 
@@ -72,7 +74,7 @@ Confirm your contribution follows this structure:
 
 ## Additional Information
 
-*Any other relevant information about the model, known limitations, performance characteristics, or special requirements*
+*Any other relevant information about the change, known limitations, performance characteristics, or special requirements*
 
 ## Related Issues
 
@@ -80,7 +82,7 @@ Confirm your contribution follows this structure:
 
 ## vLLM Integration
 
-- [ ] This model is intended for use with vLLM
+- [ ] This model/feature is intended for use with vLLM
 - [ ] Documentation includes vLLM registration instructions
 
 *For vLLM integration details, see: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/developer_guides/onboarding-models.html#nxdi-onboarding-models-vllm*
