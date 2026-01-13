@@ -407,7 +407,6 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
         # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
         hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-        print("ModuleMarkerStartWrapper set!!! ")
         if self.input_layernorm:
             if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
                 qkv_fused_rmsnorm = self.input_layernorm
