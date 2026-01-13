@@ -67,7 +67,8 @@ Confirm your contribution follows this structure:
 **Tested with:**
 - **Neuron SDK Version(s):** *e.g., 2.24*
 - **Instance Type(s):** *e.g., Trn1, Inf2*
-- **PyTorch Version:** *if applicable*
+- **PyTorch Version:** *e.g., 2.9.1
+- **Python Version:** *e.g., 3.10.0
 
 ## Additional Information
 
