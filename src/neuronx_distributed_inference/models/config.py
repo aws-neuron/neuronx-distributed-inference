@@ -36,7 +36,7 @@ CHUNKED_ATTENTION_SUPPORTED_NEURON_CONFIG = {
 LONG_CONTEXT_SCRATCHPAD_PAGE_SIZE = 1024
 
 # shard-on-I dimension per tp, intermediate size needs to be divisible by it
-SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP = 256
+SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP = 256
 
 # Non All-expert MoE TKG MK currently only support intermediate dim to be multiples of 128
 MOE_TKG_MK_INTERMEDIATE_PER_TP = 128
