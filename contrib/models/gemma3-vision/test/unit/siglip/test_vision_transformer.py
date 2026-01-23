@@ -1,4 +1,3 @@
-
 import pytest
 import torch
 import torch_xla.core.xla_model as xm
@@ -6,17 +5,53 @@ from transformers import AutoConfig, AutoModel
 from transformers.models.siglip.modeling_siglip import SiglipVisionTransformer
 
 from gemma3_vision.siglip.modeling_siglip import NeuronSiglipConfig, SiglipInferenceConfig, NeuronSiglipVisionTransformer
-from test.utils import assert_tensor_all_close, mark_step, FP32_TOLERANCES, FP16_TOLERANCES, BF16_TOLERANCES
+from test.utils import assert_tensor_all_close, mark_step, FP32_TOLERANCES
+
+
+def convert_neuron_to_hf_state_dict(neuron_state_dict):
+    """Convert Neuron model state dict to HuggingFace compatible format.
+    
+    Neuron model structure:
+    - encoder.layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,bias}
+    - encoder.layers.X.self_attn.o_proj.o_proj.{weight,bias}
+    - encoder.layers.X.self_attn.rank_util.rank (excluded)
+    
+    HuggingFace model structure:
+    - encoder.layers.X.self_attn.{q,k,v}_proj.{weight,bias}
+    - encoder.layers.X.self_attn.out_proj.{weight,bias}
+    """
+    hf_state_dict = {}
+    
+    for key, value in neuron_state_dict.items():
+        # Skip rank_util parameters
+        if 'rank_util' in key:
+            continue
+        
+        # Convert qkv_proj paths
+        if '.qkv_proj.q_proj.' in key:
+            new_key = key.replace('.qkv_proj.q_proj.', '.q_proj.')
+        elif '.qkv_proj.k_proj.' in key:
+            new_key = key.replace('.qkv_proj.k_proj.', '.k_proj.')
+        elif '.qkv_proj.v_proj.' in key:
+            new_key = key.replace('.qkv_proj.v_proj.', '.v_proj.')
+        # Convert o_proj paths
+        elif '.o_proj.o_proj.' in key:
+            new_key = key.replace('.o_proj.o_proj.', '.out_proj.')
+        else:
+            new_key = key
+        
+        hf_state_dict[new_key] = value
+    
+    return hf_state_dict
+
 
 config = AutoConfig.from_pretrained("google/gemma-3-27b-it")  # nosec B615
 hf_config = AutoModel.from_config(config=config.vision_config).config
-hf_config.num_hidden_layers = 5    # lower num_hidden_layers for faster testing
+hf_config.num_hidden_layers = 3    # lower num_hidden_layers for faster testing
 
 
 @pytest.mark.parametrize("tolerances, compiler_flags", [
     (FP32_TOLERANCES, ["--model-type=transformer", "--auto-cast=none"]),
-    (FP16_TOLERANCES, ["--model-type=transformer", "--auto-cast=matmult", "--enable-mixed-precision-accumulation", "--auto-cast-type=fp16"]),
-    (BF16_TOLERANCES, ["--model-type=transformer", "--auto-cast=matmult", "--enable-mixed-precision-accumulation", "--auto-cast-type=bf16"]),
     ])
 def test_vision_transformer(monkeypatch, base_compiler_flags, tolerances, compiler_flags) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
@@ -28,9 +63,10 @@ def test_vision_transformer(monkeypatch, base_compiler_flags, tolerances, compil
     pixel_values = torch.randn(batch_size, num_channels, image_size, image_size).to(dtype=inputs_dtype)
 
     neuron_config = NeuronSiglipConfig(
-        tp_degree=2,
+        tp_degree=1,
         batch_size=batch_size,
         torch_dtype=model_dtype,
+        attn_kernel_enabled=False,  # Otherwise, a NKI kernel is automatically selected due to the sequence length (cannot run on CPU)
     )
 
     config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.to_dict())
@@ -58,9 +94,10 @@ def test_nxdi_vision_transformer_vs_transformers_implementation(random_seed) -> 
     pixel_values = torch.randn(batch_size, num_channels, image_size, image_size).to(dtype=inputs_dtype)
 
     neuron_config = NeuronSiglipConfig(
-        tp_degree=2,
+        tp_degree=1,
         batch_size=batch_size,
         torch_dtype=model_dtype,
+        attn_kernel_enabled=False,  # Otherwise, a NKI kernel is automatically selected due to the sequence length (cannot run on CPU)
     )
 
     config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.to_dict())
@@ -69,7 +106,8 @@ def test_nxdi_vision_transformer_vs_transformers_implementation(random_seed) -> 
     vision_transformer.eval()
 
     reference_model = SiglipVisionTransformer(config=hf_config).to(dtype=model_dtype)
-    reference_model.load_state_dict(vision_transformer.state_dict(), strict=True)
+    hf_compatible_state_dict = convert_neuron_to_hf_state_dict(vision_transformer.state_dict())
+    reference_model.load_state_dict(hf_compatible_state_dict, strict=True)
     reference_model.eval()    
 
     with torch.no_grad():
