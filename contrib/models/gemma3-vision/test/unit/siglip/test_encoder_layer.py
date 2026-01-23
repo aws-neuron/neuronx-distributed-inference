@@ -8,7 +8,7 @@ from transformers import AutoConfig, AutoModel
 from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
 
 from gemma3_vision.siglip.modeling_siglip import NeuronSiglipConfig, SiglipInferenceConfig, NeuronSiglipEncoderLayer
-from test.utils import assert_tensor_all_close, mark_step, FP32_TOLERANCES, FP16_TOLERANCES, BF16_TOLERANCES
+from test.utils import assert_tensor_all_close, mark_step, FP32_TOLERANCES
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)

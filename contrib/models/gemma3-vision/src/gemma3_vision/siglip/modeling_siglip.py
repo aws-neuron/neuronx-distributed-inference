@@ -224,7 +224,8 @@ class NeuronSiglipMultiheadAttention(NeuronSiglipAttention):
         bsz, tgt_len, embed_dim = query.size() 
 
         # get query proj
-        query_states = self.q_proj(query) * self.scale
+        qkv_proj = self.get_qkv_proj()
+        query_states = qkv_proj.q_proj(query) * self.scale
         key_states = self._shape(self.k_proj(key), -1, bsz)
         value_states = self._shape(self.v_proj(value), -1, bsz)
 
