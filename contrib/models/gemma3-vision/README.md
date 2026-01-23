@@ -1,77 +1,207 @@
-# Contrib Model Example/Template: Llama (Text)
+# Gemma3-Vision Model
 
-Support for Llama text models from the Llama 2 and Llama 3 collections.
+Support for Google Gemma3-Vision VLM (Vision-Language Model) based on the HuggingFace Transformers Gemma3 architecture with SigLIP vision encoder.
+
+## Architecture
+
+Gemma3-Vision is a multimodal model that combines:
+- **Text Model**: Gemma3 language model with sliding window attention
+- **Vision Encoder**: SigLIP vision transformer with average pooling
+- **Multimodal Projector**: Linear projection to align vision and text spaces
+
+The model uses a dual configuration architecture with separate NeuronConfig instances for text and vision components.
 
 ## Usage
 
-```
-from transformers import AutoTokenizer, GenerationConfig
+### Text + Image Generation
 
-from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
-from neuronx_distributed_inference.models.llama.modeling_llama import LlamaInferenceConfig, NeuronLlamaForCausalLM
-from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
+```python
+import torch
+from transformers import AutoTokenizer, AutoProcessor, GenerationConfig
+from PIL import Image
 
-model_path = "/home/ubuntu/models/Llama-3.2-1B/"
-compiled_model_path = "/home/ubuntu/neuron_models/Llama-3.2-1B/"
-
-prompts = ["The color of the sky is"]
-
-# Init Neuron model, HuggingFace tokenizer, and HuggingFace generation config.
-neuron_config = NeuronConfig(
-    tp_degree=32,
-    batch_size=1,
-    max_context_length=128,
-    seq_len=128,
-    on_device_sampling_config=OnDeviceSamplingConfig(),
+from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.llama4.utils.input_processor import (
+    prepare_generation_inputs_hf
 )
-config = LlamaInferenceConfig(
-    neuron_config,
+from neuronx_distributed_inference.utils.hf_adapter import (
+    load_pretrained_config,
+    HuggingFaceGenerationAdapter,
+)
+
+from gemma3_vision import (
+    NeuronGemma3ForCausalLM,
+    Gemma3InferenceConfig,
+)
+
+model_path = "/home/ubuntu/models/google/gemma-3-27b-it/"
+compiled_model_path = "/home/ubuntu/neuron-models/gemma-3-27b-it/"
+image_path = "/path/to/image.jpg"
+
+# Create dual configs
+text_config = NeuronConfig(
+    tp_degree=8,
+    batch_size=1,
+    seq_len=2048,
+    torch_dtype=torch.bfloat16,
+    fused_qkv=True,
+    attn_kernel_enabled=True,
+    enable_bucketing=True,
+    context_encoding_buckets=[2048],
+    token_generation_buckets=[2048],
+    is_continuous_batching=True,
+    ctx_batch_size=1,
+)
+
+vision_config = NeuronConfig(
+    tp_degree=8,
+    batch_size=1,
+    seq_len=2048,
+    torch_dtype=torch.bfloat16,
+    fused_qkv=False,  # SigLIP requires separate QKV
+    attn_kernel_enabled=True,
+    enable_bucketing=True,
+    buckets=[1],  # Auto-bucketing for vision
+    is_continuous_batching=True,
+    ctx_batch_size=1,
+)
+
+# Initialize model
+config = Gemma3InferenceConfig(
+    text_neuron_config=text_config,
+    vision_neuron_config=vision_config,
     load_config=load_pretrained_config(model_path),
 )
-model = NeuronLlamaForCausalLM(model_path, config)
+
+model = NeuronGemma3ForCausalLM(model_path, config)
 model.compile(compiled_model_path)
 model.load(compiled_model_path)
 
+# Prepare inputs
 tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
+processor = AutoProcessor.from_pretrained(model_path)
 generation_config = GenerationConfig.from_pretrained(model_path)
 
-# Run generation with HuggingFaceGenerationAdapter.
+text_prompt = "Describe this image"
+input_ids, attention_mask, pixel_values, vision_mask = prepare_generation_inputs_hf(
+    text_prompt, image_path, processor, 'user', config
+)
+
+# Generate
 generation_model = HuggingFaceGenerationAdapter(model)
-inputs = tokenizer(prompts, padding=True, return_tensors="pt")
 outputs = generation_model.generate(
-    inputs.input_ids,
+    input_ids,
     generation_config=generation_config,
-    attention_mask=inputs.attention_mask,
-    max_length=model.neuron_config.max_length,
+    attention_mask=attention_mask,
+    pixel_values=pixel_values,
+    vision_mask=vision_mask.to(torch.bool),
+    max_new_tokens=100,
 )
-output_tokens = tokenizer.batch_decode(
-    outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
+
+output_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+print(output_text[0])
+```
+
+### Text-Only Generation
+
+```python
+# Same setup as above, but prepare inputs without image
+text_prompt = "What is the capital of France?"
+input_ids, attention_mask, _, _ = prepare_generation_inputs_hf(
+    text_prompt, None, processor, 'user'
 )
-print("Generated outputs:")
-for i, output_token in enumerate(output_tokens):
-    print(f"Output {i}: {output_token}")
+
+outputs = generation_model.generate(
+    input_ids,
+    generation_config=generation_config,
+    attention_mask=attention_mask,
+    max_new_tokens=100,
+)
+
+output_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+print(output_text[0])
 ```
 
 ## Compatibility Matrix
 
-This matrix shows which Neuron SDK versions and instance types are tested with this model.
+### Neuron SDK Versions and Instance Types
 
-|Instance/Version	|2.24	|2.23 and earlier   |
+|Instance/Version	|2.27.1+	|2.26 and earlier   |
 |---	|---	|---	|
-|Trn2	|Not tested	|Not tested	|
-|Trn1	|Working	|Not tested	|
-|Inf2	|Not working	|Not tested	|
+|Trn2	|Working	|Not tested	|
+|Trn1	|Working	|Not compatible (API breaking changes)	|
+|Inf2	|Working	|Not tested	|
+
+### Supported Features
+
+|Feature	|Status|Notes|
+|---	|---	|---	|
+|Tensor Parallelism	|:white_check_mark:	|Tested with TP=8|
+|Sequence Parallelism	|:x:	|Not supported|
+|Context Parallelism	|:x:	|Not supported|
+|Expert Parallelism	|Not applicable	||
+|QKV Fusion	|:white_check_mark:	|Text model only|
+|Continuous Batching	|:white_check_mark:	||
+|On-Device Sampling	|:white_check_mark:	||
+|Async Mode	|:white_check_mark:	||
+|Bucketing	|:white_check_mark:	|Dual bucketing for text/vision|
+|Weight Quantization	|:white_check_mark:	|Excludes vision components|
+|Activation Quantization	|:x:	|Not supported|
+|KV Cache Quantization	|:x:	|Not supported|
+|Flash Decoding	|:x:	|Not supported|
+|Prefix Caching	|:x:	|Not supported|
+|Paged Attention	|:x:	|Not supported|
+|Chunked Prefill	|:x:	|Not supported|
+|Speculation	|:x:	|Not supported|
+|Attention Kernels	|:white_check_mark:	|Context encoding only|
+
+## Architecture Details
+
+### Dual Configuration
+
+Gemma3-Vision requires separate NeuronConfig instances for text and vision:
+
+- **Text Config**: `fused_qkv=True`, bucketing for variable sequence lengths
+- **Vision Config**: `fused_qkv=False`, auto-bucketing from 1024 to seq_len
+
+This is necessary because SigLIP vision encoder has different architectural requirements than the Gemma3 text model.
+
+### Vision Encoder
+
+The vision encoder uses:
+- **SigLIP**: Vision transformer with layer normalization
+- **Average Pooling**: Reduces patch embeddings to fixed number of tokens
+- **Linear Projection**: Projects vision embeddings to text model's hidden size
+
+### Quantization
+
+When using quantization, the following components must be excluded:
+- `multi_modal_projector`: Vision-to-text projection layer
+- `vision_tower`: Entire SigLIP encoder
+- All `self_attn` layers in the language model
+- `lm_head`: Final output projection
+
+### Compiler Optimization Levels
+
+- Vision encoder: `-O1` (faster compilation)
+- Context encoding: `-O1` (balanced)
+- Token generation: `-O2` (maximum optimization)
 
 ## Example Checkpoints
 
-* https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct
-* https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct
-* https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct
+* https://huggingface.co/google/gemma-3-27b-it
 
 ## Testing
 
-The following command runs a set of end-to-end integration tests that compile the model and run it on Neuron to validate that it’s accurate.
+Run integration tests to validate model accuracy and performance:
 
+```bash
+export PYTHONPATH="${PYTHONPATH}:${PWD}/contrib/models/gemma3-vision/src"
+pytest contrib/models/gemma3-vision/test/integration/test_model.py --capture=tee-sys
 ```
-pytest contrib/models/template/test/test_model.py --capture=tee-sys
+
+Run all tests (integration + unit):
+
+```bash
+pytest contrib/models/gemma3-vision/test/ --capture=tee-sys
 ```
