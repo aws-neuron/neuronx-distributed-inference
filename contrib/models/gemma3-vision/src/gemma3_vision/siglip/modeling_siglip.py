@@ -14,42 +14,10 @@ from neuronx_distributed_inference.modules.attention.attention_base import Neuro
   
 from gemma3_vision.siglip.layers import OutputChannelParallelConv2d
 
-"""
-[Model Architecture] 
-SiglipVisionModel(
-  (vision_model): SiglipVisionTransformer(
-    (embeddings): SiglipVisionEmbeddings(
-      (patch_embedding): Conv2d(3, 1152, kernel_size=(14, 14), stride=(14, 14), padding=valid)
-      (position_embedding): Embedding(4096, 1152)
-    )
-    (encoder): SiglipEncoder(
-      (layers): ModuleList(
-        (0-26): 27 x SiglipEncoderLayer(
-          (layer_norm1): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
-          (self_attn): SiglipAttention(
-            (k_proj): Linear(in_features=1152, out_features=1152, bias=True)
-            (v_proj): Linear(in_features=1152, out_features=1152, bias=True)
-            (q_proj): Linear(in_features=1152, out_features=1152, bias=True)
-            (out_proj): Linear(in_features=1152, out_features=1152, bias=True)
-          )
-          (layer_norm2): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
-          (mlp): SiglipMLP(
-            (activation_fn): PytorchGELUTanh()
-            (fc1): Linear(in_features=1152, out_features=4304, bias=True)
-            (fc2): Linear(in_features=4304, out_features=1152, bias=True)
-          )
-        )
-      )
-    )
-    (post_layernorm): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
-  )
-)
-"""
 
 class NeuronSiglipConfig(NeuronConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Set any args/defaults
 
 
 class SiglipInferenceConfig(InferenceConfig):
@@ -130,10 +98,9 @@ class LayerNorm(torch.nn.LayerNorm):
         )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        original_input_dtype = input.dtype
-        input = input.to(torch.double)
+        # Ensure input matches the weight dtype to avoid mixed dtype errors
+        input = input.to(self.weight.dtype)
         output = super().forward(input)
-        output = output.to(original_input_dtype)
         return output
 
   
@@ -236,7 +203,7 @@ class NeuronSiglipEncoder(nn.Module):
         )
 
 
-class NueronSiglipMultiheadAttention(NeuronSiglipAttention):
+class NeuronSiglipMultiheadAttention(NeuronSiglipAttention):
     """
     Compared to NeuronSiglipAttention:
         1. Accept three inputs (Query, Key, Value) instead of a single hidden states
@@ -319,7 +286,7 @@ class NeuronSiglipMultiheadAttentionPoolingHead(nn.Module):
         super().__init__()
 
         self.probe = nn.Parameter(torch.randn(1, 1, config.hidden_size))
-        self.attention = NueronSiglipMultiheadAttention(config)
+        self.attention = NeuronSiglipMultiheadAttention(config)
         self.layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = NeuronSiglipMLP(config)
 
@@ -418,13 +385,17 @@ class NeuronSiglipVisionEmbeddings(nn.Module):
     def forward(self, pixel_values: torch.FloatTensor, interpolate_pos_encoding=False) -> torch.Tensor:
         _, _, height, width = pixel_values.shape
         target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]
+        # Convert pixel_values to target dtype before passing to patch_embedding to avoid mixed dtype errors
+        pixel_values_converted = pixel_values.to(dtype=target_dtype)
+        patch_embeds = self.patch_embedding(pixel_values_converted)  # shape = [*, width, grid, grid]
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
 
         if interpolate_pos_encoding:
             embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
         else:
-            embeddings = embeddings + self.position_embedding(self.position_ids)
+            # Ensure position embeddings match the dtype of embeddings
+            pos_emb = self.position_embedding(self.position_ids)
+            embeddings = embeddings + pos_emb.to(dtype=embeddings.dtype)
         return embeddings
 
         

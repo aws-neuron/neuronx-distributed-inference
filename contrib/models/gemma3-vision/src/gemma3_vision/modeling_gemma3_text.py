@@ -1,5 +1,3 @@
-# Copyright 2025 © Amazon.com and Affiliates: This deliverable is considered Developed Content as defined in the AWS Service Terms.
-
 import logging
 import copy
 from typing import Optional, Tuple
