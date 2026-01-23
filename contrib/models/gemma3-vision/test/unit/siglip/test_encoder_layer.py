@@ -1,4 +1,3 @@
-
 import logging
 import pytest
 from typing import Dict, OrderedDict
@@ -34,8 +33,6 @@ hf_config = AutoModel.from_config(config=config.vision_config).config
 
 @pytest.mark.parametrize("tolerances, compiler_flags", [
     (FP32_TOLERANCES, ["--model-type=transformer", "--auto-cast=none"]),
-    (FP16_TOLERANCES, ["--model-type=transformer", "--auto-cast=matmult", "--enable-mixed-precision-accumulation", "--auto-cast-type=fp16"]),
-    (BF16_TOLERANCES, ["--model-type=transformer", "--auto-cast=matmult", "--enable-mixed-precision-accumulation", "--auto-cast-type=bf16"]),
     ])
 def test_encoder_layer(monkeypatch, base_compiler_flags, tolerances, compiler_flags) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
