@@ -1,4 +1,3 @@
-
 import torch
 
 # context-encoding, non-sliding
