@@ -246,3 +246,44 @@ def apply_sliding_window(x: torch.FloatTensor,
     index = torch.arange(sliding_window_size)[None, :] + offset
     index = index[:, None, :, None].expand(-1, num_kv_heads, -1, head_dim)
     return torch.gather(x, dim=2, index=index)
+
+
+def convert_neuron_siglip_encoder_state_dict_to_hf(neuron_state_dict: dict) -> dict:
+    """
+    Convert Neuron SigLIP encoder state dict to HuggingFace format.
+    
+    Neuron model has:
+    - layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,bias}
+    - layers.X.self_attn.o_proj.o_proj.{weight,bias}
+    - layers.X.self_attn.rank_util.rank (not needed in HF)
+    
+    HuggingFace model expects:
+    - layers.X.self_attn.{q,k,v}_proj.{weight,bias}
+    - layers.X.self_attn.out_proj.{weight,bias}
+    """
+    hf_state_dict = {}
+    
+    for key, value in neuron_state_dict.items():
+        # Skip rank_util parameters (not needed in HF)
+        if "rank_util" in key:
+            continue
+        
+        # Convert qkv_proj paths
+        if "qkv_proj.q_proj" in key:
+            new_key = key.replace("qkv_proj.q_proj", "q_proj")
+            hf_state_dict[new_key] = value
+        elif "qkv_proj.k_proj" in key:
+            new_key = key.replace("qkv_proj.k_proj", "k_proj")
+            hf_state_dict[new_key] = value
+        elif "qkv_proj.v_proj" in key:
+            new_key = key.replace("qkv_proj.v_proj", "v_proj")
+            hf_state_dict[new_key] = value
+        # Convert o_proj path
+        elif "o_proj.o_proj" in key:
+            new_key = key.replace("o_proj.o_proj", "out_proj")
+            hf_state_dict[new_key] = value
+        else:
+            # Keep other parameters as-is
+            hf_state_dict[key] = value
+    
+    return hf_state_dict
