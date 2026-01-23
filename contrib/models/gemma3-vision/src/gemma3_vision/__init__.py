@@ -12,6 +12,10 @@ from .modeling_gemma3_vision import (
 from .modeling_gemma3_text import (
     NeuronGemma3TextModel,
 )
+from .modeling_causal_lm_gemma3 import (
+    TextGemma3InferenceConfig,
+    NeuronTextGemma3ForCausalLM,
+)
 
 __all__ = [
     "NeuronGemma3ForCausalLM",
@@ -20,4 +24,6 @@ __all__ = [
     "NeuronGemma3MultiModalProjector",
     "Gemma3VisionModelWrapper",
     "NeuronGemma3TextModel",
+    "TextGemma3InferenceConfig",
+    "NeuronTextGemma3ForCausalLM",
 ]
