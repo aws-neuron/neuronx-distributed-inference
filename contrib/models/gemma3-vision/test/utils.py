@@ -10,7 +10,7 @@ import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
 from transformers.configuration_utils import PretrainedConfig
-from transformers.models.gemma3.modeling_gemma3 import Gemma3TextModel, Gemma3RotaryEmbedding
+from transformers.models.gemma3.modeling_gemma3 import Gemma3RotaryEmbedding
 
 torch.set_printoptions(precision=5)
 
@@ -178,6 +178,41 @@ def create_hidden_states(attention_mask_2d: torch.LongTensor, hf_config: Pretrai
     return torch.randn(batch_size, sequence_length, hf_config.hidden_size, requires_grad=False).to(dtype=torch.float32)
 
 
+def _prepare_4d_causal_attention_mask_with_cache_position(
+        attention_mask: torch.Tensor,
+        sequence_length: int,
+        target_length: int,
+        dtype: torch.dtype,
+        cache_position: torch.Tensor,
+        batch_size: int,
+        **kwargs,
+    ):
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
+            causal_mask = attention_mask
+        else:
+            min_dtype = torch.finfo(dtype).min
+            causal_mask = torch.full(
+                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
+            )
+            if sequence_length != 1:
+                causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
+            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+                mask_length = attention_mask.shape[-1]
+                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
+                    causal_mask.device
+                )
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                    padding_mask, min_dtype
+                )
+
+        return causal_mask
+
+
 def create_hf_attention_mask_4d(
         attention_mask_2d: torch.LongTensor,
         cache_position: torch.LongTensor,
@@ -192,7 +227,7 @@ def create_hf_attention_mask_4d(
         sequence_length = 1
     print("attention mask 2D")
     print(attention_mask_2d)
-    attention_mask_4d = Gemma3TextModel._prepare_4d_causal_attention_mask_with_cache_position(
+    attention_mask_4d = _prepare_4d_causal_attention_mask_with_cache_position(
         attention_mask=attention_mask_2d,
         sequence_length=sequence_length, # len_q
         target_length=target_length, # len_k

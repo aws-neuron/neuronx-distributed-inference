@@ -14,7 +14,7 @@ from neuronx_distributed_inference.utils.random import set_random_seed
 from neuronx_distributed_inference.utils.testing import destroy_mp
 from neuronx_distributed_inference.models.config import NeuronConfig
 
-from gemma3_vision.modeling_gemma3_text import NeuronGemma3Attention, NeuronGemma3TextModel
+from gemma3_vision.modeling_gemma3_text import NeuronGemma3Attention, NeuronGemma3TextModel, get_rmsnorm_cls
 from gemma3_vision.modeling_causal_lm_gemma3 import TextGemma3InferenceConfig
 from test.unit.gemma3.test_config import get_gemma3_config
 # from test.unit.gemma3.utils import (
@@ -202,10 +202,13 @@ def test_nxdi_attn_layer_vs_transformers_implementation_prefill(random_seed, mon
     hf_text_config.sliding_window = sliding_window_size
     hf_text_config.sliding_window_pattern = sliding_window_pattern
     # Make test faster on CPU
+    head_dim = 2
     hf_text_config.num_attention_heads = 2
     hf_text_config.num_key_value_heads = 1
-    hf_text_config.head_dim = 2
+    hf_text_config.head_dim = head_dim
     hf_text_config.hidden_size = 4
+    hf_text_config._attn_implementation = "eager"
+    hf_text_config.query_pre_attn_scalar = head_dim
 
     attention_mask_2d = torch.tensor([[0, 0, 0, 1, 1],
                                       [0, 0, 1, 1, 1],
@@ -242,7 +245,23 @@ def test_nxdi_attn_layer_vs_transformers_implementation_prefill(random_seed, mon
     
     nrn_model = NeuronGemma3TextModel(config=config)
 
-    nrn_attn_layer = NeuronGemma3Attention(config=config, layer_idx=layer_idx)
+    sliding_window = sliding_window_size if is_swa_layer else None
+    rms_norm_cls = get_rmsnorm_cls()
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    q_norm = rms_norm_cls(config.head_dim, rms_norm_eps) if rms_norm_eps else rms_norm_cls(config.head_dim)
+    k_norm = rms_norm_cls(config.head_dim, rms_norm_eps) if rms_norm_eps else rms_norm_cls(config.head_dim)
+
+    nrn_attn_layer = NeuronGemma3Attention(
+        config=config,
+        hidden_size=config.hidden_size,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        sliding_window=sliding_window,
+        use_qk_norm=False,
+        q_layernorm=q_norm,
+        k_layernorm=k_norm,
+        rotary_emb=NeuronGemma3Attention.get_rope(config=config, is_swa_layer=is_swa_layer),
+        )
     nrn_attn_layer.eval()
 
     hf_attn_layer = Gemma3Attention(config=hf_text_config, layer_idx=layer_idx).to(dtype=model_dtype)
