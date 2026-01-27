@@ -407,6 +407,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         tensor_capture_hook: Optional[Callable] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        # Very close to NeuronLlama4ForCausalLM.forward
         is_prefill = (input_ids.shape[-1] > 1)
         include_images = (pixel_values is not None) and (vision_mask is not None) and (pixel_values.sum() != 0)
 
@@ -418,13 +419,18 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
                 vision_mask.dtype == torch.bool
             ), f"Parameter `vision_mask` must be of type bool, recieved {vision_mask.dtype}"
             # Call the vision encoder to create a sequence of vision token embeddings for each input image
+            #   pixel_values of shape (batch_sz * img_per_sample, 3, height, width)
             vision_embeddings = self.vision_encoder_model(
                 pixel_values.to(self.vision_config.neuron_config.torch_dtype),
             ).to(self.text_config.neuron_config.torch_dtype)
 
-            # flatten vision embeddings
-            # embedding_dim = vision_embeddings.shape[-1]
-            # vision_embeddings = vision_embeddings.view(-1, embedding_dim).unsqueeze(0)
+            # Flatten vision embeddings: required if img_per_sample > 1
+            #   vision_embeddings of shape (batch_sz * img_per_sample, seq_len_per_image, embedding_dim)
+            #   vision_mask of shape (batch_sz, total_seq_len)
+            batch_sz = 1 if (vision_mask.dim() == 1) else vision_mask.shape[0]
+            num_images, seq_len, embedding_dim = vision_embeddings.shape
+            img_per_sample = num_images // batch_sz
+            vision_embeddings = vision_embeddings.view(batch_sz, img_per_sample * seq_len, embedding_dim)
 
             # Sequences of vision token embeddings are padded to the bucket size the text model has been compiled with
             vision_embeddings = pad_vision_embeddings(vision_embeddings=vision_embeddings, pad_limit=pad_target_size)
@@ -445,7 +451,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
                 n_active_tokens=pad_target_size,
                 fill_value=pad_fill_value
             )
-        output_token = super().forward(
+        return super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -454,7 +460,6 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             vision_embeddings=vision_embeddings,
             vision_mask=vision_mask,
         )
-        return output_token
 
     def enable_token_generation(self):
         # Identical to NeuronLlama4ForCausalLM.enable_token_generation -> Required for get_compiler_args to succeed
