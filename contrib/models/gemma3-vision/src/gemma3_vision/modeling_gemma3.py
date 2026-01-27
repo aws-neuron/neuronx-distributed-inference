@@ -139,7 +139,12 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         return Gemma3InferenceConfig
 
     def enable_vision_encoder(self, enable_wlt_optimization: bool = True, **model_init_kwargs):
-        # Identical to NeuronPixtralForCausalLM.get_vision_compiler_args, except pipeline_execution=False
+        # Identical to NeuronPixtralForCausalLM.enable_vision_encoder
+        # - except pipeline_execution=False
+        # - except use get_compiler_args + VISION_ENCODER_MODEL_TAG (instead of get_vision_compiler_args) 
+        #   like NeuronLlama4ForCausalLM.enable_vision_encoder
+        self.compile_tag = VISION_ENCODER_MODEL_TAG
+
         new_config = copy.deepcopy(self.config)
         if new_config.vision_config.neuron_config.enable_bucketing:
             # neuron_config.buckets default to neuron_config.seq_len is not given. For vision we want to do auto-bucketing here
@@ -160,7 +165,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             config=new_config,
             model_cls=self.vision_model_cls,
             tag=VISION_ENCODER_MODEL_TAG,
-            compiler_args=self.get_vision_compiler_args(),
+            compiler_args=self.get_compiler_args(),
             model_init_kwargs=model_init_kwargs,
             # to turn on weight layout optimization
             priority_model_idx=(0 if enable_wlt_optimization else None),
@@ -450,9 +455,14 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         return output_token
 
     def enable_token_generation(self):
-        # Identical to NeuronLlama4ForCausalLM.enable_token_generation -> Why
+        # Identical to NeuronLlama4ForCausalLM.enable_token_generation -> Required for get_compiler_args to succeed
         self.compile_tag = TOKEN_GENERATION_MODEL_TAG
         super().enable_token_generation()
+
+    def enable_context_encoding(self):
+        # Identical to NeuronLlama4ForCausalLM.enable_context_encoding -> Required for get_compiler_args to succeed
+        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
+        super().enable_context_encoding()
 
     def get_compiler_args(self) -> str:
         # Identical to NeuronLlama4ForCausalLM.get_compiler_args
@@ -472,40 +482,6 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
                f"--cc-pipeline-tiling-factor=1 --vectorize-strided-dma --enable-scalar-dge-vectorization' " \
                f"--lnc={logical_nc_config} {optimization_level} "
         return args
-
-    def load(
-        self, compiled_model_path, start_rank_id=None, local_ranks_size=None, skip_warmup=False
-    ):
-        # Fixed broken path creation (Neuron 2.26)
-        compiled_model_path = normalize_path(compiled_model_path)
-        text_compiled_model_path = normalize_path(compiled_model_path) + "text_model/"
-        vision_compiled_model_path = normalize_path(compiled_model_path) + "vision_model/"
-
-        """Loads the compiled model checkpoint to the Neuron device."""
-        self.text_traced_model = torch.jit.load(text_compiled_model_path + COMPILED_MODEL_FILE_NAME)  # nosec B614
-        self.vision_traced_model = torch.jit.load(  # nosec B614
-            vision_compiled_model_path + COMPILED_MODEL_FILE_NAME
-        )
-
-        self.load_weights(
-            text_compiled_model_path,
-            vision_compiled_model_path,
-            start_rank_id=start_rank_id,
-            local_ranks_size=local_ranks_size,
-        )
-
-        for model_wrapper in self.text_models:
-            model_wrapper.model = self.text_traced_model
-
-        for model_wrapper in self.vision_models:
-            model_wrapper.model = self.vision_traced_model
-
-        self.is_loaded_to_neuron = True
-
-        if not self.neuron_config.skip_warmup and not skip_warmup:
-            self.warmup()  # warmup will be executed only if both flags are false
-        else:
-            logger.info("Skipping model warmup")
 
     @classmethod
     def prepare_quantized_state_dict(cls, hf_model_quant):
