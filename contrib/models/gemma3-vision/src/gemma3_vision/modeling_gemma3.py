@@ -27,7 +27,6 @@ from neuronx_distributed_inference.models.image_to_text_model_wrapper import (
     IMAGE_TO_TEXT_MODEL_WRAPPER_INPUT_KEYS
 )
 from neuronx_distributed_inference.models.llama4.utils.encoder_utils import pad_vision_embeddings
-from neuronx_distributed_inference.models.pixtral.modeling_pixtral import NeuronPixtralForCausalLM
 from neuronx_distributed_inference.models.model_wrapper import (
     CONTEXT_ENCODING_MODEL_TAG,
     TOKEN_GENERATION_MODEL_TAG,
@@ -136,25 +135,11 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
 
     @classmethod
     def get_config_cls(cls):
+        # Gemma3-specific
         return Gemma3InferenceConfig
 
-    def get_vision_compiler_args(self) -> str:
-        cc_pipeline_tiling_factor = self.vision_config.neuron_config.cc_pipeline_tiling_factor
-        return f"--enable-saturate-infinity --auto-cast=none --model-type=transformer \
-                --tensorizer-options='--enable-ccop-compute-overlap \
-                --cc-pipeline-tiling-factor={cc_pipeline_tiling_factor} --vectorize-strided-dma' -O1 \
-                --hbm-scratchpad-page-size=1024 \
-                --internal-hlo2tensorizer-options='--verify-hlo=true'"
-
-    def get_compiler_args(self) -> str:
-        cc_pipeline_tiling_factor = self.text_config.neuron_config.cc_pipeline_tiling_factor
-        return f"--enable-saturate-infinity --auto-cast=none --model-type=transformer \
-                --tensorizer-options='--enable-ccop-compute-overlap \
-                --cc-pipeline-tiling-factor={cc_pipeline_tiling_factor} --vectorize-strided-dma' -O1 \
-                --hbm-scratchpad-page-size=1024 \
-                --internal-hlo2tensorizer-options='--verify-hlo=true'"
-
     def enable_vision_encoder(self, enable_wlt_optimization: bool = True, **model_init_kwargs):
+        # Identical to NeuronPixtralForCausalLM.get_vision_compiler_args, except pipeline_execution=False
         new_config = copy.deepcopy(self.config)
         if new_config.vision_config.neuron_config.enable_bucketing:
             # neuron_config.buckets default to neuron_config.seq_len is not given. For vision we want to do auto-bucketing here
@@ -170,6 +155,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         # This should not be needed as in vision modeling code we should always use vision_config.neuron_config as vision model's neuron config
         # added this line just to add insurance to avoid mix-up
         new_config.neuron_config = copy.deepcopy(new_config.vision_config.neuron_config)
+
         self.vision_encoder_model = self.vision_model_wrapper(
             config=new_config,
             model_cls=self.vision_model_cls,
@@ -178,13 +164,14 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             model_init_kwargs=model_init_kwargs,
             # to turn on weight layout optimization
             priority_model_idx=(0 if enable_wlt_optimization else None),
-            pipeline_execution=False, # TODO: True for opimization?
+            pipeline_execution=False,
             return_ranked_to_cpu=True
         )
         self.vision_models.append(self.vision_encoder_model)
 
     @staticmethod
     def update_state_dict_for_tied_weights(state_dict: StateDict) -> None:
+    # Gemma3-specific
         try: 
             state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"].clone()
         except KeyError:
@@ -192,6 +179,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: StateDict, inference_config: InferenceConfig) -> StateDict:
+    # Gemma3-specific
         neuron_config = inference_config.neuron_config
         attention_keys = {
             ".self_attn.q_proj.": ".self_attn.qkv_proj.q_proj.",
@@ -267,6 +255,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         return new_state_dict
 
     def _convert_input_dict_to_ordered_tuple(self, input_dict: Dict[str, Any]):
+        # Identical NeuronLlama4ForCausalLM._convert_input_dict_to_ordered_tuple, to be removed?
         """
         Utility function to convert input dictionary to ordered tuple
         based on outputs of _get_model_outputs
@@ -283,6 +272,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         return tuple(args)
     
     def _select_buckets_for_padding_length(self, position_ids):
+        # Identical to NeuronLlama4ForCausalLM._select_buckets_for_padding_length
         neuron_config = self.config.neuron_config
         context_encoding_buckets = neuron_config.context_encoding_buckets if neuron_config.context_encoding_buckets is not None \
             else neuron_config.buckets
@@ -296,6 +286,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         return selected_buckets
     
     def get_padding_length(self, buckets, position_ids):
+        # Identical to [NeuronLlama4ForCausalLM|NeuronPixtralForCausalLM]._select_buckets_for_padding_length
         max_position_id = torch.max(position_ids).item()
         for val in buckets:
             if val > max_position_id:
@@ -303,6 +294,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         raise ValueError("No bucket found for provided input_ids!")
 
     def get_required_kwargs(self) -> List[str]:
+        # Gemma3-specific
         """The list of additional input arguments to be prepared in HuggingFaceGenerationAdapter.prepare_inputs_for_generation()"""
         return [
             "pixel_values",
@@ -311,6 +303,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         ]
 
     def concat_causal_lm_outputs(self, outputs_list):
+        # From Pixtral, to be removed
         concatenated_logits = []
         concatenated_hidden_states = []
         concatenated_tokens = []
@@ -334,7 +327,8 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             concatentated_output.tokens = concatenated_tokens
         return concatentated_output
 
-    def generate_positions_from_mask(self, mask):
+    def generate_positions_from_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        # Gemma3-specific
         """
         Generate position indices from a boolean mask.
         Compared to generate_positions_from_mask() of models/llama4/utils/encoder_utils.py,
@@ -444,7 +438,6 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
                 n_active_tokens=pad_limit,
                 fill_value=(pad_limit - 1)
             )
-
         output_token = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -456,114 +449,13 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         )
         return output_token
 
-    @staticmethod
-    def load_hf_model(model_path, **kwargs):
-        from transformers import Gemma3ForConditionalGeneration
-        return Gemma3ForConditionalGeneration.from_pretrained(model_path, **kwargs)  # nosec B615
-
-    def to_cpu(self):
-        """
-        Initialize CPU versions of both text and vision models with different parallelism configurations,
-        shard and load their weights, and assign to respective model wrappers.
-        This function as of now only supports TP DEGREE of 1 in vision and text.
-        """
-        os.environ["NXD_CPU_MODE"] = "1"
-
-        # Validation checks
-        if self.neuron_config.torch_dtype == torch.bfloat16 and (
-            self.neuron_config.tp_degree > 1 or self.neuron_config.ve_tp_degree > 1
-        ):
-            raise NotImplementedError(
-                "The gloo backend does not natively support bfloat16, please proceed with float32 dtype instead."
-            )
-        if self.neuron_config.speculation_length > 0:
-            raise NotImplementedError("Speculation is not yet supported for CPU inference.")
-
-        # destroy distributed process if already started
-        if model_parallel_is_initialized():
-            destroy_model_parallel()
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-
-        # Initialize distributed processing
-        if "WORLD_SIZE" in os.environ:
-            assert (
-                int(os.environ["WORLD_SIZE"]) == self.neuron_config.world_size
-            ), "Total number of processes does not match implied world size from NeuronConfig inputs."
-            torch.distributed.init_process_group("gloo")
-        if not torch.distributed.is_initialized():
-            if self.neuron_config.world_size == 1:
-                os.environ["MASTER_ADDR"] = "127.0.0.1"
-                os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
-                torch.distributed.init_process_group(
-                    backend="gloo",
-                    world_size=1,
-                    rank=0,
-                )
-            else:
-                raise RuntimeError("Please initialize parallel processing via 'torchrun'.")
-
-        # Initialize model parallel for vision and text model. We only support TP Degree 1 at this point.
-        initialize_model_parallel(
-            tensor_model_parallel_size=self.neuron_config.tp_degree,
-            pipeline_model_parallel_size=1,  # No pipeline parallelism for vision encoder
-            expert_model_parallel_size=1,  # No expert parallelism for vision encoder
-            skip_collective_init=True,
-        )
-
-        # Initialize and load vision model with vision-specific config
-        vision_base_model = self.vision_model_cls(self.config)
-        vision_base_model = vision_base_model.to(
-            self.vision_config.neuron_config.torch_dtype
-        )
-
-        vision_model_sd = (
-            self.checkpoint_loader_fn()
-        )  # You might need a separate loader for vision weights
-        if self.vision_config.neuron_config.tp_degree > 1:
-            get_sharded_checkpoint(
-                vision_model_sd,
-                vision_base_model,
-                torch.distributed.get_rank(),
-                self.vision_config.neuron_config.tp_degree,
-            )
-
-        vision_base_model.load_state_dict(vision_model_sd, strict=False)
-
-        # Initialize and load text model with text-specific config
-        text_base_model = self.text_model_cls(self.config.text_config)
-        text_base_model = text_base_model.to(self.config.text_config.neuron_config.torch_dtype)
-
-        text_model_sd = self.checkpoint_loader_fn()
-        if self.neuron_config.tp_degree > 1:
-            get_sharded_checkpoint(
-                text_model_sd,
-                text_base_model,
-                torch.distributed.get_rank(),
-                self.neuron_config.tp_degree,
-            )
-        text_base_model.load_state_dict(text_model_sd, strict=False)
-
-        # Assign models to their respective wrappers
-        for model_wrapper in self.text_models:
-            model_wrapper.model = text_base_model
-
-        for model_wrapper in self.vision_models:
-            model_wrapper.model = vision_base_model
-
-        self.eval()
-
-    # Wraps NeuronBaseForCausalLM.enable_context_encoding() to add compile_tag.
-    def enable_context_encoding(self):
-        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
-        super().enable_context_encoding()
-
-    # Wraps NeuronBaseForCausalLM.enable_token_generation() to add compile_tag.
     def enable_token_generation(self):
+        # Identical to NeuronLlama4ForCausalLM.enable_token_generation -> Why
         self.compile_tag = TOKEN_GENERATION_MODEL_TAG
         super().enable_token_generation()
 
     def get_compiler_args(self) -> str:
+        # Identical to NeuronLlama4ForCausalLM.get_compiler_args
         logical_nc_config = self.text_config.neuron_config.logical_nc_config
 
         if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
@@ -617,7 +509,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
 
     @classmethod
     def prepare_quantized_state_dict(cls, hf_model_quant):
-        # Default assumes text-only model structure and breaks (AttributeError on hf_model_quant.model.state_dict())
+        # Gemma3-specific
         model_quant_sd = hf_model_quant.state_dict()
         convert_qint8_to_int8_state_dict(model_quant_sd)
         return model_quant_sd
