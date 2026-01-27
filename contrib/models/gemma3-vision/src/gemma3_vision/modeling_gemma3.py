@@ -169,7 +169,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             model_init_kwargs=model_init_kwargs,
             # to turn on weight layout optimization
             priority_model_idx=(0 if enable_wlt_optimization else None),
-            pipeline_execution=False,
+            pipeline_execution=True,
             return_ranked_to_cpu=True
         )
         self.vision_models.append(self.vision_encoder_model)

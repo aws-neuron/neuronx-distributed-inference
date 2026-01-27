@@ -128,7 +128,7 @@ class Gemma3VisionModelWrapper(Llama4VisionModelWrapper):
         tag="",
         compiler_args: str = None,
         priority_model_idx: int = None,
-        pipeline_execution: bool = False,
+        pipeline_execution: bool = True,
         return_ranked_to_cpu: bool = True,
         model_init_kwargs={},
     ) -> None:
