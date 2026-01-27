@@ -5,6 +5,7 @@ import os
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union, Any
 
 import torch
+import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -140,7 +141,6 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
 
     def enable_vision_encoder(self, enable_wlt_optimization: bool = True, **model_init_kwargs):
         # Identical to NeuronPixtralForCausalLM.enable_vision_encoder
-        # - except pipeline_execution=False
         # - except use get_compiler_args + VISION_ENCODER_MODEL_TAG (instead of get_vision_compiler_args) 
         #   like NeuronLlama4ForCausalLM.enable_vision_encoder
         self.compile_tag = VISION_ENCODER_MODEL_TAG
@@ -331,7 +331,8 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             concatentated_output.tokens = concatenated_tokens
         return concatentated_output
 
-    def generate_positions_from_mask(self, mask: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def generate_positions_from_mask(mask: torch.Tensor) -> torch.Tensor:
         # Gemma3-specific
         """
         Generate position indices from a boolean mask.
@@ -352,7 +353,8 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             cols_per_row = torch.split(cols, row_counts.tolist())
             return rnn_utils.pad_sequence(cols_per_row, batch_first=True, padding_value=0)
 
-    def pad_positions(self, positions, target_size, fill_value):
+    @staticmethod
+    def pad_positions(positions: torch.LongTensor, target_size: int, fill_value: float) -> torch.LongTensor:
         """
         Pad the positions tensor to a target size.
         Compared to pad_positions() of models/llama4/utils/encoder_utils.py,
@@ -366,28 +368,13 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         Returns:
         torch.Tensor: A 3D tensor of shape (batch_size, target_size, 1) containing padded position indices
         """
-        if positions.dim() == 1:
-            # Handle 1D case (original behavior)
-            padding_size = target_size - len(positions)
-            if padding_size > 0:
-                padding = torch.full(
-                    (padding_size,), fill_value, dtype=positions.dtype, device=positions.device
-                )
-                positions_padded = torch.cat([positions, padding])
-            elif padding_size < 0:
-                raise RuntimeError("Text model sequence length is not enough to handle all vision embeddings")
-            return positions_padded.unsqueeze(0).unsqueeze(-1)  # Shape: [1, x, 1]
-        else:
-            # Handle 2D case [batch_size, position_indices]
-            padding_size = target_size - positions.shape[1]
-            if padding_size > 0:
-                padding = torch.full(
-                    (positions.shape[0], padding_size), fill_value, dtype=positions.dtype, device=positions.device
-                )
-                positions_padded = torch.cat([positions, padding], dim=1)
-            elif padding_size < 0:
-                raise RuntimeError("Text model sequence length is not enough to handle all vision embeddings")
-            return positions_padded.unsqueeze(-1)  # Shape: [batch_size, target_size, 1]
+        # positions_2d of shape (batch_sz, seq_len)
+        positions_2d = positions.unsqueeze(0) if positions.dim() == 1 else positions
+        padding_size = target_size - positions_2d.shape[1]        
+        assert padding_size >= 0, "Text model sequence length is not enough to handle all vision embeddings"
+        positions_padded = F.pad(positions_2d, (0, padding_size), value=fill_value)
+        # output tensor of shape (batch_sz, target_sz, 1)
+        return positions_padded.unsqueeze(-1)
 
     def forward(
         self,
