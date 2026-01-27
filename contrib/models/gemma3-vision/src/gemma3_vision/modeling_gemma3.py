@@ -407,25 +407,17 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         tensor_capture_hook: Optional[Callable] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        buckets = self._select_buckets_for_padding_length(position_ids)
-        pad_limit = self.get_padding_length(buckets, position_ids)
-        if (
-            (pixel_values is not None)
-            and (vision_mask is not None)
-            and input_ids.shape[-1] > 1
-            and pixel_values.sum() != 0
-        ):  # call vision encoder
+        is_prefill = (input_ids.shape[-1] > 1)
+        include_images = (pixel_values is not None) and (vision_mask is not None) and (pixel_values.sum() != 0)
+
+        buckets = self._select_buckets_for_padding_length(position_ids=position_ids)
+        pad_target_size = self.get_padding_length(buckets=buckets, position_ids=position_ids)
+        pad_fill_value = (pad_target_size - 1)
+        if (is_prefill and include_images):
             assert (
                 vision_mask.dtype == torch.bool
             ), f"Parameter `vision_mask` must be of type bool, recieved {vision_mask.dtype}"
-
-            logger.info("pixel_values provided, using vision embeddings")
-
-            vision_mask = self.generate_positions_from_mask(vision_mask.squeeze())
-            vision_mask = self.pad_positions(
-                vision_mask, pad_limit, (pad_limit - 1) # pad_limit = 512
-            )
-
+            # Call the vision encoder to create a sequence of vision token embeddings for each input image
             vision_embeddings = self.vision_encoder_model(
                 pixel_values.to(self.vision_config.neuron_config.torch_dtype),
             ).to(self.text_config.neuron_config.torch_dtype)
@@ -434,13 +426,24 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             # embedding_dim = vision_embeddings.shape[-1]
             # vision_embeddings = vision_embeddings.view(-1, embedding_dim).unsqueeze(0)
 
-            vision_embeddings = pad_vision_embeddings(vision_embeddings, pad_limit)
+            # Sequences of vision token embeddings are padded to the bucket size the text model has been compiled with
+            vision_embeddings = pad_vision_embeddings(vision_embeddings=vision_embeddings, pad_limit=pad_target_size)
+
+            # Positions used to scatter vision embeddings at specific positions into the sequence passed to the text model
+            # are created from the vision mask
+            vision_mask = self.generate_positions_from_mask(mask=vision_mask.squeeze())
+            vision_mask = self.pad_positions(
+                positions=vision_mask, 
+                target_size=pad_target_size, 
+                fill_value=pad_fill_value
+            )
         else:
+            # Either token generation or text-only prefill -> still need dummy inputs for the compiled text model
             vision_embeddings, vision_mask = self.context_encoding_model.get_dummy_vision_inputs(
                 config=self.text_config,
                 input_ids=input_ids,
-                n_active_tokens=pad_limit,
-                fill_value=(pad_limit - 1)
+                n_active_tokens=pad_target_size,
+                fill_value=pad_fill_value
             )
         output_token = super().forward(
             input_ids=input_ids,
