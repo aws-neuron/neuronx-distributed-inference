@@ -27,6 +27,7 @@ from neuronx_distributed_inference.models.image_to_text_model_wrapper import (
     IMAGE_TO_TEXT_MODEL_WRAPPER_INPUT_KEYS
 )
 from neuronx_distributed_inference.models.llama4.utils.encoder_utils import pad_vision_embeddings
+from neuronx_distributed_inference.models.pixtral.modeling_pixtral import NeuronPixtralForCausalLM
 from neuronx_distributed_inference.models.model_wrapper import (
     CONTEXT_ENCODING_MODEL_TAG,
     TOKEN_GENERATION_MODEL_TAG,
@@ -444,8 +445,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
                 fill_value=(pad_limit - 1)
             )
 
-        # super().forward broken in Neuron 2.26
-        output_token = self._forward(
+        output_token = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -455,109 +455,6 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             vision_mask=vision_mask,
         )
         return output_token
-
-    def _forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        seq_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        sampling_params: Optional[torch.FloatTensor] = None,
-        prev_hidden: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        adapter_ids: Optional[torch.LongTensor] = None,
-        medusa_args=None,
-        return_dict: Optional[bool] = None,
-        llava_args: Optional[List] = [],
-        input_capture_hook: Optional[Callable] = None,
-        slot_mapping: Optional[torch.LongTensor] = None,
-        block_table: Optional[torch.LongTensor] = None,
-        full_context_lens: Optional[torch.LongTensor] = None,
-        computed_context_lens: Optional[torch.LongTensor] = None,
-        vision_embeddings: Optional[torch.FloatTensor] = None,
-        vision_mask: Optional[torch.BoolTensor] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-        """
-        Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-        """
-        # infer attention_mask from position_ids if not provided
-        if attention_mask is None:
-            attention_mask = self._infer_attention_mask(position_ids)
-
-        if seq_ids is None:
-            seq_ids = torch.arange(input_ids.shape[0])
-
-        self.preprocess_inputs(
-            input_ids=input_ids,
-            seq_ids=seq_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            sampling_params=sampling_params,
-            prev_hidden=prev_hidden,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            adapter_ids=adapter_ids,
-            medusa_args=medusa_args,
-            return_dict=return_dict,
-            llava_args=llava_args,
-            input_capture_hook=input_capture_hook,
-            slot_mapping=slot_mapping,
-            block_table=block_table,
-            full_context_lens=full_context_lens,
-            computed_context_lens=computed_context_lens,
-        )
-
-        if self.async_mode:
-            outputs, is_run_on_neuron = self._get_model_outputs_async(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                seq_ids=seq_ids,
-                sampling_params=sampling_params,
-                prev_hidden=prev_hidden,
-                adapter_ids=adapter_ids,
-                vision_embeddings=vision_embeddings,
-                vision_mask=vision_mask,
-                medusa_args=medusa_args,
-                llava_args=llava_args,
-            )
-        else:
-            outputs, is_run_on_neuron = self._get_model_outputs(
-                input_ids,
-                attention_mask,
-                position_ids,
-                seq_ids,
-                sampling_params,
-                prev_hidden,
-                adapter_ids,
-                vision_embeddings,
-                vision_mask,
-                medusa_args,
-                llava_args,
-            )
-
-        generation_model = self.get_generation_model()
-        if not generation_model.is_neuron():
-            self._copy_past_key_values(outputs)
-
-        # Process outputs
-        constructed_outputs = self._get_constructed_outputs(outputs, is_run_on_neuron)
-
-        return constructed_outputs
-
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
