@@ -306,31 +306,6 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
             "vision_mask",
         ]
 
-    def concat_causal_lm_outputs(self, outputs_list):
-        # From Pixtral, to be removed
-        concatenated_logits = []
-        concatenated_hidden_states = []
-        concatenated_tokens = []
-        for output in outputs_list:
-            if isinstance(output.logits, torch.Tensor):
-                concatenated_logits.append(output.logits)
-            if isinstance(output.hidden_states, torch.Tensor):
-                concatenated_hidden_states.append(output.hidden_states)
-            elif isinstance(output.hidden_states, list):
-                concatenated_hidden_states.extend(output.hidden_states)
-            if hasattr(output, 'tokens') and isinstance(output.tokens, torch.Tensor):
-                concatenated_tokens.append(output.tokens)
-        concatenated_logits = torch.cat(concatenated_logits, dim=0) if len(concatenated_logits) > 0 else None
-        concatenated_tokens = torch.cat(concatenated_tokens, dim=0) if len(concatenated_tokens) else None
-
-        concatentated_output = CausalLMOutputWithPast(
-            logits=concatenated_logits,
-            hidden_states=concatenated_hidden_states,
-        )
-        if concatenated_tokens is not None:
-            concatentated_output.tokens = concatenated_tokens
-        return concatentated_output
-
     @staticmethod
     def generate_positions_from_mask(mask: torch.Tensor) -> torch.Tensor:
         # Gemma3-specific
