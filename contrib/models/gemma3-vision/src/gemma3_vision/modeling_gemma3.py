@@ -304,7 +304,6 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         return [
             "pixel_values",
             "vision_mask",
-            "image_sizes",
         ]
 
     def concat_causal_lm_outputs(self, outputs_list):
