@@ -259,7 +259,8 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
 
         return new_state_dict
 
-    def _convert_input_dict_to_ordered_tuple(self, input_dict: Dict[str, Any]):
+    @staticmethod
+    def _convert_input_dict_to_ordered_tuple(input_dict: Dict[str, Any]):
         # Identical NeuronLlama4ForCausalLM._convert_input_dict_to_ordered_tuple, to be removed?
         """
         Utility function to convert input dictionary to ordered tuple
@@ -290,7 +291,8 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
 
         return selected_buckets
     
-    def get_padding_length(self, buckets, position_ids):
+    @staticmethod
+    def get_padding_length(buckets, position_ids):
         # Identical to [NeuronLlama4ForCausalLM|NeuronPixtralForCausalLM]._select_buckets_for_padding_length
         max_position_id = torch.max(position_ids).item()
         for val in buckets:
@@ -298,7 +300,8 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
                 return val
         raise ValueError("No bucket found for provided input_ids!")
 
-    def get_required_kwargs(self) -> List[str]:
+    @staticmethod
+    def get_required_kwargs() -> List[str]:
         # Gemma3-specific
         """The list of additional input arguments to be prepared in HuggingFaceGenerationAdapter.prepare_inputs_for_generation()"""
         return [
