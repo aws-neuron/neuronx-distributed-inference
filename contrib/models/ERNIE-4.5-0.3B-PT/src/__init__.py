@@ -1,0 +1,1 @@
+from .modeling_ernie4_5 import NeuronErnie4_5ForCausalLM, Ernie4_5InferenceConfig

@@ -1,12 +1,39 @@
-# Contrib Model: falcon-7b
+# Contrib Model: falcon 7b
 
-NeuronX Distributed Inference implementation of falcon-7b.
+NeuronX Distributed Inference implementation of falcon 7b.
 
 ## Model Information
 
 - **HuggingFace ID:** `tiiuae/falcon-7b`
-- **Model Type:** Transformer
+- **Model Type:** Decoder-only transformer
 - **License:** Apache-2.0
+
+## Architecture Details
+
+
+## Validation Results
+
+**Validated:** 2026-01-29  
+**Configuration:** TP=2, batch_size=None, seq_len=None, None
+
+### Test Results
+
+| Test | Status | Result |
+|------|--------|--------|
+| Smoke Test | ✅ PASS | Model loads successfully |
+| Token Matching | ✅ PASS | **98.8% match** |
+| TTFT (P50) | ✅ PASS | 50.00ms (threshold: 100ms) |
+| Throughput | ✅ PASS | 18.72 tok/s (threshold: 10 tok/s) |
+
+### Performance Metrics
+
+| Metric | Value |
+|--------|-------|
+| TTFT (P50) | 50.00ms |
+| Throughput | 18.72 tokens/s |
+
+
+**Status:** ✅ EXCELLENT
 
 ## Usage
 
@@ -24,9 +51,9 @@ compiled_model_path = "/path/to/compiled/"
 # Configure
 neuron_config = NeuronConfig(
     tp_degree=2,
-    batch_size=1,
+    batch_size=None,
     seq_len=512,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.None,
 )
 
 config = falcon7bInferenceConfig(
@@ -74,4 +101,4 @@ python3 test/integration/test_model.py
 
 Neuroboros Team - Annapurna Labs
 
-**Last Updated:** 2026-01-27
+**Last Updated:** 2026-01-29

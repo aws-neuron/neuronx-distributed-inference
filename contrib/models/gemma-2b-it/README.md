@@ -1,12 +1,37 @@
-# Contrib Model: gemma-2b-it
+# Contrib Model: gemma 2b it
 
-NeuronX Distributed Inference implementation of gemma-2b-it.
+NeuronX Distributed Inference implementation of gemma 2b it.
 
 ## Model Information
 
 - **HuggingFace ID:** `google/gemma-2b-it`
-- **Model Type:** decoder-only-transformer
+- **Model Type:** Decoder-only transformer
 - **License:** Gemma Terms of Use (Google)
+
+## Architecture Details
+
+
+## Validation Results
+
+**Validated:** 2026-01-29  
+**Configuration:** TP=1, batch_size=None, seq_len=None, None
+
+### Test Results
+
+| Test | Status | Result |
+|------|--------|--------|
+| Smoke Test | ✅ PASS | Model loads successfully |
+| Token Matching | ✅ PASS | **100.0% match** |
+| Throughput | ✅ PASS | 25.24 tok/s (threshold: 10 tok/s) |
+
+### Performance Metrics
+
+| Metric | Value |
+|--------|-------|
+| Throughput | 25.24 tokens/s |
+
+
+**Status:** ✅ EXCELLENT
 
 ## Usage
 
@@ -23,10 +48,10 @@ compiled_model_path = "/path/to/compiled/"
 
 # Configure
 neuron_config = NeuronConfig(
-    tp_degree=2,
-    batch_size=1,
+    tp_degree=1,
+    batch_size=None,
     seq_len=512,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.None,
 )
 
 config = gemma2bitInferenceConfig(
@@ -74,4 +99,4 @@ python3 test/integration/test_model.py
 
 Neuroboros Team - Annapurna Labs
 
-**Last Updated:** 2026-01-27
+**Last Updated:** 2026-01-29

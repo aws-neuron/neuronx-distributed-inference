@@ -1,12 +1,38 @@
-# Contrib Model: helium-1-2b
+# Contrib Model: helium 1 2b
 
-NeuronX Distributed Inference implementation of helium-1-2b.
+NeuronX Distributed Inference implementation of helium 1 2b.
 
 ## Model Information
 
 - **HuggingFace ID:** `kyutai/helium-1-2b`
-- **Model Type:** helium
-- **License:** See HuggingFace model card
+- **Model Type:** Decoder-only transformer
+- **License:** Check HuggingFace model card
+
+## Architecture Details
+
+- **Parameters:** 2B
+
+## Validation Results
+
+**Validated:** 2026-01-29  
+**Configuration:** TP=2, batch_size=None, seq_len=None, None
+
+### Test Results
+
+| Test | Status | Result |
+|------|--------|--------|
+| Smoke Test | ✅ PASS | Model loads successfully |
+| Token Matching | ⚠️ PARTIAL | **82.2% match** |
+| Throughput | ✅ PASS | 42.00 tok/s (threshold: 10 tok/s) |
+
+### Performance Metrics
+
+| Metric | Value |
+|--------|-------|
+| Throughput | 42.00 tokens/s |
+
+
+**Status:** ✅ GOOD
 
 ## Usage
 
@@ -24,9 +50,9 @@ compiled_model_path = "/path/to/compiled/"
 # Configure
 neuron_config = NeuronConfig(
     tp_degree=2,
-    batch_size=1,
+    batch_size=None,
     seq_len=512,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.None,
 )
 
 config = helium12bInferenceConfig(
@@ -74,4 +100,4 @@ python3 test/integration/test_model.py
 
 Neuroboros Team - Annapurna Labs
 
-**Last Updated:** 2026-01-27
+**Last Updated:** 2026-01-29

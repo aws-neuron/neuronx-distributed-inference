@@ -22,8 +22,8 @@ from modeling_gemma import NeuronGemmaForCausalLM, GemmaInferenceConfig
 
 
 # Test configuration
-MODEL_PATH = "/home/ubuntu/models/Gemma-2b-It/"
-COMPILED_MODEL_PATH = "/tmp/gemma-2b-it_compiled/"
+MODEL_PATH = "/home/ubuntu/models/gemma-2b-it/"
+COMPILED_MODEL_PATH = "/home/ubuntu/neuron_models/gemma-2b-it/"
 
 
 def load_neuron_config_from_compiled(compiled_path: str):

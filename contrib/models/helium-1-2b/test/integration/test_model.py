@@ -22,8 +22,8 @@ from modeling_helium import NeuronHeliumForCausalLM, HeliumInferenceConfig
 
 
 # Test configuration
-MODEL_PATH = "/home/ubuntu/models/Helium-1-2b/"
-COMPILED_MODEL_PATH = "/tmp/helium-1-2b_compiled/"
+MODEL_PATH = "/home/ubuntu/models/helium-1-2b/"
+COMPILED_MODEL_PATH = "/home/ubuntu/neuron_models/helium-1-2b/"
 
 
 def load_neuron_config_from_compiled(compiled_path: str):

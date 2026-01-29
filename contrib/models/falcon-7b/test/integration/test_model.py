@@ -22,8 +22,8 @@ from modeling_falcon import NeuronFalconForCausalLM, FalconInferenceConfig
 
 
 # Test configuration
-MODEL_PATH = "/home/ubuntu/models/Falcon-7b/"
-COMPILED_MODEL_PATH = "/tmp/falcon-7b_compiled/"
+MODEL_PATH = "/home/ubuntu/models/falcon-7b/"
+COMPILED_MODEL_PATH = "/home/ubuntu/neuron_models/falcon-7b/"
 
 
 def load_neuron_config_from_compiled(compiled_path: str):

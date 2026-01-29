@@ -17,7 +17,6 @@
 PyTorch Gemma model for NXD inference
 
 Ported from HuggingFace transformers:
-/shared/dhwanw/agent_friday_test/example/transformers/src/transformers/models/gemma/modeling_gemma.py
 
 Key architectural features:
 - Multi-Query Attention (MQA) with 1 KV head
