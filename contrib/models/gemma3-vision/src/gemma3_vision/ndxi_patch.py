@@ -1,5 +1,6 @@
 from typing import Callable, List, Optional, Tuple, Union
 
+from neuronx_distributed_inference.utils.tensor_replacement.registry import TensorReplacementRegister
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -139,8 +140,90 @@ def patched_base_image_to_text_model_forward(
     return constructed_outputs
 
 
+def patched_hf_adapter_prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        sampling_params=None,
+        adapter_ids=None,
+        **kwargs,
+    ):
+        # Store KV cache flag before forward pass.
+        self.prev_kv_cache_populated = self.neuron_model.kv_cache_populated
+        if self.neuron_model.kv_cache_populated:
+            input_ids = input_ids[:, -1:]
+
+        accepted_indices = kwargs.get("accepted_indices", None)
+        current_length = kwargs.get("current_length", None)
+        medusa_mask = kwargs.get("medusa_mask", None)
+        scatter_index = kwargs.get("scatter_index", None)
+        position_ids = kwargs.get("position_ids", None)
+        input_capture_hook = kwargs.get("input_capture_hook", None)
+
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            if self.input_start_offsets:
+                if len(self.input_start_offsets) > 1:
+                    position_ids += torch.tensor(self.input_start_offsets, dtype=position_ids.dtype, device=position_ids.device)[:, None]
+                else:
+                    position_ids += self.input_start_offsets[0]
+                for i, offset in enumerate(self.input_start_offsets):
+                    position_ids[i, 0:offset] = torch.arange(offset)
+            else:
+                position_ids.masked_fill_(attention_mask == 0, 1)
+
+            if self.neuron_model.kv_cache_populated:
+                position_ids = torch.amax(position_ids, 1, keepdim=True)
+                position_ids = position_ids + 1
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache", False),
+                "attention_mask": attention_mask,
+                "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
+                "sampling_params": sampling_params,
+                "input_capture_hook": input_capture_hook,
+                #"tensor_capture_hook": tensor_capture_hook, -> FIX: Otherwise raises a breaking NameError
+                "adapter_ids": adapter_ids
+            }
+        )
+
+        tf_args = []
+        if self.neuron_config.tensor_replacement_config:
+            if hasattr(self, 'generation_step'):
+                self.generation_step += 1
+            else:
+                self.generation_step = 1
+            reg = TensorReplacementRegister.get_instance()
+            tf , masks = reg.step_args(self.generation_step)
+            tf_args = tf + masks
+
+        # Only add tf_args if not empty
+        if tf_args:
+            model_inputs["tf_args"] = tf_args
+
+        # WARNING: This is needed for propagating additional kwargs to the neuron model
+        additional_kwargs = self.neuron_model.get_required_kwargs()
+        for arg in additional_kwargs:
+            model_inputs.update({arg: kwargs.get(arg, None)})
+
+        return model_inputs
+
+
 def apply_patch() -> None:
     import neuronx_distributed_inference.modules.attention.utils as u
     u.get_last_kv_window = patched_get_last_kv_window
     import neuronx_distributed_inference.models.image_to_text_model_base as mm_base
     mm_base.NeuronBaseForImageToText.forward = patched_base_image_to_text_model_forward
+    import neuronx_distributed_inference.utils.hf_adapter as hf_adapter
+    hf_adapter.HuggingFaceGenerationAdapter.prepare_inputs_for_generation = patched_hf_adapter_prepare_inputs_for_generation
