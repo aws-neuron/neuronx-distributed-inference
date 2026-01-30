@@ -198,7 +198,7 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
 
         # At the time of writing, NxDI (Neuron 2.26) attention layer does not provide a simple way to use a custom 
         # scaling factor for raw attention scores (QK^T) while ensuring all optimizations (e.g. kernels) remain available 
-        # To work around this, we fuse the scaling factor into the weights (knowing that  the attention layer will use the 
+        # To work around this, we fuse the scaling factor into the weights (knowing that the attention layer will use the 
         # default math.sqrt(inference_config.head_dim) value)
         default_qk_scaling_factor_inv = math.sqrt(float(inference_config.text_config.query_pre_attn_scalar))
         gemma_qk_scaling_factor = 1.0 / math.sqrt(float(inference_config.text_config.head_dim))
@@ -354,6 +354,15 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         # output tensor of shape (batch_sz, target_sz, 1)
         return positions_padded.unsqueeze(-1)
 
+    @staticmethod
+    def _create_position_ids(attention_mask_2d: torch.LongTensor, is_prefill: bool) -> torch.LongTensor:
+        position_ids = attention_mask_2d.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask_2d == 0, 1)
+        if is_prefill:
+            return position_ids
+        else: 
+            return torch.amax(position_ids, dim=1, keepdim=True) + 1
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -375,6 +384,9 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         # Very close to NeuronLlama4ForCausalLM.forward
         is_prefill = (input_ids.shape[-1] > 1)
         include_images = (pixel_values is not None) and (vision_mask is not None) and (pixel_values.sum() != 0)
+
+        if position_ids is None:
+            position_ids = self._create_position_ids(attention_mask_2d=attention_mask, is_prefill=is_prefill)
 
         buckets = self._select_buckets_for_padding_length(position_ids=position_ids)
         pad_target_size = self.get_padding_length(buckets=buckets, position_ids=position_ids)
@@ -461,3 +473,33 @@ class NeuronGemma3ForCausalLM(NeuronBaseForImageToText):
         model_quant_sd = hf_model_quant.state_dict()
         convert_qint8_to_int8_state_dict(model_quant_sd)
         return model_quant_sd
+
+    def _get_constructed_outputs(self, outputs, is_run_on_neuron):
+        if self.on_device_sampling and self.text_config.neuron_config.output_logits and not \
+                (self.text_config.neuron_config.enable_fused_speculation or self.text_config.neuron_config.is_medusa):
+            logits_or_next_tokens = outputs[:2]
+            constructed_outputs = self._construct_output_with_tokens_and_logits(next_tokens=logits_or_next_tokens[0], logits=logits_or_next_tokens[1])
+        else:
+            if is_run_on_neuron:
+                # FIX: Remove updated KV cache tensor (outputs[1])
+                logits_or_next_tokens = logits_or_next_tokens = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+            else:
+                # When run on cpu, KV cache is returned which has to be ignored
+                logits_or_next_tokens, *_ = outputs
+            constructed_outputs = self._construct_output(logits_or_next_tokens)
+
+        if logging.root.isEnabledFor(logging.DEBUG):
+            logging.debug("---output---")
+            logging.debug(
+                f"{'tokens' if self.on_device_sampling else 'logits'} = %s, ",
+                logits_or_next_tokens,
+            )
+
+        return constructed_outputs
+
+    @staticmethod
+    def load_hf_model(model_path, **kwargs):
+        from transformers import Gemma3ForConditionalGeneration, Gemma3Config
+        config = Gemma3Config.from_pretrained(model_path)
+        model = Gemma3ForConditionalGeneration.from_pretrained(model_path, config=config).eval()
+        return model
