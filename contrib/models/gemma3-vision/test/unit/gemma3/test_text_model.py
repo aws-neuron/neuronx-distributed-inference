@@ -108,4 +108,5 @@ def test_nxdi_text_model_cpu_vs_transformers_implementation(random_seed) -> None
         ) # first item is logits when on_device_sampling is off
 
     rtol, atol = FP32_TOLERANCES.rtol, FP32_TOLERANCES.atol
+    print((ref_output - output).abs().max())
     assert_tensor_all_close(test_objective="Gemma3 text model - nxdi (cpu) vs huggingface", computed_value=output, reference_value=ref_output, rtol=rtol, atol=atol, equal_nan=True)
