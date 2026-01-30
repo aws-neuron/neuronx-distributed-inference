@@ -49,7 +49,6 @@ LNC = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "1"))
     ]
 )
 def test_original_cpu_vs_nxdi_neuron(
-    random_seed: None,
     tmp_path: Path,
     config_file_path: Path,
     tp_degree: int,
@@ -139,3 +138,34 @@ def test_original_cpu_vs_nxdi_neuron(
         additional_input_args=additional_input_args,
         divergence_difference_tol=token_divergence_atol,
     )
+
+if __name__ == "__main__":
+    import tempfile
+    tmp_dir = tempfile.TemporaryDirectory()
+    tmp_dir_path = Path(tmp_dir.name)
+    torch_dtype = torch.float16
+    token_divergence_atol = 0.02
+    config_file_path = Path(__file__).resolve().parent / "config_gemma3_4layers.json"
+    perf_thresholds = {
+        "text_cte_p50_latency": 20.55,
+        "text_cte_throughput": 49807.3,
+        "tkg_p50_latency": 4.42,
+        "tkg_throughput": 226.4,
+    }
+    tp_degree = 8
+    batch_size = num_images_per_sample = 1
+    total_max_seq_len = 1024
+
+    test_original_cpu_vs_nxdi_neuron(
+        config_file_path=config_file_path,
+        tmp_path=tmp_dir_path,
+        torch_dtype=torch_dtype,
+        token_divergence_atol=token_divergence_atol,
+        perf_thresholds=perf_thresholds,
+        tp_degree=tp_degree,
+        batch_size=batch_size,
+        num_images_per_sample=num_images_per_sample,
+        total_max_seq_len=total_max_seq_len,
+        )
+        
+    tmp_dir.cleanup()

@@ -196,8 +196,7 @@ When using quantization, the following components must be excluded:
 Run integration tests to validate model accuracy and performance:
 
 ```bash
-export PYTHONPATH="${PYTHONPATH}:${PWD}/contrib/models/gemma3-vision/src"
-pytest contrib/models/gemma3-vision/test/integration/test_model.py --capture=tee-sys
+cd /home/ubuntu/nxdi-gemma3-contribution/contrib/models/gemma3-vision && PYTHONPATH="src:/home/ubuntu/nxdi-gemma3-contribution/src:$PYTHONPATH" uv run python -m test.integration.test_model
 ```
 
 Run all tests (integration + unit):

@@ -58,3 +58,12 @@ def hf_text_config():
 @pytest.fixture
 def cpu_xla_env(monkeypatch):    
     monkeypatch.setenv("PJRT_DEVICE", "CPU")
+
+
+@pytest.fixture
+def tmp_dir_path():
+    import tempfile
+    tmp_dir = tempfile.TemporaryDirectory()
+    tmp_dir_path = Path(tmp_dir.name)
+    yield tmp_dir_path
+    tmp_dir.cleanup()
