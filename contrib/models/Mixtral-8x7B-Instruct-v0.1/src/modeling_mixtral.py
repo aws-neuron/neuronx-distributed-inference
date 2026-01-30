@@ -32,7 +32,7 @@ class MixtralInferenceConfig(InferenceConfig):
     This extends InferenceConfig with Mixtral-specific parameters and adds
     a from_pretrained class method for loading configurations.
     
-    Based on: /shared/dhwanw/agent_friday_test/example/transformers/src/transformers/models/mixtral/configuration_mixtral.py
+    Based on: 
     Reference: NeuronxDistributedInference/src/neuronx_distributed_inference/models/mixtral/modeling_mixtral.py
     """
     
@@ -96,7 +96,7 @@ class MixtralInferenceConfig(InferenceConfig):
             
         Example:
             config = MixtralInferenceConfig.from_pretrained(
-                "/shared/dhwanw/models/Mixtral-8x7B-Instruct-v0.1",
+                "",
                 neuron_config=neuron_config
             )
         """
@@ -204,7 +204,7 @@ class NeuronMixtralForCausalLM(BaseNeuronMixtralForCausalLM):
       * RMSNorm for normalization
       * Rotary Position Embeddings (RoPE)
     
-    Based on: /shared/dhwanw/agent_friday_test/example/transformers/src/transformers/models/mixtral/modeling_mixtral.py
+    Based on: 
     Reference: NeuronxDistributedInference/src/neuronx_distributed_inference/models/mixtral/modeling_mixtral.py
     """
     

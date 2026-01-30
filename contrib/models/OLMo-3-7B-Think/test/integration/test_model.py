@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Integration tests for Qwen3-VL-8B-Thinking NeuronX implementation.
+Integration tests for OLMo-3-7B-Think NeuronX implementation.
 """
 
 import pytest
@@ -15,12 +15,12 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_qwen3_vl import *
+from modeling_olmo3_sliding_window import *
 
 
 # Test configuration
-MODEL_PATH = "/home/ubuntu/models/Qwen3-VL-8B-Thinking/"
-COMPILED_MODEL_PATH = "/home/ubuntu/neuron_models/Qwen3-VL-8B-Thinking/"
+MODEL_PATH = "/home/ubuntu/models/OLMo-3-7B-Think/"
+COMPILED_MODEL_PATH = "/home/ubuntu/neuron_models/OLMo-3-7B-Think/"
 
 
 def load_neuron_config_from_compiled(compiled_path: str):
@@ -141,7 +141,7 @@ def test_output_coherence(compiled_model, tokenizer):
 
 if __name__ == "__main__":
     print("="*80)
-    print("Qwen3-VL-8B-Thinking Integration Tests")
+    print("OLMo-3-7B-Think Integration Tests")
     print("="*80)
     
     print("\nNote: This is a template test file.")

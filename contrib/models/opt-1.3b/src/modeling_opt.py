@@ -5,7 +5,7 @@ This implementation ports the OPT model from HuggingFace transformers to the Neu
 Inference framework for efficient inference on AWS Trainium/Inferentia hardware.
 
 Original implementation reference:
-/shared/dhwanw/agent_friday_test/example/transformers/src/transformers/models/opt/modeling_opt.py
+
 
 Key architectural features of OPT:
 - Decoder-only causal language model (like GPT)

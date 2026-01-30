@@ -18,7 +18,7 @@ Falcon-H1 model implementation for NeuronX Distributed Inference.
 
 This is a hybrid Mamba2 + Attention architecture with MLP.
 Based on the transformers implementation at:
-/shared/dhwanw/agent_friday_test/example/transformers/src/transformers/models/falcon_h1/modeling_falcon_h1.py
+
 """
 
 import math

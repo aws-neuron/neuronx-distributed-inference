@@ -19,7 +19,7 @@
 PyTorch Phi3 model for NeuronxDistributed inference
 
 This implementation is based on the original Phi3 model from:
-/home/ec2-user/TestFramework/transformers/src/transformers/models/phi3/modular_phi3.py
+
 
 Key architectural features from the original:
 - Combined gate_up_proj in MLP (gate and up projections combined)
@@ -85,7 +85,7 @@ class Phi3InferenceConfig(InferenceConfig):
     Configuration class for Phi3 model inference
     
     Based on the configuration from:
-    /home/ec2-user/TestFramework/Phi-3-mini-4k-instruct/config.json
+    
     """
     
     def add_derived_config(self):
@@ -154,7 +154,7 @@ class Phi3InferenceConfig(InferenceConfig):
             config_dict = json.load(f)
         
         # Create configuration with values from config file
-        # Based on /home/ec2-user/TestFramework/Phi-3-mini-4k-instruct/config.json
+        # Based on 
         final_config = {
             "hidden_size": config_dict.get("hidden_size", 3072),
             "num_attention_heads": config_dict.get("num_attention_heads", 32),
@@ -189,7 +189,7 @@ class NeuronPhi3MLP(nn.Module):
     Phi3 MLP implementation for NeuronxDistributed
     
     Based on the original Phi3MLP from:
-    /home/ec2-user/TestFramework/transformers/src/transformers/models/phi3/modular_phi3.py
+    
     
     Original implementation:
     - gate_up_proj: Linear(hidden_size, 2 * intermediate_size, bias=False)
@@ -256,7 +256,7 @@ class NeuronPhi3Attention(NeuronAttentionBase):
     Phi3 Attention implementation for NeuronxDistributed
     
     Based on the original Phi3Attention from:
-    /home/ec2-user/TestFramework/transformers/src/transformers/models/phi3/modular_phi3.py
+    
     
     Original implementation:
     - Uses combined qkv_proj: Linear(hidden_size, op_size, bias=False)
@@ -298,7 +298,7 @@ class NeuronPhi3DecoderLayer(nn.Module):
     Phi3 Decoder Layer implementation for NeuronxDistributed
     
     Based on the original Phi3DecoderLayer from:
-    /home/ec2-user/TestFramework/transformers/src/transformers/models/phi3/modular_phi3.py
+    
     
     Original implementation extends MistralDecoderLayer with:
     - self_attn: Phi3Attention

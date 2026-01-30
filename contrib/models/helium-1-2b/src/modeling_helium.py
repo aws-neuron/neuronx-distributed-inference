@@ -25,7 +25,7 @@ The architecture is similar to LLaMA with:
 - RoPE (Rotary Position Embeddings)
 
 Original implementation reference:
-/shared/dhwanw/agent_friday_test/example/transformers/src/transformers/models/helium/
+
 """
 
 import torch
