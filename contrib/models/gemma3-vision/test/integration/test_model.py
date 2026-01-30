@@ -1,183 +1,259 @@
-# Copyright 2025 © Amazon.com and Affiliates
+from gemma3_vision.ndxi_patch import apply_patch
+apply_patch()
 
-"""
-Integration test for Gemma3-Vision VLM model.
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
-This test validates model accuracy and performance for the Gemma3-Vision multimodal model
-with both text+image and text-only generation.
-
-Feature: gemma3-vision-migration, Property 3: Text+Image Generation Correctness
-Feature: gemma3-vision-migration, Property 4: Text-Only Generation Correctness
-Feature: gemma3-vision-migration, Property 5: Model Compilation Success
-"""
-
-import pytest
-import torch
-from transformers import AutoTokenizer, AutoProcessor, GenerationConfig
-
-from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.models.llama4.utils.input_processor import (
-    prepare_generation_inputs_hf
+from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
+from neuronx_distributed_inference.utils.accuracy import (
+    generate_expected_logits,
+    check_accuracy_logits_v2,
 )
-from neuronx_distributed_inference.utils.accuracy import check_accuracy_logits
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
-from neuronx_distributed_inference.utils.exceptions import LogitMatchingValidationError
-from neuronx_distributed_inference.utils.hf_adapter import (
-    load_pretrained_config,
-    HuggingFaceGenerationAdapter,
-)
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+import torch
+from transformers import Gemma3ForConditionalGeneration, Gemma3Config, GenerationConfig
 
-from gemma3_vision import NeuronGemma3ForCausalLM, Gemma3InferenceConfig
+from gemma3_vision.modeling_gemma3 import NeuronGemma3ForCausalLM, Gemma3InferenceConfig
 
-# Model paths
-model_path = "/home/ubuntu/models/google/gemma-3-27b-it/"
-compiled_model_path = "/home/ubuntu/neuron-models/gemma-3-27b-it/"
-test_image_path = "tmp/external-code/scripts/dog.jpg"
-
-NUM_TOKENS_TO_CHECK = 256
 
 torch.manual_seed(0)
 
 
-def create_neuron_configs(batch_size, seq_len):
-    """Create text and vision neuron configurations."""
+def get_hf_config(
+    hf_model_path: Path,
+    torch_dtype: Optional[torch.dtype] = None,
+    num_hidden_layers: Optional[int] = None,
+) -> Gemma3Config:
+    hf_config = Gemma3Config.from_pretrained(hf_model_path)
+
+    if torch_dtype is not None:
+        hf_config.torch_dtype = torch_dtype
+
+    if num_hidden_layers is not None:
+        hf_config.num_hidden_layers = num_hidden_layers
+        if getattr(hf_config, "text_config", None) is not None:
+            hf_config.text_config.num_hidden_layers = num_hidden_layers
+        if getattr(hf_config, "vision_config", None) is not None:
+            hf_config.vision_config.num_hidden_layers = num_hidden_layers
+
+    return hf_config
+
+
+def save_hf_checkpoint(
+    output_dir_path: Path,
+    config_file_path: Path,
+    torch_dtype: torch.dtype,
+    ) -> None:
+    hf_config = Gemma3Config.from_pretrained(config_file_path, torch_dtype=torch_dtype)
+    hf_model = Gemma3ForConditionalGeneration(config=hf_config) # random weights
+    hf_model.save_pretrained(output_dir_path)
+
+
+def create_neuron_config(
+    hf_config_path: Path,
+    text_batch_size: int = 1,
+    vision_batch_size: int = 1,
+    total_max_seq_len: int = 1024,
+    torch_dtype: torch.dtype = torch.float16,
+    lnc: int = 1,
+    tp_degree: int = 8,
+
+) -> Gemma3InferenceConfig:    
     text_config = NeuronConfig(
-        # Basic configs
-        tp_degree=8,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        torch_dtype=torch.bfloat16,
-        
-        # Bucketing
+        batch_size=text_batch_size,
+        seq_len=total_max_seq_len,
+        torch_dtype=torch_dtype,
+        rpl_reduce_dtype=torch.float32,
+        cast_type="as-declared",
+        logical_nc_config=lnc,
+        tp_degree=tp_degree,
+        world_size=tp_degree,
+        skip_sharding=False,
+        save_sharded_checkpoint=True,
         enable_bucketing=True,
-        context_encoding_buckets=[seq_len],
-        token_generation_buckets=[seq_len],
-        
-        # Optimizations
-        fused_qkv=True,
-        attn_kernel_enabled=True,
-        async_mode=True,
-        
-        # Continuous batching
-        is_continuous_batching=True,
-        ctx_batch_size=1,
+        context_encoding_buckets=[total_max_seq_len],
+        token_generation_buckets=[total_max_seq_len],
+        on_device_sampling_config=OnDeviceSamplingConfig(
+            dynamic=False,
+            do_sample=False, 
+            deterministic=True,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=1,
+            global_topk=256, 
+            top_k_kernel_enabled=False,
+        ),
+        output_logits=True,
     )
-    
+
     vision_config = NeuronConfig(
-        # Basic configs
-        tp_degree=8,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        torch_dtype=torch.bfloat16,
-        
-        # Bucketing - auto-bucketing for vision
+        batch_size=vision_batch_size,
+        seq_len=total_max_seq_len, # Does not matter
+        torch_dtype=torch_dtype,
+        rpl_reduce_dtype=torch.float32,
+        logical_nc_config=lnc,
+        tp_degree=tp_degree,
+        world_size=tp_degree,
+        skip_sharding=False,
+        save_sharded_checkpoint=True,
         enable_bucketing=True,
-        buckets=[1],  # Auto-bucketing from 1024 to seq_len
-        
-        # Optimizations
-        fused_qkv=False,  # SigLIP requires separate QKV
-        attn_kernel_enabled=True,
-        
-        # Continuous batching
-        is_continuous_batching=True,
-        ctx_batch_size=1,
+        buckets=[vision_batch_size],
     )
     
-    return text_config, vision_config
-
-
-# Performance numbers based on v14_bs1.py configuration (TP=8, BS=1, SEQ=512)
-@pytest.mark.parametrize(
-    "batch_size, seq_len, ttft_threshold, throughput_threshold",
-    [
-        (1, 512, 50.0, 80),    # Baseline configuration
-        (1, 2048, 200.0, 70),  # Long context
-    ]
-)
-def test_model_accuracy_and_performance(batch_size, seq_len, ttft_threshold, throughput_threshold):
-    """
-    Test Gemma3-Vision model accuracy and performance.
-    
-    Feature: gemma3-vision-migration, Property 3: Text+Image Generation Correctness
-    Feature: gemma3-vision-migration, Property 4: Text-Only Generation Correctness
-    Feature: gemma3-vision-migration, Property 5: Model Compilation Success
-    """
-    print(f"Testing model with parameters: {batch_size=}, {seq_len=}, {ttft_threshold=}, {throughput_threshold=}")
-    
-    # Initialize configs
-    text_config, vision_config = create_neuron_configs(batch_size, seq_len)
-    
-    config = Gemma3InferenceConfig(
+    nrn_config = Gemma3InferenceConfig(
         text_neuron_config=text_config,
         vision_neuron_config=vision_config,
-        load_config=load_pretrained_config(model_path),
+        load_config=load_pretrained_config(hf_config_path),
+    )
+    return nrn_config
+
+
+def create_generation_config(nrn_config: Gemma3InferenceConfig) -> GenerationConfig:
+    return GenerationConfig(
+        do_sample=False, 
+        pad_token_id=nrn_config.text_config.pad_token_id, 
+        output_scores=True,  # Processed & warped logits
+        output_logits=False, # Raw logits -> not needed
+        return_dict_in_generate=True)
+    
+
+def prepare_inputs(nrn_config: Gemma3InferenceConfig, torch_dtype: torch.dtype) -> Tuple[torch.Tensor, ...]:
+    batch_size = nrn_config.text_config.neuron_config.batch_size
+    text_tokens_length = 16
+    text_input_ids = torch.rand((batch_size, text_tokens_length)) * nrn_config.text_config.vocab_size
+
+    image_per_sample = nrn_config.vision_config.neuron_config.batch_size // batch_size
+    vision_tokens_length = nrn_config.mm_tokens_per_image
+    vision_input_ids = torch.full([batch_size, image_per_sample * vision_tokens_length], fill_value=nrn_config.image_token_index)
+
+    input_ids = torch.cat((text_input_ids, vision_input_ids), dim=1).to(dtype=torch.int32)
+
+    total_length = text_tokens_length + vision_tokens_length
+    attention_mask_2d = torch.ones((batch_size, total_length), dtype=torch.int32)
+
+    pixel_values = torch.rand((
+            batch_size * image_per_sample,
+            nrn_config.vision_config.num_channels,
+            nrn_config.vision_config.image_size,
+            nrn_config.vision_config.image_size,
+        ),
+        dtype=torch.float32
+    )
+    pixel_values = (2.0 * pixel_values - 1.0).to(dtype=torch_dtype)
+
+    vision_mask = (input_ids == nrn_config.image_token_index).unsqueeze(-1)
+    vision_mask = vision_mask.to(torch.bool)
+
+    return input_ids, attention_mask_2d, pixel_values, vision_mask
+
+
+def test_original_cpu_vs_nxdi_neuron(
+    config_file_path: Path,
+    tmp_dir_path: Path,
+    torch_dtype: torch.dtype, 
+    token_divergence_atol: float,
+    perf_thresholds: Dict[str, float],
+    batch_size: int = 1,
+    num_images_per_sample: int = 1,
+    total_max_seq_len: int = 1024,
+    lnc: int = 1,
+    tp_degree: int = 8,
+    num_tokens_to_check: int = 16
+    ) -> None:
+    nrn_config = create_neuron_config(
+        hf_config_path=config_file_path,
+        text_batch_size=batch_size,
+        vision_batch_size=(num_images_per_sample * batch_size),
+        total_max_seq_len=total_max_seq_len,
+        torch_dtype=torch_dtype,
+        lnc=lnc,
+        tp_degree=tp_degree
+    )
+
+    input_ids, attention_mask, pixel_values, vision_mask = prepare_inputs(
+        nrn_config=nrn_config,
+        torch_dtype=torch_dtype
     )
     
-    # Initialize tokenizer and processor
-    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
-    tokenizer.pad_token = tokenizer.eos_token
-    processor = AutoProcessor.from_pretrained(model_path)
-    generation_config = GenerationConfig.from_pretrained(model_path)
-    generation_config.do_sample = False
-    generation_config.top_k = 1
-    
-    # Compile and load model
-    print("\nCompiling and loading model...")
-    model = NeuronGemma3ForCausalLM(model_path, config)
-    model.compile(compiled_model_path)
-    model.load(compiled_model_path)
-    
-    # Test 1: Text+Image Generation Accuracy
-    print("\n=== Testing Text+Image Generation ===")
-    try:
-        check_accuracy_logits(
-            model,
-            tokenizer,
-            generation_config,
-            num_tokens_to_check=NUM_TOKENS_TO_CHECK,
-            image_path=test_image_path,
+    generation_config = create_generation_config(nrn_config=nrn_config)
+
+    save_hf_checkpoint(
+        output_dir_path=tmp_dir_path, 
+        config_file_path=config_file_path,
+        torch_dtype=torch_dtype,
         )
-        print("✓ Text+Image generation accuracy validated")
-    except LogitMatchingValidationError as e:
-        print(f"✗ Text+Image generation accuracy validation failed: {e}")
-        raise e
+
+    nrn_config._name_or_path = tmp_dir_path.as_posix()
+    nrn_model = NeuronGemma3ForCausalLM(model_path=tmp_dir_path, config=nrn_config)
+
+    traced_model_path = tmp_dir_path / "traced_model"
+    traced_model_path.mkdir(exist_ok=True)
     
-    # Test 2: Text-Only Generation
-    print("\n=== Testing Text-Only Generation ===")
-    text_prompt = "What is the capital of France?"
-    input_ids, attention_mask, _, _ = prepare_generation_inputs_hf(
-        text_prompt, None, processor, 'user'
-    )
-    
-    generation_model = HuggingFaceGenerationAdapter(model)
-    outputs = generation_model.generate(
-        input_ids,
+    nrn_model.compile(traced_model_path.as_posix())
+
+    nrn_model.load(traced_model_path.as_posix())
+
+    benchmark_report = benchmark_sampling(
+        model=nrn_model, 
         generation_config=generation_config,
-        attention_mask=attention_mask,
-        max_new_tokens=50,
+        image=False # image=True currently broken (Neuron 2.27.1)
+        )
+    
+    assert benchmark_report["context_encoding_model"]["latency_ms_p50"] < perf_thresholds["text_cte_p50_latency"] * 1.1
+    assert benchmark_report["context_encoding_model"]["throughput"] > perf_thresholds["text_cte_throughput"] * 0.9
+    assert benchmark_report["token_generation_model"]["latency_ms_p50"] < perf_thresholds["tkg_p50_latency"] * 1.1
+    assert benchmark_report["token_generation_model"]["throughput"] > perf_thresholds["tkg_throughput"] * 0.9
+
+    expected_logits = generate_expected_logits(
+        neuron_model=nrn_model,
+        input_ids=input_ids,
+        inputs_attention_mask=attention_mask,
+        generation_config=generation_config,
+        num_tokens=num_tokens_to_check,
+        additional_input_args={
+            "pixel_values": pixel_values,
+        },
     )
-    
-    output_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    assert len(output_text) > 0, "Text-only generation produced no output"
-    print(f"✓ Text-only generation successful: {output_text[0][:100]}...")
-    
-    # Test 3: Performance Validation
-    print("\n=== Testing Performance ===")
-    benchmark_report = benchmark_sampling(model, generation_config=generation_config)
-    
-    ttft = benchmark_report["context_encoding_model"]["latency_ms_p50"]
-    throughput = benchmark_report["token_generation_model"]["throughput"]
-    
-    print(f"TTFT (p50): {ttft:.2f}ms (threshold: {ttft_threshold}ms)")
-    print(f"Throughput: {throughput:.2f} tokens/s (threshold: {throughput_threshold} tokens/s)")
-    
-    # Allow 10% margin for performance variations
-    assert ttft < ttft_threshold * 1.1, f"TTFT {ttft}ms exceeds threshold {ttft_threshold}ms"
-    assert throughput > throughput_threshold * 0.9, f"Throughput {throughput} below threshold {throughput_threshold}"
-    
-    print(f"\n✓ Test passed for parameters: {batch_size=}, {seq_len=}")
+
+    additional_input_args = {
+        "pixel_values": pixel_values,
+        "vision_mask": vision_mask,
+    }
+
+    check_accuracy_logits_v2(
+        neuron_model=nrn_model,
+        expected_logits=expected_logits,
+        inputs_input_ids=input_ids,
+        inputs_attention_mask=attention_mask,
+        generation_config=generation_config,
+        num_tokens_to_check=num_tokens_to_check,
+        additional_input_args=additional_input_args,
+        divergence_difference_tol=token_divergence_atol,
+    )
 
 
 if __name__ == "__main__":
-    # Run with default parameters for quick testing
-    test_model_accuracy_and_performance(1, 512, 50.0, 80)
+    import tempfile
+    tmp_dir = tempfile.TemporaryDirectory()
+    tmp_dir_path = Path(tmp_dir.name)
+    torch_dtype = torch.float16
+    token_divergence_atol = 0.02
+    config_file_path = Path(__file__).resolve().parent / "config_gemma3_4layers.json"
+    perf_thresholds = {
+        "text_cte_p50_latency": 20.55,
+        "text_cte_throughput": 49807.3,
+        "tkg_p50_latency": 4.42,
+        "tkg_throughput": 226.4,
+    }
+    tp_degree = 8
+
+    test_original_cpu_vs_nxdi_neuron(
+        config_file_path=config_file_path,
+        tmp_dir_path=tmp_dir_path,
+        torch_dtype=torch_dtype,
+        token_divergence_atol=token_divergence_atol,
+        perf_thresholds=perf_thresholds,
+        tp_degree=tp_degree,
+        )
+    tmp_dir.cleanup()
