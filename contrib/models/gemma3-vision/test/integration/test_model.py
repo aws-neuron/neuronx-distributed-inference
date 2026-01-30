@@ -20,6 +20,22 @@ from gemma3_vision.modeling_gemma3 import NeuronGemma3ForCausalLM, Gemma3Inferen
 torch.manual_seed(0)
 
 
+def get_test_name_suffix(
+    tp_degree: int,
+    torch_dtype: torch.dtype,
+    batch_size: int,
+    num_images_per_sample: int,
+    max_seq_len: int,
+) -> str:
+    dtype_str = {
+        torch.float16: "fp16",
+        torch.bfloat16: "bf16",
+        torch.float32: "fp32",
+    }.get(torch_dtype, str(torch_dtype).split(".")[-1])
+    vision_batch_size = batch_size * num_images_per_sample
+    return f"_{tp_degree}_{dtype_str}_tbs{batch_size}_vbs{vision_batch_size}_s{max_seq_len}"
+
+
 def get_hf_config(
     hf_model_path: Path,
     torch_dtype: Optional[torch.dtype] = None,
@@ -161,6 +177,14 @@ def test_original_cpu_vs_nxdi_neuron(
     tp_degree: int = 8,
     num_tokens_to_check: int = 16
     ) -> None:
+    suffix = get_test_name_suffix(
+        tp_degree=tp_degree,
+        torch_dtype=torch_dtype,
+        batch_size=batch_size,
+        num_images_per_sample=num_images_per_sample,
+        max_seq_len=total_max_seq_len
+    )
+
     nrn_config = create_neuron_config(
         hf_config_path=config_file_path,
         text_batch_size=batch_size,
@@ -187,7 +211,7 @@ def test_original_cpu_vs_nxdi_neuron(
     nrn_config._name_or_path = tmp_dir_path.as_posix()
     nrn_model = NeuronGemma3ForCausalLM(model_path=tmp_dir_path, config=nrn_config)
 
-    traced_model_path = tmp_dir_path / "traced_model"
+    traced_model_path = tmp_dir_path / ("traced_model" + suffix)
     traced_model_path.mkdir(exist_ok=True)
     
     nrn_model.compile(traced_model_path.as_posix())
@@ -197,7 +221,8 @@ def test_original_cpu_vs_nxdi_neuron(
     benchmark_report = benchmark_sampling(
         model=nrn_model, 
         generation_config=generation_config,
-        image=False # image=True currently broken (Neuron 2.27.1)
+        image=False, # image=True currently broken (Neuron 2.27.1)
+        benchmark_report_path=f"./benchmark_report{suffix}.json"
         )
     
     assert benchmark_report["context_encoding_model"]["latency_ms_p50"] < perf_thresholds["text_cte_p50_latency"] * 1.1
@@ -247,6 +272,8 @@ if __name__ == "__main__":
         "tkg_throughput": 226.4,
     }
     tp_degree = 8
+    batch_size = num_images_per_sample = 1
+    total_max_seq_len = 1024
 
     test_original_cpu_vs_nxdi_neuron(
         config_file_path=config_file_path,
@@ -255,5 +282,8 @@ if __name__ == "__main__":
         token_divergence_atol=token_divergence_atol,
         perf_thresholds=perf_thresholds,
         tp_degree=tp_degree,
+        batch_size=batch_size,
+        num_images_per_sample=num_images_per_sample,
+        total_max_seq_len=total_max_seq_len,
         )
     tmp_dir.cleanup()
