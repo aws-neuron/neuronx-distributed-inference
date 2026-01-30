@@ -1,6 +1,7 @@
 
 import random
 from pathlib import Path
+import tempfile
 
 from neuronx_distributed.parallel_layers import parallel_state
 import pytest
