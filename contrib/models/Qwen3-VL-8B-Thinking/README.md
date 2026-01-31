@@ -2,6 +2,8 @@
 
 NeuronX Distributed Inference implementation of Qwen3 VL 8B Thinking.
 
+> **Note:** This implementation has been validated using the **text backbone only**. Vision/image modalities are implemented but not yet verified.
+
 ## Model Information
 
 - **HuggingFace ID:** `Qwen/Qwen3-VL-8B-Thinking`

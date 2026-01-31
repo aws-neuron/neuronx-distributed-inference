@@ -15,7 +15,7 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_llava_neuron import *
+from modeling_llava import NeuronLlavaForCausalLM, LlavaInferenceConfig
 
 
 # Test configuration
@@ -133,10 +133,94 @@ def test_output_coherence(compiled_model, tokenizer):
     generated_ids = generate_with_neuron_model(compiled_model, inputs.input_ids, max_new_tokens=30)
     output_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     
-    # Basic coherence checks
+    # Coherence checks
     assert len(output_text.split()) > 3, "Output should have multiple words"
+    assert not _is_repetitive(output_text), "Output should not be repetitive"
+    
     print(f"✓ Coherence test passed")
     print(f"  Output: {output_text[:100]}...")
+
+
+
+def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
+    """Check if text has excessive repetition."""
+    words = text.split()
+    if len(words) < 10:
+        return False
+    
+    # Check for repeated words
+    for i in range(len(words) - max_repeat):
+        word = words[i]
+        if all(words[i+j] == word for j in range(max_repeat)):
+            return True
+    
+    # Check for repeated characters
+    new_text = text[-100:] if len(text) > 100 else text
+    if len(new_text) > 20:
+        char_counts = {}
+        for c in new_text:
+            char_counts[c] = char_counts.get(c, 0) + 1
+        max_char_ratio = max(char_counts.values()) / len(new_text)
+        if max_char_ratio > 0.5:
+            return True
+    
+    return False
+
+
+def test_performance_ttft(compiled_model, tokenizer):
+    """Test Time To First Token (TTFT) performance."""
+    import time
+    
+    prompt = "Hello, how are you?"
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+    input_ids = inputs.input_ids
+    
+    # Warmup
+    for _ in range(3):
+        seq_len = input_ids.shape[1]
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(input_ids.shape[0], -1)
+        with torch.no_grad():
+            _ = compiled_model(input_ids, position_ids=position_ids)
+    
+    # Measure TTFT
+    times = []
+    for _ in range(10):
+        seq_len = input_ids.shape[1]
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(input_ids.shape[0], -1)
+        
+        start = time.perf_counter()
+        with torch.no_grad():
+            _ = compiled_model(input_ids, position_ids=position_ids)
+        end = time.perf_counter()
+        
+        times.append((end - start) * 1000)  # ms
+    
+    avg_ttft = sum(times) / len(times)
+    print(f"✓ TTFT: {avg_ttft:.2f}ms")
+
+
+
+def test_performance_throughput(compiled_model, tokenizer):
+    """Test token generation throughput."""
+    import time
+    
+    prompt = "Hello"
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+    input_ids = inputs.input_ids
+    num_tokens = 50
+    
+    # Warmup
+    _ = generate_with_neuron_model(compiled_model, input_ids, max_new_tokens=5)
+    
+    # Measure throughput
+    start = time.perf_counter()
+    _ = generate_with_neuron_model(compiled_model, input_ids, max_new_tokens=num_tokens)
+    end = time.perf_counter()
+    
+    total_time = end - start
+    throughput = num_tokens / total_time
+    print(f"✓ Throughput: {throughput:.2f} tok/s")
+
 
 
 if __name__ == "__main__":

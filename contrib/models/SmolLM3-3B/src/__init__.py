@@ -26,7 +26,7 @@ Usage:
 IMPORTANT: Must use TP=1 for this model.
 """
 
-from .modeling_smollm3_neuron import (
+from .modeling_smollm3 import (
     SmolLM3InferenceConfig,
     NeuronSmolLM3Model,
     NeuronSmolLM3ForCausalLM,

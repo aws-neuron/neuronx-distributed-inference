@@ -1,6 +1,5 @@
 # coding=utf-8
-# Copyright 2024 Cohere Inc. HuggingFace Inc. team. All rights reserved.
-# Ported to NeuronX by AWS Neuron SDK.
+# Copyright 2024 Cohere Inc. and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

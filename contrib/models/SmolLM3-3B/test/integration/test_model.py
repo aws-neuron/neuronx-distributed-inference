@@ -18,7 +18,7 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_smollm3_neuron import NeuronSmolLM3ForCausalLM, SmolLM3InferenceConfig
+from modeling_smollm3 import NeuronSmolLM3ForCausalLM, SmolLM3InferenceConfig
 
 
 # Test configuration

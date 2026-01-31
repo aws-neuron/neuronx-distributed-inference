@@ -1,8 +1,5 @@
 # coding=utf-8
-# Copyright 2024 AWS Neuron. All rights reserved.
-#
-# Ported from HuggingFace transformers BioGPT implementation
-# Original Copyright 2022 The HuggingFace Team and Microsoft Research AI4Science All rights reserved.
+# Copyright 2022 The HuggingFace Team and Microsoft Research AI4Science. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

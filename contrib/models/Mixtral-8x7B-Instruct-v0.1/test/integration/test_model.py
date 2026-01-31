@@ -18,7 +18,7 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from mixtral_model import NeuronMixtralForCausalLM, MixtralInferenceConfig
+from modeling_mixtral import NeuronMixtralForCausalLM, MixtralInferenceConfig
 
 
 # Test configuration

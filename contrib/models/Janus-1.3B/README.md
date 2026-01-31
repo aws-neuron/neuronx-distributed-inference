@@ -2,6 +2,8 @@
 
 NeuronX Distributed Inference implementation of Janus 1.3B.
 
+> **Note:** This implementation has been validated using the **text backbone only**. Vision/image modalities are implemented but not yet verified.
+
 ## Model Information
 
 - **HuggingFace ID:** `Janus-1.3B`

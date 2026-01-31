@@ -2,6 +2,8 @@
 
 NeuronX Distributed Inference implementation of llava v1.5 7b.
 
+> **Note:** This implementation has been validated using the **text backbone only**. Vision/image modalities are implemented but not yet verified.
+
 ## Model Information
 
 - **HuggingFace ID:** `llava-hf/llava-v1.5-7b-hf`

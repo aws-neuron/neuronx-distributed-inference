@@ -1,6 +1,5 @@
 # coding=utf-8
 # Copyright (C) 2025 THL A29 Limited, a Tencent company and the HuggingFace Inc. team. All rights reserved.
-# Ported to NeuronX by AWS.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

@@ -1,6 +1,5 @@
 # coding=utf-8
 # Copyright 2023 Adept AI and the HuggingFace Inc. team. All rights reserved.
-# Adapted for NeuronX Distributed Inference.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

@@ -2,6 +2,8 @@
 
 NeuronX Distributed Inference implementation of idefics 9b instruct.
 
+> **Note:** This implementation has been validated using the **text backbone only**. Vision/image modalities are implemented but not yet verified.
+
 ## Model Information
 
 - **HuggingFace ID:** `HuggingFaceM4/idefics-9b-instruct`

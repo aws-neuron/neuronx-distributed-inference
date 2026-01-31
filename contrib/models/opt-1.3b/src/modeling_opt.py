@@ -1,12 +1,20 @@
+# coding=utf-8
+# Copyright 2022 The Fairseq Authors and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch OPT model for NXD inference."""
+
 """
-NeuronX Distributed Inference implementation of OPT (Open Pre-trained Transformer) model.
-
-This implementation ports the OPT model from HuggingFace transformers to the NeuronX Distributed 
-Inference framework for efficient inference on AWS Trainium/Inferentia hardware.
-
-Original implementation reference:
-
-
 Key architectural features of OPT:
 - Decoder-only causal language model (like GPT)
 - Learned positional embeddings (not RoPE)

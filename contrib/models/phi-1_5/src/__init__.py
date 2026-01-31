@@ -1,3 +1,3 @@
-from .modeling_phi_neuron import NeuronPhiForCausalLM, PhiInferenceConfig, PhiNeuronConfig
+from .modeling_phi import NeuronPhiForCausalLM, PhiInferenceConfig, PhiNeuronConfig
 
 __all__ = ["NeuronPhiForCausalLM", "PhiInferenceConfig", "PhiNeuronConfig"]

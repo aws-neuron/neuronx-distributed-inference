@@ -15,10 +15,10 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_olmo3_sliding_window import *
+from modeling_olmo3 import NeuronOlmo3ForCausalLM, Olmo3InferenceConfig
 
 
-# Test configuration
+# Test configuration - UPDATE THESE PATHS
 MODEL_PATH = "/home/ubuntu/models/OLMo-3-7B-Think/"
 COMPILED_MODEL_PATH = "/home/ubuntu/neuron_models/OLMo-3-7B-Think/"
 
@@ -54,13 +54,40 @@ def create_model_for_inference(compiled_path: str, model_path: str):
         'batch_size': neuron_config_dict.get('batch_size', 1),
         'seq_len': neuron_config_dict.get('seq_len', 128),
         'torch_dtype': dtype,
+        'save_sharded_checkpoint': neuron_config_dict.get('save_sharded_checkpoint', True),
+        'on_cpu': neuron_config_dict.get('on_cpu', False),
     }
+    
+    optional_params = ['world_size', 'max_context_length', 'enable_bucketing']
+    for param in optional_params:
+        if param in neuron_config_dict:
+            neuron_config_kwargs[param] = neuron_config_dict[param]
+    
+    if 'max_context_length' not in neuron_config_kwargs:
+        neuron_config_kwargs['max_context_length'] = neuron_config_kwargs['seq_len']
     
     neuron_config = NeuronConfig(**neuron_config_kwargs)
     
-    # This will use the imported model and config classes
-    # The actual class names will be determined at runtime
-    return None, neuron_config
+    # Create model config
+    try:
+        model_config = Olmo3InferenceConfig.from_pretrained(
+            model_path, neuron_config=neuron_config,
+        )
+    except (TypeError, AttributeError):
+        model_config = Olmo3InferenceConfig(
+            neuron_config, load_config=load_pretrained_config(model_path),
+        )
+    
+    # Create model
+    try:
+        if hasattr(NeuronOlmo3ForCausalLM, 'from_pretrained'):
+            model = NeuronOlmo3ForCausalLM.from_pretrained(compiled_path, config=model_config)
+        else:
+            raise AttributeError("No from_pretrained method")
+    except (TypeError, AttributeError, Exception):
+        model = NeuronOlmo3ForCausalLM(model_path, model_config)
+    
+    return model, neuron_config
 
 
 def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
@@ -90,10 +117,32 @@ def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
 
 @pytest.fixture(scope="module")
 def compiled_model():
-    """Load pre-compiled model."""
-    # Note: Actual implementation would load the specific model class
-    # This is a template that should be customized per model
-    return None
+    """Compile and load model."""
+    compiled_path = Path(COMPILED_MODEL_PATH)
+    if not (compiled_path / "model.pt").exists():
+        print(f"Compiling model to {COMPILED_MODEL_PATH}...")
+        
+        neuron_config = NeuronConfig(
+            tp_degree=2,
+            batch_size=1,
+            seq_len=128,
+            max_context_length=128,
+            torch_dtype=torch.bfloat16,
+        )
+        
+        config = Olmo3InferenceConfig(
+            neuron_config,
+            load_config=load_pretrained_config(MODEL_PATH),
+        )
+        
+        model = NeuronOlmo3ForCausalLM(MODEL_PATH, config)
+        model.compile(COMPILED_MODEL_PATH)
+    
+    # Load using custom pattern
+    model, neuron_config = create_model_for_inference(COMPILED_MODEL_PATH, MODEL_PATH)
+    model.load(COMPILED_MODEL_PATH)
+    
+    return model
 
 
 @pytest.fixture(scope="module")
@@ -133,10 +182,94 @@ def test_output_coherence(compiled_model, tokenizer):
     generated_ids = generate_with_neuron_model(compiled_model, inputs.input_ids, max_new_tokens=30)
     output_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     
-    # Basic coherence checks
+    # Coherence checks
     assert len(output_text.split()) > 3, "Output should have multiple words"
+    assert not _is_repetitive(output_text), "Output should not be repetitive"
+    
     print(f"✓ Coherence test passed")
     print(f"  Output: {output_text[:100]}...")
+
+
+
+def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
+    """Check if text has excessive repetition."""
+    words = text.split()
+    if len(words) < 10:
+        return False
+    
+    # Check for repeated words
+    for i in range(len(words) - max_repeat):
+        word = words[i]
+        if all(words[i+j] == word for j in range(max_repeat)):
+            return True
+    
+    # Check for repeated characters
+    new_text = text[-100:] if len(text) > 100 else text
+    if len(new_text) > 20:
+        char_counts = {}
+        for c in new_text:
+            char_counts[c] = char_counts.get(c, 0) + 1
+        max_char_ratio = max(char_counts.values()) / len(new_text)
+        if max_char_ratio > 0.5:
+            return True
+    
+    return False
+
+
+def test_performance_ttft(compiled_model, tokenizer):
+    """Test Time To First Token (TTFT) performance."""
+    import time
+    
+    prompt = "Hello, how are you?"
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+    input_ids = inputs.input_ids
+    
+    # Warmup
+    for _ in range(3):
+        seq_len = input_ids.shape[1]
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(input_ids.shape[0], -1)
+        with torch.no_grad():
+            _ = compiled_model(input_ids, position_ids=position_ids)
+    
+    # Measure TTFT
+    times = []
+    for _ in range(10):
+        seq_len = input_ids.shape[1]
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(input_ids.shape[0], -1)
+        
+        start = time.perf_counter()
+        with torch.no_grad():
+            _ = compiled_model(input_ids, position_ids=position_ids)
+        end = time.perf_counter()
+        
+        times.append((end - start) * 1000)  # ms
+    
+    avg_ttft = sum(times) / len(times)
+    print(f"✓ TTFT: {avg_ttft:.2f}ms")
+
+
+
+def test_performance_throughput(compiled_model, tokenizer):
+    """Test token generation throughput."""
+    import time
+    
+    prompt = "Hello"
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+    input_ids = inputs.input_ids
+    num_tokens = 50
+    
+    # Warmup
+    _ = generate_with_neuron_model(compiled_model, input_ids, max_new_tokens=5)
+    
+    # Measure throughput
+    start = time.perf_counter()
+    _ = generate_with_neuron_model(compiled_model, input_ids, max_new_tokens=num_tokens)
+    end = time.perf_counter()
+    
+    total_time = end - start
+    throughput = num_tokens / total_time
+    print(f"✓ Throughput: {throughput:.2f} tok/s")
+
 
 
 if __name__ == "__main__":
@@ -144,9 +277,41 @@ if __name__ == "__main__":
     print("OLMo-3-7B-Think Integration Tests")
     print("="*80)
     
-    print("\nNote: This is a template test file.")
-    print("For actual model testing, customize the model loading logic.")
+    # Manual test run
+    print("\nLoading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, padding_side="right", trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    print("Loading/compiling model...")
+    compiled_path = Path(COMPILED_MODEL_PATH)
+    if not (compiled_path / "model.pt").exists():
+        print(f"Compiling model to {COMPILED_MODEL_PATH}...")
+        
+        neuron_config = NeuronConfig(
+            tp_degree=2,
+            batch_size=1,
+            seq_len=128,
+            max_context_length=128,
+            torch_dtype=torch.bfloat16,
+        )
+        
+        config = Olmo3InferenceConfig(
+            neuron_config,
+            load_config=load_pretrained_config(MODEL_PATH),
+        )
+        
+        model = NeuronOlmo3ForCausalLM(MODEL_PATH, config)
+        model.compile(COMPILED_MODEL_PATH)
+    
+    model, _ = create_model_for_inference(COMPILED_MODEL_PATH, MODEL_PATH)
+    model.load(COMPILED_MODEL_PATH)
+    
+    print("\nRunning tests...")
+    test_model_loads(model)
+    test_model_generates(model, tokenizer)
+    test_output_coherence(model, tokenizer)
     
     print("\n" + "="*80)
-    print("✓ Template structure verified!")
+    print("✓ All tests passed!")
     print("="*80)

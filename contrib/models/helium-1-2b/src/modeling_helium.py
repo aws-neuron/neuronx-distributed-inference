@@ -1,6 +1,5 @@
 # coding=utf-8
 # Copyright 2024 The Kyutai and HuggingFace Inc. teams. All rights reserved.
-# Ported to NeuronX Distributed Inference
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

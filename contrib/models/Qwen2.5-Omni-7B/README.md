@@ -2,6 +2,8 @@
 
 NeuronX Distributed Inference implementation of Qwen2.5 Omni 7B.
 
+> **Note:** This implementation has been validated using the **text backbone only**. Vision/audio modalities are implemented but not yet verified.
+
 ## Model Information
 
 - **HuggingFace ID:** `Qwen/Qwen2.5-Omni-7B`

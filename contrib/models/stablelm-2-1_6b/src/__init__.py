@@ -1,1 +1,1 @@
-from .modeling_stablelm_neuron import NeuronStableLmForCausalLM, StableLmInferenceConfig
+from .modeling_stablelm import NeuronStableLmForCausalLM, StableLmInferenceConfig
