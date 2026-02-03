@@ -12,6 +12,12 @@ def patched_get_last_kv_window(window_size, position_ids, latest_k, latest_v, wi
     """
     batch_size, num_head, _, head_dim = latest_k.shape
     latest_pos = torch.amax(position_ids, dim=1)
+    if windowed_context_encoding_window_idx >= 1:  # if windowed cte, account for current window offset
+        latest_pos -= windowed_context_encoding_window_idx * window_size
+
+    # True window size
+    window_size = window_size - 1 + spec_len - 1 if spec_len > 0 else window_size - 1
+
     end_idx = (latest_pos + 1).clamp(min=window_size)
     start_idx = (end_idx - window_size).clamp(min=0)
     orig_indices = start_idx[:, None] + torch.arange(window_size)
