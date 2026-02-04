@@ -10,7 +10,6 @@ HOME_DIR = Path.home()
 
 os.environ['VLLM_NEURON_FRAMEWORK'] = "neuronx-distributed-inference"
 os.environ['NEURON_COMPILED_ARTIFACTS'] = f"{HOME_DIR.as_posix()}/traced_model/gemma-3-27b-it"
-os.environ['NEURON_ON_DEVICE_SAMPLING_DISABLED'] = "1"
 
 input_image_path = Path(__file__).resolve().parent / "data" / "dog.jpg"
 IMAGE_URL = f"file://{input_image_path.as_posix()}"
