@@ -3,14 +3,19 @@ import os
 from dataclasses import dataclass
 import logging
 
+from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 from neuronx_distributed_inference.utils.random import set_random_seed
 from neuronx_distributed_inference.utils.testing import init_cpu_env
-from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
 import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
+from transformers import Gemma3Config
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.gemma3.modeling_gemma3 import Gemma3RotaryEmbedding
+
+from gemma3_vision.modeling_gemma3 import Gemma3InferenceConfig
 
 torch.set_printoptions(precision=5)
 
@@ -28,6 +33,32 @@ class NumericalTolerances:
 FP32_TOLERANCES = NumericalTolerances(rtol=1.3e-6, atol=1e-5)
 FP16_TOLERANCES = NumericalTolerances(rtol=1e-3, atol=1e-5)
 BF16_TOLERANCES = NumericalTolerances(rtol=1.6e-2, atol=1e-5)
+
+
+def create_neuron_config(
+    batch_size: int,
+    max_seq_len: int,
+    tp_degree: int,
+    torch_dtype: torch.dtype,
+    hf_config: Gemma3Config
+    ) -> Gemma3InferenceConfig:
+    return Gemma3InferenceConfig(
+        text_neuron_config=NeuronConfig(
+            tp_degree=tp_degree,
+            batch_size=batch_size,
+            torch_dtype=torch_dtype,
+            attn_kernel_enabled=False,
+            seq_len=max_seq_len
+        ),
+        vision_neuron_config=NeuronConfig(
+            tp_degree=tp_degree,
+            batch_size=1,
+            torch_dtype=torch_dtype,
+            attn_kernel_enabled=False,
+            seq_len=max_seq_len
+        ),
+        load_config=load_pretrained_config(hf_config=hf_config),
+    )
 
 
 def cpu_setup(dtype):
@@ -152,16 +183,6 @@ def create_cache_position(attention_mask_2d: torch.LongTensor, is_for_context_en
         return cache_position
     else:
         return cache_position[-1:]
-    
-
-def update_2d_attention_mask(attention_mask_2d: torch.LongTensor, padding_side: str) -> torch.LongTensor:
-    batch_size, _ = attention_mask_2d.shape
-    if padding_side == "left":
-        attention_mask_2d = torch.cat([attention_mask_2d, attention_mask_2d.new_ones((batch_size, 1))], dim=1)
-        #attention_mask_2d = attention_mask_2d[:, 1:]
-    else:
-        attention_mask_2d = torch.cat([attention_mask_2d.new_ones((batch_size, 1)), attention_mask_2d], dim=1)
-    return attention_mask_2d
 
 
 def create_rope(position_ids: torch.LongTensor, hf_config: PretrainedConfig) -> torch.FloatTensor:
@@ -225,8 +246,7 @@ def create_hf_attention_mask_4d(
     target_length = sequence_length
     if not is_for_context_encoding:
         sequence_length = 1
-    print("attention mask 2D")
-    print(attention_mask_2d)
+
     attention_mask_4d = _prepare_4d_causal_attention_mask_with_cache_position(
         attention_mask=attention_mask_2d,
         sequence_length=sequence_length, # len_q
@@ -240,8 +260,6 @@ def create_hf_attention_mask_4d(
     if not is_swa_layer:
         return attention_mask_4d
     else:
-        print("attention mask 4D")
-        print(attention_mask_4d[0])
         last_cache_position = cache_position[-1] + 1 # Current total seq length, fixed from HF
         effective_seq_len = max(cache_position.shape[0], sliding_window_size)
         min_dtype = torch.finfo(dtype).min
@@ -253,72 +271,17 @@ def create_hf_attention_mask_4d(
         return attention_mask_4d[:, :, :, offset : offset + effective_seq_len]
 
 
-def left_to_right_padding(x: torch.FloatTensor, attention_mask_2d: torch.LongTensor) -> torch.FloatTensor:
-    # x is a 4D tensor of shape (batch_size, num_kv_heads, seq_length, head_dim)
-    # attention_mask_2d is a 2D tensor of shape (batch_size, seq_length)
-    _, bucket_size = attention_mask_2d.shape
-    seq_lengths = attention_mask_2d.sum(dim=1).view(-1, 1)
-    max_seq_lengths = seq_lengths.max().item()
-    offset = max_seq_lengths - seq_lengths
-    roll_index = torch.remainder(torch.arange(0, bucket_size)[None, :] + offset, bucket_size)\
-        .view(-1, 1, bucket_size, 1)\
-        .expand_as(x)
-    return torch.gather(x, dim=2, index=roll_index)
+def causal_mask(batch_size, seq_len):
+    mask = torch.full((seq_len, seq_len), True).tril(diagonal=0)
+    mask = mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
+    return mask
 
 
-def apply_sliding_window(x: torch.FloatTensor,
-                         position_ids: torch.LongTensor,
-                         sliding_window_size: int,
-                         padding_side: str) -> torch.FloatTensor:
-    # x is a 4D tensor of shape (batch_size, num_kv_heads, seq_length, head_dim)
-    # position_ids is a 2D tensor of shape (batch_size, seq_length)
-    batch_size, num_kv_heads, _, head_dim = x.shape
-    if padding_side == "left":
-        max_position_ids = torch.max(position_ids)[None, None].expand(batch_size, -1)
-    else:
-        max_position_ids = torch.amax(position_ids, dim=1, keepdim=True)
-    offset = torch.clamp(max_position_ids - sliding_window_size + 1, min=0)
-    index = torch.arange(sliding_window_size)[None, :] + offset
-    index = index[:, None, :, None].expand(-1, num_kv_heads, -1, head_dim)
-    return torch.gather(x, dim=2, index=index)
-
-
-def convert_neuron_siglip_encoder_state_dict_to_hf(neuron_state_dict: dict) -> dict:
-    """
-    Convert Neuron SigLIP encoder state dict to HuggingFace format.
-    
-    Neuron model has:
-    - layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,bias}
-    - layers.X.self_attn.o_proj.o_proj.{weight,bias}
-    - layers.X.self_attn.rank_util.rank (not needed in HF)
-    
-    HuggingFace model expects:
-    - layers.X.self_attn.{q,k,v}_proj.{weight,bias}
-    - layers.X.self_attn.out_proj.{weight,bias}
-    """
-    hf_state_dict = {}
-    
-    for key, value in neuron_state_dict.items():
-        # Skip rank_util parameters (not needed in HF)
-        if "rank_util" in key:
-            continue
-        
-        # Convert qkv_proj paths
-        if "qkv_proj.q_proj" in key:
-            new_key = key.replace("qkv_proj.q_proj", "q_proj")
-            hf_state_dict[new_key] = value
-        elif "qkv_proj.k_proj" in key:
-            new_key = key.replace("qkv_proj.k_proj", "k_proj")
-            hf_state_dict[new_key] = value
-        elif "qkv_proj.v_proj" in key:
-            new_key = key.replace("qkv_proj.v_proj", "v_proj")
-            hf_state_dict[new_key] = value
-        # Convert o_proj path
-        elif "o_proj.o_proj" in key:
-            new_key = key.replace("o_proj.o_proj", "out_proj")
-            hf_state_dict[new_key] = value
-        else:
-            # Keep other parameters as-is
-            hf_state_dict[key] = value
-    
-    return hf_state_dict
+def window_mask(batch_size: int, seq_len: int, window_size: int):
+    """create a causal, window attention mask"""
+    mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool), diagonal=0)
+    for i in range(seq_len):
+        if i >= window_size:
+            mask[i, : i - window_size + 1] = False
+    mask = mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
+    return mask

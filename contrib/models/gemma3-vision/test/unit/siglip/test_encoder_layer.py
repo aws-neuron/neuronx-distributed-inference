@@ -110,4 +110,3 @@ def test_nxdi_encoder_layer_vs_transformers_implementation(random_seed) -> None:
 
     rtol, atol = FP32_TOLERANCES.rtol, FP32_TOLERANCES.atol
     assert_tensor_all_close(test_objective="Encoder layer outputs", computed_value=output, reference_value=ref_output, rtol=rtol, atol=atol, equal_nan=True)
-

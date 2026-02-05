@@ -9,10 +9,10 @@ from test.utils import assert_tensor_all_close, mark_step, BF16_TOLERANCES
 @pytest.mark.parametrize("inputs_dtype, tolerances", [
     (torch.bfloat16, BF16_TOLERANCES),
     ])
-def test_custom_vs_hf_rms_norm_implementation(random_seed, inputs_dtype, tolerances, hf_text_config) -> None:   
+def test_custom_vs_hf_rms_norm_implementation(random_seed, inputs_dtype, tolerances, hf_config) -> None:   
     device = torch_xla.device()
     batch_size, sequence_length = 2, 16
-    hidden_size, eps = hf_text_config.hidden_size, hf_text_config.rms_norm_eps
+    hidden_size, eps = hf_config.text_config.hidden_size, hf_config.text_config.rms_norm_eps
 
     x = torch.rand((batch_size, sequence_length, hidden_size), dtype=inputs_dtype)
     nrn_norm = NeuronGemma3RMSNorm(hidden_size=hidden_size, eps=eps)

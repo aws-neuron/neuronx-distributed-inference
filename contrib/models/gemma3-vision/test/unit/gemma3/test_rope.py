@@ -1,16 +1,9 @@
-import os
 import pytest
 import torch
-import torch.nn.functional as F
-import torch_xla.core.xla_model as xm
-from transformers import AutoConfig, AutoModel
 from transformers.models.gemma3.modeling_gemma3 import Gemma3RotaryEmbedding
-from neuronx_distributed_inference.utils.random import set_random_seed
-from neuronx_distributed_inference.utils.testing import destroy_mp
 
 from gemma3_vision.modeling_gemma3_text import NeuronGemma3RotaryEmbedding
-from test.unit.gemma3.test_config import get_gemma3_config
-from test.utils import assert_tensor_all_close, mark_step, cpu_setup, FP32_TOLERANCES, FP16_TOLERANCES, BF16_TOLERANCES
+from test.utils import assert_tensor_all_close, mark_step, cpu_setup, create_neuron_config, FP32_TOLERANCES, FP16_TOLERANCES, BF16_TOLERANCES
 
 
 @pytest.mark.parametrize("inputs_dtype, tolerances", [
@@ -18,31 +11,31 @@ from test.utils import assert_tensor_all_close, mark_step, cpu_setup, FP32_TOLER
     (torch.bfloat16, BF16_TOLERANCES),
     ])
 @pytest.mark.parametrize("position", [128, 1024, 2048, 4096, 6144, 8192])
-def test_rope_global_vs_transformers_implementation(inputs_dtype, tolerances, position) -> None:   
-    
+def test_rope_global_vs_transformers_implementation(inputs_dtype, tolerances, position, hf_config) -> None:   
     # --- Set NxDI Model ---
-    text_config = get_gemma3_config(
-        tkg_batch_size=2,
-        text_tp_degree=1,
-        vision_tp_degree=1,
-        text_seq_length=64,
-        vision_seq_len=64
-    ).text_config
+    batch_size, max_seq_len = 2, 64
+    nrn_config = create_neuron_config(
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        torch_dtype=inputs_dtype,
+        tp_degree=1,
+        hf_config=hf_config
+    )
     
-    partial_rotary_factor = getattr(text_config, "partial_rotary_factor", 1.0)
-    dim = int(text_config.head_dim * partial_rotary_factor)
-    max_position_embeddings = text_config.max_position_embeddings
+    partial_rotary_factor = getattr(nrn_config.text_config, "partial_rotary_factor", 1.0)
+    dim = int(nrn_config.text_config.head_dim * partial_rotary_factor)
+    max_position_embeddings = nrn_config.text_config.max_position_embeddings
 
     nrn_rope = NeuronGemma3RotaryEmbedding(
         dim=dim,
         max_position_embeddings=max_position_embeddings,
-        base=text_config.rope_theta,
-        scaling_type = text_config.rope_scaling["rope_type"],
-        scaling_factor = text_config.rope_scaling["factor"],
+        base=nrn_config.text_config.rope_theta,
+        scaling_type=nrn_config.text_config.rope_scaling["rope_type"],
+        scaling_factor=nrn_config.text_config.rope_scaling["factor"],
     )
 
     # --- Set Transformers Model ---
-    hf_text_config = AutoConfig.from_pretrained("google/gemma-3-27b-it").text_config  # nosec B615
+    hf_text_config = hf_config.text_config
     reference_rope = Gemma3RotaryEmbedding(config=hf_text_config)
 
     # --- Inputs ---
@@ -64,29 +57,29 @@ def test_rope_global_vs_transformers_implementation(inputs_dtype, tolerances, po
     (torch.bfloat16, BF16_TOLERANCES),
     ])
 @pytest.mark.parametrize("position", [128, 1024, 2048, 4096, 6144, 8192])
-def test_rope_local_vs_transformers_implementation(inputs_dtype, tolerances, position) -> None:   
-    
+def test_rope_local_vs_transformers_implementation(inputs_dtype, tolerances, position, hf_config) -> None:   
     # --- Set NxDI Model ---
-    text_config = get_gemma3_config(
-        tkg_batch_size=2,
-        text_tp_degree=1,
-        vision_tp_degree=1,
-        text_seq_length=64,
-        vision_seq_len=64
-    ).text_config
+    batch_size, max_seq_len = 2, 64
+    nrn_config = create_neuron_config(
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        torch_dtype=inputs_dtype,
+        tp_degree=1,
+        hf_config=hf_config
+    )
 
-    partial_rotary_factor = getattr(text_config, "partial_rotary_factor", 1.0)
-    dim = int(text_config.head_dim * partial_rotary_factor)
-    max_position_embeddings = text_config.max_position_embeddings
+    partial_rotary_factor = getattr(nrn_config.text_config, "partial_rotary_factor", 1.0)
+    dim = int(nrn_config.text_config.head_dim * partial_rotary_factor)
+    max_position_embeddings = nrn_config.text_config.max_position_embeddings
 
     nrn_rope = NeuronGemma3RotaryEmbedding(
         dim=dim,
         max_position_embeddings=max_position_embeddings,
-        base=text_config.rope_local_base_freq,
+        base=nrn_config.text_config.rope_local_base_freq,
     )
 
     # --- Set Transformers Model ---
-    hf_text_config = AutoConfig.from_pretrained("google/gemma-3-27b-it").text_config  # nosec B615
+    hf_text_config = hf_config.text_config  # nosec B615
     hf_text_config.rope_theta = hf_text_config.rope_local_base_freq
     hf_text_config.rope_scaling = {"rope_type": "default"}
 

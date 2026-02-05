@@ -3,9 +3,7 @@ import pytest
 from typing import Dict, OrderedDict
 
 import torch
-import torch.nn.functional as F
 import torch_xla.core.xla_model as xm
-from transformers import AutoConfig, AutoModel
 from transformers.models.siglip.modeling_siglip import SiglipAttention
 
 from gemma3_vision.siglip.modeling_siglip import NeuronSiglipConfig, SiglipInferenceConfig, NeuronSiglipAttention
@@ -20,6 +18,7 @@ from test.utils import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+
 def convert_to_hf_state_dict(state_dict: OrderedDict[str, torch.FloatTensor]) -> Dict[str, torch.FloatTensor]:
     hf_state_dict = {}
     for key, tensor in state_dict.items():
@@ -32,19 +31,15 @@ def convert_to_hf_state_dict(state_dict: OrderedDict[str, torch.FloatTensor]) ->
     return hf_state_dict
 
 
-config = AutoConfig.from_pretrained("google/gemma-3-27b-it")  # nosec B615
-hf_config = AutoModel.from_config(config=config.vision_config).config
-
-
 @pytest.mark.parametrize("tolerances, compiler_flags", [
     (FP32_TOLERANCES, ["--model-type=transformer", "--auto-cast=none"]),
     (FP16_TOLERANCES, ["--model-type=transformer", "--auto-cast=matmult", "--enable-mixed-precision-accumulation", "--auto-cast-type=fp16"]),
     (BF16_TOLERANCES, ["--model-type=transformer", "--auto-cast=matmult", "--enable-mixed-precision-accumulation", "--auto-cast-type=bf16"]),
     ])
-def test_attention_layer(monkeypatch, base_compiler_flags, tolerances, compiler_flags) -> None:
+def test_attention_layer(monkeypatch, base_compiler_flags, tolerances, compiler_flags, hf_config) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
     
-    batch_size, seq_len, hidden_size = 2, 32, hf_config.hidden_size
+    batch_size, seq_len, hidden_size = 2, 32, hf_config.vision_config.hidden_size
     inputs_dtype = model_dtype = torch.float32
     device = xm.xla_device()
 
@@ -58,7 +53,7 @@ def test_attention_layer(monkeypatch, base_compiler_flags, tolerances, compiler_
         torch_dtype=model_dtype,
     )
 
-    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.to_dict())
+    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.vision_config.to_dict())
 
     attn_layer = NeuronSiglipAttention(config=config)
     attn_layer.eval()
@@ -84,8 +79,8 @@ def test_attention_layer(monkeypatch, base_compiler_flags, tolerances, compiler_
 
 # Note: As HuggingFace Transformers supports left padding only, we can only test the NxDI implementation of the attention layer 
 # and therefore the SWA implementation, for left padding only
-def test_nxdi_attn_vs_transformers_implementation(random_seed) -> None:
-    batch_size, seq_len, hidden_size = 2, 32, hf_config.hidden_size
+def test_nxdi_attn_vs_transformers_implementation(random_seed, hf_config) -> None:
+    batch_size, seq_len, hidden_size = 2, 32, hf_config.vision_config.hidden_size
     inputs_dtype = model_dtype = torch.float32
 
     hidden_states = torch.randn(batch_size, seq_len, hidden_size).to(dtype=inputs_dtype)
@@ -98,12 +93,13 @@ def test_nxdi_attn_vs_transformers_implementation(random_seed) -> None:
         torch_dtype=model_dtype,
     )
 
-    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.to_dict())
+    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.vision_config.to_dict())
 
     attn_layer = NeuronSiglipAttention(config=config)
     attn_layer.eval()
 
-    reference_model = SiglipAttention(config=hf_config).to(dtype=model_dtype)
+    hf_config.vision_config._attn_implementation = "eager"
+    reference_model = SiglipAttention(config=hf_config.vision_config).to(dtype=model_dtype)
     reference_model.load_state_dict(convert_to_hf_state_dict(attn_layer.state_dict()), strict=True)
     reference_model.eval()    
 
@@ -119,4 +115,3 @@ def test_nxdi_attn_vs_transformers_implementation(random_seed) -> None:
 
     rtol, atol = FP32_TOLERANCES.rtol, FP32_TOLERANCES.atol
     assert_tensor_all_close(test_objective="Attention outputs", computed_value=output, reference_value=ref_output, rtol=rtol, atol=atol, equal_nan=True)
-

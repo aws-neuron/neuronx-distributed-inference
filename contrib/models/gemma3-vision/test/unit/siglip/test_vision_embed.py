@@ -1,14 +1,10 @@
 import pytest
 import torch
 import torch_xla.core.xla_model as xm
-from transformers import AutoConfig, AutoModel
 from transformers.models.siglip.modeling_siglip import SiglipVisionEmbeddings
 
 from gemma3_vision.siglip.modeling_siglip import NeuronSiglipConfig, SiglipInferenceConfig, NeuronSiglipVisionEmbeddings
 from test.utils import assert_tensor_all_close, mark_step, FP32_TOLERANCES, FP16_TOLERANCES, BF16_TOLERANCES
-
-config = AutoConfig.from_pretrained("google/gemma-3-27b-it")  # nosec B615
-hf_config = AutoModel.from_config(config=config.vision_config).config
 
 
 @pytest.mark.parametrize("tolerances, compiler_flags", [
@@ -16,7 +12,7 @@ hf_config = AutoModel.from_config(config=config.vision_config).config
     (FP16_TOLERANCES, ["--model-type=transformer", "--auto-cast=matmult", "--enable-mixed-precision-accumulation", "--auto-cast-type=fp16"]),
     (BF16_TOLERANCES, ["--model-type=transformer", "--auto-cast=matmult", "--enable-mixed-precision-accumulation", "--auto-cast-type=bf16"]),
     ])
-def test_vision_embed(monkeypatch, base_compiler_flags, tolerances, compiler_flags) -> None:
+def test_vision_embed(monkeypatch, base_compiler_flags, tolerances, compiler_flags, hf_config) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
     
     batch_size, num_channels, image_size = 2, 3, 896
@@ -31,7 +27,7 @@ def test_vision_embed(monkeypatch, base_compiler_flags, tolerances, compiler_fla
         torch_dtype=model_dtype,
     )
 
-    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.to_dict())
+    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.vision_config.to_dict())
 
     vision_embed = NeuronSiglipVisionEmbeddings(config=config)
     vision_embed.eval()
@@ -49,7 +45,7 @@ def test_vision_embed(monkeypatch, base_compiler_flags, tolerances, compiler_fla
     assert_tensor_all_close(test_objective="Vision embedding outputs", computed_value=output_nrn, reference_value=output_cpu, rtol=rtol, atol=atol, equal_nan=True)
 
 
-def test_nxdi_vision_embedding_vs_transformers_implementation(random_seed) -> None:
+def test_nxdi_vision_embedding_vs_transformers_implementation(random_seed, hf_config) -> None:
     batch_size, num_channels, image_size = 2, 3, 896
     inputs_dtype = model_dtype = torch.float32
 
@@ -61,12 +57,12 @@ def test_nxdi_vision_embedding_vs_transformers_implementation(random_seed) -> No
         torch_dtype=model_dtype,
     )
 
-    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.to_dict())
+    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.vision_config.to_dict())
 
     vision_embed = NeuronSiglipVisionEmbeddings(config=config)
     vision_embed.eval()
 
-    reference_model = SiglipVisionEmbeddings(config=hf_config).to(dtype=model_dtype)
+    reference_model = SiglipVisionEmbeddings(config=hf_config.vision_config).to(dtype=model_dtype)
     reference_model.load_state_dict(vision_embed.state_dict(), strict=True)
     reference_model.eval()    
 

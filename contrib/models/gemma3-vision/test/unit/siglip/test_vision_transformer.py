@@ -1,7 +1,6 @@
 import pytest
 import torch
 import torch_xla.core.xla_model as xm
-from transformers import AutoConfig, AutoModel
 from transformers.models.siglip.modeling_siglip import SiglipVisionTransformer
 
 from gemma3_vision.siglip.modeling_siglip import NeuronSiglipConfig, SiglipInferenceConfig, NeuronSiglipVisionTransformer
@@ -45,18 +44,14 @@ def convert_neuron_to_hf_state_dict(neuron_state_dict):
     return hf_state_dict
 
 
-config = AutoConfig.from_pretrained("google/gemma-3-27b-it")  # nosec B615
-hf_config = AutoModel.from_config(config=config.vision_config).config
-hf_config.num_hidden_layers = 3    # lower num_hidden_layers for faster testing
-
-
 @pytest.mark.parametrize("tolerances, compiler_flags", [
     (FP32_TOLERANCES, ["--model-type=transformer", "--auto-cast=none"]),
     ])
-def test_vision_transformer(monkeypatch, base_compiler_flags, tolerances, compiler_flags) -> None:
+def test_vision_transformer(monkeypatch, base_compiler_flags, tolerances, compiler_flags, hf_config) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
     
     batch_size, num_channels, image_size = 2, 3, 896
+    hf_config.vision_config.num_hidden_layers = 3    # lower num_hidden_layers for faster testing
     inputs_dtype = model_dtype = torch.float32
     device = xm.xla_device()
 
@@ -69,7 +64,7 @@ def test_vision_transformer(monkeypatch, base_compiler_flags, tolerances, compil
         attn_kernel_enabled=False,  # Otherwise, a NKI kernel is automatically selected due to the sequence length (cannot run on CPU)
     )
 
-    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.to_dict())
+    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.vision_config.to_dict())
 
     vision_transformer = NeuronSiglipVisionTransformer(config=config)
     vision_transformer.eval()
@@ -87,8 +82,9 @@ def test_vision_transformer(monkeypatch, base_compiler_flags, tolerances, compil
     assert_tensor_all_close(test_objective="Vision transformer outputs", computed_value=output_nrn, reference_value=output_cpu, rtol=rtol, atol=atol, equal_nan=True)
 
 
-def test_nxdi_vision_transformer_vs_transformers_implementation(random_seed) -> None:
+def test_nxdi_vision_transformer_vs_transformers_implementation(random_seed, hf_config) -> None:
     batch_size, num_channels, image_size = 2, 3, 896
+    hf_config.vision_config.num_hidden_layers = 3
     inputs_dtype = model_dtype = torch.float32
 
     pixel_values = torch.randn(batch_size, num_channels, image_size, image_size).to(dtype=inputs_dtype)
@@ -100,12 +96,13 @@ def test_nxdi_vision_transformer_vs_transformers_implementation(random_seed) -> 
         attn_kernel_enabled=False,  # Otherwise, a NKI kernel is automatically selected due to the sequence length (cannot run on CPU)
     )
 
-    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.to_dict())
+    config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.vision_config.to_dict())
 
     vision_transformer = NeuronSiglipVisionTransformer(config=config)
     vision_transformer.eval()
 
-    reference_model = SiglipVisionTransformer(config=hf_config).to(dtype=model_dtype)
+    hf_config.vision_config._attn_implementation = "eager"
+    reference_model = SiglipVisionTransformer(config=hf_config.vision_config).to(dtype=model_dtype)
     hf_compatible_state_dict = convert_neuron_to_hf_state_dict(vision_transformer.state_dict())
     reference_model.load_state_dict(hf_compatible_state_dict, strict=True)
     reference_model.eval()    
