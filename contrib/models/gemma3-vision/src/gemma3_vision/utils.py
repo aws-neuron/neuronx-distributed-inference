@@ -12,7 +12,7 @@ def _helper_concat_and_delete_qkv(state_dict: StateDict, prefix: str, attr: str)
     full_state_key_q_proj = f"{prefix}.qkv_proj.q_proj.{attr}"
     full_state_key_k_proj = f"{prefix}.qkv_proj.k_proj.{attr}"
     full_state_key_v_proj = f"{prefix}.qkv_proj.v_proj.{attr}"
-    
+
     if (
         full_state_key_q_proj in state_dict
         and full_state_key_k_proj in state_dict
@@ -32,13 +32,13 @@ def _helper_concat_and_delete_qkv(state_dict: StateDict, prefix: str, attr: str)
 
 
 def convert_state_dict_to_fused_qkv(
-        state_dict: StateDict, 
-        num_layers: int, 
-        neuron_config: NeuronConfig, 
+        state_dict: StateDict,
+        num_layers: int,
+        neuron_config: NeuronConfig,
         prefix: str
         ) -> StateDict:
-    for l in range(num_layers):
-        layer_prefix = prefix.format(layer_num=l)
+    for layer_num in range(num_layers):
+        layer_prefix = prefix.format(layer_num=layer_num)
         _helper_concat_and_delete_qkv(state_dict, layer_prefix, "weight")
         _helper_concat_and_delete_qkv(state_dict, layer_prefix, "bias")
         is_qkv_quantized = (

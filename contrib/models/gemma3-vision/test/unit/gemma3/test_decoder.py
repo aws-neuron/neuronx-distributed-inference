@@ -7,7 +7,6 @@ import torch
 from transformers.models.gemma3.modeling_gemma3 import Gemma3DecoderLayer, Gemma3RotaryEmbedding
 
 from gemma3_vision.modeling_gemma3_text import NeuronGemma3DecoderLayer
-from test.utils import 
 from test.utils import assert_tensor_all_close, causal_mask, window_mask, mark_step, cpu_setup, create_neuron_config, FP32_TOLERANCES, FP16_TOLERANCES, BF16_TOLERANCES
 
 logger = logging.getLogger(__name__)
@@ -61,7 +60,7 @@ def test_nxdi_decoder_layer_cpu_vs_transformers_implementation(random_seed, laye
 
     reference_model = Gemma3DecoderLayer(hf_text_config, layer_idx=layer_idx)
     reference_model.load_state_dict(convert_to_hf_state_dict(decoder_layer.state_dict()), strict=True)
-    reference_model.eval()    
+    reference_model.eval()
 
     # --- Set Inputs ---
     batch_size, seq_len, hidden_size = 2, 15, hf_text_config.hidden_size
@@ -75,11 +74,11 @@ def test_nxdi_decoder_layer_cpu_vs_transformers_implementation(random_seed, laye
 
     attention_mask_nrn = local_mask if local_mask is not None else attention_mask
     attention_mask_hf = torch.where(attention_mask_nrn.to(bool), 0.0, torch.finfo(inputs_dtype).min).to(inputs_dtype)
-      
+
     ## Required only for the reference model
     rotary_emb = Gemma3RotaryEmbedding(config=hf_text_config)
     position_embeddings_global = rotary_emb(hidden_states, position_ids)
-    
+
     hf_text_config_copy = copy.deepcopy(hf_text_config)
     hf_text_config_copy.rope_theta = hf_text_config_copy.rope_local_base_freq
     hf_text_config_copy.rope_scaling = {"rope_type": "default"}

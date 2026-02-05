@@ -20,7 +20,7 @@ def test_vision_model(monkeypatch, base_compiler_flags, tolerances, compiler_fla
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
 
     batch_size, seq_len = 2, 64
-    num_channels, image_size = hf_config.vision_config.num_channels, hf_config.vision_config.image_size 
+    num_channels, image_size = hf_config.vision_config.num_channels, hf_config.vision_config.image_size
     inputs_dtype = model_dtype = torch.float32
     hf_config.vision_config.num_hidden_layers = 5  # test with smaller network
 
@@ -44,7 +44,7 @@ def test_vision_model(monkeypatch, base_compiler_flags, tolerances, compiler_fla
     cpu_vision_model.eval()
 
     with torch.no_grad():
-        cpu_output = cpu_vision_model(pixel_values) 
+        cpu_output = cpu_vision_model(pixel_values)
 
     # --- Neuron Device Execution ---
     # Note: Tear down CPU environment and switch to NeuronCore mode
@@ -68,7 +68,7 @@ def test_vision_model(monkeypatch, base_compiler_flags, tolerances, compiler_fla
 
 def test_nxdi_vision_model_vs_transformers_implementation(random_seed, hf_config) -> None:
     batch_size, seq_len = 2, 64
-    num_channels, image_size = hf_config.vision_config.num_channels, hf_config.vision_config.image_size 
+    num_channels, image_size = hf_config.vision_config.num_channels, hf_config.vision_config.image_size
     inputs_dtype = model_dtype = torch.float32
     hf_config.vision_config.num_hidden_layers = 5  # test with smaller network
 
@@ -86,13 +86,13 @@ def test_nxdi_vision_model_vs_transformers_implementation(random_seed, hf_config
 
     vision_model = NeuronGemma3VisionModel(config=nrn_config).to(dtype=model_dtype)
     vision_model.eval()
-    vision_model.to(device=xm.xla_device()) 
-    
+    vision_model.to(device=xm.xla_device())
+
     # --- Set Transformers Model ---
     reference_model = Gemma3ForConditionalGeneration(config=hf_config).to(dtype=model_dtype)
     reference_model.load_state_dict(vision_model.state_dict(), strict=False)
     reference_model.eval()
-    
+
     with torch.no_grad():
         # reference model Gemma3ForConditionalGeneration includes a language model (LM)
         # use get_image_features() to pass the input pixel through vision_tower and multi_modal_projector only (exclude LM)

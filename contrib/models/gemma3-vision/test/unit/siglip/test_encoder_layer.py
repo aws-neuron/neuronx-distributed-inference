@@ -24,7 +24,7 @@ def convert_to_hf_state_dict(state_dict: OrderedDict[str, torch.FloatTensor]) ->
         elif key.endswith("rank"):
             logger.info(f"Skipping neuron-related key: {key}")
         else:
-            hf_state_dict[key] = tensor      
+            hf_state_dict[key] = tensor
     return hf_state_dict
 
 config = AutoConfig.from_pretrained("google/gemma-3-27b-it")  # nosec B615
@@ -36,7 +36,7 @@ hf_config = AutoModel.from_config(config=config.vision_config).config
     ])
 def test_encoder_layer(monkeypatch, base_compiler_flags, tolerances, compiler_flags) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
-    
+
     batch_size, seq_len, hidden_size = 2, 32, hf_config.hidden_size
     inputs_dtype = model_dtype = torch.float32
     device = xm.xla_device()
@@ -55,7 +55,7 @@ def test_encoder_layer(monkeypatch, base_compiler_flags, tolerances, compiler_fl
 
     encoder_layer = NeuronSiglipEncoderLayer(config=config)
     encoder_layer.eval()
-    
+
     with torch.no_grad():
         output_cpu, *_ = encoder_layer(
             hidden_states=hidden_states,
@@ -96,7 +96,7 @@ def test_nxdi_encoder_layer_vs_transformers_implementation(random_seed) -> None:
 
     reference_model = SiglipEncoderLayer(config=hf_config).to(dtype=model_dtype)
     reference_model.load_state_dict(convert_to_hf_state_dict(encoder_layer.state_dict()), strict=True)
-    reference_model.eval()    
+    reference_model.eval()
 
     with torch.no_grad():
         ref_output, *_ = reference_model(

@@ -10,23 +10,23 @@ from test.utils import assert_tensor_all_close, mark_step, FP32_TOLERANCES
 def convert_neuron_siglip_encoder_state_dict_to_hf(neuron_state_dict: dict) -> dict:
     """
     Convert Neuron SigLIP encoder state dict to HuggingFace format.
-    
+
     Neuron model has:
     - layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,bias}
     - layers.X.self_attn.o_proj.o_proj.{weight,bias}
     - layers.X.self_attn.rank_util.rank (not needed in HF)
-    
+
     HuggingFace model expects:
     - layers.X.self_attn.{q,k,v}_proj.{weight,bias}
     - layers.X.self_attn.out_proj.{weight,bias}
     """
     hf_state_dict = {}
-    
+
     for key, value in neuron_state_dict.items():
         # Skip rank_util parameters (not needed in HF)
         if "rank_util" in key:
             continue
-        
+
         # Convert qkv_proj paths
         if "qkv_proj.q_proj" in key:
             new_key = key.replace("qkv_proj.q_proj", "q_proj")
@@ -44,7 +44,7 @@ def convert_neuron_siglip_encoder_state_dict_to_hf(neuron_state_dict: dict) -> d
         else:
             # Keep other parameters as-is
             hf_state_dict[key] = value
-    
+
     return hf_state_dict
 
 
@@ -53,7 +53,7 @@ def convert_neuron_siglip_encoder_state_dict_to_hf(neuron_state_dict: dict) -> d
     ])
 def test_encoder(monkeypatch, base_compiler_flags, tolerances, compiler_flags, hf_config) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
-    
+
     batch_size, seq_len, hidden_size = 2, 32, hf_config.vision_config.hidden_size
     inputs_dtype = model_dtype = torch.float32
     device = xm.xla_device()
@@ -72,7 +72,7 @@ def test_encoder(monkeypatch, base_compiler_flags, tolerances, compiler_flags, h
 
     encoder = NeuronSiglipEncoder(config=config)
     encoder.eval()
-    
+
     with torch.no_grad():
         output_cpu = encoder(
             inputs_embeds=inputs_embeds,
@@ -115,7 +115,7 @@ def test_nxdi_encoder_vs_transformers_implementation(random_seed, hf_config) -> 
     reference_model = SiglipEncoder(config=hf_config.vision_config).to(dtype=model_dtype)
     hf_state_dict = convert_neuron_siglip_encoder_state_dict_to_hf(encoder.state_dict())
     reference_model.load_state_dict(hf_state_dict, strict=True)
-    reference_model.eval()    
+    reference_model.eval()
 
     with torch.no_grad():
         ref_output = reference_model(

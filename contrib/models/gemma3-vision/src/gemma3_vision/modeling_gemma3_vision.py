@@ -49,7 +49,7 @@ class NeuronGemma3MultiModalProjector(nn.Module):
 
         projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
         return projected_vision_outputs.type_as(vision_outputs)
-    
+
 
 class NeuronGemma3VisionModel(torch.nn.Module):
     def __init__(self, config: InferenceConfig):
@@ -100,7 +100,7 @@ class NeuronGemma3VisionModel(torch.nn.Module):
         #     )
 
         embedding = self.vision_encoder(pixel_values).last_hidden_state
-        logger.info(f"embedding.shape {embedding.shape}") 
+        logger.info(f"embedding.shape {embedding.shape}")
 
         projected_embedding = self.multi_modal_projector(embedding)
         logger.info(f"projected_embedding.shape {projected_embedding.shape}")
@@ -111,7 +111,7 @@ class NeuronGemma3VisionModel(torch.nn.Module):
         #         h_image_proj, gather_dim=0, process_group=self.data_parallel_group
         #     )
         return projected_embedding
-    
+
 
 class Gemma3VisionModelWrapper(Llama4VisionModelWrapper):
     """
@@ -147,7 +147,7 @@ class Gemma3VisionModelWrapper(Llama4VisionModelWrapper):
         for bucket in self.neuron_config.buckets:
             pixel_values = torch.ones(
                 [
-                    self.neuron_config.batch_size, 
+                    self.neuron_config.batch_size,
                     self.config.vision_config.num_channels,
                     self.config.vision_config.image_size,
                     self.config.vision_config.image_size,
@@ -157,7 +157,7 @@ class Gemma3VisionModelWrapper(Llama4VisionModelWrapper):
             inputs.append((pixel_values,))
 
         return inputs
-    
+
     def forward(self, *args):
         """
         Override ModelWrapper.forward() to adapt for vision encoder.
@@ -170,17 +170,17 @@ class Gemma3VisionModelWrapper(Llama4VisionModelWrapper):
         # convert int64 to int32 to improve compatibility with compiler; does not apply to cpu case
         if not self.neuron_config.on_cpu:
             args = self.convert_int64_to_int32(*args)
-       
+
         pixel_values = args[0]
         input_batch_size = pixel_values.shape[0]
 
         if input_batch_size == self.neuron_config.batch_size:
             output = self._forward(*args)
             return output
-        
+
         cur_batch = 0
         outputs = []
-        
+
         logging.debug(
             f"get input_batch_size as {input_batch_size} but compiled batch_size as {self.neuron_config.batch_size}"
         )
@@ -200,7 +200,7 @@ class Gemma3VisionModelWrapper(Llama4VisionModelWrapper):
                 batch_args = self.vllm_cte_repadding(batch_args)
 
                 output = self._forward(*batch_args)
-                
+
             else:
                 # we need to pad the input to run
                 logging.debug(
@@ -215,19 +215,19 @@ class Gemma3VisionModelWrapper(Llama4VisionModelWrapper):
 
             outputs.append(output)
             cur_batch += self.neuron_config.batch_size
-        
+
         return output
-    
+
     def _forward_with_pad(self, *args):
         """
-        Override ModelWrapper._forward_with_pad 
+        Override ModelWrapper._forward_with_pad
         as vision encoder's args only includes pixel values (i.e. len(args) = 1)
         """
         # Note: NxD's tracing flow (Model Builder) does not yet support kwargs, because of which we cannot support
         # optional parameters. Kwargs support is being added as a part of the new Model Builder API. Until then we
         # maintain a specific set of inputs that the ModelWrapper can support.
         # This is not the best way to maintain code. But soon kwargs suport will render this irrelevant.
-        
+
         # pad the inputs up to the compiled batch size in the end
         def pad_helper(tensor, pad_type="fill_0", batch_sort_indices=None):
             """
@@ -286,19 +286,19 @@ class Gemma3VisionModelWrapper(Llama4VisionModelWrapper):
 
             return padded_tensor
 
-        reorder_seq_ids = False 
+        reorder_seq_ids = False
         pixel_values = args[0]
         orig_batch_size = pixel_values.shape[0]
         seq_ids_list = list(range(orig_batch_size))
         seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32)
-        
+
         padded_seq_ids = torch.tensor(
             seq_ids_list
             + [x for x in range(self.neuron_config.max_batch_size) if x not in seq_ids_list],
             dtype=seq_ids.dtype,
         )
         padded_seq_ids, indices = torch.sort(padded_seq_ids) if reorder_seq_ids else (padded_seq_ids, None)
-        
+
         padded_args = []
         # pad pixel_values
         for arg in args:

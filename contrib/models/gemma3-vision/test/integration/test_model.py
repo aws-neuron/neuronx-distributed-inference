@@ -1,9 +1,9 @@
 from gemma3_vision.ndxi_patch import apply_patch
 apply_patch()
 
-import os
-from pathlib import Path
-from typing import Dict
+import os # noqa: E402
+from pathlib import Path # noqa: E402
+from typing import Dict # noqa: E402
 
 import pytest
 import torch
@@ -81,11 +81,11 @@ def test_original_cpu_vs_nxdi_neuron(
         nrn_config=nrn_config,
         torch_dtype=torch_dtype
     )
-    
+
     generation_config = create_generation_config(nrn_config=nrn_config)
 
     save_hf_checkpoint(
-        output_dir_path=tmp_path, 
+        output_dir_path=tmp_path,
         config_file_path=config_file_path,
         torch_dtype=torch_dtype,
         )
@@ -95,18 +95,18 @@ def test_original_cpu_vs_nxdi_neuron(
 
     traced_model_path = tmp_path / ("traced_model" + suffix)
     traced_model_path.mkdir(exist_ok=True)
-    
+
     nrn_model.compile(traced_model_path.as_posix())
 
     nrn_model.load(traced_model_path.as_posix())
 
     benchmark_report = benchmark_sampling(
-        model=nrn_model, 
+        model=nrn_model,
         generation_config=generation_config,
         image=False, # image=True currently broken (Neuron 2.27.1)
         benchmark_report_path=f"./benchmark_report{suffix}.json"
         )
-    
+
     assert benchmark_report["context_encoding_model"]["latency_ms_p50"] < perf_thresholds["text_cte_p50_latency"] * 1.1
     assert benchmark_report["context_encoding_model"]["throughput"] > perf_thresholds["text_cte_throughput"] * 0.9
     assert benchmark_report["token_generation_model"]["latency_ms_p50"] < perf_thresholds["tkg_p50_latency"] * 1.1
@@ -167,5 +167,5 @@ if __name__ == "__main__":
         num_images_per_sample=num_images_per_sample,
         total_max_seq_len=total_max_seq_len,
         )
-        
+
     tmp_dir.cleanup()

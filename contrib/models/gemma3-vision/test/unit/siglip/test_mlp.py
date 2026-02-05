@@ -14,11 +14,11 @@ from test.utils import assert_tensor_all_close, mark_step, FP32_TOLERANCES, FP16
     ])
 def test_mlp_layer(monkeypatch, base_compiler_flags, tolerances, compiler_flags, hf_config) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
-    
+
     batch_size, seq_len, hidden_size = 2, 32, hf_config.vision_config.hidden_size
     inputs_dtype = model_dtype = torch.float32
     device = xm.xla_device()
-    
+
     x = torch.randn(batch_size, seq_len, hidden_size).to(dtype=inputs_dtype)
 
     neuron_config = NeuronSiglipConfig(
@@ -27,16 +27,16 @@ def test_mlp_layer(monkeypatch, base_compiler_flags, tolerances, compiler_flags,
         max_context_length=seq_len,
         torch_dtype=model_dtype,
     )
-    
+
     config = SiglipInferenceConfig(neuron_config=neuron_config, **hf_config.vision_config.to_dict())
 
     mlp_layer = NeuronSiglipMLP(config).to(dtype=model_dtype)
     mlp_layer.eval()
 
     with torch.no_grad():
-        cpu_output = mlp_layer(x) 
+        cpu_output = mlp_layer(x)
 
-        mlp_layer = mlp_layer.to(device=device) 
+        mlp_layer = mlp_layer.to(device=device)
         mark_step()
         nrn_output = mlp_layer(x.to(device=device))
         mark_step()
@@ -46,7 +46,7 @@ def test_mlp_layer(monkeypatch, base_compiler_flags, tolerances, compiler_flags,
     assert_tensor_all_close(test_objective="MLP outputs", computed_value=nrn_output, reference_value=cpu_output, rtol=rtol, atol=atol, equal_nan=True)
 
 
-def test_nxdi_mlp_vs_transformers_implementation(random_seed, hf_config) -> None:    
+def test_nxdi_mlp_vs_transformers_implementation(random_seed, hf_config) -> None:
     batch_size, seq_len = 2, 32
     inputs_dtype = model_dtype = torch.float32
 
@@ -67,7 +67,7 @@ def test_nxdi_mlp_vs_transformers_implementation(random_seed, hf_config) -> None
     reference_model = SiglipMLP(config=hf_config.vision_config).to(dtype=model_dtype)
     reference_model.load_state_dict(mlp_layer.state_dict(), strict=True)
     reference_model.eval()
-    
+
     with torch.no_grad():
         ref_output = reference_model(hidden_states=x)
         output = mlp_layer(hidden_states=x)

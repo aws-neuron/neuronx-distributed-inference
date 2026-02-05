@@ -6,7 +6,7 @@ from torch_neuronx.xla_impl.ops import RmsNorm
 from transformers.models.gemma3.modeling_gemma3 import Gemma3TextScaledWordEmbedding, Gemma3RMSNorm
 
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.layers import (  
+from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
 )
@@ -41,7 +41,7 @@ logger = logging.getLogger("Neuron")
 
 
 class HybridAttnKVCacheManager(KVCacheManager):
-    
+
     def get_kv_by_layer_id(
         self,
         idx,
@@ -55,15 +55,15 @@ class HybridAttnKVCacheManager(KVCacheManager):
     ):
         """
         Override KVCacheManager's get_kv_by_layer_id() to handle hybrid attention patterns.
-        
+
         Changes:
         1. Removed the following lines:
             ```
             if hasattr(self, "v_shapes"):
                 seq_len = self.v_shapes[idx][2]
             ```
-            
-        Without this override, get_kv_by_layer_id() would return caches with shape 
+
+        Without this override, get_kv_by_layer_id() would return caches with shape
         [batch_size, num_head_per_rank, max_seq_len, head_dim] instead of the expected
         [batch_size, num_head_per_rank, n_positions (bucket length), head_dim].
         """
@@ -102,10 +102,10 @@ class HybridAttnKVCacheManager(KVCacheManager):
             k_cache = dequantize.direct_cast_dequantize(k_cache, self.dequant_dtype)
             v_cache = dequantize.direct_cast_dequantize(v_cache, self.dequant_dtype)
         return k_cache, v_cache
-    
+
 
 class NeuronGemma3RMSNorm(nn.Module):
-    
+
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
@@ -124,11 +124,11 @@ def get_rmsnorm_cls():
 
 class NeuronGemma3TextScaledWordEmbedding(ParallelEmbedding):
 
-    def __init__(self, 
-                 num_embeddings: int, 
-                 embedding_dim: int, 
-                 padding_idx: int, 
-                 embed_scale: float = 1.0, 
+    def __init__(self,
+                 num_embeddings: int,
+                 embedding_dim: int,
+                 padding_idx: int,
+                 embed_scale: float = 1.0,
                  **kwargs) -> None:
         super().__init__(num_embeddings, embedding_dim, padding_idx, **kwargs)
         self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
@@ -143,9 +143,9 @@ class NeuronGemma3MLP(NeuronLlamaMLP):
 
 class NeuronGemma3RotaryEmbedding(RotaryEmbedding):
 
-    def __init__(self, 
-                 dim: int, 
-                 max_position_embeddings: int, 
+    def __init__(self,
+                 dim: int,
+                 max_position_embeddings: int,
                  base: float,
                  scaling_type: str = "default",
                  scaling_factor: float = 1.0,
@@ -165,16 +165,16 @@ class NeuronGemma3RotaryEmbedding(RotaryEmbedding):
             raise ValueError(
                 f"Unsupported RoPE scaling type '{scaling_type}'. Gemma3 RoPE only supports 'default' or 'linear'."
             )
-        
+
     def get_inv_freqs(self, device: Optional[torch.device] = None) -> torch.Tensor:
         inv_freq = super().get_inv_freqs(device=device)
         if self.scaling_type == "linear":
-            return inv_freq / self.scaling_factor 
+            return inv_freq / self.scaling_factor
         return inv_freq
 
 
 class NeuronGemma3Attention(NeuronAttentionBase):
-    
+
     @staticmethod
     def get_rope(config: InferenceConfig, is_swa_layer: bool) -> NeuronGemma3RotaryEmbedding:
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
@@ -188,7 +188,7 @@ class NeuronGemma3Attention(NeuronAttentionBase):
                 base=config.rope_local_base_freq,
             )
         else:
-            # RoPE for global attention layers                
+            # RoPE for global attention layers
             if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
                 scaling_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
                 scaling_factor = config.rope_scaling.get("factor", 1.0)
@@ -202,7 +202,7 @@ class NeuronGemma3Attention(NeuronAttentionBase):
                 scaling_type=scaling_type,
                 scaling_factor=scaling_factor,
             )
-        
+
 
 class NeuronGemma3DecoderLayer(nn.Module):
 
@@ -212,7 +212,7 @@ class NeuronGemma3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
 
-        config_sliding_window = getattr(config, "sliding_window", None) 
+        config_sliding_window = getattr(config, "sliding_window", None)
         self.is_swa_layer = False if config_sliding_window is None else bool((layer_idx + 1) % config._sliding_window_pattern)
         self.sliding_window = config_sliding_window if self.is_swa_layer else None
 
@@ -260,7 +260,7 @@ class NeuronGemma3DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = rms_norm_cls(
             config.hidden_size,
             eps=config.rms_norm_eps,
-        )                
+        )
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
         self.quantized_mlp_kernel_enabled = config.neuron_config.quantized_mlp_kernel_enabled
@@ -277,7 +277,7 @@ class NeuronGemma3DecoderLayer(nn.Module):
             self.mlp_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
 
         self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
-    
+
     def forward(
         self,
         hidden_states: torch.FloatTensor,
@@ -293,7 +293,7 @@ class NeuronGemma3DecoderLayer(nn.Module):
         # Adapted from NeuronLlamaDecoderLayer
         is_token_gen = past_key_value is not None
         entry_hidden_states = hidden_states
-        
+
         # Hybrid SWA/global attention layers are specific to Gemma3
         if self.is_swa_layer:
             attention_mask = local_mask
@@ -321,8 +321,8 @@ class NeuronGemma3DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(attn_output.hidden_states)
 
         if attn_output.residual is not None:
-        # In the case the QKV kernel is enabled (attn_output.residual is not None), the input hidden 
-        # states actually do not correspond to the attention layer's inputs. They are computed within 
+        # In the case the QKV kernel is enabled (attn_output.residual is not None), the input hidden
+        # states actually do not correspond to the attention layer's inputs. They are computed within
         # the layer (by the fused QKV kernel) and returned as "residual" output.
             assert self.qkv_kernel_fuse_residual_add, \
                 "residual add before qkv should be computed in the previous layer, \
@@ -369,21 +369,21 @@ class NeuronGemma3DecoderLayer(nn.Module):
         # Post-feed-forward RMS norm is specific to Gemma3
         hidden_states = self.post_feedforward_layernorm(hidden_states)
 
-        # If the QKV kernel with fused residual addition is not enabled, we perform the residual addition here, 
+        # If the QKV kernel with fused residual addition is not enabled, we perform the residual addition here,
         # otherwise, we return the residual so the fused kernel in the next block can perform the addition
         if not self.qkv_kernel_fuse_residual_add or is_token_gen:
             hidden_states = residual + hidden_states
             residual = None
 
         return  (hidden_states, attn_output.present_key_value, attn_output.cos_cache, attn_output.sin_cache, residual)
-    
+
 
 class NeuronGemma3TextModel(NeuronBaseModel):
 
     def scatter_by_index_put(self, h_image, encoded_patches_proj, positions):
         """
         Scatter encoded patches into an image tensor.
-        Compared to neuronx_distributed_inference/models/llama4/utils/encoder_utils.py's scatter_by_index_put(), 
+        Compared to neuronx_distributed_inference/models/llama4/utils/encoder_utils.py's scatter_by_index_put(),
         this function supports Batch Size >= 1.
 
         Args:
@@ -395,7 +395,7 @@ class NeuronGemma3TextModel(NeuronBaseModel):
         torch.Tensor: The updated image tensor with scattered patches
         """
         B, max_positions, embedding_dim = h_image.shape
-        
+
         # Create a new tensor instead of modifying h_image in-place
         h_image_new = h_image.clone()
 
@@ -404,24 +404,24 @@ class NeuronGemma3TextModel(NeuronBaseModel):
 
         # Flatten positions
         positions = positions.view(-1)
-        
+
         # Create Batch Indices
         # We need to tell PyTorch: "This update belongs to batch 0, that one to batch 1"
         # If positions is (B, N), we need batch_idx to look like [0,0..0, 1,1..1, ...]
         num_updates_per_batch = positions.shape[0] // B
-        
+
         batch_idx = torch.arange(B, device=h_image.device, dtype=positions.dtype)
         batch_idx = batch_idx.repeat_interleave(num_updates_per_batch)
 
         # Use index_put_ to scatter the embeddings
         h_image_new.index_put_(
-            (batch_idx.long(), positions.long()), 
-            encoded_patches_flat, 
+            (batch_idx.long(), positions.long()),
+            encoded_patches_flat,
             accumulate=False
         )
 
         return h_image_new
-    
+
     def encode_vision_to_input(self, inputs_embeds, vision_embeddings, vision_mask) -> torch.Tensor:
         # Concat vision and text embeddings during context encoding
         # Both inputs_embeds and vision_embeddings should be of the same shape: [BS, Total tokens (image + text), Hidden]
@@ -452,16 +452,16 @@ class NeuronGemma3TextModel(NeuronBaseModel):
         if self.sliding_window and config.neuron_config.seq_len < self.sliding_window:
             # When the model context (seq_len) is shorter than the window, the sliding window
             # effectively covers the entire sequence (full attention). Update to match.
-            config.sliding_window = config.neuron_config.seq_len 
+            config.sliding_window = config.neuron_config.seq_len
             self.sliding_window = config.sliding_window
 
         if self.sliding_window:
             is_layer_locals = [layer_idx % config._sliding_window_pattern != config._sliding_window_pattern - 1 for layer_idx in range(config.num_hidden_layers)]
             self.layer_to_cache_size_mapping = get_layer_to_kv_cache_size_mapping_for_mixed_attn(config.sliding_window, config.neuron_config.seq_len, is_layer_locals)
             logger.info("layer_to_cache_size_mapping initialized")
-            
+
         self.has_mixed_attn = True
-        
+
         if parallel_state.model_parallel_is_initialized():
             self.embed_tokens = NeuronGemma3TextScaledWordEmbedding(
                 config.vocab_size,

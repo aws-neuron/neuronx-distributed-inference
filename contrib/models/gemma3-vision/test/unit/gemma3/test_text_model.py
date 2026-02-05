@@ -38,7 +38,7 @@ def convert_to_hf_state_dict(state_dict: OrderedDict[str, torch.FloatTensor]) ->
 
 
 def test_nxdi_text_model_cpu_vs_transformers_implementation(random_seed, hf_config) -> None:
-    inputs_dtype = model_dtype = torch.float32
+    model_dtype = torch.float32
     batch_size, seq_len = 2, 32
     hf_config.text_config.sliding_window = 10
     hf_config.text_config.query_pre_attn_scalar = hf_config.text_config.head_dim
@@ -53,18 +53,16 @@ def test_nxdi_text_model_cpu_vs_transformers_implementation(random_seed, hf_conf
         tp_degree=1,
         hf_config=hf_config
     )
-    
+
     cpu_setup(model_dtype)
-    print(vars(nrn_config.text_config))
     text_model = NeuronGemma3TextModel(config=nrn_config.text_config, optimize_inference=False).to(dtype=model_dtype)
     text_model.kv_mgr = MockKVCacheManager(config=nrn_config.text_config, num_kv_head=nrn_config.text_config.num_key_value_heads)
     text_model.eval()
 
     # --- Set Transformers Model ---
-    print(vars(hf_config.text_config))
     reference_model = Gemma3TextModel(hf_config.text_config)
     reference_model.load_state_dict(convert_to_hf_state_dict(text_model.state_dict()), strict=False)
-    reference_model.eval()    
+    reference_model.eval()
 
     # --- Set Inputs ---
     input_ids = torch.randint(0, hf_config.text_config.vocab_size, (batch_size, seq_len)).to(dtype=torch.long)
@@ -84,8 +82,8 @@ def test_nxdi_text_model_cpu_vs_transformers_implementation(random_seed, hf_conf
 
         # pass through lm_head manually as logit calculation happens at a higher model class (Gemma3ForCausalLM) in HF
         lm_head = torch.nn.Linear(hf_config.text_config.hidden_size, hf_config.text_config.vocab_size, bias=False)
-        lm_head.load_state_dict({"weight": text_model.state_dict()["lm_head.weight"]}, strict=True) 
-        ref_output = lm_head(ref_last_hidden_state[:, -1:, :]) 
+        lm_head.load_state_dict({"weight": text_model.state_dict()["lm_head.weight"]}, strict=True)
+        ref_output = lm_head(ref_last_hidden_state[:, -1:, :])
 
         output, *_ = text_model(
             input_ids=input_ids.to(device=device),

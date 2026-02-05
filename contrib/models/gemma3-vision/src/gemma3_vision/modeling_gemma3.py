@@ -1,10 +1,10 @@
 from gemma3_vision.ndxi_patch import apply_patch
 apply_patch()
 
-import copy
-import math
-import logging
-from typing import Callable, Dict, List, Optional, Tuple, Type, Union, Any
+import copy # noqa: E402
+import math # noqa: E402
+import logging # noqa: E402
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union, Any # noqa: E402
 
 import torch
 import torch.nn.functional as F
@@ -15,11 +15,11 @@ from neuronx_distributed.quantization.quantization_utils import convert_qint8_to
 import neuronx_distributed_inference.modules.autobucketing as autobucketing
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.models.image_to_text_model_base import (
-    ImageToTextInferenceConfig, 
+    ImageToTextInferenceConfig,
     NeuronBaseForImageToText
 )
 from neuronx_distributed_inference.models.image_to_text_model_wrapper import (
-    ImageToTextModelWrapper, 
+    ImageToTextModelWrapper,
     IMAGE_TO_TEXT_MODEL_WRAPPER_INPUT_KEYS
 )
 from neuronx_distributed_inference.models.llama4.utils.encoder_utils import pad_vision_embeddings
@@ -62,7 +62,7 @@ class Gemma3InferenceConfig(ImageToTextInferenceConfig):
         if not hasattr(self.text_config, "hidden_act"):
             self.text_config.hidden_act = self.text_config.hidden_activation
             del self.text_config.hidden_activation
-        
+
         if self.text_config.neuron_config.is_block_kv_layout:
             raise ValueError("Gemma3 does not yet support block_kv_layout.")
         if self.text_config.neuron_config.is_prefix_caching:
@@ -170,7 +170,7 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
 
     def enable_vision_encoder(self, enable_wlt_optimization: bool = True, **model_init_kwargs):
         # Identical to NeuronPixtralForCausalLM.enable_vision_encoder
-        # - except use get_compiler_args + VISION_ENCODER_MODEL_TAG (instead of get_vision_compiler_args) 
+        # - except use get_compiler_args + VISION_ENCODER_MODEL_TAG (instead of get_vision_compiler_args)
         #   like NeuronLlama4ForCausalLM.enable_vision_encoder
         self.compile_tag = VISION_ENCODER_MODEL_TAG
 
@@ -206,7 +206,7 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
     @staticmethod
     def update_state_dict_for_tied_weights(state_dict: StateDict) -> None:
     # Gemma3-specific
-        try: 
+        try:
             state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"].clone()
         except KeyError:
             state_dict["embed_tokens.weight"] = state_dict["lm_head.weight"].clone()
@@ -225,9 +225,9 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
             ".self_attn.k_norm.": ".self_attn.k_layernorm.",
         }
 
-        # At the time of writing, NxDI (Neuron 2.26) attention layer does not provide a simple way to use a custom 
-        # scaling factor for raw attention scores (QK^T) while ensuring all optimizations (e.g. kernels) remain available 
-        # To work around this, we fuse the scaling factor into the weights (knowing that the attention layer will use the 
+        # At the time of writing, NxDI (Neuron 2.26) attention layer does not provide a simple way to use a custom
+        # scaling factor for raw attention scores (QK^T) while ensuring all optimizations (e.g. kernels) remain available
+        # To work around this, we fuse the scaling factor into the weights (knowing that the attention layer will use the
         # default math.sqrt(inference_config.head_dim) value)
         default_qk_scaling_factor_inv = math.sqrt(float(inference_config.text_config.query_pre_attn_scalar))
         gemma_qk_scaling_factor = 1.0 / math.sqrt(float(inference_config.text_config.head_dim))
@@ -244,7 +244,7 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
                         break
                 if key.endswith((".q_proj.weight", ".k_proj.weight")):
                     orig_dtype = weights.dtype
-                    weights = (weights.to(dtype=torch.float32) * gamma).to(dtype=orig_dtype)  
+                    weights = (weights.to(dtype=torch.float32) * gamma).to(dtype=orig_dtype)
             if 'language_model.lm_head.' in key:
                 key = key.replace('language_model.', "")
             if 'vision_tower.' in key:
@@ -260,23 +260,23 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
         if "language_model.lm_head.bias" not in state_dict and inference_config.neuron_config.lm_head_pad:
             # Use embed_tokens.weight instead of lm_head.weight as lm_head.weight is tied to embed_tokens.weight in Gemma3
             new_state_dict["lm_head.bias"] = torch.zeros(new_state_dict["embed_tokens.weight"].shape[0], dtype=torch.float32)
-            
+
         if inference_config.text_config.neuron_config.fused_qkv:
             new_state_dict = convert_state_dict_to_fused_qkv(
-                state_dict=new_state_dict, 
+                state_dict=new_state_dict,
                 num_layers=inference_config.text_config.num_hidden_layers,
                 neuron_config=inference_config.text_config.neuron_config,
                 prefix="layers.{layer_num}.self_attn"
                 )
-            
+
         if inference_config.vision_config.neuron_config.fused_qkv:
             new_state_dict = convert_state_dict_to_fused_qkv(
-                state_dict=new_state_dict, 
+                state_dict=new_state_dict,
                 num_layers=inference_config.vision_config.num_hidden_layers,
                 neuron_config=inference_config.vision_config.neuron_config,
                 prefix="vision_encoder.vision_model.encoder.layers.{layer_num}.self_attn"
                 )
-            
+
         if neuron_config.vocab_parallel:
             new_state_dict["embed_tokens.rank_util.rank"] = torch.arange(0, neuron_config.local_ranks_size)
 
@@ -305,7 +305,7 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
             args.append(arg)
 
         return tuple(args)
-    
+
     def _select_buckets_for_padding_length(self, position_ids):
         # Identical to NeuronLlama4ForCausalLM._select_buckets_for_padding_length
         neuron_config = self.config.neuron_config
@@ -319,7 +319,7 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
             selected_buckets = context_encoding_buckets
 
         return selected_buckets
-    
+
     @staticmethod
     def get_padding_length(buckets, position_ids):
         # Identical to [NeuronLlama4ForCausalLM|NeuronPixtralForCausalLM]._select_buckets_for_padding_length
@@ -366,7 +366,7 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
         Pad the positions tensor to a target size.
         Compared to pad_positions() of models/llama4/utils/encoder_utils.py,
         this function can support batch size > 1.
-        
+
         Args:
         positions (torch.Tensor): A 1D or 2D tensor containing position indices
         target_size (int): The desired size of the padded tensor
@@ -377,7 +377,7 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
         """
         # positions_2d of shape (batch_sz, seq_len)
         positions_2d = positions.unsqueeze(0) if positions.dim() == 1 else positions
-        padding_size = target_size - positions_2d.shape[1]        
+        padding_size = target_size - positions_2d.shape[1]
         assert padding_size >= 0, "Text model sequence length is not enough to handle all vision embeddings"
         positions_padded = F.pad(positions_2d, (0, padding_size), value=fill_value)
         # output tensor of shape (batch_sz, target_sz, 1)
@@ -389,7 +389,7 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
         position_ids.masked_fill_(attention_mask_2d == 0, 1)
         if is_prefill:
             return position_ids
-        else: 
+        else:
             return torch.amax(position_ids, dim=1, keepdim=True) + 1
 
     def forward(
@@ -445,8 +445,8 @@ class NeuronGemma3ForConditionalGeneration(NeuronBaseForImageToText):
             # are created from the vision mask
             vision_mask = self.generate_positions_from_mask(mask=vision_mask.squeeze())
             vision_mask = self.pad_positions(
-                positions=vision_mask, 
-                target_size=pad_target_size, 
+                positions=vision_mask,
+                target_size=pad_target_size,
                 fill_value=pad_fill_value
             )
         else:
@@ -559,9 +559,9 @@ class NeuronTextGemma3ForCausalLM(NeuronBaseForCausalLM):
             ".self_attn.k_norm.": ".self_attn.k_layernorm.",
         }
 
-        # At the time of writing, NxDI (Neuron 2.26) attention layer does not provide a simple way to use a custom 
-        # scaling factor for raw attention scores (QK^T) while ensuring all optimizations (e.g. kernels) remain available 
-        # To work around this, we fuse the scaling factor into the weights (knowing that  the attention layer will use the 
+        # At the time of writing, NxDI (Neuron 2.26) attention layer does not provide a simple way to use a custom
+        # scaling factor for raw attention scores (QK^T) while ensuring all optimizations (e.g. kernels) remain available
+        # To work around this, we fuse the scaling factor into the weights (knowing that  the attention layer will use the
         # default math.sqrt(inference_config.head_dim) value)
         default_qk_scaling_factor_inv = math.sqrt(float(inference_config.query_pre_attn_scalar))
         gemma_qk_scaling_factor = 1.0 / math.sqrt(float(inference_config.head_dim))
@@ -585,7 +585,7 @@ class NeuronTextGemma3ForCausalLM(NeuronBaseForCausalLM):
 
         if neuron_config.fused_qkv:
             new_state_dict = convert_state_dict_to_fused_qkv(
-                state_dict=new_state_dict, 
+                state_dict=new_state_dict,
                 num_layers=inference_config.num_hidden_layers,
                 neuron_config=inference_config.neuron_config,
                 prefix="layers.{layer_num}.self_attn"
@@ -601,10 +601,6 @@ class NeuronTextGemma3ForCausalLM(NeuronBaseForCausalLM):
         new_state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
 
         return new_state_dict
-
-    @staticmethod
-    def update_state_dict_for_tied_weights(state_dict):
-        state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"].clone()
 
     @classmethod
     def get_config_cls(cls):

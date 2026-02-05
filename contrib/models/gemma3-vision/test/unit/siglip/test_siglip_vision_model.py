@@ -15,9 +15,9 @@ logger.setLevel(logging.DEBUG)
 
 def convert_to_hf_state_dict(state_dict: OrderedDict[str, torch.FloatTensor]) -> Dict[str, torch.FloatTensor]:
     """Convert NeuronSiglipVisionModel state dict to HuggingFace SiglipVisionModel format.
-    
+
     Key mappings:
-    - vision_model.encoder.layers.{i}.self_attn.qkv_proj.{q,k,v}_proj.{weight,bias} 
+    - vision_model.encoder.layers.{i}.self_attn.qkv_proj.{q,k,v}_proj.{weight,bias}
       → vision_model.encoder.layers.{i}.self_attn.{q,k,v}_proj.{weight,bias}
     - vision_model.encoder.layers.{i}.self_attn.o_proj.o_proj.{weight,bias}
       → vision_model.encoder.layers.{i}.self_attn.out_proj.{weight,bias}
@@ -47,7 +47,7 @@ def convert_to_hf_state_dict(state_dict: OrderedDict[str, torch.FloatTensor]) ->
     ])
 def test_vision_model(monkeypatch, base_compiler_flags, tolerances, compiler_flags, hf_config) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
-    
+
     batch_size, num_channels, image_size = 2, 3, 896
     hf_config.vision_config.num_hidden_layers = 5    # lower num_hidden_layers for faster testing
     inputs_dtype = model_dtype = torch.float32
@@ -66,7 +66,7 @@ def test_vision_model(monkeypatch, base_compiler_flags, tolerances, compiler_fla
 
     vision_model = NeuronSiglipVisionModel(config=config)
     vision_model.eval()
-    
+
     with torch.no_grad():
         output_cpu = vision_model(pixel_values=pixel_values).last_hidden_state
 
@@ -102,7 +102,7 @@ def test_nxdi_vision_model_vs_transformers_implementation(random_seed, hf_config
     hf_config.vision_config._attn_implementation = "eager"
     reference_model = SiglipVisionModel(config=hf_config.vision_config).to(dtype=model_dtype)
     reference_model.load_state_dict(convert_to_hf_state_dict(vision_model.state_dict()), strict=True)
-    reference_model.eval()    
+    reference_model.eval()
 
     with torch.no_grad():
         ref_output = reference_model(pixel_values=pixel_values).last_hidden_state

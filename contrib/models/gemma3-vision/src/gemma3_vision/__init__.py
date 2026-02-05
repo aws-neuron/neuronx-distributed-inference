@@ -3,6 +3,8 @@
 from .modeling_gemma3 import (
     NeuronGemma3ForConditionalGeneration,
     Gemma3InferenceConfig,
+    TextGemma3InferenceConfig,
+    NeuronTextGemma3ForCausalLM,
 )
 from .modeling_gemma3_vision import (
     NeuronGemma3VisionModel,
@@ -11,10 +13,6 @@ from .modeling_gemma3_vision import (
 )
 from .modeling_gemma3_text import (
     NeuronGemma3TextModel,
-)
-from .modeling_causal_lm_gemma3 import (
-    TextGemma3InferenceConfig,
-    NeuronTextGemma3ForCausalLM,
 )
 
 __all__ = [

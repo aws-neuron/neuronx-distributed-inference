@@ -11,7 +11,7 @@ from test.utils import assert_tensor_all_close, mark_step, cpu_setup, create_neu
     (torch.bfloat16, BF16_TOLERANCES),
     ])
 @pytest.mark.parametrize("position", [128, 1024, 2048, 4096, 6144, 8192])
-def test_rope_global_vs_transformers_implementation(inputs_dtype, tolerances, position, hf_config) -> None:   
+def test_rope_global_vs_transformers_implementation(inputs_dtype, tolerances, position, hf_config) -> None:
     # --- Set NxDI Model ---
     batch_size, max_seq_len = 2, 64
     nrn_config = create_neuron_config(
@@ -21,7 +21,7 @@ def test_rope_global_vs_transformers_implementation(inputs_dtype, tolerances, po
         tp_degree=1,
         hf_config=hf_config
     )
-    
+
     partial_rotary_factor = getattr(nrn_config.text_config, "partial_rotary_factor", 1.0)
     dim = int(nrn_config.text_config.head_dim * partial_rotary_factor)
     max_position_embeddings = nrn_config.text_config.max_position_embeddings
@@ -45,7 +45,7 @@ def test_rope_global_vs_transformers_implementation(inputs_dtype, tolerances, po
 
     # --- Run Rope ---
     ref_cos, ref_sin = reference_rope(x, position_ids)
-    cos, sin = nrn_rope(x, position_ids) 
+    cos, sin = nrn_rope(x, position_ids)
 
     rtol, atol = tolerances.rtol, tolerances.atol
     assert_tensor_all_close(test_objective="cos", computed_value=cos, reference_value=ref_cos, rtol=rtol, atol=atol, equal_nan=True)
@@ -57,7 +57,7 @@ def test_rope_global_vs_transformers_implementation(inputs_dtype, tolerances, po
     (torch.bfloat16, BF16_TOLERANCES),
     ])
 @pytest.mark.parametrize("position", [128, 1024, 2048, 4096, 6144, 8192])
-def test_rope_local_vs_transformers_implementation(inputs_dtype, tolerances, position, hf_config) -> None:   
+def test_rope_local_vs_transformers_implementation(inputs_dtype, tolerances, position, hf_config) -> None:
     # --- Set NxDI Model ---
     batch_size, max_seq_len = 2, 64
     nrn_config = create_neuron_config(
@@ -92,7 +92,7 @@ def test_rope_local_vs_transformers_implementation(inputs_dtype, tolerances, pos
 
     # --- Run Rope ---
     ref_cos, ref_sin = reference_rope(x, position_ids)
-    cos, sin = nrn_rope(x, position_ids) 
+    cos, sin = nrn_rope(x, position_ids)
 
     rtol, atol = tolerances.rtol, tolerances.atol
     assert_tensor_all_close(test_objective="cos", computed_value=cos, reference_value=ref_cos, rtol=rtol, atol=atol, equal_nan=True)

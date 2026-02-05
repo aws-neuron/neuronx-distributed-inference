@@ -1,8 +1,8 @@
 from gemma3_vision.ndxi_patch import apply_patch
 apply_patch()
 
-import os
-from pathlib import Path
+import os # noqa: E402
+from pathlib import Path # noqa: E402
 
 from vllm import LLM, SamplingParams
 
@@ -34,13 +34,13 @@ def main(max_seq_len: int = 1024, images_per_sample: int = 1) -> None:
                     "token_generation_buckets": [max_seq_len],
                     "is_continuous_batching": True,
                     "async_mode": True,
-                }, 
+                },
                 "vision_neuron_config": {
                     "enable_bucketing": True,
                     "buckets": [images_per_sample],
                     "is_continuous_batching": True,
                 }
-                
+
             },
         },
     )

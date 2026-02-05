@@ -71,9 +71,9 @@ def test_nxdi_attn_layer_vs_transformers_implementation_prefill(random_seed, mon
 
     attention_mask_2d = torch.tensor([[0, 0, 0, 1, 1],
                                       [0, 0, 1, 1, 1],
-                                      [0, 1, 1, 1, 1], 
+                                      [0, 1, 1, 1, 1],
                                       [1, 1, 1, 1, 1]], dtype=torch.int32)
-    
+
     batch_size, max_input_seq_len = attention_mask_2d.shape
     inputs_dtype = model_dtype = torch.float32
 
@@ -81,7 +81,7 @@ def test_nxdi_attn_layer_vs_transformers_implementation_prefill(random_seed, mon
 
     position_ids = create_position_ids(attention_mask_2d=attention_mask_2d, is_for_context_encoding=True)
     cache_position = create_cache_position(attention_mask_2d=attention_mask_2d, is_for_context_encoding=True)
-    
+
     cos, sin = create_rope(position_ids=position_ids, hf_config=hf_text_config)
     hidden_states = create_hidden_states(attention_mask_2d=attention_mask_2d, hf_config=hf_text_config, is_for_context_encoding=True)
 
@@ -101,7 +101,7 @@ def test_nxdi_attn_layer_vs_transformers_implementation_prefill(random_seed, mon
         neuron_config=neuron_config,
         **hf_text_config.to_dict()
         )
-    
+
     nrn_model = NeuronGemma3TextModel(config=config)
 
     sliding_window = sliding_window_size if is_swa_layer else None

@@ -1,17 +1,22 @@
-# Gemma3-Vision Model
+# Contrib Model: Gemma3-Vision
 
 Support for Google Gemma3-Vision VLM (Vision-Language Model) based on the HuggingFace Transformers Gemma3 architecture with SigLIP vision encoder.
 
-## Architecture
+## Model Information
 
-Gemma3-Vision is a multimodal model that combines:
-- **Text Model**: Gemma3 language model with sliding window attention
-- **Vision Encoder**: SigLIP vision transformer with average pooling
-- **Multimodal Projector**: Linear projection to align vision and text spaces
-
-The model uses a dual configuration architecture with separate NeuronConfig instances for text and vision components.
+- **HuggingFace ID:** [`google/gemma-3-27b-it`](https://huggingface.co/google/gemma-3-27b-it)
+- **Model Type:** Transformer decoder with a SigLIP vision encoder
+- **License:** Check HuggingFace model card
 
 ## Usage
+
+### Prerequisites
+
+Download the Gemma-3-27b-it model from HuggingFace:
+
+```bash
+huggingface-cli download google/gemma-3-27b-it --local-dir /home/ubuntu/models/google/gemma-3-27b-it/
+```
 
 ### Text + Image Generation
 
@@ -30,7 +35,7 @@ from neuronx_distributed_inference.utils.hf_adapter import (
 )
 
 from gemma3_vision import (
-    NeuronGemma3ForConditionalGeneration,
+    NeuronGemma3ForCausalLM,
     Gemma3InferenceConfig,
 )
 
@@ -42,13 +47,13 @@ image_path = "/path/to/image.jpg"
 text_config = NeuronConfig(
     tp_degree=8,
     batch_size=1,
-    seq_len=2048,
+    seq_len=1024,
     torch_dtype=torch.bfloat16,
     fused_qkv=True,
     attn_kernel_enabled=True,
     enable_bucketing=True,
-    context_encoding_buckets=[2048],
-    token_generation_buckets=[2048],
+    context_encoding_buckets=[1024],
+    token_generation_buckets=[1024],
     is_continuous_batching=True,
     ctx_batch_size=1,
 )
@@ -56,7 +61,7 @@ text_config = NeuronConfig(
 vision_config = NeuronConfig(
     tp_degree=8,
     batch_size=1,
-    seq_len=2048,
+    seq_len=1024,
     torch_dtype=torch.bfloat16,
     fused_qkv=False,  # SigLIP requires separate QKV
     attn_kernel_enabled=True,
@@ -73,7 +78,7 @@ config = Gemma3InferenceConfig(
     load_config=load_pretrained_config(model_path),
 )
 
-model = NeuronGemma3ForConditionalGeneration(model_path, config)
+model = NeuronGemma3ForCausalLM(model_path, config)
 model.compile(compiled_model_path)
 model.load(compiled_model_path)
 
@@ -132,71 +137,13 @@ print(output_text[0])
 |Trn1	|Working	|Not compatible (API breaking changes)	|
 |Inf2	|Working	|Not tested	|
 
-### Supported Features
-
-|Feature	|Status|Notes|
-|---	|---	|---	|
-|Tensor Parallelism	|:white_check_mark:	|Tested with TP=8|
-|Sequence Parallelism	|:x:	|Not supported|
-|Context Parallelism	|:x:	|Not supported|
-|Expert Parallelism	|Not applicable	||
-|QKV Fusion	|:white_check_mark:	|Text model only|
-|Continuous Batching	|:white_check_mark:	||
-|On-Device Sampling	|:white_check_mark:	||
-|Async Mode	|:white_check_mark:	||
-|Bucketing	|:white_check_mark:	|Dual bucketing for text/vision|
-|Weight Quantization	|:white_check_mark:	|Excludes vision components|
-|Activation Quantization	|:x:	|Not supported|
-|KV Cache Quantization	|:x:	|Not supported|
-|Flash Decoding	|:x:	|Not supported|
-|Prefix Caching	|:x:	|Not supported|
-|Paged Attention	|:x:	|Not supported|
-|Chunked Prefill	|:x:	|Not supported|
-|Speculation	|:x:	|Not supported|
-|Attention Kernels	|:white_check_mark:	|Context encoding only|
-
-## Architecture Details
-
-### Dual Configuration
-
-Gemma3-Vision requires separate NeuronConfig instances for text and vision:
-
-- **Text Config**: `fused_qkv=True`, bucketing for variable sequence lengths
-- **Vision Config**: `fused_qkv=False`, auto-bucketing from 1024 to seq_len
-
-This is necessary because SigLIP vision encoder has different architectural requirements than the Gemma3 text model.
-
-### Vision Encoder
-
-The vision encoder uses:
-- **SigLIP**: Vision transformer with layer normalization
-- **Average Pooling**: Reduces patch embeddings to fixed number of tokens
-- **Linear Projection**: Projects vision embeddings to text model's hidden size
-
-### Quantization
-
-When using quantization, the following components must be excluded:
-- `multi_modal_projector`: Vision-to-text projection layer
-- `vision_tower`: Entire SigLIP encoder
-- All `self_attn` layers in the language model
-- `lm_head`: Final output projection
-
-### Compiler Optimization Levels
-
-- Vision encoder: `-O1` (faster compilation)
-- Context encoding: `-O1` (balanced)
-- Token generation: `-O2` (maximum optimization)
-
-## Example Checkpoints
-
-* https://huggingface.co/google/gemma-3-27b-it
-
 ## Testing
 
-Run integration tests to validate model accuracy and performance:
+Run integration tests:
 
 ```bash
-cd /home/ubuntu/nxdi-gemma3-contribution/contrib/models/gemma3-vision && PYTHONPATH="src:/home/ubuntu/nxdi-gemma3-contribution/src:$PYTHONPATH" uv run python -m test.integration.test_model
+export PYTHONPATH="/home/ubuntu/nxdi-gemma3-contribution/contrib/models/gemma3-vision/src:$PYTHONPATH"
+pytest contrib/models/gemma3-vision/test/integration/test_model.py --capture=tee-sys
 ```
 
 Run all tests (integration + unit):
@@ -204,3 +151,13 @@ Run all tests (integration + unit):
 ```bash
 pytest contrib/models/gemma3-vision/test/ --capture=tee-sys
 ```
+
+## Example Checkpoints
+
+* gemma-3-27b-it
+
+## Maintainer
+
+AWS Generative AI Innovation Center
+
+**Last Updated:** 2026-02-05

@@ -11,7 +11,7 @@ from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear, ParallelEmbedding
 from neuronx_distributed_inference.models.config import NeuronConfig, InferenceConfig
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
-  
+
 from gemma3_vision.siglip.layers import OutputChannelParallelConv2d
 
 
@@ -70,7 +70,7 @@ class NeuronSiglipMLP(nn.Module):
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
         hidden_states = self.fc2(hidden_states)
-        return hidden_states    
+        return hidden_states
 
 _shape_t = Union[int, List[int], Size]
 
@@ -103,7 +103,7 @@ class LayerNorm(torch.nn.LayerNorm):
         output = super().forward(input)
         return output
 
-  
+
 class NeuronSiglipEncoderLayer(nn.Module):
     def __init__(self, config: InferenceConfig):
         super().__init__()
@@ -135,7 +135,7 @@ class NeuronSiglipEncoderLayer(nn.Module):
         outputs = (hidden_states,)
 
         return outputs
-    
+
 
 class NeuronSiglipEncoder(nn.Module):
     def __init__(self, config: InferenceConfig):
@@ -221,7 +221,7 @@ class NeuronSiglipMultiheadAttention(NeuronSiglipAttention):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
 
-        bsz, tgt_len, embed_dim = query.size() 
+        bsz, tgt_len, embed_dim = query.size()
 
         # get query proj
         qkv_proj = self.get_qkv_proj()
@@ -399,7 +399,7 @@ class NeuronSiglipVisionEmbeddings(nn.Module):
             embeddings = embeddings + pos_emb.to(dtype=embeddings.dtype)
         return embeddings
 
-        
+
 class NeuronSiglipVisionTransformer(nn.Module):
     def __init__(self, config: InferenceConfig):
         super().__init__()
@@ -426,11 +426,11 @@ class NeuronSiglipVisionTransformer(nn.Module):
         )
 
         hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
-        
+
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,        
+            output_hidden_states=output_hidden_states,
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state

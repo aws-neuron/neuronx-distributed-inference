@@ -1,7 +1,7 @@
 # Running Gemma3 Vision Models with vLLM on AWS Neuron
 
 ## Setup
-*Note*: In the following, we assume that the HuggingFace model weights are available on the host. If not, 
+*Note*: In the following, we assume that the HuggingFace model weights are available on the host. If not,
 download them using the following commands:
 
 ```bash
@@ -30,7 +30,7 @@ Modify `vllm-neuron/vllm-neuron/worker/constants.py`:
 Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_loader.py`:
 Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
 
-#### 2.1 Register Gemma3 HuggingFace model class in supported `NEURON_MULTI_MODAL_MODELS` 
+#### 2.1 Register Gemma3 HuggingFace model class in supported `NEURON_MULTI_MODAL_MODELS`
 
 ```diff
 --- a/vllm_neuron/worker/constants.py
@@ -41,7 +41,7 @@ Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
      "Llama4ForConditionalGeneration",
 +    "Gemma3ForConditionalGeneration"
  ]
- 
+
  TORCH_DTYPE_TO_NEURON_AMP = {
 ```
 
@@ -56,7 +56,7 @@ Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
  from vllm.v1.outputs import SamplerOutput
 -from vllm.v1.sample import sampler as Sampler
 +from vllm.v1.sample.sampler import Sampler
- 
+
  from vllm_neuron.worker.constants import (
      NEURON_MULTI_MODAL_MODELS,
 ```
@@ -67,7 +67,7 @@ Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
 @@ -704,6 +704,61 @@ class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
              **kwargs,
          )
- 
+
 +class NeuronGemma3ForConditionalGeneration(NeuronLlama4ForCausalLM):
 +    """Gemma3 multimodal model using dynamically loaded NeuronGemma3ForConditionalGeneration from contrib."""
 +
@@ -123,7 +123,7 @@ Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
 +        ).input_ids[0]
 +        return success, compiled_model_path
 +
- 
+
  def _get_model_configs(config: PretrainedConfig) -> str:
      logger.debug("PretrainedConfig: %s", config)
 ```
@@ -151,7 +151,7 @@ Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
 --- a/vllm_neuron/worker/neuronx_distributed_model_runner.py
 +++ b/vllm_neuron/worker/neuronx_distributed_model_runner.py
 @@ -1067,7 +1067,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
- 
+
          if self.model.model.config.model_type == "llava":
              mm_kwargs = self._process_multi_modal_data_neuron_llava(mm_kwargs)
 -        elif self.model.model.config.model_type == "llama4":
@@ -166,7 +166,7 @@ Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
 #### 3.1 Offline Inference
 
 ```bash
-PYTHONPATH="$PWD/contrib/models/gemma3-vision/src:src:$PYTHONPATH" run python contrib/models/gemma3-vision/vllm/run_offline_inference.py 
+PYTHONPATH="$PWD/contrib/models/gemma3-vision/src:src:$PYTHONPATH" run python contrib/models/gemma3-vision/vllm/run_offline_inference.py
 ```
 
 #### 3.2 Online Inference
@@ -180,5 +180,5 @@ PYTHONPATH="$PWD/contrib/models/gemma3-vision/src:src:$PYTHONPATH" bash contrib/
 2. Query the running server:
 
 ```bash
-PYTHONPATH="$PWD/contrib/models/gemma3-vision/src:src:$PYTHONPATH" run python contrib/models/gemma3-vision/vllm/run_online_inference.py 
+PYTHONPATH="$PWD/contrib/models/gemma3-vision/src:src:$PYTHONPATH" run python contrib/models/gemma3-vision/vllm/run_online_inference.py
 ```

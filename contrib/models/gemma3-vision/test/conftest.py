@@ -9,10 +9,10 @@ import torch_xla.core.xla_model as xm
 from transformers import Gemma3Config
 from transformers.models.gemma3.configuration_gemma3 import Gemma3TextConfig
 from neuronx_distributed_inference.utils.random import set_random_seed
-  
+
 
 @pytest.fixture
-def base_compiler_flags(): 
+def base_compiler_flags():
     return [
         "--framework=XLA",
     ]
@@ -34,7 +34,6 @@ def hf_config():
 
 @pytest.fixture
 def tmp_dir_path():
-    import tempfile
     tmp_dir = tempfile.TemporaryDirectory()
     tmp_dir_path = Path(tmp_dir.name)
     yield tmp_dir_path

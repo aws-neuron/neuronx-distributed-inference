@@ -9,9 +9,9 @@ from transformers.models.siglip.modeling_siglip import SiglipAttention
 from gemma3_vision.siglip.modeling_siglip import NeuronSiglipConfig, SiglipInferenceConfig, NeuronSiglipAttention
 from test.utils import (
     assert_tensor_all_close,
-    mark_step, 
-    FP32_TOLERANCES, 
-    FP16_TOLERANCES, 
+    mark_step,
+    FP32_TOLERANCES,
+    FP16_TOLERANCES,
     BF16_TOLERANCES
 )
 
@@ -38,7 +38,7 @@ def convert_to_hf_state_dict(state_dict: OrderedDict[str, torch.FloatTensor]) ->
     ])
 def test_attention_layer(monkeypatch, base_compiler_flags, tolerances, compiler_flags, hf_config) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
-    
+
     batch_size, seq_len, hidden_size = 2, 32, hf_config.vision_config.hidden_size
     inputs_dtype = model_dtype = torch.float32
     device = xm.xla_device()
@@ -57,7 +57,7 @@ def test_attention_layer(monkeypatch, base_compiler_flags, tolerances, compiler_
 
     attn_layer = NeuronSiglipAttention(config=config)
     attn_layer.eval()
-    
+
     with torch.no_grad():
         output_cpu, *_ = attn_layer(
             hidden_states=hidden_states,
@@ -77,7 +77,7 @@ def test_attention_layer(monkeypatch, base_compiler_flags, tolerances, compiler_
     assert_tensor_all_close(test_objective="Attention outputs", computed_value=output_nrn, reference_value=output_cpu, rtol=rtol, atol=atol, equal_nan=True)
 
 
-# Note: As HuggingFace Transformers supports left padding only, we can only test the NxDI implementation of the attention layer 
+# Note: As HuggingFace Transformers supports left padding only, we can only test the NxDI implementation of the attention layer
 # and therefore the SWA implementation, for left padding only
 def test_nxdi_attn_vs_transformers_implementation(random_seed, hf_config) -> None:
     batch_size, seq_len, hidden_size = 2, 32, hf_config.vision_config.hidden_size
@@ -101,7 +101,7 @@ def test_nxdi_attn_vs_transformers_implementation(random_seed, hf_config) -> Non
     hf_config.vision_config._attn_implementation = "eager"
     reference_model = SiglipAttention(config=hf_config.vision_config).to(dtype=model_dtype)
     reference_model.load_state_dict(convert_to_hf_state_dict(attn_layer.state_dict()), strict=True)
-    reference_model.eval()    
+    reference_model.eval()
 
     with torch.no_grad():
         ref_output, *_ = reference_model(

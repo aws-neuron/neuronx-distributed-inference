@@ -116,10 +116,10 @@ class BaseParallelConv(torch.nn.Module):
                 )
         elif self.device.type == "meta":
             set_tensor_model_parallel_attributes(
-                tensor=self.weight, 
-                is_parallel=True, 
-                dim=partition_dim, 
-                stride=1, 
+                tensor=self.weight,
+                is_parallel=True,
+                dim=partition_dim,
+                stride=1,
                 num_partitions=self.world_size,
             )
         else:
@@ -134,13 +134,13 @@ class BaseParallelConv(torch.nn.Module):
 
         if self.add_bias:
             # Bias is added before running the all-gather collective
-            # If conv layer is sharded across output channels (partition_dim == CONV_KERNEL_OUTPUT_CHANNEL_DIMENSION), 
+            # If conv layer is sharded across output channels (partition_dim == CONV_KERNEL_OUTPUT_CHANNEL_DIMENSION),
             # then the bias must be sharded
             # 1. We initialize the bias to an empty parameter tensor of shape (C_out,) or (C_out/TP,)
             self.bias = Parameter(torch.empty(self.bias_shape, dtype=dtype, device=device))
 
             # 2. Parameter initialization
-            # These parallel layers are used for both training and inference. When training from scratch, weight 
+            # These parallel layers are used for both training and inference. When training from scratch, weight
             # initialization must be carefully done, especially when distributed (e.g. ensure the same seed is used on every rank)
             # Such careful initialization is not needed when tracing (device.type == meta) or at inference
             if self.device.type == "cpu":
@@ -160,10 +160,10 @@ class BaseParallelConv(torch.nn.Module):
             elif self.device.type == "meta":
                 if partition_dim == CONV_KERNEL_OUTPUT_CHANNEL_DIMENSION:
                     set_tensor_model_parallel_attributes(
-                            self.bias, 
-                            is_parallel=True, 
+                            self.bias,
+                            is_parallel=True,
                             dim=self.partition_dim,
-                            stride=1, 
+                            stride=1,
                             num_partitions=self.world_size,
                             )
                 self.master_bias = self.bias if self.keep_master_params else None
@@ -171,10 +171,10 @@ class BaseParallelConv(torch.nn.Module):
                 assert device and device.type == "xla", "Currently only xla device type is supported"
                 if partition_dim == CONV_KERNEL_OUTPUT_CHANNEL_DIMENSION:
                         set_tensor_model_parallel_attributes(
-                                self.bias, 
-                                is_parallel=True, 
+                                self.bias,
+                                is_parallel=True,
                                 dim=self.partition_dim,
-                                stride=1, 
+                                stride=1,
                                 num_partitions=self.world_size,
                                 )
                 self._init_bias(self.bias)

@@ -172,7 +172,7 @@ def create_position_ids_for_token_generation(attention_mask_2d: torch.LongTensor
 def create_position_ids(attention_mask_2d: torch.LongTensor, is_for_context_encoding: bool) -> torch.LongTensor:
     if is_for_context_encoding:
         return create_position_ids_for_context_processing(attention_mask_2d=attention_mask_2d)
-    else: 
+    else:
         return create_position_ids_for_token_generation(attention_mask_2d=attention_mask_2d)
 
 
@@ -189,7 +189,7 @@ def create_rope(position_ids: torch.LongTensor, hf_config: PretrainedConfig) -> 
     batch_size, sequence_length = position_ids.shape
     x = torch.randn(batch_size, hf_config.num_attention_heads, sequence_length, hf_config.head_dim).to(dtype=torch.float32)
     rope = Gemma3RotaryEmbedding(config=hf_config)
-    cos, sin = rope(x, position_ids) 
+    cos, sin = rope(x, position_ids)
     return cos, sin
 
 

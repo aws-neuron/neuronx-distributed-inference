@@ -14,7 +14,7 @@ from test.utils import assert_tensor_all_close, mark_step, FP32_TOLERANCES, FP16
     ])
 def test_vision_embed(monkeypatch, base_compiler_flags, tolerances, compiler_flags, hf_config) -> None:
     monkeypatch.setenv("NEURON_CC_FLAGS", " ".join(base_compiler_flags + compiler_flags))
-    
+
     batch_size, num_channels, image_size = 2, 3, 896
     inputs_dtype = model_dtype = torch.float32
     device = xm.xla_device()
@@ -31,7 +31,7 @@ def test_vision_embed(monkeypatch, base_compiler_flags, tolerances, compiler_fla
 
     vision_embed = NeuronSiglipVisionEmbeddings(config=config)
     vision_embed.eval()
-    
+
     with torch.no_grad():
         output_cpu = vision_embed(pixel_values=pixel_values)
 
@@ -64,7 +64,7 @@ def test_nxdi_vision_embedding_vs_transformers_implementation(random_seed, hf_co
 
     reference_model = SiglipVisionEmbeddings(config=hf_config.vision_config).to(dtype=model_dtype)
     reference_model.load_state_dict(vision_embed.state_dict(), strict=True)
-    reference_model.eval()    
+    reference_model.eval()
 
     with torch.no_grad():
         ref_output = reference_model(pixel_values=pixel_values)
@@ -72,4 +72,3 @@ def test_nxdi_vision_embedding_vs_transformers_implementation(random_seed, hf_co
 
     rtol, atol = FP32_TOLERANCES.rtol, FP32_TOLERANCES.atol
     assert_tensor_all_close(test_objective="Vision embedding outputs", computed_value=output, reference_value=ref_output, rtol=rtol, atol=atol, equal_nan=True)
-
