@@ -21,7 +21,7 @@ from neuronx_distributed_inference.utils.hf_adapter import (
     HuggingFaceGenerationAdapter
 )
 
-from gemma3_vision.modeling_gemma3 import NeuronGemma3ForCausalLM, Gemma3InferenceConfig
+from gemma3_vision.modeling_gemma3 import NeuronGemma3ForConditionalGeneration, Gemma3InferenceConfig
 
 
 # Configure logging
@@ -43,7 +43,7 @@ CONFIG = {
     'TKG_BUCKETS': [1024], # Set to a single bucket or powers of two between 128 and the SEQ_LENGTH.
     'DTYPE': torch.bfloat16,
     'MODEL_PATH': f"{DATA_PATH}/models/gemma-3-27b-it",
-    'TRACED_MODEL_PATH': f"{DATA_PATH}/traced_model/gemma-3-27b-it",
+    'TRACED_MODEL_PATH': f"{DATA_PATH}/traced_model/gemma-3-27b-it-small",
     'IMAGE_PATH': f"{BASE_PATH}/dog.jpg",
     'MAX_NEW_TOKENS': 100,
     # Optimizations
@@ -55,6 +55,7 @@ CONFIG = {
     'FUSED_QKV': True,
     'VISION_FUSED_QKV': False,
     'ASYNC_MODE': True,
+    'OUTPUT_LOGITS': True,
     'ON_DEVICE_SAMPLING': OnDeviceSamplingConfig(
         dynamic=True, # Allow per-request sampling config
         do_sample=True, 
@@ -112,7 +113,7 @@ def create_neuron_configs():
         cp_degree=1,
         # rpl_reduce_dtype=torch.float32, # comment out if optimizing for latency. uncomment if optimizing for accuracy
         save_sharded_checkpoint=True,
-        skip_sharding=True,
+        skip_sharding=False,
         
         ## Continuous batching ##
         is_continuous_batching=True, # set to true for vLLM integration
@@ -126,6 +127,7 @@ def create_neuron_configs():
         ## Optimizations ##
         async_mode=CONFIG['ASYNC_MODE'],
         on_device_sampling_config=CONFIG['ON_DEVICE_SAMPLING'],
+        output_logits=CONFIG['OUTPUT_LOGITS'], # When on-device sampling, logits are not returned by default, set to true to return logits when on-device sampling is enabled
         fused_qkv=CONFIG['FUSED_QKV'],
         sequence_parallel_enabled=False, # always set to false. has meaningful impacts for long-context use cases only
         
@@ -161,7 +163,7 @@ def create_neuron_configs():
     vision_config = NeuronConfig(
 
         ## Basic configs ##
-        batch_size=CONFIG['BATCH_SIZE'],
+        batch_size=CONFIG['BATCH_SIZE'] * 2,
         seq_len=CONFIG['SEQ_LENGTH'],
         torch_dtype=CONFIG['DTYPE'],
         # cast_type="as-declared", # comment out if optimizing for latency. uncomment if optimizing for accuracy
@@ -205,7 +207,8 @@ def setup_model_and_tokenizer():
         vision_neuron_config=vision_config,
         load_config=load_pretrained_config(CONFIG['MODEL_PATH']),
     )
-
+    config.vision_config.num_hidden_layers = 1
+    config.text_config.num_hidden_layers = 1
     tokenizer = AutoTokenizer.from_pretrained(CONFIG['MODEL_PATH'], padding_side="right")  # nosec B615
     tokenizer.pad_token = tokenizer.eos_token
     processor = AutoProcessor.from_pretrained(CONFIG['MODEL_PATH'])  # nosec B615
@@ -223,14 +226,14 @@ def compile_or_load_model(config, tokenizer):
             # Weights quantized at compile-time. Directory must already exist.
                 print("\nQuantizing and saving model weights...")
                 quantized_state_dict_path.mkdir(parents=True, exist_ok=True)        
-                NeuronGemma3ForCausalLM.save_quantized_state_dict(CONFIG['MODEL_PATH'], config)
+                NeuronGemma3ForConditionalGeneration.save_quantized_state_dict(CONFIG['MODEL_PATH'], config)
         print("\nCompiling and saving model...")
-        model = NeuronGemma3ForCausalLM(CONFIG['MODEL_PATH'], config)
+        model = NeuronGemma3ForConditionalGeneration(CONFIG['MODEL_PATH'], config)
         model.compile(CONFIG['TRACED_MODEL_PATH'], debug=True)
         tokenizer.save_pretrained(CONFIG['TRACED_MODEL_PATH'])
     
     print("\nLoading model from compiled checkpoint...")
-    model = NeuronGemma3ForCausalLM(CONFIG['TRACED_MODEL_PATH'])
+    model = NeuronGemma3ForConditionalGeneration(CONFIG['TRACED_MODEL_PATH'])
     model.load(CONFIG['TRACED_MODEL_PATH'], skip_warmup=True)
     tokenizer = AutoTokenizer.from_pretrained(CONFIG['TRACED_MODEL_PATH'])  # nosec B615
     
@@ -243,6 +246,15 @@ def generate_outputs(model, tokenizer, input_ids, attention_mask, pixel_values=N
     generation_config = GenerationConfig.from_pretrained(CONFIG['MODEL_PATH'])  # nosec B615
     sampling_params = prepare_sampling_params(batch_size=CONFIG['BATCH_SIZE'], top_k=[1], top_p=[1.0], temperature=[0.0])
     
+    return_dict_in_generate = False
+
+    generation_config.update(**{
+        "do_sample": True,
+        "output_scores": False, # Post-processed logits
+        "output_logits": False, # Raw logits
+        "return_dict_in_generate": return_dict_in_generate,
+        })
+
     outputs = generation_model.generate(
         input_ids,
         generation_config=generation_config,
@@ -252,9 +264,13 @@ def generate_outputs(model, tokenizer, input_ids, attention_mask, pixel_values=N
         pixel_values=pixel_values,
         vision_mask=vision_mask.to(torch.bool) if vision_mask is not None else None,
         max_new_tokens=max_new_tokens,
+        return_dict_in_generate=return_dict_in_generate,
+        output_scores=False,
     )
     
-    output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    output_sequences = outputs.sequences if return_dict_in_generate else outputs
+    
+    output_tokens = tokenizer.batch_decode(output_sequences, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     return outputs, output_tokens
 
 
@@ -270,10 +286,10 @@ def run_gemma3_generate_image_to_text(run_test_inference=False, run_benchmark=Fa
         
         # Test 1: Text + Image generation
         print("\n=== Text + Image Generation ===")
-        text_prompt = "Describe this image"
+        text_prompt = "Describe what you see in the following image(s)"
         
         input_ids, attention_mask, pixel_values, vision_mask = prepare_generation_inputs_hf(
-            text_prompt, CONFIG['IMAGE_PATH'], processor, 'user', config
+            text_prompt, [CONFIG['IMAGE_PATH'], CONFIG['IMAGE_PATH']], processor, 'user', config
         )
 
         if CONFIG['BATCH_SIZE'] > 1:
@@ -286,7 +302,6 @@ def run_gemma3_generate_image_to_text(run_test_inference=False, run_benchmark=Fa
             model, tokenizer, input_ids, attention_mask, pixel_values, vision_mask, max_new_tokens=CONFIG['MAX_NEW_TOKENS']
         )
         
-        print(f"Generated outputs shape: {outputs.shape}")
         for i, output_token in enumerate(output_tokens):
             print(f"Output {i}: {output_token}")
 
@@ -306,7 +321,6 @@ def run_gemma3_generate_image_to_text(run_test_inference=False, run_benchmark=Fa
             model, tokenizer, input_ids, attention_mask, max_new_tokens=CONFIG['MAX_NEW_TOKENS']
         )
         
-        print(f"Generated outputs shape: {outputs.shape}")
         for i, output_token in enumerate(output_tokens):
             print(f"Output {i}: {output_token}")
 

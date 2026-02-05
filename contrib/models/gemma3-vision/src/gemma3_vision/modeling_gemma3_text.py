@@ -103,6 +103,7 @@ class HybridAttnKVCacheManager(KVCacheManager):
             v_cache = dequantize.direct_cast_dequantize(v_cache, self.dequant_dtype)
         return k_cache, v_cache
     
+
 class NeuronGemma3RMSNorm(nn.Module):
     
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
@@ -501,9 +502,6 @@ class NeuronGemma3TextModel(NeuronBaseModel):
                 config.vocab_size,
                 bias=False,
             )
-
-        # TODO: copied from llama4_text. Double check if it's needed
-        # updated_configs = get_updated_configs(config)
 
         self.layers = nn.ModuleList(
             [NeuronGemma3DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)]

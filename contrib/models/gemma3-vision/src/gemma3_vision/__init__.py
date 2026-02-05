@@ -1,7 +1,7 @@
 # Copyright 2025 © Amazon.com and Affiliates
 
 from .modeling_gemma3 import (
-    NeuronGemma3ForCausalLM,
+    NeuronGemma3ForConditionalGeneration,
     Gemma3InferenceConfig,
 )
 from .modeling_gemma3_vision import (
@@ -18,7 +18,7 @@ from .modeling_causal_lm_gemma3 import (
 )
 
 __all__ = [
-    "NeuronGemma3ForCausalLM",
+    "NeuronGemma3ForConditionalGeneration",
     "Gemma3InferenceConfig",
     "NeuronGemma3VisionModel",
     "NeuronGemma3MultiModalProjector",

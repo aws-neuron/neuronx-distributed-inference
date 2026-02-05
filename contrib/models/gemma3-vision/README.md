@@ -30,7 +30,7 @@ from neuronx_distributed_inference.utils.hf_adapter import (
 )
 
 from gemma3_vision import (
-    NeuronGemma3ForCausalLM,
+    NeuronGemma3ForConditionalGeneration,
     Gemma3InferenceConfig,
 )
 
@@ -73,7 +73,7 @@ config = Gemma3InferenceConfig(
     load_config=load_pretrained_config(model_path),
 )
 
-model = NeuronGemma3ForCausalLM(model_path, config)
+model = NeuronGemma3ForConditionalGeneration(model_path, config)
 model.compile(compiled_model_path)
 model.load(compiled_model_path)
 

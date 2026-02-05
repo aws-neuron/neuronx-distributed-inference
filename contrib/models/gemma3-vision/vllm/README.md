@@ -61,21 +61,21 @@ Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
      NEURON_MULTI_MODAL_MODELS,
 ```
 
-#### 2.3 Add `NeuronGemma3ForCausalLM` class to `vllm_neuron/worker/neuronx_distributed_model_loader.py`
+#### 2.3 Add `NeuronGemma3ForConditionalGeneration` class to `vllm_neuron/worker/neuronx_distributed_model_loader.py`
 
 ```diff
 @@ -704,6 +704,61 @@ class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
              **kwargs,
          )
  
-+class NeuronGemma3ForCausalLM(NeuronLlama4ForCausalLM):
-+    """Gemma3 multimodal model using dynamically loaded NeuronGemma3ForCausalLM from contrib."""
++class NeuronGemma3ForConditionalGeneration(NeuronLlama4ForCausalLM):
++    """Gemma3 multimodal model using dynamically loaded NeuronGemma3ForConditionalGeneration from contrib."""
 +
 +    def load_weights(self, model_name_or_path: str, architecture: str, **kwargs):
 +        import importlib
 +
 +        neuronx_module = importlib.import_module("gemma3_vision.modeling_gemma3")
-+        neuronx_model_cls = getattr(neuronx_module, "NeuronGemma3ForCausalLM")
++        neuronx_model_cls = getattr(neuronx_module, "NeuronGemma3ForConditionalGeneration")
 +
 +        default_neuron_config = kwargs["neuron_config"]
 +        override_neuron_config = _validate_image_to_text_override_neuron_config(
@@ -128,7 +128,7 @@ Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
      logger.debug("PretrainedConfig: %s", config)
 ```
 
-#### 2.4 Map `NeuronGemma3ForCausalLM` to corresponding HuggingFace model class in `vllm_neuron/worker/neuronx_distributed_model_runner.py`
+#### 2.4 Map `NeuronGemma3ForConditionalGeneration` to corresponding HuggingFace model class in `vllm_neuron/worker/neuronx_distributed_model_runner.py`
 
 
 ```diff
@@ -139,7 +139,7 @@ Modify `vllm-neuron/vllm-neuron/worker/neuronx_distributed_model_runner.py`:
      elif architecture == "Llama4ForConditionalGeneration":
          model = NeuronLlama4ForCausalLM(model_config.hf_config)
 +    elif architecture == "Gemma3ForConditionalGeneration":
-+        model = NeuronGemma3ForCausalLM(model_config.hf_config)
++        model = NeuronGemma3ForConditionalGeneration(model_config.hf_config)
      else:
          model = NeuronCausalLM(model_config.hf_config)
 ```

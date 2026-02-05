@@ -14,7 +14,7 @@ from neuronx_distributed_inference.utils.accuracy import (
 )
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 
-from gemma3_vision.modeling_gemma3 import NeuronGemma3ForCausalLM
+from gemma3_vision.modeling_gemma3 import NeuronGemma3ForConditionalGeneration
 from .utils import (
     get_test_name_suffix,
     save_hf_checkpoint,
@@ -91,7 +91,7 @@ def test_original_cpu_vs_nxdi_neuron(
         )
 
     nrn_config._name_or_path = tmp_path.as_posix()
-    nrn_model = NeuronGemma3ForCausalLM(model_path=tmp_path, config=nrn_config)
+    nrn_model = NeuronGemma3ForConditionalGeneration(model_path=tmp_path, config=nrn_config)
 
     traced_model_path = tmp_path / ("traced_model" + suffix)
     traced_model_path.mkdir(exist_ok=True)
