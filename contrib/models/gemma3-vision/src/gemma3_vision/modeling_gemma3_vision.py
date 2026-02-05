@@ -3,7 +3,6 @@ from typing import List, Tuple
 
 import torch
 from torch import nn
-from transformers.models.gemma3.modeling_gemma3 import Gemma3RMSNorm
 
 from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.models.llama4.modeling_llama4_vision import Llama4VisionModelWrapper

@@ -1,7 +1,9 @@
+from gemma3_vision.ndxi_patch import apply_patch
+apply_patch()
+
 import copy
 import math
 import logging
-import os
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union, Any
 
 import torch
@@ -9,14 +11,7 @@ import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from neuronx_distributed.parallel_layers.parallel_state import (
-    destroy_model_parallel,
-    initialize_model_parallel,
-    model_parallel_is_initialized,
-)
 from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
-from neuronx_distributed.trace.trace import get_sharded_checkpoint
-
 import neuronx_distributed_inference.modules.autobucketing as autobucketing
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.models.image_to_text_model_base import (
@@ -34,10 +29,6 @@ from neuronx_distributed_inference.models.model_wrapper import (
     VISION_ENCODER_MODEL_TAG
 )
 from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
-from neuronx_distributed_inference.models.application_base import (
-    COMPILED_MODEL_FILE_NAME,
-    normalize_path,
-)
 
 from gemma3_vision.modeling_gemma3_text import NeuronGemma3TextModel
 from gemma3_vision.modeling_gemma3_vision import NeuronGemma3VisionModel, Gemma3VisionModelWrapper
