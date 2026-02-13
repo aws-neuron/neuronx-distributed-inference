@@ -699,6 +699,7 @@ class MoENeuronConfig(NeuronConfig):
 
         self.moe_tp_degree = kwargs.pop("moe_tp_degree", 1)
         self.moe_ep_degree = kwargs.pop("moe_ep_degree", 1)
+        self.expert_wise_scale = kwargs.pop("expert_wise_scale", False)
         self.transpose_shared_experts_weights = kwargs.pop("transpose_shared_experts_weights", False)
 
         self.blockwise_matmul_config = kwargs.pop("blockwise_matmul_config", {})
