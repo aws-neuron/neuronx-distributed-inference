@@ -1652,11 +1652,12 @@ class DecoderModelInstance(BaseModelInstance):
             else:
                 models_to_convert.append(float_model)
 
-            # Check if expert_wise_scale is enabled for two-pass conversion
-            use_expert_wise_scale = getattr(self.neuron_config, "expert_wise_scale", False)
-
             for model in models_to_convert:
                 user_modules_to_not_convert = get_modules_to_not_convert(model.config.neuron_config)
+
+                # Read expert_wise_scale per-model (not from self.neuron_config) so that
+                # fused speculation with a non-MoE draft + MoE target is handled correctly.
+                use_expert_wise_scale = getattr(model.config.neuron_config, "expert_wise_scale", False)
 
                 if use_expert_wise_scale and quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
                     # Two-pass conversion:
