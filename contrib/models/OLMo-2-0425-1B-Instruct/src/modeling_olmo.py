@@ -20,8 +20,6 @@ This module ports the OLMo-2-1124-7B model to NeuronX Distributed Inference.
 Key architectural differences from LLaMA:
 1. Post-layer normalization (RMSNorm after attention and MLP, not before)
 2. Q-K normalization (RMSNorm on Q and K projections before RoPE)
-
-Reference: /shared/dhwanw/agent_friday_test/example/transformers/src/transformers/models/olmo2/modeling_olmo2.py
 """
 
 import os
