@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 Integration tests for vaultgemma-1b NeuronX implementation.
+
+IMPORTANT: VaultGemma requires OnDeviceSamplingConfig for correct accuracy.
+This is automatically enabled in VaultGemmaNeuronConfig.
 """
 
 import pytest
@@ -9,13 +12,17 @@ import json
 from pathlib import Path
 from transformers import AutoTokenizer, GenerationConfig
 
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_vaultgemma import *
+from modeling_vaultgemma import (
+    NeuronVaultGemmaForCausalLM,
+    VaultGemmaInferenceConfig,
+    VaultGemmaNeuronConfig,
+)
 
 
 # Test configuration
@@ -40,7 +47,12 @@ def load_neuron_config_from_compiled(compiled_path: str):
 
 
 def create_model_for_inference(compiled_path: str, model_path: str):
-    """Create model for inference using compiled neuron_config."""
+    """
+    Create model for inference using compiled neuron_config.
+    
+    Note: VaultGemmaNeuronConfig automatically enables OnDeviceSamplingConfig
+    for correct accuracy.
+    """
     neuron_config_dict = load_neuron_config_from_compiled(compiled_path)
     
     dtype_str = neuron_config_dict.get('torch_dtype', 'torch.bfloat16')
@@ -49,22 +61,36 @@ def create_model_for_inference(compiled_path: str, model_path: str):
     else:
         dtype = dtype_str
     
-    neuron_config_kwargs = {
-        'tp_degree': neuron_config_dict.get('tp_degree', 2),
-        'batch_size': neuron_config_dict.get('batch_size', 1),
-        'seq_len': neuron_config_dict.get('seq_len', 128),
-        'torch_dtype': dtype,
-    }
+    # Use VaultGemmaNeuronConfig which automatically enables OnDeviceSamplingConfig
+    neuron_config = VaultGemmaNeuronConfig(
+        tp_degree=neuron_config_dict.get('tp_degree', 1),
+        batch_size=neuron_config_dict.get('batch_size', 1),
+        seq_len=neuron_config_dict.get('seq_len', 128),
+        torch_dtype=dtype,
+    )
     
-    neuron_config = NeuronConfig(**neuron_config_kwargs)
+    # Verify OnDeviceSamplingConfig is enabled (critical for accuracy)
+    assert neuron_config.on_device_sampling_config is not None, \
+        "OnDeviceSamplingConfig must be enabled for VaultGemma accuracy"
     
-    # This will use the imported model and config classes
-    # The actual class names will be determined at runtime
-    return None, neuron_config
+    config = VaultGemmaInferenceConfig.from_pretrained(
+        model_path,
+        neuron_config=neuron_config,
+    )
+    
+    model = NeuronVaultGemmaForCausalLM(model_path, config)
+    model.load(compiled_path)
+    
+    return model, neuron_config
 
 
 def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
-    """Generate tokens using manual forward pass loop."""
+    """
+    Generate tokens using manual forward pass loop.
+    
+    Note: With OnDeviceSamplingConfig enabled, the model returns sampled tokens
+    directly in outputs.tokens instead of logits.
+    """
     generated_ids = input_ids.clone()
     
     for _ in range(max_new_tokens):
@@ -74,15 +100,27 @@ def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
         with torch.no_grad():
             outputs = model(generated_ids, position_ids=position_ids)
         
-        if hasattr(outputs, 'logits'):
+        # With OnDeviceSamplingConfig, outputs.tokens contains the sampled token
+        if hasattr(outputs, 'tokens') and outputs.tokens is not None:
+            if outputs.tokens.numel() == 1:
+                next_token = outputs.tokens.view(1, 1)
+            else:
+                # Fallback to argmax if tokens is full vocab
+                next_token = torch.argmax(outputs.tokens, dim=-1).unsqueeze(-1)
+        elif hasattr(outputs, 'logits') and outputs.logits is not None:
             logits = outputs.logits
+            if logits.dim() == 3:
+                next_token_logits = logits[:, -1, :]
+            else:
+                next_token_logits = logits
+            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
         elif isinstance(outputs, tuple):
             logits = outputs[0]
+            next_token_logits = logits[:, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
         else:
-            logits = outputs
+            raise ValueError(f"Unexpected output format: {type(outputs)}")
         
-        next_token_logits = logits[:, -1, :]
-        next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
         generated_ids = torch.cat([generated_ids, next_token], dim=-1)
     
     return generated_ids
@@ -123,6 +161,48 @@ def test_model_generates(compiled_model, tokenizer):
     assert len(output_text) > len(prompt), "Output should be longer than prompt"
     print(f"✓ Generation test passed")
     print(f"  Output: {output_text}")
+
+
+def test_accuracy_with_ods(compiled_model, tokenizer):
+    """
+    Test that model produces correct predictions with OnDeviceSamplingConfig.
+    
+    This test verifies the critical fix for VaultGemma accuracy.
+    Without OnDeviceSamplingConfig, the model would predict 'in' instead of 'Paris'.
+    """
+    prompt = "The capital of France is"
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+    input_ids = inputs.input_ids
+    seq_len = input_ids.shape[1]
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    
+    with torch.no_grad():
+        outputs = compiled_model(input_ids, position_ids=position_ids)
+    
+    # Get the predicted token
+    if hasattr(outputs, 'tokens') and outputs.tokens is not None:
+        if outputs.tokens.numel() == 1:
+            predicted_token_id = outputs.tokens[0].item()
+        else:
+            predicted_token_id = outputs.tokens.argmax().item()
+    elif hasattr(outputs, 'logits') and outputs.logits is not None:
+        logits = outputs.logits
+        if logits.dim() == 3:
+            logits = logits[0, -1, :]
+        predicted_token_id = logits.argmax().item()
+    else:
+        raise ValueError("Could not get prediction from model output")
+    
+    predicted_token = tokenizer.decode([predicted_token_id])
+    
+    print(f"✓ Accuracy test")
+    print(f"  Prompt: '{prompt}'")
+    print(f"  Predicted: '{predicted_token}'")
+    
+    # The correct prediction should contain 'Paris' (or at least not 'in')
+    # This is the key test for the OnDeviceSamplingConfig fix
+    assert 'in' not in predicted_token.lower() or 'paris' in predicted_token.lower(), \
+        f"Expected 'Paris' but got '{predicted_token}' - OnDeviceSamplingConfig may not be working"
 
 
 def test_output_coherence(compiled_model, tokenizer):

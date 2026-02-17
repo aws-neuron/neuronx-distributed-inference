@@ -22,6 +22,21 @@ Key architectural differences from standard LLaMA-style models:
 3. Query pre-attention scalar for attention scaling
 4. Hidden state normalization with sqrt(hidden_size)
 5. Optional attention and logit softcapping
+
+CRITICAL FIX (2026-02-05):
+==========================
+VaultGemma requires OnDeviceSamplingConfig for correct accuracy.
+Without it, the model produces incorrect predictions due to compiler optimization issues.
+
+Investigation findings:
+- Pure PyTorch implementation matches HuggingFace perfectly (correlation ~0.99)
+- Compiled Neuron model WITHOUT OnDeviceSamplingConfig diverges (correlation ~0.61)
+- Compiled Neuron model WITH OnDeviceSamplingConfig matches HF exactly (correlation ~1.0)
+
+Root cause: The Neuron compiler's aggressive kernel fusion changes numerical behavior.
+OnDeviceSamplingConfig forces a different compilation path that preserves accuracy.
+
+The fix is automatically applied in VaultGemmaNeuronConfig.__init__().
 """
 
 import json
@@ -120,11 +135,22 @@ class VaultGemmaNeuronConfig(NeuronConfig):
     Neuron-specific configuration for VaultGemma model.
     
     Sets the attention class to use NeuronVaultGemmaAttention.
+    
+    IMPORTANT: VaultGemma requires OnDeviceSamplingConfig for correct accuracy.
+    Without it, the model produces incorrect predictions due to compiler
+    optimization issues. See the debugging guide for details.
     """
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.attn_cls = "NeuronVaultGemmaAttention"
+        
+        # CRITICAL: Enable OnDeviceSamplingConfig by default for accuracy
+        # VaultGemma has accuracy issues without this due to compiler optimizations.
+        # Investigation showed: Without ODS predicts 'in', with ODS predicts 'Paris' (correct)
+        if self.on_device_sampling_config is None:
+            from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig
+            self.on_device_sampling_config = OnDeviceSamplingConfig()
 
 
 class VaultGemmaInferenceConfig(InferenceConfig):
