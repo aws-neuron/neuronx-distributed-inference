@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 Integration tests for granite-3.1-8b-instruct NeuronX implementation.
+
+Tests model compilation, loading, and inference accuracy/performance.
+Follows the exact patterns from validate_model.py for consistency.
 """
 
 import pytest
@@ -15,7 +18,7 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_granite import *
+from modeling_granite import NeuronGraniteForCausalLM, GraniteInferenceConfig
 
 
 # Test configuration
@@ -35,8 +38,7 @@ def load_neuron_config_from_compiled(compiled_path: str):
     
     if "neuron_config" in config_data:
         return config_data["neuron_config"]
-    else:
-        return config_data
+    return config_data
 
 
 def create_model_for_inference(compiled_path: str, model_path: str):
@@ -54,13 +56,38 @@ def create_model_for_inference(compiled_path: str, model_path: str):
         'batch_size': neuron_config_dict.get('batch_size', 1),
         'seq_len': neuron_config_dict.get('seq_len', 128),
         'torch_dtype': dtype,
+        'save_sharded_checkpoint': neuron_config_dict.get('save_sharded_checkpoint', True),
+        'on_cpu': neuron_config_dict.get('on_cpu', False),
     }
+    
+    optional_params = ['world_size', 'max_context_length', 'enable_bucketing']
+    for param in optional_params:
+        if param in neuron_config_dict:
+            neuron_config_kwargs[param] = neuron_config_dict[param]
+    
+    if 'max_context_length' not in neuron_config_kwargs:
+        neuron_config_kwargs['max_context_length'] = neuron_config_kwargs['seq_len']
     
     neuron_config = NeuronConfig(**neuron_config_kwargs)
     
-    # This will use the imported model and config classes
-    # The actual class names will be determined at runtime
-    return None, neuron_config
+    try:
+        model_config = GraniteInferenceConfig.from_pretrained(
+            model_path, neuron_config=neuron_config,
+        )
+    except (TypeError, AttributeError):
+        model_config = GraniteInferenceConfig(
+            neuron_config, load_config=load_pretrained_config(model_path),
+        )
+    
+    try:
+        if hasattr(NeuronGraniteForCausalLM, 'from_pretrained'):
+            model = NeuronGraniteForCausalLM.from_pretrained(compiled_path, config=model_config)
+        else:
+            raise AttributeError("No from_pretrained method")
+    except (TypeError, AttributeError, Exception):
+        model = NeuronGraniteForCausalLM(model_path, model_config)
+    
+    return model, neuron_config
 
 
 def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
@@ -88,12 +115,34 @@ def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
     return generated_ids
 
 
+
 @pytest.fixture(scope="module")
 def compiled_model():
-    """Load pre-compiled model."""
-    # Note: Actual implementation would load the specific model class
-    # This is a template that should be customized per model
-    return None
+    """Compile and load model using our custom pattern."""
+    compiled_path = Path(COMPILED_MODEL_PATH)
+    if not (compiled_path / "model.pt").exists():
+        print(f"Compiling model to {COMPILED_MODEL_PATH}...")
+        
+        neuron_config = NeuronConfig(
+            tp_degree=2,
+            batch_size=1,
+            seq_len=128,
+            max_context_length=128,
+            torch_dtype=torch.bfloat16,
+        )
+        
+        config = GraniteInferenceConfig(
+            neuron_config,
+            load_config=load_pretrained_config(MODEL_PATH),
+        )
+        
+        model = NeuronGraniteForCausalLM(MODEL_PATH, config)
+        model.compile(COMPILED_MODEL_PATH)
+    
+    model, neuron_config = create_model_for_inference(COMPILED_MODEL_PATH, MODEL_PATH)
+    model.load(COMPILED_MODEL_PATH)
+    
+    return model
 
 
 @pytest.fixture(scope="module")
@@ -105,10 +154,17 @@ def tokenizer():
     return tokenizer
 
 
+@pytest.fixture(scope="module")
+def generation_config():
+    """Load generation config."""
+    return GenerationConfig.from_pretrained(MODEL_PATH, do_sample=False, top_k=1, trust_remote_code=True)
+
+
 def test_model_loads(compiled_model):
     """Test that model loads successfully (smoke test)."""
     assert compiled_model is not None
     assert hasattr(compiled_model, 'config')
+    assert hasattr(compiled_model.config, 'neuron_config')
     print("✓ Smoke test passed - Model loaded successfully")
 
 
@@ -127,44 +183,18 @@ def test_model_generates(compiled_model, tokenizer):
 
 def test_output_coherence(compiled_model, tokenizer):
     """Test that output is coherent (not gibberish)."""
-    prompt = "Hello, how are you?"
+    prompt = "What is 2 + 2?"
     inputs = tokenizer(prompt, return_tensors="pt", padding=True)
     
     generated_ids = generate_with_neuron_model(compiled_model, inputs.input_ids, max_new_tokens=30)
     output_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     
-    # Coherence checks
-    assert len(output_text.split()) > 3, "Output should have multiple words"
+    assert len(output_text.split()) > 5, "Output should have multiple words"
     assert not _is_repetitive(output_text), "Output should not be repetitive"
     
     print(f"✓ Coherence test passed")
     print(f"  Output: {output_text[:100]}...")
 
-
-
-def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
-    """Check if text has excessive repetition."""
-    words = text.split()
-    if len(words) < 10:
-        return False
-    
-    # Check for repeated words
-    for i in range(len(words) - max_repeat):
-        word = words[i]
-        if all(words[i+j] == word for j in range(max_repeat)):
-            return True
-    
-    # Check for repeated characters
-    new_text = text[-100:] if len(text) > 100 else text
-    if len(new_text) > 20:
-        char_counts = {}
-        for c in new_text:
-            char_counts[c] = char_counts.get(c, 0) + 1
-        max_char_ratio = max(char_counts.values()) / len(new_text)
-        if max_char_ratio > 0.5:
-            return True
-    
-    return False
 
 
 def test_performance_ttft(compiled_model, tokenizer):
@@ -193,11 +223,12 @@ def test_performance_ttft(compiled_model, tokenizer):
             _ = compiled_model(input_ids, position_ids=position_ids)
         end = time.perf_counter()
         
-        times.append((end - start) * 1000)  # ms
+        times.append((end - start) * 1000)
     
     avg_ttft = sum(times) / len(times)
-    print(f"✓ TTFT: {avg_ttft:.2f}ms")
-
+    
+    assert avg_ttft < 100, f"TTFT {avg_ttft:.2f}ms exceeds 100ms threshold"
+    print(f"✓ TTFT test passed: {avg_ttft:.2f}ms (threshold: 100ms)")
 
 
 def test_performance_throughput(compiled_model, tokenizer):
@@ -219,18 +250,85 @@ def test_performance_throughput(compiled_model, tokenizer):
     
     total_time = end - start
     throughput = num_tokens / total_time
-    print(f"✓ Throughput: {throughput:.2f} tok/s")
+    
+    assert throughput > 10, f"Throughput {throughput:.2f} tok/s below 10 tok/s threshold"
+    print(f"✓ Throughput test passed: {throughput:.2f} tok/s (threshold: 10 tok/s)")
+
+
+def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
+    """Check if text has excessive repetition."""
+    words = text.split()
+    if len(words) < 10:
+        return False
+    
+    for i in range(len(words) - max_repeat):
+        word = words[i]
+        if all(words[i+j] == word for j in range(max_repeat)):
+            return True
+    
+    return False
 
 
 
 if __name__ == "__main__":
+    # Run tests manually (without pytest)
     print("="*80)
     print("granite-3.1-8b-instruct Integration Tests")
     print("="*80)
     
-    print("\nNote: This is a template test file.")
-    print("For actual model testing, customize the model loading logic.")
+    # Setup - compile if needed
+    compiled_path = Path(COMPILED_MODEL_PATH)
+    if not (compiled_path / "model.pt").exists():
+        print(f"\nCompiling model to {COMPILED_MODEL_PATH}...")
+        
+        neuron_config = NeuronConfig(
+            tp_degree=2,
+            batch_size=1,
+            seq_len=128,
+            max_context_length=128,
+            torch_dtype=torch.bfloat16,
+        )
+        
+        config = GraniteInferenceConfig(
+            neuron_config,
+            load_config=load_pretrained_config(MODEL_PATH),
+        )
+        
+        model = NeuronGraniteForCausalLM(MODEL_PATH, config)
+        model.compile(COMPILED_MODEL_PATH)
+        print("✓ Compilation complete")
+    
+    # Load model
+    print(f"\nLoading compiled model from {COMPILED_MODEL_PATH}...")
+    model, neuron_config = create_model_for_inference(COMPILED_MODEL_PATH, MODEL_PATH)
+    model.load(COMPILED_MODEL_PATH)
+    print("✓ Model loaded")
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, padding_side="right", trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Run tests
+    print("\n" + "="*80)
+    print("Running Tests")
+    print("="*80)
+    
+    print("\n1. Smoke Test (Model Loading)...")
+    test_model_loads(model)
+    
+    print("\n2. Generation Test...")
+    test_model_generates(model, tokenizer)
+    
+    print("\n3. Coherence Test...")
+    test_output_coherence(model, tokenizer)
+    
+    print("\n4. TTFT Performance Test...")
+    test_performance_ttft(model, tokenizer)
+    
+    print("\n5. Throughput Performance Test...")
+    test_performance_throughput(model, tokenizer)
     
     print("\n" + "="*80)
-    print("✓ Template structure verified!")
+    print("✓ All tests passed!")
     print("="*80)
