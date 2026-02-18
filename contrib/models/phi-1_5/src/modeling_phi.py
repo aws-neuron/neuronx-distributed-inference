@@ -536,12 +536,12 @@ class NeuronPhiForCausalLM(NeuronBaseForCausalLM):
         - model.final_layernorm.weight/bias
         - lm_head.weight/bias
         
-        Neuron format:
+        Neuron format (NeuronAttentionBase expects):
         - embed_tokens.weight
-        - layers.{i}.self_attn.q_proj.weight/bias
-        - layers.{i}.self_attn.k_proj.weight/bias
-        - layers.{i}.self_attn.v_proj.weight/bias
-        - layers.{i}.self_attn.o_proj.weight/bias
+        - layers.{i}.self_attn.qkv_proj.q_proj.weight/bias
+        - layers.{i}.self_attn.qkv_proj.k_proj.weight/bias
+        - layers.{i}.self_attn.qkv_proj.v_proj.weight/bias
+        - layers.{i}.self_attn.o_proj.o_proj.weight/bias
         - layers.{i}.mlp.fc1.weight/bias
         - layers.{i}.mlp.fc2.weight/bias
         - layers.{i}.input_layernorm.weight/bias
@@ -553,19 +553,29 @@ class NeuronPhiForCausalLM(NeuronBaseForCausalLM):
         # Convert HF naming to Neuron naming
         new_state_dict = {}
         for key, value in state_dict.items():
-            # Remove 'model.' prefix if present
-            if key.startswith('model.'):
-                key = key[6:]  # Remove 'model.'
+            new_key = key
             
-            # Rename attention output projection: dense -> o_proj
-            if '.self_attn.dense.' in key:
-                key = key.replace('.self_attn.dense.', '.self_attn.o_proj.')
+            # Remove 'model.' prefix if present
+            if new_key.startswith('model.'):
+                new_key = new_key[6:]  # Remove 'model.'
+            
+            # Rename attention projections to match NeuronAttentionBase format
+            # q_proj -> qkv_proj.q_proj
+            if '.self_attn.q_proj.' in new_key:
+                new_key = new_key.replace('.self_attn.q_proj.', '.self_attn.qkv_proj.q_proj.')
+            elif '.self_attn.k_proj.' in new_key:
+                new_key = new_key.replace('.self_attn.k_proj.', '.self_attn.qkv_proj.k_proj.')
+            elif '.self_attn.v_proj.' in new_key:
+                new_key = new_key.replace('.self_attn.v_proj.', '.self_attn.qkv_proj.v_proj.')
+            # dense -> o_proj.o_proj
+            elif '.self_attn.dense.' in new_key:
+                new_key = new_key.replace('.self_attn.dense.', '.self_attn.o_proj.o_proj.')
             
             # Rename final layernorm: final_layernorm -> norm
-            if key.startswith('final_layernorm.'):
-                key = key.replace('final_layernorm.', 'norm.')
+            if new_key.startswith('final_layernorm.'):
+                new_key = new_key.replace('final_layernorm.', 'norm.')
             
-            new_state_dict[key] = value
+            new_state_dict[new_key] = value
         
         state_dict = new_state_dict
         
