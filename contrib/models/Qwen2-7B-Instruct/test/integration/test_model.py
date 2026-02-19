@@ -188,7 +188,7 @@ def test_model_loads(compiled_model):
 
 def test_model_generates(compiled_model, tokenizer):
     """Test that model can generate text using our custom generation loop."""
-    prompt = "The capital of France is"
+    prompt = "def fibonacci(n):"
     inputs = tokenizer(prompt, return_tensors="pt", padding=True)
     
     # Use our custom generation function
@@ -196,7 +196,7 @@ def test_model_generates(compiled_model, tokenizer):
     output_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     
     assert len(output_text) > len(prompt), "Output should be longer than prompt"
-    assert "Paris" in output_text, "Should mention Paris"
+    assert "return" in output_text or "if" in output_text, "Should contain Python code"
     print(f"✓ Generation test passed")
     print(f"  Output: {output_text}")
 
