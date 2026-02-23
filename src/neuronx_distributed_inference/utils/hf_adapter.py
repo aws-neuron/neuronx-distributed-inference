@@ -295,7 +295,6 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
                 "sampling_params": sampling_params,
                 "input_capture_hook": input_capture_hook,
-                "tensor_capture_hook": tensor_capture_hook,
                 "adapter_ids": adapter_ids
             }
         )
