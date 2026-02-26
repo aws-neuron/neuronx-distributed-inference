@@ -22,8 +22,8 @@ from modeling_phi3 import NeuronPhi3ForCausalLM, Phi3InferenceConfig
 
 
 # Test configuration - update these paths for your environment
-MODEL_PATH = "/home/ec2-user/neuroboros-autoport/NeuroborosFoundations/model_validation/hf_models/Phi-3.5-mini-instruct"
-COMPILED_MODEL_PATH = "/home/ec2-user/neuroboros-autoport/NeuroborosFoundations/model_validation/neuron_models/Phi-3.5-mini-instruct"
+MODEL_PATH = "/home/ubuntu/models/Phi-3.5-mini-instruct"
+COMPILED_MODEL_PATH = "/home/ubuntu/neuron-models/Phi-3.5-mini-instruct"
 
 
 def load_neuron_config_from_compiled(compiled_path: str):
