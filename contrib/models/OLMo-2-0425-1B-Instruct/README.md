@@ -125,6 +125,6 @@ inputs = tokenizer("The capital of France is", return_tensors="pt")
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-02-06
