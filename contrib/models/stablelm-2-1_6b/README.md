@@ -110,6 +110,6 @@ print(tokenizer.decode(outputs[0]))
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-02-06
