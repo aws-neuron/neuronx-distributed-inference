@@ -136,6 +136,6 @@ GLM-4-9B-Chat-HF uses `model_type="glm"`, NOT `model_type="glm4"`. This affects:
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-02-06
