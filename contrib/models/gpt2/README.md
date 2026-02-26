@@ -144,6 +144,6 @@ inputs = tokenizer("Hello, I am a language model", return_tensors="pt")
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-02-07
