@@ -138,6 +138,6 @@ inputs = tokenizer("The color of the sky is", return_tensors="pt")
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-02-06
