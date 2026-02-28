@@ -138,7 +138,7 @@ compiled_path = "/path/to/compiled-nano/"
 neuron_config = MoENeuronConfig(
     tp_degree=2,       # Nano is small enough for TP=2
     batch_size=1,
-    seq_len=2048,
+    seq_len=2048,      # Max tested: 40960 (TP=2), 49152 (TP=4)
     torch_dtype=torch.bfloat16,
 )
 
@@ -172,7 +172,7 @@ compiled_path = "/path/to/compiled-mini/"
 neuron_config = MoENeuronConfig(
     tp_degree=4,
     batch_size=1,
-    seq_len=2048,
+    seq_len=2048,      # Max tested: 32768
     torch_dtype=torch.bfloat16,
 )
 
@@ -206,7 +206,7 @@ compiled_path = "/path/to/compiled-large/"
 neuron_config = MoENeuronConfig(
     tp_degree=64,
     batch_size=1,
-    seq_len=4096,
+    seq_len=4096,      # Max tested: 30720
     torch_dtype=torch.bfloat16,
 )
 
@@ -241,17 +241,37 @@ tokenizer = AutoTokenizer.from_pretrained(
 
 7. **Gate padding at high TP** -- When `num_attention_heads` is not evenly divisible by `tp_degree` (e.g., Large at TP=64: 48/64), gate weights are padded with interleaved layout matching the Q projection. This is handled automatically during weight conversion.
 
+8. **Mixed attention KV cache sizing** -- Trinity uses mixed attention (alternating sliding window and global attention layers). When `seq_len > sliding_window`, global attention layers need full `seq_len`-sized KV caches while sliding layers only need `sliding_window`-sized caches. The `layer_to_cache_size_mapping` in `setup_attr_for_model()` provides per-layer cache sizes to the framework. Without this, NxDI's `KVCacheManager` sizes ALL layers to `sliding_window`, causing a tensor shape mismatch in `compute_for_token_gen` where `prior_scores` (from undersized KV cache) doesn't match `attention_mask` (sized to `seq_len`). This fix is required for any `seq_len` above the model's sliding window.
+
+## Maximum Sequence Length
+
+Validated with token generation (5 tokens per prompt) at each max seq_len:
+
+| Model | Instance | TP | Max seq_len | Compile | Load | Gen Latency |
+|-------|----------|-----|------------|---------|------|-------------|
+| Nano | trn2.3xlarge | 2 | **40,960** | 1.5 min | 3.2 min | 2.4s/tok |
+| Nano | trn2.3xlarge | 4 | **49,152** | 1.4 min | 1.4 min | 2.4s/tok |
+| Mini | trn2.3xlarge | 4 | **32,768** | 0.9 min | 7.7 min | 2.4s/tok |
+| Large | trn2.48xlarge | 64 | **30,720** | 1.6 min | 16.5 min | 2.9s/tok |
+
+Compile times above are for cache-hit runs. First compilation at each seq_len takes 5-25 min.
+
+Higher TP gives more headroom for KV cache (Nano TP=4 fits 49K vs 41K at TP=2). The failure mode at the limit is compilation timeout, not OOM.
+
+**Important:** The `layer_to_cache_size_mapping` fix in `modeling_trinity.py` is **required** for `seq_len > sliding_window` (2048 for Nano/Mini, 4096 for Large). Without it, token generation fails with a tensor shape mismatch in `compute_for_token_gen`. See Caveats section.
+
 ## Compatibility Matrix
 
-| Model | Instance | TP | LNC | Status |
-|-------|----------|-----|-----|--------|
-| Nano | inf2.xlarge | 1 | N/A | FAIL (16GB system RAM OOM) |
-| Nano | inf2.8xlarge | 1 | N/A | Validated |
-| Nano | trn2.3xlarge | 2 | 2 | Validated |
-| Mini | inf2.8xlarge | -- | -- | Does NOT fit |
-| Mini | trn2.3xlarge | 4 | 2 | Validated |
-| Large | trn2.48xlarge | 32 | 2 | FAIL (HBM OOM per NC) |
-| Large | trn2.48xlarge | 64 | 2 | Validated |
+| Model | Instance | TP | LNC | Max seq_len | Status |
+|-------|----------|-----|-----|------------|--------|
+| Nano | inf2.xlarge | 1 | N/A | -- | FAIL (16GB system RAM OOM) |
+| Nano | inf2.8xlarge | 1 | N/A | -- | Validated (not seq_len tested) |
+| Nano | trn2.3xlarge | 2 | 2 | 40,960 | Validated |
+| Nano | trn2.3xlarge | 4 | 2 | 49,152 | Validated |
+| Mini | inf2.8xlarge | -- | -- | -- | Does NOT fit |
+| Mini | trn2.3xlarge | 4 | 2 | 32,768 | Validated |
+| Large | trn2.48xlarge | 32 | 2 | -- | FAIL (HBM OOM per NC) |
+| Large | trn2.48xlarge | 64 | 2 | 30,720 | Validated |
 
 ### Minimum Requirements by Model Size
 
@@ -336,4 +356,4 @@ The NxDI framework uses several NKI (Neuron Kernel Interface) kernels during Tri
 
 Jim Burtoft
 
-**Last Updated:** 2026-02-27
+**Last Updated:** 2026-02-28

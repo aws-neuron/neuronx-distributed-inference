@@ -1016,6 +1016,20 @@ class NeuronTrinityModel(NeuronBaseModel):
         self.sliding_window = getattr(config, "sliding_window", None)
         self.has_mixed_attn = True
 
+        # Per-layer KV cache sizing for mixed attention.
+        # Global attention layers need the full seq_len KV cache; sliding layers
+        # only need sliding_window.  Without this, the KV cache manager sizes ALL
+        # layers to sliding_window, which causes a shape mismatch at token-gen time
+        # when seq_len > sliding_window (the global attention mask is sized to
+        # seq_len but K_prior is sized to sliding_window).
+        n_positions = config.neuron_config.n_positions
+        sw = self.sliding_window or n_positions
+        if sw < n_positions:
+            self.layer_to_cache_size_mapping = [
+                sw if lt == "sliding_attention" else n_positions
+                for lt in config.layer_types
+            ]
+
     def init_model(self, config: TrinityInferenceConfig):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
