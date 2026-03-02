@@ -336,7 +336,7 @@ If `context_encoding_buckets` / `token_generation_buckets` are omitted, NxDI aut
 
 ### Validated Bucketing Results
 
-Trinity-Nano on trn2.3xlarge (TP=2, seq_len=4096, buckets=[2048, 4096]):
+**Trinity-Nano** on trn2.3xlarge (TP=2, seq_len=4096, buckets=[2048, 4096]):
 
 | Prompt | Input Tokens | Top-1 | Forward | Status |
 |--------|-------------|-------|---------|--------|
@@ -349,6 +349,32 @@ Trinity-Nano on trn2.3xlarge (TP=2, seq_len=4096, buckets=[2048, 4096]):
 - Load: 37.6s
 - Token generation: ~0.5s/tok (5 tokens generated per prompt)
 - Backward compatible with non-bucketing flow
+
+**Trinity-Mini** on trn2.3xlarge (TP=4, seq_len=4096, buckets=[2048, 4096]):
+
+| Prompt | Input Tokens | Top-1 | Forward | Status |
+|--------|-------------|-------|---------|--------|
+| "Hello!" | 3 | "I" | 0.37s | PASS |
+| "What is the capital of France?" | 8 | "Paris" | 0.37s | PASS |
+| (20-token prompt) | 20 | "Also" | 0.37s | PASS |
+| (124-token prompt) | 124 | "Conclude" | 0.37s | PASS |
+
+- Compile: 5.5 min (4 NEFFs: 2 CTE + 2 TKG)
+- Load: 78.3s (1.3 min)
+- Token generation: ~0.4s/tok (5 tokens generated per prompt)
+
+**Trinity-Large** on trn2.48xlarge (TP=64, seq_len=8192, buckets=[4096, 8192]):
+
+| Prompt | Input Tokens | Top-1 | Forward | Status |
+|--------|-------------|-------|---------|--------|
+| "Hello!" | 3 | "I" | 1.16s | PASS |
+| "What is the capital of France?" | 8 | "\n" | 1.15s | PASS |
+| (20-token prompt) | 20 | "\n" | 1.15s | PASS |
+| (124-token prompt) | 124 | `<\|end_of_text\|>` | 1.15s | PASS |
+
+- Compile: 12.5 min (4 NEFFs: 2 CTE + 2 TKG)
+- Load: 15.7 min
+- Token generation: ~1.2s/tok (5 tokens generated per prompt)
 
 ### How It Works
 
