@@ -50,13 +50,27 @@ from neuronx_distributed_inference.modules.attention.attention_base import (
     NeuronAttentionBase,
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.modules.attention.gqa import (
+    determine_sharding_strategy,
+    get_shardable_head_counts,
+)
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
+    KVCacheManager,
+)
+from neuronx_distributed_inference.modules.kvcache.utils import (
+    dynamic_update_slice,
+    fill_prefix,
+)
+from neuronx_distributed_inference.modules.generation.sampling import Sampler
 
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
 )
+from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers import utils as nxd_utils
 from neuronx_distributed.utils import cpu_mode
 
 # MoE v2 module (required for MoE layers)
@@ -68,6 +82,281 @@ try:
 except ImportError:
     MOE_V2_AVAILABLE = False
     print("WARNING: moe_v2 not available, MoE layers will not work")
+
+
+# ---------------------------------------------------------------------------
+# TrinityKVCacheManager: Per-layer KV cache sizing for mixed attention
+# ---------------------------------------------------------------------------
+# Adapted from GptOssKVCacheManager in NxDI.  Trinity has mixed attention:
+# most layers use sliding-window attention (KV cache = sliding_window - 1),
+# while every 4th layer uses full attention (KV cache = max_length).
+#
+# The standard KVCacheManager applies a single sliding_window modulation to
+# ALL layers in _get_index_to_update_new_position, which causes OOB when
+# full-attention layers have larger KV cache buffers.  This custom manager
+# creates per-layer cache buffers and applies per-layer scatter modulation.
+# ---------------------------------------------------------------------------
+
+
+def _slice_kv_cacheline(padding_side, seq_len, cache, transposed):
+    """Slice KV cache to seq_len along the sequence dimension."""
+    seqlen_dim = 3 if transposed else 2
+    if padding_side == "right":
+        return torch.ops.aten.slice(cache, dim=seqlen_dim, start=0, end=seq_len)
+    max_idx = cache.shape[seqlen_dim]
+    return torch.ops.aten.slice(
+        cache, dim=seqlen_dim, start=max_idx - seq_len, end=max_idx
+    )
+
+
+class TrinityKVCacheManager(nn.Module):
+    """Per-layer KV cache manager for Trinity's mixed attention.
+
+    Sliding-window layers get a smaller KV cache (sliding_window - 1 positions).
+    Full-attention layers get the full max_length cache.  Each layer's scatter
+    index is modulated correctly to stay within its own buffer.
+    """
+
+    def __init__(
+        self, config, num_kv_head, layer_types, sliding_window, global_rank=None
+    ):
+        super().__init__()
+        self.config = config
+        self.neuron_config = config.neuron_config
+        self.padding_side = config.neuron_config.padding_side
+        self.is_continuous_batching = config.neuron_config.is_continuous_batching
+        self.num_kv_head = num_kv_head
+        self.batch_size = config.neuron_config.max_batch_size
+        self.k_cache_transposed = config.neuron_config.k_cache_transposed
+        self.global_rank = global_rank
+        self.num_layers = config.num_hidden_layers
+        self.num_attention_heads = config.num_attention_heads
+        self.tp_degree = config.neuron_config.tp_degree
+        self.dtype = (
+            config.neuron_config.attention_dtype
+            if config.neuron_config.attention_dtype is not None
+            else config.neuron_config.torch_dtype
+        )
+
+        # Per-layer attention type
+        self.layer_types = layer_types
+        # Use sliding_window directly as the cache size.  GptOss uses
+        # sliding_window - 1 because its attention kernel convention differs,
+        # but Trinity's windowed_attention_forward creates TKG masks of size
+        # sliding_window, so the cache must match exactly.
+        self.sliding_window = sliding_window
+
+        self._init_kv_shape()
+
+        self.past_key_values = nn.ParameterList(
+            [
+                nn.Parameter(torch.zeros(shape, dtype=self.dtype), requires_grad=False)
+                for layer_idx in range(self.num_layers)
+                for shape in [self.k_shapes[layer_idx], self.v_shapes[layer_idx]]
+            ]
+        )
+
+    def _get_num_kv_heads_per_rank(self):
+        gqa_sharding_strategy = determine_sharding_strategy(
+            self.tp_degree, self.num_kv_head
+        )
+        _, num_key_value_heads = get_shardable_head_counts(
+            self.tp_degree,
+            self.num_attention_heads,
+            self.num_kv_head,
+            gqa_sharding_strategy,
+        )
+        if parallel_state.model_parallel_is_initialized():
+            return nxd_utils.divide(num_key_value_heads, self.tp_degree)
+        return num_key_value_heads
+
+    def _init_kv_shape(self):
+        self.k_shapes = []
+        self.v_shapes = []
+        num_kv_heads_per_rank = self._get_num_kv_heads_per_rank()
+        head_dim = getattr(
+            self.config,
+            "head_dim",
+            self.config.hidden_size // self.config.num_attention_heads,
+        )
+        max_length = self.config.neuron_config.max_length
+
+        # All layers get max_length cache.  During CTE, fill_prefix writes
+        # the full context (up to max_length tokens) into the cache.  A
+        # smaller sliding-window cache would cause OOB when the CTE bucket
+        # exceeds sliding_window.  The sliding-window optimization is applied
+        # only at TKG time via _get_index_to_update_new_position (wrapping
+        # position_ids modulo sliding_window for sliding layers) and via
+        # get_kv_by_layer_id (slicing the cache to sliding_window during read).
+        for layer_idx in range(self.num_layers):
+            shape = (self.batch_size, num_kv_heads_per_rank, max_length, head_dim)
+            self.k_shapes.append(shape)
+            self.v_shapes.append(shape)
+
+    def _fetch_cache(self, idx, kvcache_buffer=None):
+        if kvcache_buffer is not None:
+            if (
+                len(kvcache_buffer) == len(self.past_key_values) // 2
+                and len(kvcache_buffer[0]) == 2
+            ):
+                return kvcache_buffer[idx][0], kvcache_buffer[idx][1]
+            elif len(kvcache_buffer) == len(self.past_key_values):
+                return kvcache_buffer[2 * idx], kvcache_buffer[2 * idx + 1]
+            else:
+                raise ValueError(
+                    f"kvcache_buffer length {len(kvcache_buffer)} not recognized"
+                )
+        return self.past_key_values[2 * idx], self.past_key_values[2 * idx + 1]
+
+    def get_kv_by_layer_id(
+        self,
+        idx,
+        seq_len,
+        skip_slice=False,
+        kvcache_buffer=None,
+        **kwargs,
+    ):
+        k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer)
+
+        # Override seq_len with the per-layer effective size:
+        # - Sliding layers: min(sliding_window, max_length) — only read the
+        #   last sliding_window positions during TKG.
+        # - Full-attention layers: max_length — read everything.
+        # During CTE, seq_len from the caller equals n_positions (the bucket);
+        # we still override to ensure the slice matches what attention expects.
+        if hasattr(self, "v_shapes"):
+            is_sliding = self.layer_types[idx] == "sliding_attention"
+            max_len = self.v_shapes[idx][2]  # always max_length
+            if is_sliding and self.sliding_window and self.sliding_window < max_len:
+                seq_len = self.sliding_window
+            else:
+                seq_len = max_len
+
+        if not skip_slice:
+            k_cache = _slice_kv_cacheline(
+                self.padding_side, seq_len, k_cache, self.k_cache_transposed
+            )
+            v_cache = _slice_kv_cacheline(self.padding_side, seq_len, v_cache, False)
+        return k_cache, v_cache
+
+    def get_cache(self, seq_len, skip_slice=False, kvcache_buffer=None, **kwargs):
+        past_key_values = []
+        for idx in range(len(self.past_key_values) // 2):
+            k_cache, v_cache = self.get_kv_by_layer_id(
+                idx=idx,
+                seq_len=seq_len,
+                skip_slice=skip_slice,
+                kvcache_buffer=kvcache_buffer,
+                **kwargs,
+            )
+            past_key_values.append([k_cache, v_cache])
+        return past_key_values
+
+    def update_cache(
+        self,
+        is_for_context_encoding,
+        seq_ids,
+        position_ids,
+        new_key_values,
+        seq_len,
+        scatter_index=None,
+        kv_active_mask=None,
+        kvcache_buffer=None,
+        **kwargs,
+    ):
+        updated_kv_cache = []
+        for idx, kv_per_layer in enumerate(new_key_values):
+            k_cache, v_cache = self.update_kv_by_layer_id(
+                idx=idx,
+                is_for_context_encoding=is_for_context_encoding,
+                seq_ids=seq_ids,
+                position_ids=position_ids,
+                kv_per_layer=kv_per_layer,
+                seq_len=seq_len,
+                scatter_index=scatter_index,
+                kv_active_mask=kv_active_mask,
+                kvcache_buffer=kvcache_buffer,
+            )
+            updated_kv_cache.append(k_cache)
+            updated_kv_cache.append(v_cache)
+        return updated_kv_cache
+
+    def update_kv_by_layer_id(
+        self,
+        idx,
+        is_for_context_encoding,
+        seq_ids,
+        position_ids,
+        kv_per_layer,
+        seq_len,
+        scatter_index=None,
+        kv_active_mask=None,
+        kvcache_buffer=None,
+        **kwargs,
+    ):
+        latest_k, latest_v = kv_per_layer[0], kv_per_layer[1]
+        k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer)
+
+        if is_for_context_encoding:
+            if self.is_continuous_batching:
+                assert seq_ids.dim() == 1 and seq_ids.shape[0] == 1
+                if self.k_cache_transposed:
+                    cache_idx = seq_ids
+                    indices = [cache_idx] + [
+                        torch.zeros(1, device=seq_ids.device)
+                        for _ in range(k_cache.dim() - 1)
+                    ]
+                    indices = [t.squeeze().to(torch.int32) for t in indices]
+                    k_cache = dynamic_update_slice(k_cache, latest_k, indices)
+                    v_cache = dynamic_update_slice(v_cache, latest_v, indices)
+                else:
+                    from neuronx_distributed_inference.modules.kvcache.utils import (
+                        update_cache_const_indices,
+                    )
+
+                    k_cache = update_cache_const_indices(k_cache, latest_k, seq_ids)
+                    v_cache = update_cache_const_indices(v_cache, latest_v, seq_ids)
+            else:
+                k_cache = fill_prefix(k_cache, latest_k)
+                v_cache = fill_prefix(v_cache, latest_v)
+        else:
+            # Token generation: scatter new KV into the correct position.
+            # Per-layer modulation keeps indices within the buffer bounds.
+            scatter_index_k = self._get_index_to_update_new_position(
+                scatter_index, position_ids, latest_k, self.k_cache_transposed, idx
+            )
+            scatter_index_v = self._get_index_to_update_new_position(
+                scatter_index, position_ids, latest_v, False, idx
+            )
+            k_cache = torch.scatter(
+                input=k_cache,
+                dim=(2 if not self.k_cache_transposed else 3),
+                index=scatter_index_k,
+                src=latest_k,
+            )
+            v_cache = torch.scatter(
+                input=v_cache, dim=2, index=scatter_index_v, src=latest_v
+            )
+        return k_cache, v_cache
+
+    def _get_index_to_update_new_position(
+        self, scatter_index, position_ids, full_k, transposed, layer_idx
+    ):
+        """Per-layer scatter index modulation.
+
+        Sliding-window layers: position_ids % sliding_window  (wraps within window)
+        Full-attention layers: position_ids as-is              (no modulation needed)
+        """
+        is_sliding = self.layer_types[layer_idx] == "sliding_attention"
+        if is_sliding and self.sliding_window:
+            position_ids = position_ids % self.sliding_window
+        index = position_ids
+        view_shape = (
+            (-1, 1, index.shape[-1], 1)
+            if not transposed
+            else (-1, 1, 1, index.shape[-1])
+        )
+        return index.view(*view_shape).expand_as(full_k)
 
 
 class RouterTopKWithBias(RouterTopK):
@@ -344,6 +633,9 @@ class NeuronTrinityAttention(NeuronAttentionBase):
         else:
             rotary_emb = None
 
+        # Set sliding_window on sliding layers so the base class dispatches to
+        # windowed_attention_forward (which uses the local_mask from the
+        # framework's mixed-attention flow).  Full-attention layers get None.
         sliding_window = config.sliding_window if is_sliding else None
 
         # Per-head QK norm
@@ -956,11 +1248,15 @@ class NeuronTrinityDecoderLayer(nn.Module):
         residual = hidden_states
         normed = self.input_layernorm(hidden_states)
 
-        # Select correct attention mask for this layer type.
-        # Mixed attention: local_mask for sliding layers, attention_mask for full layers.
+        # Mixed attention mask selection (matches Llama4 pattern):
+        # - Sliding layers use local_mask (windowed, sized to sliding_window)
+        # - Full-attention layers use attention_mask (global, sized to n_positions;
+        #   padded by apply_seq_ids_mask in compute_for_token_gen when KV cache
+        #   is larger than the mask)
         local_mask = kwargs.pop("local_mask", None)
-        mask = local_mask
-        if self.attention_type == "full_attention" or local_mask is None:
+        if self.attention_type == "sliding_attention" and local_mask is not None:
+            mask = local_mask
+        else:
             mask = attention_mask
 
         attn_output, present_key_value, cos_cache, sin_cache = self.self_attn(
@@ -1011,24 +1307,40 @@ class NeuronTrinityModel(NeuronBaseModel):
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = getattr(config.neuron_config, "buckets", None)
 
-        # Mixed attention: set sliding_window and has_mixed_attn so the framework
-        # creates both global and local (windowed) masks
+        # Mixed attention: set has_mixed_attn so the framework creates both
+        # global and local masks.  Set self.sliding_window so the framework
+        # generates local_attn_mask via _create_windowed_attn_mask_tkg.
+        # Full-attention layers use the global mask (padded by apply_seq_ids_mask
+        # in compute_for_token_gen when KV cache > mask size).
+        # Sliding layers use local_mask (sized to sliding_window).
         self.sliding_window = getattr(config, "sliding_window", None)
         self.has_mixed_attn = True
 
-        # Per-layer KV cache sizing for mixed attention.
-        # Global attention layers need the full seq_len KV cache; sliding layers
-        # only need sliding_window.  Without this, the KV cache manager sizes ALL
-        # layers to sliding_window, which causes a shape mismatch at token-gen time
-        # when seq_len > sliding_window (the global attention mask is sized to
-        # seq_len but K_prior is sized to sliding_window).
-        n_positions = config.neuron_config.n_positions
-        sw = self.sliding_window or n_positions
-        if sw < n_positions:
-            self.layer_to_cache_size_mapping = [
-                sw if lt == "sliding_attention" else n_positions
-                for lt in config.layer_types
-            ]
+        # Store layer_types and raw sliding_window for the custom KV cache manager.
+        self._layer_types = config.layer_types
+        self._config_sliding_window = getattr(config, "sliding_window", None)
+
+    def init_inference_optimization(self, config: TrinityInferenceConfig):
+        """Override to use TrinityKVCacheManager for per-layer KV cache sizing.
+
+        The standard KVCacheManager cannot handle mixed attention with bucketing:
+        its _get_index_to_update_new_position applies uniform sliding_window
+        modulation to ALL layers, causing OOB for full-attention layers.
+
+        TrinityKVCacheManager creates per-layer cache buffers and applies
+        per-layer scatter modulation (sliding layers: position % window,
+        full-attention layers: no modulation).
+        """
+        if self.on_device_sampling:
+            self.sampler = Sampler(config.neuron_config)
+
+        self.kv_mgr = TrinityKVCacheManager(
+            config,
+            num_kv_head=self.num_key_value_heads,
+            layer_types=self._layer_types,
+            sliding_window=self._config_sliding_window,
+            global_rank=self.rank_util,
+        )
 
     def init_model(self, config: TrinityInferenceConfig):
         self.padding_idx = getattr(config, "pad_token_id", None)

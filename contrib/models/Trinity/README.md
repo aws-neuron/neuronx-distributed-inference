@@ -45,7 +45,7 @@ NeuronX Distributed Inference implementation of the Trinity model family (AfmoeF
 
 ## Validation Results
 
-**Validated:** 2026-02-26
+**Validated:** 2026-03-02
 **SDK:** NxDI 0.7.15063, neuronx-cc 2.22.12471, torch-neuronx 2.9.0.2.11, transformers 4.56.2
 
 All results below are from the **unified `modeling_trinity.py`** (this code).
@@ -155,6 +155,21 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 ```
 
+**With bucketing** (for variable-length inputs):
+
+```python
+neuron_config = MoENeuronConfig(
+    tp_degree=2,
+    batch_size=1,
+    seq_len=4096,
+    torch_dtype=torch.bfloat16,
+    enable_bucketing=True,
+    apply_seq_ids_mask=True,
+    context_encoding_buckets=[2048, 4096],  # Must be >= sliding_window (2048)
+    token_generation_buckets=[2048, 4096],
+)
+```
+
 **Instance:** inf2.8xlarge (TP=1) or trn2.3xlarge (TP=2). Does NOT fit inf2.xlarge (16GB system RAM causes OOM).
 
 ### Trinity-Mini (~26B total, ~4.5B active)
@@ -186,6 +201,21 @@ model.load(compiled_path)
 
 tokenizer = AutoTokenizer.from_pretrained(
     model_path, padding_side="right", trust_remote_code=True
+)
+```
+
+**With bucketing** (for variable-length inputs):
+
+```python
+neuron_config = MoENeuronConfig(
+    tp_degree=4,
+    batch_size=1,
+    seq_len=4096,
+    torch_dtype=torch.bfloat16,
+    enable_bucketing=True,
+    apply_seq_ids_mask=True,
+    context_encoding_buckets=[2048, 4096],  # Must be >= sliding_window (2048)
+    token_generation_buckets=[2048, 4096],
 )
 ```
 
@@ -223,6 +253,21 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 ```
 
+**With bucketing** (for variable-length inputs):
+
+```python
+neuron_config = MoENeuronConfig(
+    tp_degree=64,
+    batch_size=1,
+    seq_len=8192,
+    torch_dtype=torch.bfloat16,
+    enable_bucketing=True,
+    apply_seq_ids_mask=True,
+    context_encoding_buckets=[4096, 8192],  # Must be >= sliding_window (4096)
+    token_generation_buckets=[4096, 8192],
+)
+```
+
 **Instance:** trn2.48xlarge only (TP=64, capacity block required, NVMe instance store for model storage).
 
 ## Caveats
@@ -241,7 +286,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 
 7. **Gate padding at high TP** -- When `num_attention_heads` is not evenly divisible by `tp_degree` (e.g., Large at TP=64: 48/64), gate weights are padded with interleaved layout matching the Q projection. This is handled automatically during weight conversion.
 
-8. **Mixed attention KV cache sizing** -- Trinity uses mixed attention (alternating sliding window and global attention layers). When `seq_len > sliding_window`, global attention layers need full `seq_len`-sized KV caches while sliding layers only need `sliding_window`-sized caches. The `layer_to_cache_size_mapping` in `setup_attr_for_model()` provides per-layer cache sizes to the framework. Without this, NxDI's `KVCacheManager` sizes ALL layers to `sliding_window`, causing a tensor shape mismatch in `compute_for_token_gen` where `prior_scores` (from undersized KV cache) doesn't match `attention_mask` (sized to `seq_len`). This fix is required for any `seq_len` above the model's sliding window.
+8. **Mixed attention KV cache (TrinityKVCacheManager)** -- Trinity uses mixed attention (alternating sliding window and full attention every 4th layer). The standard `KVCacheManager` applies a single `sliding_window` modulation to all layers, which causes out-of-bounds writes for full-attention layers with larger KV caches. `TrinityKVCacheManager` provides per-layer KV cache management: uniform `max_length` cache buffers (safe for CTE `fill_prefix`), per-layer scatter modulation during TKG (sliding: `pos % sliding_window`, global: no modulation), and per-layer KV read slicing (sliding: `sliding_window`, global: `max_length`). This is enabled automatically.
 
 ## Maximum Sequence Length
 
@@ -258,7 +303,62 @@ Compile times above are for cache-hit runs. First compilation at each seq_len ta
 
 Higher TP gives more headroom for KV cache (Nano TP=4 fits 49K vs 41K at TP=2). The failure mode at the limit is compilation timeout, not OOM.
 
-**Important:** The `layer_to_cache_size_mapping` fix in `modeling_trinity.py` is **required** for `seq_len > sliding_window` (2048 for Nano/Mini, 4096 for Large). Without it, token generation fails with a tensor shape mismatch in `compute_for_token_gen`. See Caveats section.
+## Bucketing
+
+Bucketing compiles separate NEFFs for different sequence length buckets, enabling efficient inference for variable-length inputs without padding every input to `seq_len`.
+
+### Configuration
+
+Enable bucketing by adding `enable_bucketing=True` and `apply_seq_ids_mask=True` to the neuron config:
+
+```python
+neuron_config = MoENeuronConfig(
+    tp_degree=2,
+    batch_size=1,
+    seq_len=4096,
+    torch_dtype=torch.bfloat16,
+    enable_bucketing=True,
+    apply_seq_ids_mask=True,       # Required for mixed attention bucketing
+    context_encoding_buckets=[2048, 4096],  # Optional: custom CTE buckets
+    token_generation_buckets=[2048, 4096],  # Optional: custom TKG buckets
+)
+```
+
+If `context_encoding_buckets` / `token_generation_buckets` are omitted, NxDI auto-generates power-of-2 buckets from 128 to `seq_len`.
+
+### Restrictions
+
+1. **`apply_seq_ids_mask=True` is required.** Without it, TKG fails with a shape mismatch: full-attention layers have KV caches sized to `seq_len` but the TKG attention mask is only sized to the bucket value.
+
+2. **All context encoding buckets must be >= `sliding_window`.** The `get_last_kv_window` function in windowed attention gathers indices up to `sliding_window - 1` from the K/V tensors. A CTE bucket smaller than `sliding_window` produces K/V tensors too short for those indices, causing an out-of-bounds memory access. For Trinity-Nano and Trinity-Mini (`sliding_window=2048`), the smallest CTE bucket must be at least 2048. For Trinity-Large (`sliding_window=4096`), the smallest CTE bucket must be at least 4096. Short prompts are padded to the smallest qualifying bucket.
+
+3. **Token generation buckets have no minimum.** TKG buckets control the `n_positions` dimension for the attention mask. The `apply_seq_ids_mask` flag dynamically pads the mask when needed.
+
+### Validated Bucketing Results
+
+Trinity-Nano on trn2.3xlarge (TP=2, seq_len=4096, buckets=[2048, 4096]):
+
+| Prompt | Input Tokens | Top-1 | Forward | Status |
+|--------|-------------|-------|---------|--------|
+| "Hello!" | 3 | "I" | 0.51s | PASS |
+| "What is the capital of France?" | 8 | "(" | 0.50s | PASS |
+| (20-token prompt) | 20 | "Provide" | 0.50s | PASS |
+| (124-token prompt) | 124 | `<\|im_end\|>` | 0.50s | PASS |
+
+- Compile: 7.0 min (4 NEFFs: 2 CTE + 2 TKG)
+- Load: 37.6s
+- Token generation: ~0.5s/tok (5 tokens generated per prompt)
+- Backward compatible with non-bucketing flow
+
+### How It Works
+
+Trinity's mixed attention (sliding window + full attention every 4th layer) requires three mechanisms working together for bucketing:
+
+1. **`has_mixed_attn=True`** on the model base tells the framework to generate dual attention masks: a global causal mask for full-attention layers and a local windowed mask for sliding layers. The decoder layer selects the appropriate mask per layer type (Llama4 pattern).
+
+2. **`apply_seq_ids_mask=True`** enables dynamic mask padding in `compute_for_token_gen`. When a full-attention layer's KV cache (sized `max_length`) exceeds the TKG bucket's attention mask (sized `n_positions`), the mask is automatically padded with zeros.
+
+3. **`TrinityKVCacheManager`** replaces the standard `KVCacheManager` with per-layer awareness. All layers share uniform `max_length` cache buffers (required for CTE `fill_prefix` safety), but during TKG, scatter indices are modulated per-layer (sliding: `position % sliding_window`, global: raw position) and KV reads are sliced per-layer (sliding: `sliding_window`, global: `max_length`).
 
 ## Compatibility Matrix
 
@@ -321,7 +421,7 @@ This model required solving several non-trivial porting challenges:
 4. **route_scale not supported by NxDI MoE v2:** Baked into expert `down_proj` weights during conversion.
 5. **expert_bias not supported by NxDI:** Created custom `RouterTopKWithBias` subclass.
 6. **Conditional RoPE:** Only sliding attention layers get rotary embeddings.
-7. **Mixed attention masks:** Framework provides both global and local masks; decoder layer selects based on layer type.
+7. **Mixed attention masks and KV cache:** Framework provides both global and local masks via `has_mixed_attn=True`; decoder layer selects based on layer type. `TrinityKVCacheManager` provides per-layer KV cache management (uniform buffers, per-layer scatter modulation and read slicing) to handle the different cache sizes of sliding vs full-attention layers.
 8. **Gate weight padding at high TP:** Interleaved padding matching Q projection layout (prevents wrong-head gating on 54/64 cores).
 9. **Shared expert weight loading:** Standalone module for reliable weight mapping vs NxDI built-in shared expert handling.
 
@@ -356,4 +456,4 @@ The NxDI framework uses several NKI (Neuron Kernel Interface) kernels during Tri
 
 Jim Burtoft
 
-**Last Updated:** 2026-02-28
+**Last Updated:** 2026-03-02
