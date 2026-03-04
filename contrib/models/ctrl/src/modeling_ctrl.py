@@ -91,14 +91,11 @@ class CTRLInferenceConfig(InferenceConfig):
     ):
         self.vocab_size = vocab_size
         self.n_positions = n_positions
-        self.n_embd = n_embd
         self.hidden_size = n_embd
         self.max_position_embeddings = n_positions
         self.dff = dff
         self.intermediate_size = dff
-        self.n_layer = n_layer
         self.num_hidden_layers = n_layer
-        self.n_head = n_head
         self.num_attention_heads = n_head
         self.num_key_value_heads = n_head
         self.resid_pdrop = resid_pdrop
@@ -399,15 +396,16 @@ class NeuronCTRLForCausalLM(NeuronBaseForCausalLM):
 
         # Token embeddings
         if "transformer.w.weight" in state_dict:
-            neuron_state_dict["embed_tokens.weight"] = state_dict["transformer.w.weight"].clone()
+            neuron_state_dict["embed_tokens.weight"] = state_dict["transformer.w.weight"]
 
         # LM head weight and bias (separate from embedding in HF checkpoint)
         if "lm_head.weight" in state_dict:
-            neuron_state_dict["lm_head.weight"] = state_dict["lm_head.weight"].clone()
+            neuron_state_dict["lm_head.weight"] = state_dict["lm_head.weight"]
         elif "transformer.w.weight" in state_dict:
+            # Tied weights - clone to avoid shared memory during save
             neuron_state_dict["lm_head.weight"] = state_dict["transformer.w.weight"].clone()
         if "lm_head.bias" in state_dict:
-            neuron_state_dict["lm_head.bias"] = state_dict["lm_head.bias"].clone()
+            neuron_state_dict["lm_head.bias"] = state_dict["lm_head.bias"]
 
         # Position embeddings - generate sinusoidal matching HF layout
         # HF CTRL computes these dynamically, they're not in the checkpoint
@@ -416,9 +414,9 @@ class NeuronCTRLForCausalLM(NeuronBaseForCausalLM):
 
         # Final layer norm
         if "transformer.layernorm.weight" in state_dict:
-            neuron_state_dict["norm.weight"] = state_dict["transformer.layernorm.weight"].clone()
+            neuron_state_dict["norm.weight"] = state_dict["transformer.layernorm.weight"]
         if "transformer.layernorm.bias" in state_dict:
-            neuron_state_dict["norm.bias"] = state_dict["transformer.layernorm.bias"].clone()
+            neuron_state_dict["norm.bias"] = state_dict["transformer.layernorm.bias"]
 
         # Decoder layers
         for i in range(config.num_hidden_layers):
@@ -446,7 +444,7 @@ class NeuronCTRLForCausalLM(NeuronBaseForCausalLM):
 
             for src, dst in mappings:
                 if src in state_dict:
-                    neuron_state_dict[dst] = state_dict[src].clone()
+                    neuron_state_dict[dst] = state_dict[src]
 
             neuron_state_dict[f"{neuron_prefix}.self_attn.rank_util.rank"] = \
                 torch.arange(0, tp_degree, dtype=torch.int32)

@@ -34,7 +34,6 @@ from typing import List, Optional, Tuple, Type
 import torch
 import torch.nn as nn
 
-from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
@@ -332,19 +331,19 @@ class NeuronCodeGenForCausalLM(NeuronBaseForCausalLM):
 
         # Token embeddings
         if "transformer.wte.weight" in state_dict:
-            neuron_state_dict["embed_tokens.weight"] = state_dict["transformer.wte.weight"].clone()
+            neuron_state_dict["embed_tokens.weight"] = state_dict["transformer.wte.weight"]
 
         # Final layer norm
         if "transformer.ln_f.weight" in state_dict:
-            neuron_state_dict["norm.weight"] = state_dict["transformer.ln_f.weight"].clone()
+            neuron_state_dict["norm.weight"] = state_dict["transformer.ln_f.weight"]
         if "transformer.ln_f.bias" in state_dict:
-            neuron_state_dict["norm.bias"] = state_dict["transformer.ln_f.bias"].clone()
+            neuron_state_dict["norm.bias"] = state_dict["transformer.ln_f.bias"]
 
         # LM head (CodeGen has separate lm_head, not tied)
         if "lm_head.weight" in state_dict:
-            neuron_state_dict["lm_head.weight"] = state_dict["lm_head.weight"].clone()
+            neuron_state_dict["lm_head.weight"] = state_dict["lm_head.weight"]
         if "lm_head.bias" in state_dict:
-            neuron_state_dict["lm_head.bias"] = state_dict["lm_head.bias"].clone()
+            neuron_state_dict["lm_head.bias"] = state_dict["lm_head.bias"]
 
         # Decoder layers
         for i in range(config.num_hidden_layers):
@@ -353,9 +352,9 @@ class NeuronCodeGenForCausalLM(NeuronBaseForCausalLM):
 
             # Layer norm
             if f"{hf}.ln_1.weight" in state_dict:
-                neuron_state_dict[f"{nx}.input_layernorm.weight"] = state_dict[f"{hf}.ln_1.weight"].clone()
+                neuron_state_dict[f"{nx}.input_layernorm.weight"] = state_dict[f"{hf}.ln_1.weight"]
             if f"{hf}.ln_1.bias" in state_dict:
-                neuron_state_dict[f"{nx}.input_layernorm.bias"] = state_dict[f"{hf}.ln_1.bias"].clone()
+                neuron_state_dict[f"{nx}.input_layernorm.bias"] = state_dict[f"{hf}.ln_1.bias"]
 
             # QKV projection - decompose fused qkv_proj with mp_num=4 and (Q,V,K) order
             if f"{hf}.attn.qkv_proj.weight" in state_dict:
@@ -376,20 +375,23 @@ class NeuronCodeGenForCausalLM(NeuronBaseForCausalLM):
 
             # Output projection
             if f"{hf}.attn.out_proj.weight" in state_dict:
-                neuron_state_dict[f"{nx}.self_attn.o_proj.weight"] = state_dict[f"{hf}.attn.out_proj.weight"].clone()
+                neuron_state_dict[f"{nx}.self_attn.o_proj.weight"] = state_dict[f"{hf}.attn.out_proj.weight"]
 
             # MLP
             if f"{hf}.mlp.fc_in.weight" in state_dict:
-                neuron_state_dict[f"{nx}.mlp.fc_in.weight"] = state_dict[f"{hf}.mlp.fc_in.weight"].clone()
+                neuron_state_dict[f"{nx}.mlp.fc_in.weight"] = state_dict[f"{hf}.mlp.fc_in.weight"]
             if f"{hf}.mlp.fc_in.bias" in state_dict:
-                neuron_state_dict[f"{nx}.mlp.fc_in.bias"] = state_dict[f"{hf}.mlp.fc_in.bias"].clone()
+                neuron_state_dict[f"{nx}.mlp.fc_in.bias"] = state_dict[f"{hf}.mlp.fc_in.bias"]
             if f"{hf}.mlp.fc_out.weight" in state_dict:
-                neuron_state_dict[f"{nx}.mlp.fc_out.weight"] = state_dict[f"{hf}.mlp.fc_out.weight"].clone()
+                neuron_state_dict[f"{nx}.mlp.fc_out.weight"] = state_dict[f"{hf}.mlp.fc_out.weight"]
             if f"{hf}.mlp.fc_out.bias" in state_dict:
-                neuron_state_dict[f"{nx}.mlp.fc_out.bias"] = state_dict[f"{hf}.mlp.fc_out.bias"].clone()
+                neuron_state_dict[f"{nx}.mlp.fc_out.bias"] = state_dict[f"{hf}.mlp.fc_out.bias"]
 
             neuron_state_dict[f"{nx}.self_attn.rank_util.rank"] = \
                 torch.arange(0, tp_degree, dtype=torch.int32)
+
+        # Top-level rank_util for base model
+        neuron_state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
 
         if config.neuron_config.vocab_parallel:
             neuron_state_dict["embed_tokens.rank_util.rank"] = \

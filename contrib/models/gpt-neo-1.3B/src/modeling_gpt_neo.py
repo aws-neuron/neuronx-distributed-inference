@@ -22,14 +22,11 @@ from typing import List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
-from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
 )
-from neuronx_distributed.utils import cpu_mode
-
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.models.model_base import (
     NeuronBaseForCausalLM,
@@ -165,24 +162,20 @@ class NeuronGPTNeoMLP(nn.Module):
 
     def __init__(self, config: GPTNeoInferenceConfig):
         super().__init__()
-        self.config = config
-
-        intermediate_size = config.intermediate_size
-        if intermediate_size is None:
-            intermediate_size = 4 * config.hidden_size
 
         self.c_fc = ColumnParallelLinear(
             config.hidden_size,
-            intermediate_size,
+            config.intermediate_size,
             bias=True,
             gather_output=False,
             dtype=config.neuron_config.torch_dtype,
         )
 
-        self.use_gelu_new = (getattr(config, 'activation_function', 'gelu_new') == "gelu_new")
+        # GPT-Neo uses gelu_new (tanh approximation). nn.GELU enables Neuron compiler fusion.
+        self.act = nn.GELU(approximate='tanh')
 
         self.c_proj = RowParallelLinear(
-            intermediate_size,
+            config.intermediate_size,
             config.hidden_size,
             bias=True,
             input_is_parallel=True,
@@ -191,15 +184,7 @@ class NeuronGPTNeoMLP(nn.Module):
 
     def forward(self, hidden_states, **kwargs):
         hidden_states = self.c_fc(hidden_states)
-
-        if self.use_gelu_new:
-            a = math.sqrt(2.0 / math.pi)
-            b = 0.044715
-            inner = a * (hidden_states + b * torch.pow(hidden_states, 3))
-            hidden_states = 0.5 * hidden_states * (1.0 + torch.tanh(inner))
-        else:
-            hidden_states = 0.5 * hidden_states * (1.0 + torch.erf(hidden_states / math.sqrt(2.0)))
-
+        hidden_states = self.act(hidden_states)
         hidden_states = self.c_proj(hidden_states)
         return hidden_states, None
 
