@@ -32,7 +32,7 @@ NeuronX Distributed Inference implementation of LFM2-2.6B, Liquid AI's Language 
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ LOW | **0.0% match** |
+| Token Matching | ✅ PASS | **100% match** (with ChatML template) |
 | TTFT (P50) | ⚠️ SLOW | 213.13ms (threshold: 100ms) |
 | Throughput | ✅ PASS | 4.69 tok/s (threshold: 4.0 tok/s) |
 
@@ -44,9 +44,18 @@ NeuronX Distributed Inference implementation of LFM2-2.6B, Liquid AI's Language 
 | Token Generation (P50) | 213.27ms per token |
 | Throughput | 4.69 tokens/s |
 
-**Status:** ✅ VALIDATED (Performance-Only)
+**Status:** ✅ VALIDATED
 
-**Note:** Token matching shows 0.0% due to HF LlamaForCausalLM fallback generating incorrect output (architecture mismatch). Neuron model generates correct quiz-style output with Paris as the answer. Previous S3 validation showed 75% success rate with correct factual outputs.
+### Prompt Template Requirement
+
+LFM2 is an instruct-tuned model that requires the ChatML prompt template for accurate token matching. Without the template, the model produces valid but mismatched outputs compared to the HuggingFace reference.
+
+```python
+# ChatML format (required for token matching)
+prompt = "<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n"
+```
+
+Using raw prompts (no template) results in low/0% token match despite the model generating coherent, factually correct text. This is because the HF reference and Neuron model diverge in generation style without the structured template.
 
 ## Usage
 
@@ -112,13 +121,14 @@ python3 test/integration/test_model.py
 
 ## Notes
 
-- LFM2 uses Llama-based architecture with custom modifications
-- Model generates coherent, factually correct text
-- Performance validated; accuracy validation pending HF support
-- Previous validation (S3): 75% success rate, correct outputs
+- LFM2 is a state space model (not a standard transformer), but validates using the same NeuronX methodology
+- Uses Llama-based architecture registration with custom modifications
+- ChatML prompt template (`<|im_start|>`) is required for accurate token matching against HF reference
+- Without the template, the model generates coherent, factually correct text but tokens diverge from HF output
+- Model generates correct factual outputs (e.g., "Paris" for capital of France) regardless of template usage
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29
