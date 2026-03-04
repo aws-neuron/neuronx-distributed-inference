@@ -7,18 +7,19 @@ import pytest
 import torch
 import json
 from pathlib import Path
-from transformers import AutoTokenizer, GenerationConfig
-
-from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+from transformers import AutoTokenizer
 
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_olmo2 import *
+from modeling_olmo2 import (
+    NeuronOlmo2ForCausalLM,
+    Olmo2InferenceConfig,
+    Olmo2NeuronConfig,
+)
 
 
-# Test configuration
+# Test configuration - update these paths for your environment
 MODEL_PATH = "/home/ubuntu/models/OLMo-2-1124-7B/"
 COMPILED_MODEL_PATH = "/home/ubuntu/neuron_models/OLMo-2-1124-7B/"
 
@@ -49,18 +50,22 @@ def create_model_for_inference(compiled_path: str, model_path: str):
     else:
         dtype = dtype_str
     
-    neuron_config_kwargs = {
-        'tp_degree': neuron_config_dict.get('tp_degree', 2),
-        'batch_size': neuron_config_dict.get('batch_size', 1),
-        'seq_len': neuron_config_dict.get('seq_len', 128),
-        'torch_dtype': dtype,
-    }
+    neuron_config = Olmo2NeuronConfig(
+        tp_degree=neuron_config_dict.get('tp_degree', 8),
+        batch_size=neuron_config_dict.get('batch_size', 1),
+        seq_len=neuron_config_dict.get('seq_len', 128),
+        torch_dtype=dtype,
+    )
     
-    neuron_config = NeuronConfig(**neuron_config_kwargs)
+    config = Olmo2InferenceConfig.from_pretrained(
+        model_path,
+        neuron_config=neuron_config,
+    )
     
-    # This will use the imported model and config classes
-    # The actual class names will be determined at runtime
-    return None, neuron_config
+    model = NeuronOlmo2ForCausalLM(model_path, config)
+    model.load(compiled_path)
+    
+    return model, neuron_config
 
 
 def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
@@ -91,9 +96,8 @@ def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
 @pytest.fixture(scope="module")
 def compiled_model():
     """Load pre-compiled model."""
-    # Note: Actual implementation would load the specific model class
-    # This is a template that should be customized per model
-    return None
+    model, _ = create_model_for_inference(COMPILED_MODEL_PATH, MODEL_PATH)
+    return model
 
 
 @pytest.fixture(scope="module")
@@ -139,7 +143,6 @@ def test_output_coherence(compiled_model, tokenizer):
     
     print(f"✓ Coherence test passed")
     print(f"  Output: {output_text[:100]}...")
-
 
 
 def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
@@ -199,7 +202,6 @@ def test_performance_ttft(compiled_model, tokenizer):
     print(f"✓ TTFT: {avg_ttft:.2f}ms")
 
 
-
 def test_performance_throughput(compiled_model, tokenizer):
     """Test token generation throughput."""
     import time
@@ -222,15 +224,14 @@ def test_performance_throughput(compiled_model, tokenizer):
     print(f"✓ Throughput: {throughput:.2f} tok/s")
 
 
-
 if __name__ == "__main__":
-    print("="*80)
+    print("=" * 80)
     print("OLMo-2-1124-7B Integration Tests")
-    print("="*80)
+    print("=" * 80)
     
-    print("\nNote: This is a template test file.")
-    print("For actual model testing, customize the model loading logic.")
+    print("\nTo run tests:")
+    print("  pytest test_model.py -v --capture=tee-sys")
+    print("\nOr run individual tests:")
+    print("  pytest test_model.py::test_model_loads -v")
     
-    print("\n" + "="*80)
-    print("✓ Template structure verified!")
-    print("="*80)
+    print("\n" + "=" * 80)
