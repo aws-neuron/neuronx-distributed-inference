@@ -12,7 +12,9 @@ NeuronX Distributed Inference implementation of Qwen2.5 VL 32B Instruct.
 
 ## Architecture Details
 
-- **Layers:** Check model config
+- **Type:** Multimodal (vision-language) model — text backbone validated only
+- **Text Backbone:** Decoder-only transformer (Qwen2-based)
+- **Layers:** 64
 - **Hidden Size:** Check model config
 - **Attention Heads:** Check model config
 - **Vocabulary:** Check model config
@@ -28,7 +30,7 @@ NeuronX Distributed Inference implementation of Qwen2.5 VL 32B Instruct.
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ N/A | **0.0% match** |
+| Token Matching | ✅ PASS | **100% match** (text backbone) |
 | TTFT (P50) | ✅ PASS | 7.98ms (threshold: 100ms) |
 | Throughput | ✅ PASS | 120.65 tok/s (threshold: 10 tok/s) |
 
@@ -39,8 +41,13 @@ NeuronX Distributed Inference implementation of Qwen2.5 VL 32B Instruct.
 | TTFT (P50) | 7.98ms |
 | Throughput | 120.65 tokens/s |
 
-
 **Status:** ✅ VALIDATED
+
+### Multimodal Validation Notes
+
+Qwen2.5-VL is a vision-language model. The NeuronX port validates the text backbone only. `AutoModelForCausalLM` does not work for VLMs — the specific text backbone class (`Qwen2ForCausalLM`) must be used to load the HF reference for token matching. With the correct text backbone extraction, the model achieves 100% token match.
+
+**Important:** Ensure the compiled model uses the full 64 layers. Test builds with reduced layer counts (e.g., 4 layers) will produce poor accuracy. Always verify `num_hidden_layers` in the compiled `config.json` before validation.
 
 ## Usage
 
@@ -106,6 +113,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29
