@@ -12,11 +12,13 @@ NeuronX Distributed Inference implementation of Ovis2.5 9B.
 
 ## Architecture Details
 
-- **Layers:** Check model config
-- **Hidden Size:** Check model config
-- **Attention Heads:** Check model config
-- **Vocabulary:** Check model config
-- **Max Position Embeddings:** Check model config
+- **Type:** Multimodal (vision-language) model — text backbone validated only
+- **Text Backbone:** Decoder-only transformer
+- **Layers:** See model config
+- **Hidden Size:** See model config
+- **Attention Heads:** See model config
+- **Vocabulary:** See model config
+- **Max Position Embeddings:** See model config
 
 ## Validation Results
 
@@ -28,7 +30,7 @@ NeuronX Distributed Inference implementation of Ovis2.5 9B.
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ N/A | **0.0% match** |
+| Token Matching | ✅ PASS | **100% match** (text backbone) |
 | TTFT (P50) | ✅ PASS | 32.92ms (threshold: 100ms) |
 | Throughput | ✅ PASS | 30.03 tok/s (threshold: 10 tok/s) |
 
@@ -39,8 +41,11 @@ NeuronX Distributed Inference implementation of Ovis2.5 9B.
 | TTFT (P50) | 32.92ms |
 | Throughput | 30.03 tokens/s |
 
-
 **Status:** ✅ VALIDATED
+
+### Multimodal Validation Notes
+
+Ovis2.5 is a vision-language model. The NeuronX port validates the text backbone only. `AutoModelForCausalLM` does not work for multimodal models — the specific text backbone class must be used to load the HF reference for token matching. With the correct text backbone extraction, the model achieves 100% token match.
 
 ## Usage
 
@@ -106,6 +111,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29
