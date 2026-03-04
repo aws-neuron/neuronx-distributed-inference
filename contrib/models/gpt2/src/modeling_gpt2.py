@@ -422,17 +422,19 @@ class NeuronGPT2Model(NeuronBaseModel):
 
         # Language modeling head
         # ✅ CRITICAL: lm_head belongs HERE in base model, not in CausalLM wrapper
+        # Note: GPT2 vocab size (50257) may not be divisible by TP degree, so we use pad=True
+        # We do NOT tie weights here - the state dict conversion handles weight sharing
         self.lm_head = ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
             bias=False,  # GPT2 typically doesn't use bias in lm_head
             gather_output=True,
             dtype=config.neuron_config.torch_dtype,
+            pad=True,  # Enable padding for non-divisible vocab sizes
         )
-
-        # Tie embeddings if specified
-        if getattr(config, 'tie_word_embeddings', True):
-            self.lm_head.weight = self.embed_tokens.weight
+        
+        # Note: We don't tie embeddings here because the framework's preshard_hook
+        # expects separate weights. The state dict conversion handles weight sharing.
 
     def forward(
         self,
@@ -577,10 +579,12 @@ class NeuronGPT2ForCausalLM(NeuronBaseForCausalLM):
             neuron_state_dict["norm.bias"] = state_dict["ln_f.bias"].clone()
 
         # Language modeling head
+        # GPT2 ties embeddings by default, so lm_head.weight = embed_tokens.weight
+        # We need to provide the weight for the framework's preshard_hook
         if "lm_head.weight" in state_dict:
             neuron_state_dict["lm_head.weight"] = state_dict["lm_head.weight"].clone()
-        elif "wte.weight" in state_dict and getattr(config, 'tie_word_embeddings', True):
-            # If tied embeddings, use the same weight
+        elif "wte.weight" in state_dict:
+            # Use embedding weight for tied embeddings
             neuron_state_dict["lm_head.weight"] = state_dict["wte.weight"].clone()
 
         # Decoder layers (base class strips "transformer." prefix, so keys are h.{i}.*)
