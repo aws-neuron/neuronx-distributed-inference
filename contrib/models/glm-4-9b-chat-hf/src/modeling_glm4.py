@@ -21,9 +21,10 @@ This implementation ports the GLM-4 architecture from:
 Key architectural features:
 - Grouped Query Attention (GQA) with 32 Q heads and 2 KV heads
 - Attention projections have bias (attention_bias=True)
-- 4 RMSNorm layers per decoder layer (vs 2 in Llama)
+- 2 RMSNorm layers per decoder layer (model_type="glm", not "glm4")
 - Fused gate_up_proj in MLP that is split into gate_proj and up_proj  
-- Custom RoPE with partial_rotary_factor (0.5) - only half of head_dim gets rotary
+- Custom RoPE with partial_rotary_factor=0.5 - only half of head_dim gets rotary
+- INTERLEAVED RoPE pattern: rotate_half uses x[..., 0::2] and x[..., 1::2]
 - SiLU activation in MLP
 """
 
@@ -71,12 +72,15 @@ class Glm4RotaryEmbedding(nn.Module):
     """
     GLM-4 Rotary Position Embedding.
 
-    CRITICAL FIX: GLM-4-9b-chat-hf uses partial_rotary_factor=1.0 (full head_dim=128).
-    The original port incorrectly assumed partial_rotary_factor=0.5, which halved
-    the rotary dimension from 128 to 64, causing accuracy to drop to ~10.9%.
+    GLM-4-9b-chat-hf uses partial_rotary_factor=0.5 (half of head_dim=128, so rotary_dim=64).
+    Only the first 64 dimensions of Q and K get rotary embeddings applied.
+    The remaining 64 dimensions pass through unchanged.
+
+    This model also uses an INTERLEAVED RoPE pattern where rotate_half operates on
+    alternating elements (x[..., 0::2] and x[..., 1::2]) rather than splitting in half.
 
     Reference: transformers/src/transformers/models/glm/modeling_glm.py
-    Reference: transformers/src/transformers/modeling_rope_utils.py (line 111-113)
+    Reference: transformers/src/transformers/models/glm/configuration_glm.py (partial_rotary_factor=0.5)
     """
 
     def __init__(
@@ -84,7 +88,7 @@ class Glm4RotaryEmbedding(nn.Module):
         dim: int,
         max_position_embeddings: int = 131072,
         base: float = 10000.0,
-        partial_rotary_factor: float = 1.0,  # FIXED: was 0.5, should be 1.0 for GLM-4
+        partial_rotary_factor: float = 0.5,  # GLM-4 uses 0.5 by default
     ):
         super().__init__()
         self.dim = dim
@@ -402,18 +406,16 @@ class NeuronGlm4DecoderLayer(nn.Module):
     """
     GLM-4 Decoder Layer implementation for NeuronX.
     
-    Note: While the original GLM-4 modeling code shows 4 RMSNorm layers, the actual
-    pretrained checkpoint only contains 2:
+    The GLM-4-9b-chat-hf model uses the GLM architecture (model_type="glm"), which has
+    only 2 RMSNorm layers per decoder layer:
     - input_layernorm: Before attention
     - post_attention_layernorm: After first residual add, before MLP
     
-    The additional post_self_attn_layernorm and post_mlp_layernorm shown in the
-    HuggingFace code are initialized with ones (identity) and may not be saved
-    in all checkpoints.
+    Note: The HuggingFace GLM4 code (model_type="glm4") shows 4 RMSNorm layers, but
+    GLM-4-9b-chat-hf actually uses model_type="glm" which loads GlmForCausalLM from
+    transformers.models.glm.modeling_glm - this architecture has only 2 norms.
     
-    We implement the structure that matches the checkpoint.
-    
-    Reference: modeling_glm4.py - Glm4DecoderLayer class
+    Reference: transformers/src/transformers/models/glm/modeling_glm.py - GlmDecoderLayer class
     """
     
     def __init__(self, config: Glm4InferenceConfig):
