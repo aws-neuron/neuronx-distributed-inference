@@ -189,7 +189,7 @@ def test_model_loads(compiled_model):
 
 def test_model_generates(compiled_model, tokenizer):
     """Test that model can generate text using our custom generation loop."""
-    prompt = "Once upon a time"
+    prompt = "The square root of 144 is"
     inputs = tokenizer(prompt, return_tensors="pt", padding=True)
     
     # Use our custom generation function
@@ -197,7 +197,7 @@ def test_model_generates(compiled_model, tokenizer):
     output_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     
     assert len(output_text) > len(prompt), "Output should be longer than prompt"
-    assert "Paris" in output_text, "Should mention Paris"
+    assert "12" in output_text, "Should mention 12 (the answer)"
     print(f"✓ Generation test passed")
     print(f"  Output: {output_text}")
 
