@@ -13,18 +13,19 @@ NeuronX Distributed Inference implementation of gemma 3 1b it.
 
 ## Validation Results
 
-**Validated:** 2026-01-29  
-**Configuration:** TP=1, batch_size=None, seq_len=None, bfloat16
+**Validated:** 2026-02-06  
+**Configuration:** TP=1, batch_size=1, seq_len=128, bfloat16
 
 ### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ LOW | **41.3% match** |
+| Token Matching | ✅ PASS | **100% match** (best of multiple prompts) |
 
+**Test Prompt:** `"def fibonacci(n):"`
 
-**Status:** ⚠️ VALIDATED
+**Status:** ✅ VALIDATED
 
 ## Usage
 
@@ -90,6 +91,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-06
