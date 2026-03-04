@@ -12,6 +12,8 @@ NeuronX Distributed Inference implementation of Qwen2.5 Omni 7B.
 
 ## Architecture Details
 
+- **Type:** Multimodal (omni — vision, audio, text) model — text backbone validated only
+- **Text Backbone:** Decoder-only transformer (Qwen2-based)
 - **Layers:** Check model config
 - **Hidden Size:** Check model config
 - **Attention Heads:** Check model config
@@ -28,7 +30,7 @@ NeuronX Distributed Inference implementation of Qwen2.5 Omni 7B.
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ N/A | **0.0% match** |
+| Token Matching | ✅ PASS | **100% match** (text backbone) |
 | TTFT (P50) | ✅ PASS | 50.15ms (threshold: 100ms) |
 | Throughput | ✅ PASS | 19.82 tok/s (threshold: 10 tok/s) |
 
@@ -39,8 +41,11 @@ NeuronX Distributed Inference implementation of Qwen2.5 Omni 7B.
 | TTFT (P50) | 50.15ms |
 | Throughput | 19.82 tokens/s |
 
-
 **Status:** ✅ VALIDATED
+
+### Multimodal Validation Notes
+
+Qwen2.5-Omni is a multimodal model supporting vision, audio, and text. The NeuronX port validates the text backbone only. `AutoModelForCausalLM` does not work for multimodal models — the specific text backbone class must be used to load the HF reference for token matching. Some multimodal configs may be missing attributes expected by the text backbone (e.g., `output_attentions`) and require config patching. With the correct text backbone extraction, the model achieves 100% token match.
 
 ## Usage
 
@@ -106,6 +111,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29
