@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 Integration tests for OLMo-2-0425-1B-Instruct NeuronX implementation.
+
+This model uses the OLMo-2 architecture with:
+- Q-K RMSNorm (applied before head reshape, requires ShardedRMSNorm for TP)
+- Post-layer normalization
+- SwiGLU activation
 """
 
 import pytest
@@ -15,7 +20,7 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_olmo import *
+from modeling_olmo import NeuronOlmo2ForCausalLM, Olmo2InferenceConfig
 
 
 # Test configuration

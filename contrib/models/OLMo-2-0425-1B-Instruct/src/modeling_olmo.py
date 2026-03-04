@@ -20,7 +20,6 @@ This module ports the OLMo-2-1124-7B model to NeuronX Distributed Inference.
 Key architectural differences from LLaMA:
 1. Post-layer normalization (RMSNorm after attention and MLP, not before)
 2. Q-K normalization (RMSNorm on Q and K projections before RoPE)
-
 """
 
 import os
@@ -50,21 +49,102 @@ from neuronx_distributed_inference.utils.distributed import get_tp_group
 
 
 # ============================================================================
+# Custom RMSNorm with TP Sharding Support
+# ============================================================================
+
+from neuronx_distributed.parallel_layers.layers import BaseParallelLinear
+from neuronx_distributed.parallel_layers.utils import set_tensor_model_parallel_attributes
+
+
+class ShardedRMSNorm(BaseParallelLinear):
+    """
+    RMSNorm that supports tensor parallel sharding with correct variance computation.
+    
+    This is needed for OLMo2's Q-K normalization where the norm is applied
+    BEFORE reshaping to heads. Since Q/K projections are sharded across TP,
+    the norm weights must also be sharded.
+    
+    CRITICAL: The variance must be computed over the FULL dimension (4096),
+    not the sharded dimension (512). This requires an all-reduce across TP ranks
+    to sum the squared values before computing the mean.
+    
+    By inheriting from BaseParallelLinear, this module is recognized by the
+    framework's shard_children function and will have its weights properly
+    sharded across TP ranks.
+    """
+    
+    def __init__(self, hidden_size: int, full_hidden_size: int, eps: float = 1e-6, tp_degree: int = 1):
+        super().__init__(device=None)
+        self.hidden_size = hidden_size  # Sharded size (per-rank)
+        self.full_hidden_size = full_hidden_size  # Full size (before sharding)
+        self.eps = eps
+        self.tp_degree = tp_degree
+        
+        # Create weight with SHARDED size - this is what the forward pass uses
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        
+        # Mark the weight for tensor parallel sharding
+        # This tells shard_children how to shard the checkpoint weight
+        # The checkpoint has full_hidden_size, and we want to shard it into tp_degree parts
+        set_tensor_model_parallel_attributes(
+            tensor=self.weight,
+            is_parallel=True,
+            dim=0,  # Shard along dimension 0
+            stride=1,  # Contiguous sharding
+            num_partitions=tp_degree,
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply RMSNorm with correct variance computation across TP ranks.
+        
+        The variance must be computed over the FULL dimension, not the sharded dimension.
+        This is done by:
+        1. Computing sum of squares locally (over sharded dimension)
+        2. All-reduce to get global sum of squares
+        3. Divide by full dimension size to get variance
+        4. Apply normalization with the correct variance
+        """
+        from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
+        
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        
+        # Compute local sum of squares (not mean yet!)
+        local_sum_sq = x.pow(2).sum(-1, keepdim=True)
+        
+        # All-reduce to get global sum of squares across all TP ranks
+        # This is needed because variance should be computed over the FULL dimension
+        # Use reduce_from_tensor_model_parallel_region which is the standard NeuronX way
+        if self.tp_degree > 1:
+            global_sum_sq = reduce_from_tensor_model_parallel_region(local_sum_sq)
+        else:
+            global_sum_sq = local_sum_sq
+        
+        # Compute variance as mean of squares over FULL dimension
+        variance = global_sum_sq / self.full_hidden_size
+        
+        # Apply RMSNorm: x * rsqrt(variance + eps) * weight
+        x = x * torch.rsqrt(variance + self.eps)
+        return self.weight * x.to(input_dtype)
+
+
+# ============================================================================
 # Configuration Classes
 # ============================================================================
 
-class OlmoNeuronConfig(NeuronConfig):
+class Olmo2NeuronConfig(NeuronConfig):
     """
     NeuronConfig subclass for OLMo2 model.
     
-    Sets up the attention class to use NeuronOlmoAttention.
+    Sets up the attention class to use NeuronOlmo2Attention.
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.attn_cls = NeuronOlmoAttention
+        self.attn_cls = NeuronOlmo2Attention
 
 
-class OlmoInferenceConfig(InferenceConfig):
+class Olmo2InferenceConfig(InferenceConfig):
     """
     InferenceConfig for OLMo2 model.
     
@@ -72,6 +152,7 @@ class OlmoInferenceConfig(InferenceConfig):
     This class handles loading configuration from HuggingFace format and setting up
     the required attributes for inference.
     
+    Reference: /shared/dhwanw/agent_friday_test/example/transformers/src/transformers/models/olmo2/configuration_olmo2.py
     """
     
     def add_derived_config(self):
@@ -94,24 +175,24 @@ class OlmoInferenceConfig(InferenceConfig):
         ]
     
     @classmethod
-    def get_neuron_config_cls(cls) -> Type[OlmoNeuronConfig]:
+    def get_neuron_config_cls(cls) -> Type[Olmo2NeuronConfig]:
         """Return the NeuronConfig class to use."""
-        return OlmoNeuronConfig
+        return Olmo2NeuronConfig
     
     @classmethod
-    def from_pretrained(cls, model_path: str, **kwargs) -> "OlmoInferenceConfig":
+    def from_pretrained(cls, model_path: str, **kwargs) -> "Olmo2InferenceConfig":
         """
         Load configuration from a pretrained model directory.
         
         This method reads the config.json file from the HuggingFace model directory
-        and creates an OlmoInferenceConfig object with the appropriate parameters.
+        and creates an Olmo2InferenceConfig object with the appropriate parameters.
         
         Args:
             model_path: Path to the model directory containing config.json
             **kwargs: Additional arguments to override configuration, including neuron_config
             
         Returns:
-            OlmoInferenceConfig: Configuration object for the model
+            Olmo2InferenceConfig: Configuration object for the model
         """
         # Extract neuron_config from kwargs if it exists
         neuron_config = kwargs.pop("neuron_config", None)
@@ -122,6 +203,7 @@ class OlmoInferenceConfig(InferenceConfig):
             hf_config = json.load(f)
         
         # Map HuggingFace config to our config format
+        # Reference: /shared/dhwanw2/models/OLMo-2-1124-7B/config.json
         config_dict = {
             "hidden_size": hf_config.get("hidden_size", 4096),
             "num_attention_heads": hf_config.get("num_attention_heads", 32),
@@ -156,7 +238,7 @@ class OlmoInferenceConfig(InferenceConfig):
 # Attention Classes
 # ============================================================================
 
-class NeuronOlmoAttention(NeuronAttentionBase):
+class NeuronOlmo2Attention(NeuronAttentionBase):
     """
     OLMo2 Attention implementation for NeuronX.
     
@@ -165,6 +247,11 @@ class NeuronOlmoAttention(NeuronAttentionBase):
     - In OLMo2: q_norm operates on (batch, seq, num_heads * head_dim)
     - This is different from Qwen3's per-head normalization
     
+    IMPORTANT: For TP > 1, we use ShardedRMSNorm which has a preshard_hook
+    that handles extracting the correct slice of weights for each TP rank
+    during checkpoint loading. This allows the framework to properly shard
+    the q_norm/k_norm weights even though they're not in __SUPPORTED_SHARDED_MODULES.
+    
     Reference: Olmo2Attention in modeling_olmo2.py
     - self.q_norm = Olmo2RMSNorm(config.num_attention_heads * self.head_dim, config.rms_norm_eps)
     - self.k_norm = Olmo2RMSNorm(config.num_key_value_heads * self.head_dim, config.rms_norm_eps)
@@ -172,8 +259,9 @@ class NeuronOlmoAttention(NeuronAttentionBase):
     - key_states = self.k_norm(self.k_proj(hidden_states))
     """
     
-    def __init__(self, config: OlmoInferenceConfig):
+    def __init__(self, config: Olmo2InferenceConfig):
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        tp_degree = config.neuron_config.tp_degree
         
         # Create rotary embedding for position encoding
         rotary_emb = RotaryEmbedding(
@@ -200,15 +288,26 @@ class NeuronOlmoAttention(NeuronAttentionBase):
             o_bias=getattr(config, "attention_bias", False),
         )
         
-        # OLMo2-specific: RMSNorm on full Q and K projections (before head reshape)
-        # Shape: (num_attention_heads * head_dim) for Q, (num_key_value_heads * head_dim) for K
-        self.q_norm = get_rmsnorm_cls()(
-            hidden_size=config.num_attention_heads * head_dim,
+        # OLMo2-specific: RMSNorm on Q and K projections (before head reshape)
+        # We use ShardedRMSNorm which has a preshard_hook to handle TP sharding
+        # during checkpoint loading. The norm weights are sharded to match the
+        # sharded Q/K projection outputs.
+        sharded_q_dim = (config.num_attention_heads // tp_degree) * head_dim
+        sharded_k_dim = (config.num_key_value_heads // tp_degree) * head_dim
+        full_q_dim = config.num_attention_heads * head_dim
+        full_k_dim = config.num_key_value_heads * head_dim
+        
+        self.q_norm = ShardedRMSNorm(
+            hidden_size=sharded_q_dim,
+            full_hidden_size=full_q_dim,
             eps=config.rms_norm_eps,
+            tp_degree=tp_degree,
         )
-        self.k_norm = get_rmsnorm_cls()(
-            hidden_size=config.num_key_value_heads * head_dim,
+        self.k_norm = ShardedRMSNorm(
+            hidden_size=sharded_k_dim,
+            full_hidden_size=full_k_dim,
             eps=config.rms_norm_eps,
+            tp_degree=tp_degree,
         )
     
     def prep_qkv_tensors(
@@ -241,14 +340,15 @@ class NeuronOlmoAttention(NeuronAttentionBase):
         )
         
         # OLMo2-specific: Apply RMSNorm to Q and K BEFORE reshaping to heads
-        # Q shape at this point: (batch, seq, num_heads * head_dim)
-        # K shape at this point: (batch, seq, num_kv_heads * head_dim)
+        # Q shape at this point: (batch, seq, num_heads/tp * head_dim)
+        # K shape at this point: (batch, seq, num_kv_heads/tp * head_dim)
         Q = self.q_norm(Q)
         K = self.k_norm(K)
         
         # Now reshape to heads (same as base class)
         bsz, q_len, _ = hidden_states.size()
-        if self.qkv_proj_sp_enabled:
+        # Use getattr with default False for safety
+        if getattr(self, 'qkv_proj_sp_enabled', False):
             q_len *= self.tensor_model_parallel_group.size()
         
         # BSHD -> BHSD layout
@@ -263,7 +363,7 @@ class NeuronOlmoAttention(NeuronAttentionBase):
             Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
         
         # Gather KV to full S when CP is enabled (same as base class)
-        if past_key_value is None and self.cp_degree > 1:
+        if past_key_value is None and getattr(self, 'cp_degree', 1) > 1:
             from neuronx_distributed.parallel_layers.mappings import gather_from_tensor_model_parallel_region_with_dim
             from neuronx_distributed_inference.modules.attention.attention_process_groups import get_context_parallel_attention_cp_group
             from neuronx_distributed_inference.modules.attention.utils import order_strided_tensor
@@ -280,13 +380,21 @@ class NeuronOlmoAttention(NeuronAttentionBase):
             K, V = torch.unbind(stacked_kv, dim=0)
         
         return Q, K, V, cos_cache, sin_cache, residual
+    
+    # NOTE: We intentionally do NOT define a preshard_hook here.
+    # The framework's invoke_preshard_hook function returns early if a module has preshard_hook,
+    # which would prevent it from recursing into child modules (q_norm, k_norm, and the GQA class).
+    # By not having preshard_hook here, the framework will:
+    # 1. Recurse into q_norm and call ShardedRMSNorm.preshard_hook
+    # 2. Recurse into k_norm and call ShardedRMSNorm.preshard_hook  
+    # 3. Recurse into the GQA class and call its preshard_hook for QKV weight handling
 
 
 # ============================================================================
 # Decoder Layer
 # ============================================================================
 
-class NeuronOlmoDecoderLayer(nn.Module):
+class NeuronOlmo2DecoderLayer(nn.Module):
     """
     OLMo2 Decoder Layer for NeuronX.
     
@@ -308,12 +416,12 @@ class NeuronOlmoDecoderLayer(nn.Module):
     Reference: Olmo2DecoderLayer in modeling_olmo2.py
     """
     
-    def __init__(self, config: OlmoInferenceConfig):
+    def __init__(self, config: Olmo2InferenceConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         
         # Self-attention (no pre-norm in OLMo2)
-        self.self_attn = NeuronOlmoAttention(config)
+        self.self_attn = NeuronOlmo2Attention(config)
         
         # MLP (reuse LLaMA MLP - same architecture with SwiGLU)
         self.mlp = NeuronLlamaMLP(config)
@@ -388,7 +496,7 @@ class NeuronOlmoDecoderLayer(nn.Module):
 # Model Classes
 # ============================================================================
 
-class NeuronOlmoModel(NeuronBaseModel):
+class NeuronOlmo2Model(NeuronBaseModel):
     """
     OLMo2 Model for NeuronX.
     
@@ -401,7 +509,7 @@ class NeuronOlmoModel(NeuronBaseModel):
     Reference: Olmo2Model in modeling_olmo2.py
     """
     
-    def setup_attr_for_model(self, config: OlmoInferenceConfig):
+    def setup_attr_for_model(self, config: Olmo2InferenceConfig):
         """Setup attributes required by the NeuronX framework."""
         self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
         self.tp_degree = config.neuron_config.tp_degree
@@ -411,7 +519,7 @@ class NeuronOlmoModel(NeuronBaseModel):
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
     
-    def init_model(self, config: OlmoInferenceConfig):
+    def init_model(self, config: Olmo2InferenceConfig):
         """Initialize model components."""
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -429,7 +537,7 @@ class NeuronOlmoModel(NeuronBaseModel):
         
         # Stack of OLMo2 decoder layers
         self.layers = nn.ModuleList(
-            [NeuronOlmoDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [NeuronOlmo2DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
         
         # Final layer normalization
@@ -446,7 +554,7 @@ class NeuronOlmoModel(NeuronBaseModel):
         )
 
 
-class NeuronOlmoForCausalLM(NeuronBaseForCausalLM):
+class NeuronOlmo2ForCausalLM(NeuronBaseForCausalLM):
     """
     OLMo2 for Causal Language Modeling on NeuronX.
     
@@ -459,7 +567,7 @@ class NeuronOlmoForCausalLM(NeuronBaseForCausalLM):
     Reference: Olmo2ForCausalLM in modeling_olmo2.py
     """
     
-    _model_cls = NeuronOlmoModel
+    _model_cls = NeuronOlmo2Model
     
     @staticmethod
     def load_hf_model(model_path, **kwargs):
@@ -478,9 +586,10 @@ class NeuronOlmoForCausalLM(NeuronBaseForCausalLM):
         - model.norm.weight -> norm.weight
         - lm_head.weight -> lm_head.weight
         
-        OLMo2-specific conversions:
-        - layers.X.self_attn.q_norm.weight -> layers.X.self_attn.q_norm.weight (kept same)
-        - layers.X.self_attn.k_norm.weight -> layers.X.self_attn.k_norm.weight (kept same)
+        OLMo2-specific:
+        - q_norm and k_norm weights are kept at original shape [4096]
+        - The ShardedRMSNorm class has a preshard_hook that shards these weights
+          during checkpoint loading based on the TP rank
         
         Args:
             state_dict: Original HuggingFace state dictionary
@@ -490,6 +599,7 @@ class NeuronOlmoForCausalLM(NeuronBaseForCausalLM):
             Converted state dictionary for NeuronX
         """
         neuron_config = config.neuron_config
+        tp_degree = neuron_config.tp_degree
         
         # Add rank utilities for vocab parallel and tensor parallel
         if neuron_config.vocab_parallel:
@@ -498,7 +608,6 @@ class NeuronOlmoForCausalLM(NeuronBaseForCausalLM):
             )
         
         num_layers = config.num_hidden_layers
-        tp_degree = neuron_config.tp_degree
         
         for i in range(num_layers):
             # Add rank utilities for attention layers
@@ -506,9 +615,10 @@ class NeuronOlmoForCausalLM(NeuronBaseForCausalLM):
                 0, tp_degree, dtype=torch.int32
             )
             
-            # OLMo2 uses q_norm and k_norm on the full projection dimension
-            # These weights are already in the correct shape (num_heads * head_dim)
-            # and don't need renaming since we use q_norm/k_norm in our implementation
+            # NOTE: q_norm and k_norm weights are NOT manually sharded here.
+            # The ShardedRMSNorm class has a preshard_hook method that will
+            # automatically shard these weights during checkpoint loading.
+            # We just keep the original shape [4096].
         
         # Add rank utility for base model
         state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
@@ -524,4 +634,4 @@ class NeuronOlmoForCausalLM(NeuronBaseForCausalLM):
     @classmethod
     def get_config_cls(cls):
         """Return the configuration class."""
-        return OlmoInferenceConfig
+        return Olmo2InferenceConfig

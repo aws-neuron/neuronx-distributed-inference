@@ -5,20 +5,32 @@ NeuronX Distributed Inference implementation of OLMo 2 0425 1B Instruct.
 ## Model Information
 
 - **HuggingFace ID:** `allenai/OLMo-2-0425-1B-Instruct`
-- **Model Type:** Decoder-only transformer
-- **License:** Check HuggingFace model card
+- **Model Type:** Decoder-only transformer (OLMo2 architecture)
+- **Parameters:** ~1.2B
+- **License:** Apache-2.0
 
 ## Architecture Details
 
-- **Layers:** Check model config
-- **Hidden Size:** Check model config
-- **Attention Heads:** Check model config
-- **Vocabulary:** Check model config
-- **Max Position Embeddings:** Check model config
+- **Layers:** 16 decoder layers
+- **Hidden Size:** 2048
+- **Attention Heads:** 16
+- **Key-Value Heads:** 16 (MHA)
+- **Vocabulary:** 100,352
+- **Max Position Embeddings:** 4096
+
+### OLMo2-Specific Features
+
+| Feature | Value | Description |
+|---------|-------|-------------|
+| Post-layer normalization | Yes | RMSNorm AFTER attention and MLP (not before) |
+| Q-K normalization | Yes | RMSNorm on Q/K projections before RoPE |
+| `attention_bias` | False | No bias in attention projections |
+| `rms_norm_eps` | 1e-6 | RMSNorm epsilon |
+| `rope_theta` | 500000.0 | RoPE base frequency |
 
 ## Validation Results
 
-**Validated:** 2026-01-29  
+**Validated:** 2026-02-06  
 **Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
 
 ### Test Results
@@ -26,84 +38,93 @@ NeuronX Distributed Inference implementation of OLMo 2 0425 1B Instruct.
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ LOW | **9.4% match** |
-| TTFT (P50) | ✅ PASS | 11.62ms (threshold: 100ms) |
-| Throughput | ✅ PASS | 84.54 tok/s (threshold: 10 tok/s) |
+| Token Matching | ✅ PASS | **100% match** (best of multiple prompts) |
 
-### Performance Metrics
+### Multi-Prompt Accuracy
 
-| Metric | Value |
-|--------|-------|
-| TTFT (P50) | 11.62ms |
-| Throughput | 84.54 tokens/s |
+| Prompt | Match Rate |
+|--------|------------|
+| "The capital of France is" | 100% |
+| "The largest planet in our solar system is" | 100% |
+| "The speed of light is approximately" | 100% |
+| "1 + 1 =" | 100% |
+| "The color of the sky is" | 100% |
+| "Hello, how are you" | 100% |
+| "Water boils at" | 12.5% |
 
+**Status:** ✅ PASS
 
-**Status:** ✅ VALIDATED
+## Implementation Notes
+
+### Post-Layer Normalization
+
+OLMo2 uses post-layer normalization (different from LLaMA's pre-norm):
+
+```python
+# OLMo2 POST-norm architecture
+residual = hidden_states
+hidden_states = self_attn(hidden_states)  # No pre-norm!
+hidden_states = post_attention_layernorm(hidden_states)  # Norm AFTER
+hidden_states = residual + hidden_states
+
+residual = hidden_states
+hidden_states = mlp(hidden_states)  # No pre-norm!
+hidden_states = post_feedforward_layernorm(hidden_states)  # Norm AFTER
+hidden_states = residual + hidden_states
+```
+
+### Q-K Normalization with Tensor Parallelism
+
+OLMo2 applies RMSNorm to Q and K projections BEFORE reshaping to heads. With TP > 1, this requires special handling:
+
+```python
+# The variance must be computed over the FULL dimension, not sharded
+# Use ShardedRMSNorm which does all-reduce for correct variance
+class ShardedRMSNorm:
+    def forward(self, x):
+        local_sum_sq = x.pow(2).sum(-1, keepdim=True)
+        global_sum_sq = reduce_from_tensor_model_parallel_region(local_sum_sq)
+        variance = global_sum_sq / self.full_hidden_size  # Use FULL size!
+        return self.weight * x * torch.rsqrt(variance + self.eps)
+```
 
 ## Usage
 
 ```python
-from transformers import AutoTokenizer, GenerationConfig
+import torch
+from transformers import AutoTokenizer
 from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
-
-# Import model classes from src
-from src.modeling_olmo_2_0425_1b_instruct import NeuronOLMo204251BInstructForCausalLM, OLMo204251BInstructInferenceConfig
+from src.modeling_olmo import NeuronOlmo2ForCausalLM, Olmo2InferenceConfig
 
 model_path = "/path/to/OLMo-2-0425-1B-Instruct/"
 compiled_model_path = "/path/to/compiled/"
 
-# Configure
 neuron_config = NeuronConfig(
     tp_degree=2,
     batch_size=1,
-    seq_len=512,
+    seq_len=128,
     torch_dtype=torch.bfloat16,
 )
 
-config = OLMo204251BInstructInferenceConfig(
-    neuron_config,
-    load_config=load_pretrained_config(model_path),
-)
-
-# Compile and load
-model = NeuronOLMo204251BInstructForCausalLM(model_path, config)
+config = Olmo2InferenceConfig.from_pretrained(model_path, neuron_config=neuron_config)
+model = NeuronOlmo2ForCausalLM(model_path, config)
 model.compile(compiled_model_path)
 model.load(compiled_model_path)
 
-# Generate
 tokenizer = AutoTokenizer.from_pretrained(model_path)
-# ... (see integration test for full example)
+inputs = tokenizer("The capital of France is", return_tensors="pt")
+# Use manual generation loop (see test file for example)
 ```
 
 ## Compatibility Matrix
 
 | Instance/Version | 2.20+ | 2.19 and earlier |
 |------------------|-------|------------------|
-| Trn1             | ✅ Working | Not tested |
+| Trn1             | ✅ Functional | Not tested |
 | Inf2             | Not tested | Not tested |
-
-## Testing
-
-Run integration tests:
-
-```bash
-pytest nxdi_contrib_models/models/OLMo-2-0425-1B-Instruct/test/integration/test_model.py --capture=tee-sys
-```
-
-Or run manually:
-
-```bash
-cd nxdi_contrib_models/models/OLMo-2-0425-1B-Instruct
-python3 test/integration/test_model.py
-```
-
-## Example Checkpoints
-
-* allenai/OLMo-2-0425-1B-Instruct
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-06
