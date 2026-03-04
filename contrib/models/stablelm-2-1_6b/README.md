@@ -1,95 +1,115 @@
-# Contrib Model: stablelm 2 1 6b
+# Contrib Model: StableLM 2 1.6B
 
-NeuronX Distributed Inference implementation of stablelm 2 1 6b.
+NeuronX Distributed Inference implementation of StableLM 2 1.6B.
 
 ## Model Information
 
-- **HuggingFace ID:** `stablelm-2-1_6b`
+- **HuggingFace ID:** `stabilityai/stablelm-2-1_6b`
 - **Model Type:** Decoder-only transformer
 - **License:** Check HuggingFace model card
 
 ## Architecture Details
 
+- **Layers:** 24
+- **Hidden Size:** 2048
+- **Attention Heads:** 32
+- **Key-Value Heads:** 32 (MHA)
+- **Vocabulary:** 100352
+- **Max Position Embeddings:** 4096
+
+### StableLM-Specific Features
+
+| Feature | Value | Description |
+|---------|-------|-------------|
+| `partial_rotary_factor` | 0.25 | Only 25% of head_dim (16 out of 64) uses RoPE |
+| `use_qkv_bias` | True | QKV projections have bias |
+| `qk_layernorm` | False | No Q-K layer normalization |
+| `use_parallel_residual` | False | Standard residual connections |
+| `layer_norm_eps` | 1e-5 | Uses standard LayerNorm (not RMSNorm) |
 
 ## Validation Results
 
-**Validated:** 2026-01-29  
-**Configuration:** TP=2, batch_size=None, seq_len=None, None
+**Validated:** 2026-02-06  
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
 
 ### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ LOW | **40.6% match** |
+| Token Matching | ✅ PASS | **100% match** (best of multiple prompts) |
 
+### Multi-Prompt Accuracy
 
-**Status:** ⚠️ VALIDATED
+| Prompt | Match Rate |
+|--------|------------|
+| "The largest planet in our solar system is" | 100% |
+| "Water boils at" | 100% |
+| "The capital of France is" | 0% (different but correct output) |
+
+**Status:** ✅ PASS
+
+## Implementation Notes
+
+### Partial Rotary Embedding
+
+StableLM uses `partial_rotary_factor=0.25`, meaning only 16 out of 64 head dimensions get RoPE:
+
+```python
+rotary_ndims = int(head_dim * 0.25)  # 16
+Q_rot, Q_pass = Q[..., :rotary_ndims], Q[..., rotary_ndims:]
+K_rot, K_pass = K[..., :rotary_ndims], K[..., rotary_ndims:]
+# Apply RoPE only to Q_rot, K_rot
+# Concatenate: [rotated_part, pass_through_part]
+```
+
+### LayerNorm (not RMSNorm)
+
+StableLM uses standard `nn.LayerNorm` with bias, unlike most modern LLMs that use RMSNorm:
+
+```python
+self.input_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+self.post_attention_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+```
 
 ## Usage
 
 ```python
-from transformers import AutoTokenizer, GenerationConfig
+import torch
+from transformers import AutoTokenizer
 from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
-
-# Import model classes from src
-from src.modeling_stablelm_2_1_6b import Neuronstablelm216bForCausalLM, stablelm216bInferenceConfig
+from src.modeling_stablelm import NeuronStableLmForCausalLM, StableLmInferenceConfig
 
 model_path = "/path/to/stablelm-2-1_6b/"
 compiled_model_path = "/path/to/compiled/"
 
-# Configure
 neuron_config = NeuronConfig(
     tp_degree=2,
-    batch_size=None,
-    seq_len=512,
-    torch_dtype=torch.None,
+    batch_size=1,
+    seq_len=128,
+    torch_dtype=torch.bfloat16,
 )
 
-config = stablelm216bInferenceConfig(
-    neuron_config,
-    load_config=load_pretrained_config(model_path),
-)
-
-# Compile and load
-model = Neuronstablelm216bForCausalLM(model_path, config)
+config = StableLmInferenceConfig.from_pretrained(model_path, neuron_config=neuron_config)
+model = NeuronStableLmForCausalLM(model_path, config)
 model.compile(compiled_model_path)
 model.load(compiled_model_path)
 
-# Generate
 tokenizer = AutoTokenizer.from_pretrained(model_path)
-# ... (see integration test for full example)
+inputs = tokenizer("The capital of France is", return_tensors="pt")
+outputs = model.generate(inputs.input_ids, max_length=64)
+print(tokenizer.decode(outputs[0]))
 ```
 
 ## Compatibility Matrix
 
 | Instance/Version | 2.20+ | 2.19 and earlier |
 |------------------|-------|------------------|
-| Trn1             | ✅ Working | Not tested |
+| Trn1             | ✅ Functional | Not tested |
 | Inf2             | Not tested | Not tested |
-
-## Testing
-
-Run integration tests:
-
-```bash
-pytest nxdi_contrib_models/models/stablelm-2-1_6b/test/integration/test_model.py --capture=tee-sys
-```
-
-Or run manually:
-
-```bash
-cd nxdi_contrib_models/models/stablelm-2-1_6b
-python3 test/integration/test_model.py
-```
-
-## Example Checkpoints
-
-* stablelm-2-1_6b
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-06

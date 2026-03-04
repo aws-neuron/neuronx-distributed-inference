@@ -17,7 +17,7 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_stablelm import NeuronStableLMForCausalLM, StableLMInferenceConfig
+from modeling_stablelm import NeuronStableLmForCausalLM, StableLmInferenceConfig
 
 
 # Test configuration
@@ -83,22 +83,22 @@ def create_model_for_inference(compiled_path: str, model_path: str):
     
     # Create model config
     try:
-        model_config = StableLMInferenceConfig.from_pretrained(
+        model_config = StableLmInferenceConfig.from_pretrained(
             model_path, neuron_config=neuron_config,
         )
     except (TypeError, AttributeError):
-        model_config = StableLMInferenceConfig(
+        model_config = StableLmInferenceConfig(
             neuron_config, load_config=load_pretrained_config(model_path),
         )
     
     # Create model
     try:
-        if hasattr(NeuronStableLMForCausalLM, 'from_pretrained'):
-            model = NeuronStableLMForCausalLM.from_pretrained(compiled_path, config=model_config)
+        if hasattr(NeuronStableLmForCausalLM, 'from_pretrained'):
+            model = NeuronStableLmForCausalLM.from_pretrained(compiled_path, config=model_config)
         else:
             raise AttributeError("No from_pretrained method")
     except (TypeError, AttributeError, Exception):
-        model = NeuronStableLMForCausalLM(model_path, model_config)
+        model = NeuronStableLmForCausalLM(model_path, model_config)
     
     return model, neuron_config
 
@@ -148,12 +148,12 @@ def compiled_model():
             torch_dtype=torch.bfloat16,
         )
         
-        config = StableLMInferenceConfig(
+        config = StableLmInferenceConfig(
             neuron_config,
             load_config=load_pretrained_config(MODEL_PATH),
         )
         
-        model = NeuronStableLMForCausalLM(MODEL_PATH, config)
+        model = NeuronStableLmForCausalLM(MODEL_PATH, config)
         model.compile(COMPILED_MODEL_PATH)
     
     # Load using our custom pattern
@@ -311,12 +311,12 @@ if __name__ == "__main__":
             torch_dtype=torch.bfloat16,
         )
         
-        config = StableLMInferenceConfig(
+        config = StableLmInferenceConfig(
             neuron_config,
             load_config=load_pretrained_config(MODEL_PATH),
         )
         
-        model = NeuronStableLMForCausalLM(MODEL_PATH, config)
+        model = NeuronStableLmForCausalLM(MODEL_PATH, config)
         model.compile(COMPILED_MODEL_PATH)
         print("✓ Compilation complete")
     
