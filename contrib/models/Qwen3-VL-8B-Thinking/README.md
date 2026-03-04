@@ -12,6 +12,8 @@ NeuronX Distributed Inference implementation of Qwen3 VL 8B Thinking.
 
 ## Architecture Details
 
+- **Type:** Multimodal (vision-language) model with thinking/reasoning — text backbone validated only
+- **Text Backbone:** Decoder-only transformer (Qwen3-based)
 - **Layers:** Check model config
 - **Hidden Size:** Check model config
 - **Attention Heads:** Check model config
@@ -28,7 +30,7 @@ NeuronX Distributed Inference implementation of Qwen3 VL 8B Thinking.
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ N/A | **0.0% match** |
+| Token Matching | ✅ PASS | **100% match** (text backbone) |
 | TTFT (P50) | ✅ PASS | 93.57ms (threshold: 100ms) |
 | Throughput | ✅ PASS | 10.66 tok/s (threshold: 10 tok/s) |
 
@@ -39,8 +41,13 @@ NeuronX Distributed Inference implementation of Qwen3 VL 8B Thinking.
 | TTFT (P50) | 93.57ms |
 | Throughput | 10.66 tokens/s |
 
-
 **Status:** ✅ VALIDATED
+
+### Multimodal Validation Notes
+
+Qwen3-VL is a vision-language model with thinking/reasoning capabilities. The NeuronX port validates the text backbone only. `AutoModelForCausalLM` does not work for VLMs — the specific text backbone class must be used to load the HF reference for token matching.
+
+**Note:** Qwen3-VL requires dev transformers (5.0.0.dev0). The validation uses a subprocess approach to run the HF reference in a separate venv with the dev version, allowing version isolation without affecting the main environment. With the correct text backbone extraction, the model achieves 100% token match.
 
 ## Usage
 
@@ -106,6 +113,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29
