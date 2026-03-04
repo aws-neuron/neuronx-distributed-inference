@@ -1653,13 +1653,54 @@ class DecoderModelInstance(BaseModelInstance):
                 models_to_convert.append(float_model)
 
             for model in models_to_convert:
-                convert(
-                    model,
-                    q_config=q_config,
-                    inplace=True,
-                    mapping=None,
-                    modules_to_not_convert=get_modules_to_not_convert(model.config.neuron_config),
-                )
+                user_modules_to_not_convert = get_modules_to_not_convert(model.config.neuron_config)
+
+                # Read expert_wise_scale per-model (not from self.neuron_config) so that
+                # fused speculation with a non-MoE draft + MoE target is handled correctly.
+                use_expert_wise_scale = getattr(model.config.neuron_config, "expert_wise_scale", False)
+
+                if use_expert_wise_scale and quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
+                    # Two-pass conversion:
+                    # Pass 1: Convert non-expert modules with per_channel_symmetric,
+                    #         skip expert MoE modules (expert_mlps)
+                    pass1_skip = list(user_modules_to_not_convert) if user_modules_to_not_convert else []
+                    pass1_skip.append("expert_mlps")
+                    convert(
+                        model,
+                        q_config=q_config,
+                        inplace=True,
+                        mapping=None,
+                        modules_to_not_convert=pass1_skip,
+                    )
+
+                    # Pass 2: Convert expert MoE modules with expert_wise_per_channel_symmetric
+                    expert_q_config = get_default_expert_wise_per_channel_custom_qconfig_dict()
+                    if isinstance(self.neuron_config.quantization_dtype, str):
+                        expert_q_config["quantized_dtype"] = QuantizedDtype.get_dtype(
+                            self.neuron_config.quantization_dtype
+                        )
+                    elif isinstance(self.neuron_config.quantization_dtype, QuantizedDtype):
+                        expert_q_config["quantized_dtype"] = self.neuron_config.quantization_dtype
+                    expert_q_config["activation_quantization_type"] = ActivationQuantizationType(
+                        self.neuron_config.activation_quantization_type
+                    )
+                    expert_q_config["clamp_bound"] = self.neuron_config.quantize_clamp_bound
+                    convert(
+                        model,
+                        q_config=expert_q_config,
+                        inplace=True,
+                        mapping=None,
+                        include=["*expert_mlps.mlp_op*"],
+                    )
+                else:
+                    # Standard single-pass conversion
+                    convert(
+                        model,
+                        q_config=q_config,
+                        inplace=True,
+                        mapping=None,
+                        modules_to_not_convert=user_modules_to_not_convert,
+                    )
             self.module = float_model
 
         else:
