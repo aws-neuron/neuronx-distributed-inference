@@ -1,0 +1,363 @@
+"""
+NxDI LTX-2 Pipeline
+====================
+Neuron-aware pipeline that wraps the Diffusers LTX2Pipeline with
+Neuron-compiled transformer backbone.
+
+The pipeline works by:
+1. Using the stock Diffusers LTX2Pipeline for text encoding, VAE, vocoder
+2. Intercepting transformer calls and routing them through:
+   a. CPU preprocessing (proj_in, time_embed, RoPE, caption_projection)
+   b. Neuron compiled backbone (48 blocks + output layers)
+3. Returning the pipeline output (frames + audio)
+
+This approach avoids reimplementing the complex LTX2Pipeline scheduling,
+CFG handling, VAE decoding, etc. We only replace the transformer forward().
+"""
+
+import gc
+import logging
+import os
+import time
+from typing import Optional
+
+import torch
+import torch.nn as nn
+
+try:
+    from .modeling_ltx2 import replace_sdpa_with_bmm
+except ImportError:
+    from modeling_ltx2 import replace_sdpa_with_bmm
+
+logger = logging.getLogger(__name__)
+
+
+class NeuronTransformerWrapper(nn.Module):
+    """Drop-in replacement for LTX2VideoTransformer3DModel in the Diffusers pipeline.
+
+    The pipeline calls:
+        self.transformer(
+            hidden_states=..., audio_hidden_states=...,
+            encoder_hidden_states=..., audio_encoder_hidden_states=...,
+            timestep=..., encoder_attention_mask=...,
+            audio_encoder_attention_mask=...,
+            num_frames=..., height=..., width=..., fps=...,
+            audio_num_frames=..., video_coords=..., audio_coords=...,
+            return_dict=False,
+        )
+
+    This wrapper:
+    1. Keeps a CPU copy of the transformer's preprocessing layers
+       (proj_in, time_embed, caption_projection, rope, etc.)
+    2. Replicates the preprocessing from LTX2VideoTransformer3DModel.forward()
+    3. Converts encoder_attention_mask to additive bias format
+    4. Calls the compiled Neuron model with 22 positional tensor args
+    5. Returns (video_output, audio_output) as the pipeline expects
+    """
+
+    def __init__(self, compiled_backbone, cpu_transformer, text_seq=1024):
+        """
+        Args:
+            compiled_backbone: The NeuronLTX2BackboneApplication or
+                              TensorParallelNeuronModel (loaded Neuron model)
+            cpu_transformer: The original LTX2VideoTransformer3DModel (for preprocessing layers)
+            text_seq: Maximum text sequence length (must match compile-time)
+        """
+        super().__init__()
+        self.compiled_backbone = compiled_backbone
+        self.text_seq = text_seq
+
+        # Copy config and attributes the pipeline expects
+        self.config = cpu_transformer.config
+        self.dtype = cpu_transformer.dtype
+        self.device = cpu_transformer.device
+        if hasattr(cpu_transformer, "cache_context"):
+            self.cache_context = cpu_transformer.cache_context
+
+        # Keep CPU preprocessing layers (NOT compiled, NOT in the Neuron model)
+        self.proj_in = cpu_transformer.proj_in
+        self.audio_proj_in = cpu_transformer.audio_proj_in
+        self.time_embed = cpu_transformer.time_embed
+        self.audio_time_embed = cpu_transformer.audio_time_embed
+        self.av_cross_attn_video_scale_shift = (
+            cpu_transformer.av_cross_attn_video_scale_shift
+        )
+        self.av_cross_attn_video_a2v_gate = cpu_transformer.av_cross_attn_video_a2v_gate
+        self.av_cross_attn_audio_scale_shift = (
+            cpu_transformer.av_cross_attn_audio_scale_shift
+        )
+        self.av_cross_attn_audio_v2a_gate = cpu_transformer.av_cross_attn_audio_v2a_gate
+        self.caption_projection = cpu_transformer.caption_projection
+        self.audio_caption_projection = cpu_transformer.audio_caption_projection
+        self.rope = cpu_transformer.rope
+        self.audio_rope = cpu_transformer.audio_rope
+        self.cross_attn_rope = cpu_transformer.cross_attn_rope
+        self.cross_attn_audio_rope = cpu_transformer.cross_attn_audio_rope
+
+    def forward(
+        self,
+        hidden_states,
+        audio_hidden_states=None,
+        encoder_hidden_states=None,
+        audio_encoder_hidden_states=None,
+        timestep=None,
+        encoder_attention_mask=None,
+        audio_encoder_attention_mask=None,
+        num_frames=None,
+        height=None,
+        width=None,
+        fps=None,
+        audio_num_frames=None,
+        video_coords=None,
+        audio_coords=None,
+        return_dict=False,
+        **kwargs,
+    ):
+        """Preprocess on CPU, run 48 blocks on Neuron, return results."""
+        batch_size = hidden_states.shape[0]
+        dtype = torch.bfloat16
+
+        with torch.no_grad():
+            # 1. Project inputs (CPU)
+            hs = self.proj_in(hidden_states)
+            ahs = self.audio_proj_in(audio_hidden_states)
+
+            # 2. Time embeddings (CPU)
+            temb, embedded_ts = self.time_embed(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
+            )
+            temb = temb.view(batch_size, -1, temb.size(-1))
+            embedded_ts = embedded_ts.view(batch_size, -1, embedded_ts.size(-1))
+
+            temb_audio, audio_embedded_ts = self.audio_time_embed(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
+            )
+            temb_audio = temb_audio.view(batch_size, -1, temb_audio.size(-1))
+            audio_embedded_ts = audio_embedded_ts.view(
+                batch_size, -1, audio_embedded_ts.size(-1)
+            )
+
+            # 3. Cross-attention conditioning (CPU)
+            ts_scale = (
+                self.config.cross_attn_timestep_scale_multiplier
+                / self.config.timestep_scale_multiplier
+            )
+
+            video_ca_ss, _ = self.av_cross_attn_video_scale_shift(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
+            )
+            video_ca_gate, _ = self.av_cross_attn_video_a2v_gate(
+                timestep.flatten() * ts_scale, batch_size=batch_size, hidden_dtype=dtype
+            )
+            video_ca_ss = video_ca_ss.view(batch_size, -1, video_ca_ss.shape[-1])
+            video_ca_gate = video_ca_gate.view(batch_size, -1, video_ca_gate.shape[-1])
+
+            audio_ca_ss, _ = self.av_cross_attn_audio_scale_shift(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
+            )
+            audio_ca_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
+                timestep.flatten() * ts_scale, batch_size=batch_size, hidden_dtype=dtype
+            )
+            audio_ca_ss = audio_ca_ss.view(batch_size, -1, audio_ca_ss.shape[-1])
+            audio_ca_v2a_gate = audio_ca_v2a_gate.view(
+                batch_size, -1, audio_ca_v2a_gate.shape[-1]
+            )
+
+            # 4. Caption projection (CPU)
+            enc_hs = self.caption_projection(encoder_hidden_states)
+            enc_hs = enc_hs.view(batch_size, -1, hs.size(-1))
+            audio_enc_hs = self.audio_caption_projection(audio_encoder_hidden_states)
+            audio_enc_hs = audio_enc_hs.view(batch_size, -1, ahs.size(-1))
+
+            # 5. RoPE (CPU) — use precomputed coords from the pipeline
+            video_rotary_emb = self.rope(video_coords, device="cpu")
+            audio_rotary_emb = self.audio_rope(audio_coords, device="cpu")
+            video_cross_rotary_emb = self.cross_attn_rope(
+                video_coords[:, 0:1, :], device="cpu"
+            )
+            audio_cross_rotary_emb = self.cross_attn_audio_rope(
+                audio_coords[:, 0:1, :], device="cpu"
+            )
+
+        # RoPE modules return float32 for precision; cast to bfloat16 for Neuron
+        video_rotary_emb = (
+            video_rotary_emb[0].to(dtype),
+            video_rotary_emb[1].to(dtype),
+        )
+        audio_rotary_emb = (
+            audio_rotary_emb[0].to(dtype),
+            audio_rotary_emb[1].to(dtype),
+        )
+        video_cross_rotary_emb = (
+            video_cross_rotary_emb[0].to(dtype),
+            video_cross_rotary_emb[1].to(dtype),
+        )
+        audio_cross_rotary_emb = (
+            audio_cross_rotary_emb[0].to(dtype),
+            audio_cross_rotary_emb[1].to(dtype),
+        )
+
+        # 6. Attention masks — convert from binary (B, text_seq) to additive bias
+        with torch.no_grad():
+            if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+                enc_mask = (1 - encoder_attention_mask.to(dtype)) * -10000.0
+                enc_mask = enc_mask.unsqueeze(1)  # (B, 1, text_seq)
+            else:
+                enc_mask = encoder_attention_mask
+
+            if (
+                audio_encoder_attention_mask is not None
+                and audio_encoder_attention_mask.ndim == 2
+            ):
+                audio_enc_mask = (1 - audio_encoder_attention_mask.to(dtype)) * -10000.0
+                audio_enc_mask = audio_enc_mask.unsqueeze(1)
+            else:
+                audio_enc_mask = audio_encoder_attention_mask
+
+            if enc_mask is None:
+                enc_mask = torch.zeros(batch_size, 1, self.text_seq, dtype=dtype)
+            if audio_enc_mask is None:
+                audio_enc_mask = torch.zeros(batch_size, 1, self.text_seq, dtype=dtype)
+
+        # 7. Call compiled Neuron model (22 positional args)
+        # The Neuron backbone is compiled for batch_size=1. When CFG is active
+        # (guidance_scale > 1), the pipeline doubles the batch to 2 (uncond + cond).
+        # We handle this by calling the backbone twice and concatenating results.
+        backbone_args = (
+            hs,
+            ahs,
+            enc_hs,
+            audio_enc_hs,
+            temb,
+            temb_audio,
+            embedded_ts,
+            audio_embedded_ts,
+            video_ca_ss,
+            audio_ca_ss,
+            video_ca_gate,
+            audio_ca_v2a_gate,
+            video_rotary_emb[0],  # cos
+            video_rotary_emb[1],  # sin
+            audio_rotary_emb[0],
+            audio_rotary_emb[1],
+            video_cross_rotary_emb[0],
+            video_cross_rotary_emb[1],
+            audio_cross_rotary_emb[0],
+            audio_cross_rotary_emb[1],
+            enc_mask,
+            audio_enc_mask,
+        )
+
+        if batch_size == 1:
+            video_output, audio_output = self.compiled_backbone(*backbone_args)
+        else:
+            # CFG mode: split batch, run twice, concatenate
+            video_parts = []
+            audio_parts = []
+            for i in range(batch_size):
+                single_args = tuple(
+                    a[i : i + 1] if a.shape[0] == batch_size else a
+                    for a in backbone_args
+                )
+                v, a = self.compiled_backbone(*single_args)
+                video_parts.append(v)
+                audio_parts.append(a)
+            video_output = torch.cat(video_parts, dim=0)
+            audio_output = torch.cat(audio_parts, dim=0)
+
+        return video_output, audio_output
+
+
+class NeuronLTX2Pipeline:
+    """Wrapper around the Diffusers LTX2Pipeline that supports Neuron acceleration.
+
+    This class manages:
+    1. Loading the stock Diffusers pipeline (text encoder, VAEs, vocoder on CPU)
+    2. Holding a reference to the NeuronLTX2BackboneApplication
+    3. Swapping the transformer with NeuronTransformerWrapper after loading
+
+    Usage:
+        pipe = NeuronLTX2Pipeline.from_pretrained("Lightricks/LTX-2", torch_dtype=torch.bfloat16)
+        pipe.neuron_backbone = NeuronLTX2BackboneApplication(...)
+        pipe.neuron_backbone.compile(path)
+        pipe.neuron_backbone.load(path)
+        pipe._swap_transformer_to_neuron()
+        output = pipe(prompt="...", height=384, width=512, num_frames=25)
+    """
+
+    def __init__(self, diffusers_pipe, text_seq=1024):
+        """
+        Args:
+            diffusers_pipe: A loaded Diffusers LTX2Pipeline
+            text_seq: Maximum text sequence length (must match compile-time)
+        """
+        self.pipe = diffusers_pipe
+        self.text_seq = text_seq
+        self.neuron_backbone = None
+        self._original_transformer = None
+
+    @classmethod
+    def from_pretrained(
+        cls, model_path, torch_dtype=torch.bfloat16, text_seq=1024, **kwargs
+    ):
+        """Load the Diffusers LTX2Pipeline from HuggingFace.
+
+        Args:
+            model_path: HuggingFace model ID or local path (e.g., "Lightricks/LTX-2")
+            torch_dtype: Dtype for CPU components (default bfloat16)
+            text_seq: Maximum text sequence length
+            **kwargs: Additional args passed to LTX2Pipeline.from_pretrained()
+        """
+        from diffusers import LTX2Pipeline
+
+        logger.info("Loading Diffusers LTX2Pipeline from %s", model_path)
+        diffusers_pipe = LTX2Pipeline.from_pretrained(
+            model_path, torch_dtype=torch_dtype, **kwargs
+        )
+        logger.info(
+            "Pipeline components: %s",
+            ", ".join(k for k, v in diffusers_pipe.components.items() if v is not None),
+        )
+
+        return cls(diffusers_pipe, text_seq=text_seq)
+
+    def _swap_transformer_to_neuron(self):
+        """Replace the pipeline's CPU transformer with the Neuron-compiled version.
+
+        Must be called after neuron_backbone.load() succeeds.
+        Preserves the CPU preprocessing layers (proj_in, time_embed, etc.)
+        and frees the heavy transformer blocks (~38 GB).
+        """
+        if self.neuron_backbone is None:
+            raise RuntimeError("neuron_backbone must be set and loaded before swapping")
+
+        cpu_transformer = self.pipe.transformer
+        cpu_transformer.eval()
+
+        # Create the wrapper that adapts pipeline calls to 22 positional args
+        wrapper = NeuronTransformerWrapper(
+            compiled_backbone=self.neuron_backbone,
+            cpu_transformer=cpu_transformer,
+            text_seq=self.text_seq,
+        )
+
+        # Free the heavy transformer blocks (keep preprocessing layers via wrapper refs)
+        self._original_transformer = cpu_transformer
+        del cpu_transformer.transformer_blocks
+        del cpu_transformer.norm_out, cpu_transformer.proj_out
+        del cpu_transformer.audio_norm_out, cpu_transformer.audio_proj_out
+        gc.collect()
+
+        # Hot-swap
+        self.pipe.transformer = wrapper
+        logger.info("Transformer swapped to Neuron backbone")
+
+    def __call__(self, *args, **kwargs):
+        """Run the full LTX-2 pipeline (text encoding + denoising + VAE decode)."""
+        return self.pipe(*args, **kwargs)
+
+    def __getattr__(self, name):
+        """Proxy attribute access to the underlying Diffusers pipeline."""
+        if name in ("pipe", "text_seq", "neuron_backbone", "_original_transformer"):
+            raise AttributeError(name)
+        return getattr(self.pipe, name)
