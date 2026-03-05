@@ -1,18 +1,39 @@
 # coding=utf-8
 # Copyright 2023 Baichuan Inc. All rights reserved.
-# Adapted for NeuronX Distributed Inference.
-"""PyTorch Baichuan2-7B model for NeuronX Distributed Inference.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+NeuronX implementation of Baichuan2-7B-Base for AWS Trainium.
 
-Architecture: Identical to Llama-2-7b with these differences:
-- Fused QKV projection (W_pack) instead of separate q/k/v_proj
-- NormHead LM head (weight-normalized linear layer)
-- Larger vocabulary (125696 vs 32000)
-- rms_norm_eps = 1e-06 (vs 1e-05)
+This implementation leverages the existing NeuronLlama infrastructure
+from NeuronxDistributedInference. Baichuan2-7B is architecturally identical
+to Llama-2-7b with these differences:
 
-This port extends NXDI's Llama infrastructure and only overrides:
-- Config: from_pretrained for Baichuan2 HF config
-- Weight conversion: W_pack split + NormHead normalization
-- load_hf_model: Direct state dict loading (custom HF code)
+Architecture:
+    - Model: Baichuan2-7B-Base (32 layers, 4096 hidden size)
+    - Attention: Multi-Head Attention (32 heads, head_dim=128)
+    - MLP: SwiGLU activation (gate_proj, up_proj, down_proj)
+    - Normalization: RMSNorm (eps=1e-06)
+    - Position Encoding: RoPE (theta=10000.0)
+    - Vocabulary: 125696 tokens
+    - Max Position Embeddings: 4096
+
+Key Differences from Llama-2:
+    - Fused QKV projection (W_pack) instead of separate q/k/v_proj
+    - NormHead LM head (weight-normalized linear layer)
+    - Larger vocabulary (125696 vs 32000)
+    - rms_norm_eps = 1e-06 (vs 1e-05)
+    - Custom HF code requires trust_remote_code (bypassed by direct loading)
 """
 
 import json
@@ -66,16 +87,18 @@ def _load_baichuan2_config(model_path: str):
 
 
 class Baichuan2InferenceConfig(LlamaInferenceConfig):
-    """Configuration for Baichuan2-7B inference on NeuronX.
+    """
+    Configuration class for Baichuan2-7B-Base inference on NeuronX.
 
     Inherits from LlamaInferenceConfig since the architecture is identical.
-    The HF config.json uses standard Llama-compatible key names.
+    Uses a custom config loader to bypass trust_remote_code requirement.
     """
 
     @classmethod
     def from_pretrained(cls, model_path: str, neuron_config: NeuronConfig = None, **kwargs):
         if neuron_config is None:
             neuron_config = NeuronConfig(tp_degree=1, batch_size=1, seq_len=128)
+            logger.debug("Created default neuron_config for config loading")
 
         config = cls(
             neuron_config=neuron_config,
@@ -86,11 +109,14 @@ class Baichuan2InferenceConfig(LlamaInferenceConfig):
 
 
 class NeuronBaichuan2ForCausalLM(NeuronLlamaForCausalLM):
-    """Baichuan2-7B for NeuronX, extending Llama infrastructure.
+    """
+    NeuronX implementation of Baichuan2-7B-Base for causal language modeling.
 
-    Only overrides weight loading/conversion to handle:
+    This class wraps the existing NeuronLlamaForCausalLM implementation
+    and overrides weight loading/conversion to handle:
     1. W_pack (fused QKV) -> separate q_proj, k_proj, v_proj
     2. NormHead lm_head -> pre-normalized weights
+    3. Direct state dict loading (bypasses trust_remote_code)
     """
 
     _model_cls = NeuronLlamaModel
@@ -101,8 +127,6 @@ class NeuronBaichuan2ForCausalLM(NeuronLlamaForCausalLM):
 
         Bypasses AutoModelForCausalLM which requires trust_remote_code=True.
         Uses NXDI's checkpoint utility for efficient safetensors/bin loading.
-        Note: Only called when model_path is a HF hub ID; for local dirs the
-        framework uses load_state_dict directly via get_state_dict.
         """
         state_dict = load_state_dict(os.path.expanduser(model_path))
 
@@ -129,7 +153,7 @@ class NeuronBaichuan2ForCausalLM(NeuronLlamaForCausalLM):
         for key in list(state_dict.keys()):
             if "W_pack" in key:
                 # W_pack.weight: [3*hidden_size, hidden_size] -> split into q/k/v_proj
-                layer_prefix = key.rsplit("W_pack", 1)[0]  # e.g., "layers.0.self_attn."
+                layer_prefix = key.rsplit("W_pack", 1)[0]
                 w = state_dict[key]
                 q, k, v = w.chunk(3, dim=0)
                 keys_to_add[f"{layer_prefix}q_proj.weight"] = q
@@ -145,7 +169,7 @@ class NeuronBaichuan2ForCausalLM(NeuronLlamaForCausalLM):
         if "lm_head.weight" in state_dict:
             state_dict["lm_head.weight"] = F.normalize(state_dict["lm_head.weight"], dim=-1)
 
-        # Delegate to Llama's conversion (adds rank_util, handles fused_qkv, etc.)
+        # Delegate to Llama's conversion
         return NeuronLlamaForCausalLM.convert_hf_to_neuron_state_dict(state_dict, config)
 
     @staticmethod
@@ -154,5 +178,13 @@ class NeuronBaichuan2ForCausalLM(NeuronLlamaForCausalLM):
         pass
 
     @classmethod
-    def get_config_cls(cls) -> Type:
+    def get_config_cls(cls):
+        """Return the configuration class for Baichuan2"""
         return Baichuan2InferenceConfig
+
+
+# Export classes
+__all__ = [
+    "Baichuan2InferenceConfig",
+    "NeuronBaichuan2ForCausalLM",
+]

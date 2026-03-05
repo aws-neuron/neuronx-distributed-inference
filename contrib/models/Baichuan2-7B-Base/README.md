@@ -1,38 +1,24 @@
 # Contrib Model: Baichuan2-7B-Base
 
-NeuronX Distributed Inference implementation of Baichuan Inc. Baichuan2-7B-Base.
+NeuronX Distributed Inference implementation of Baichuan2-7B-Base.
 
 ## Model Information
 
 - **HuggingFace ID:** `baichuan-inc/Baichuan2-7B-Base`
 - **Model Type:** Decoder-only transformer (Llama-2 architecture variant)
-- **Parameters:** 7B
 - **License:** Apache-2.0
 
 ## Architecture Details
 
-| Property | Value |
-|----------|-------|
-| Hidden Size | 4096 |
-| Num Attention Heads | 32 (MHA) |
-| Head Dimension | 128 |
-| Num Hidden Layers | 32 |
-| Vocab Size | 125696 |
-| Max Position Embeddings | 4096 |
-| Intermediate Size | 11008 |
-| Position Encoding | RoPE (theta=10000) |
-| Residual Connection | Pre-norm (RMSNorm -> Attn -> Add -> RMSNorm -> MLP -> Add) |
-| Normalization | RMSNorm (epsilon=1e-6) |
-| Activation | SiLU |
-| LM Head | NormHead (weight-normalized, no bias) |
+- **Layers:** 32 decoder layers
+- **Hidden Size:** 4096
+- **Attention Heads:** 32 (MHA, head_dim=128)
 
-### Key Implementation Notes
+### Baichuan2-Specific Features
 
-- **Extends Llama:** Architecture is identical to Llama-2-7b, so this port extends `NeuronLlamaForCausalLM` and only overrides config loading, weight conversion, and HF model loading.
-- **W_pack (fused QKV):** Baichuan2 stores Q/K/V as a single fused tensor `W_pack.weight` of shape `[3*hidden_size, hidden_size]`. Weight conversion splits this into separate `q_proj`, `k_proj`, `v_proj`.
-- **NormHead lm_head:** The lm_head applies L2 normalization to weights at inference time. We pre-normalize during weight conversion with `F.normalize(dim=-1)`.
-- **Direct loading:** Bypasses `trust_remote_code` by loading `config.json` and safetensors directly, adding missing Llama-required keys (`num_key_value_heads`, `rope_theta`).
-- **Tied weights:** `tie_word_embeddings=false` — override prevents Llama's default weight tying.
+- **W_pack (fused QKV):** Stores Q/K/V as a single fused tensor `W_pack.weight [3*H, H]`, split into separate projections during weight conversion.
+- **NormHead lm_head:** Applies L2 normalization to lm_head weights at inference time; pre-normalized during weight conversion.
+- **Direct loading:** Bypasses `trust_remote_code` by loading config.json and safetensors directly, adding missing Llama-required keys.
 
 ## Validation Results
 
@@ -100,6 +86,13 @@ Run integration tests:
 
 ```bash
 pytest contrib/models/Baichuan2-7B-Base/test/integration/test_model.py --capture=tee-sys
+```
+
+Or run manually:
+
+```bash
+cd contrib/models/Baichuan2-7B-Base
+python3 test/integration/test_model.py
 ```
 
 ## Example Checkpoints
