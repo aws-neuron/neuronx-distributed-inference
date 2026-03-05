@@ -16,9 +16,6 @@ import torch
 from pathlib import Path
 from transformers import AutoTokenizer
 
-from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
-
 # Monkey-patch hf_adapter to handle read-only PretrainedConfig attrs
 import neuronx_distributed_inference.utils.hf_adapter as hf_adapter_module
 from transformers import PretrainedConfig
@@ -50,6 +47,21 @@ MODEL_PATH = "/shared/dhwanw2/models/mpt-7b-chat/"
 COMPILED_MODEL_PATH = "/tmp/neuron_models/mpt-7b-chat/"
 
 
+def _create_model():
+    """Create configured MPT model instance."""
+    neuron_config = MptInferenceConfig.get_neuron_config_cls()(
+        tp_degree=1,
+        batch_size=1,
+        seq_len=128,
+        max_context_length=128,
+        torch_dtype=torch.bfloat16,
+    )
+    config = MptInferenceConfig.from_pretrained(
+        MODEL_PATH, neuron_config=neuron_config,
+    )
+    return NeuronMptForCausalLM(MODEL_PATH, config)
+
+
 def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
     """Generate tokens using manual forward pass loop."""
     generated_ids = input_ids.clone()
@@ -79,36 +91,11 @@ def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
 def compiled_model():
     """Compile and load model."""
     compiled_path = Path(COMPILED_MODEL_PATH)
+    model = _create_model()
     if not (compiled_path / "model.pt").exists():
         print(f"Compiling model to {COMPILED_MODEL_PATH}...")
-
-        neuron_config = MptInferenceConfig.get_neuron_config_cls()(
-            tp_degree=1,
-            batch_size=1,
-            seq_len=128,
-            max_context_length=128,
-            torch_dtype=torch.bfloat16,
-        )
-
-        config = MptInferenceConfig.from_pretrained(
-            MODEL_PATH, neuron_config=neuron_config,
-        )
-
-        model = NeuronMptForCausalLM(MODEL_PATH, config)
         model.compile(COMPILED_MODEL_PATH)
         print("Compilation complete.")
-    else:
-        neuron_config = MptInferenceConfig.get_neuron_config_cls()(
-            tp_degree=1,
-            batch_size=1,
-            seq_len=128,
-            max_context_length=128,
-            torch_dtype=torch.bfloat16,
-        )
-        config = MptInferenceConfig.from_pretrained(
-            MODEL_PATH, neuron_config=neuron_config,
-        )
-        model = NeuronMptForCausalLM(MODEL_PATH, config)
 
     model.load(COMPILED_MODEL_PATH)
     return model
@@ -186,28 +173,12 @@ if __name__ == "__main__":
     print("MPT-7B-Chat Integration Tests")
     print("=" * 80)
 
+    model = _create_model()
     compiled_path = Path(COMPILED_MODEL_PATH)
     if not (compiled_path / "model.pt").exists():
         print(f"\nCompiling model to {COMPILED_MODEL_PATH}...")
-        neuron_config = MptInferenceConfig.get_neuron_config_cls()(
-            tp_degree=1, batch_size=1, seq_len=128,
-            max_context_length=128, torch_dtype=torch.bfloat16,
-        )
-        config = MptInferenceConfig.from_pretrained(
-            MODEL_PATH, neuron_config=neuron_config,
-        )
-        model = NeuronMptForCausalLM(MODEL_PATH, config)
         model.compile(COMPILED_MODEL_PATH)
         print("Compilation complete")
-    else:
-        neuron_config = MptInferenceConfig.get_neuron_config_cls()(
-            tp_degree=1, batch_size=1, seq_len=128,
-            max_context_length=128, torch_dtype=torch.bfloat16,
-        )
-        config = MptInferenceConfig.from_pretrained(
-            MODEL_PATH, neuron_config=neuron_config,
-        )
-        model = NeuronMptForCausalLM(MODEL_PATH, config)
 
     print(f"\nLoading compiled model from {COMPILED_MODEL_PATH}...")
     model.load(COMPILED_MODEL_PATH)

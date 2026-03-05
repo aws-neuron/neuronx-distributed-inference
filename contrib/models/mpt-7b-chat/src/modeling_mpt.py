@@ -29,21 +29,18 @@ ALiBi implementation strategy:
 """
 
 import json
-import logging
 import math
 import os
-from typing import List, Optional, Tuple, Type
+from typing import List, Type
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
 )
-from neuronx_distributed.utils import cpu_mode
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.models.model_base import (
@@ -56,8 +53,6 @@ from neuronx_distributed_inference.modules.attention.utils import (
     repeat_kv,
 )
 from neuronx_distributed_inference.utils.distributed import get_tp_group
-
-logger = logging.getLogger("Neuron")
 
 
 def compute_alibi_slopes(num_heads, alibi_bias_max=8):
@@ -86,16 +81,15 @@ class MptInferenceConfig(InferenceConfig):
         self.num_cores_per_group = 1
         self.sliding_window = None
 
+        if not hasattr(self, "no_bias"):
+            self.no_bias = True
+
         if not hasattr(self, "intermediate_size") or self.intermediate_size is None:
             self.intermediate_size = self.expansion_ratio * self.hidden_size
 
         # MPT uses MHA
         if not hasattr(self, "num_key_value_heads") or self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
-
-        self.output_attentions = False
-        self.output_hidden_states = False
-        self.use_cache = True
 
     def get_required_attributes(self) -> List[str]:
         return [
@@ -160,7 +154,7 @@ class NeuronMptAttention(NeuronAttentionBase):
     def __init__(self, config: MptInferenceConfig, layer_idx: int = None, **kwargs):
         self.layer_idx = layer_idx
         head_dim = config.hidden_size // config.num_attention_heads
-        no_bias = getattr(config, "no_bias", True)
+        no_bias = config.no_bias
 
         super().__init__(
             config=config,
@@ -283,7 +277,7 @@ class NeuronMptMLP(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
-        no_bias = getattr(config, "no_bias", True)
+        no_bias = config.no_bias
 
         self.up_proj = ColumnParallelLinear(
             hidden_size,
@@ -316,7 +310,7 @@ class NeuronMptBlock(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        no_bias = getattr(config, "no_bias", True)
+        no_bias = config.no_bias
 
         self.norm_1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         if no_bias:
@@ -394,7 +388,7 @@ class NeuronMptModel(NeuronBaseModel):
             for i in range(config.num_hidden_layers)
         ])
 
-        no_bias = getattr(config, "no_bias", True)
+        no_bias = config.no_bias
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         if no_bias:
             self.norm.bias = None
