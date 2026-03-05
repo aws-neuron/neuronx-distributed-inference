@@ -91,6 +91,11 @@ class MptInferenceConfig(InferenceConfig):
         if not hasattr(self, "num_key_value_heads") or self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
+        # Required by NXDI _setup_func_config (accessed without getattr)
+        self.output_attentions = False
+        self.output_hidden_states = False
+        self.use_cache = True
+
     def get_required_attributes(self) -> List[str]:
         return [
             "hidden_size",
