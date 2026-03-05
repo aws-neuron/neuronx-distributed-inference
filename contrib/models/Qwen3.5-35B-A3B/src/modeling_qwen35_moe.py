@@ -46,8 +46,12 @@ from neuronx_distributed.utils import cpu_mode
 from torch_neuronx.xla_impl.ops import nki_jit
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-from .nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
-from .nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
+try:
+    from .nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
+    from .nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
+except ImportError:
+    from nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
+    from nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
