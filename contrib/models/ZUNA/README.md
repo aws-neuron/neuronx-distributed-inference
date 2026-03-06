@@ -209,12 +209,23 @@ pytest contrib/models/ZUNA/test/integration/test_model.py --capture=tee-sys -v
 python contrib/models/ZUNA/test/integration/test_model.py
 ```
 
-The test suite includes:
-- **TestModelLoads**: Smoke tests (encoder/decoder compile, run, full pipeline)
-- **TestAccuracy**: Cosine similarity across 5 seeds with `--auto-cast=matmult`, MSE bounds
-- **TestNoAutocast**: Compiles with `--auto-cast=none` and verifies perfect cosine similarity (>=0.999) across the same 5 seeds, confirming that all accuracy loss comes from BF16 matmul conversion
-- **TestDataParallel**: Multi-core execution and speedup validation
-- **TestPerformance**: Throughput and latency threshold assertions
+The test suite includes 46 tests across 7 classes:
+
+**Unit tests** (`test/unit/test_patching.py`) -- CPU-only, no Neuron hardware required:
+- **TestFlexAttentionPatch** (5 tests): Verifies all dummy flex_attention symbols are installed
+- **TestModelLoading** (4 tests): Model loads from HuggingFace, ~382M params, eval mode, correct config
+- **TestPatching** (2 tests): All 32 Attention + 16 CrossAttention modules patched to SDPA
+- **TestSyntheticInput** (4 tests): Input shapes, dtype, determinism, seed independence
+- **TestEncoderWrapper** (3 tests): Output shape, finiteness, 2D tok_idx auto-unsqueeze
+- **TestDecoderWrapper** (3 tests): Output shape, finiteness, timestep sensitivity
+- **TestDiffusionLoop** (5 tests): Output shape, finiteness, determinism, seed/step sensitivity
+
+**Integration tests** (`test/integration/test_model.py`) -- requires Neuron hardware:
+- **TestModelLoads** (5 tests): Encoder/decoder compile, run, full 50-step pipeline
+- **TestAccuracy** (6 tests): Cosine similarity across 5 seeds with `--auto-cast=matmult`, MSE bounds
+- **TestNoAutocast** (5 tests): Compiles with `--auto-cast=none` and verifies perfect cosine similarity (>=0.999), confirming all accuracy loss comes from BF16 matmul conversion
+- **TestDataParallel** (2 tests): Multi-core execution and speedup validation
+- **TestPerformance** (2 tests): Throughput and latency threshold assertions
 
 ## Known Issues
 
