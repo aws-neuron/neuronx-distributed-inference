@@ -97,6 +97,7 @@ To run on trn2.3xlarge, uncomment the `--lnc` compiler arg in the compilation ce
 
 ## Maintainer
 
+Jim Burtoft
 Community contribution
 
 **Last Updated:** 2026-03-04
