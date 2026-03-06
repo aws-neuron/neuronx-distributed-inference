@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Unified NeuronX Distributed Inference implementation for the Trinity model family
 (AfmoeForCausalLM) from Arcee AI.
@@ -31,7 +44,8 @@ Key porting decisions:
 import json
 import os
 import math
-from typing import List, Optional, Tuple, Type, Union
+import logging
+from typing import List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -55,9 +69,6 @@ from neuronx_distributed_inference.modules.attention.gqa import (
     get_shardable_head_counts,
 )
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
-from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
-    KVCacheManager,
-)
 from neuronx_distributed_inference.modules.kvcache.utils import (
     dynamic_update_slice,
     fill_prefix,
@@ -73,6 +84,8 @@ from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers import utils as nxd_utils
 from neuronx_distributed.utils import cpu_mode
 
+logger = logging.getLogger(__name__)
+
 # MoE v2 module (required for MoE layers)
 try:
     from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
@@ -81,7 +94,74 @@ try:
     MOE_V2_AVAILABLE = True
 except ImportError:
     MOE_V2_AVAILABLE = False
-    print("WARNING: moe_v2 not available, MoE layers will not work")
+    logger.warning("moe_v2 not available, MoE layers will not work")
+
+
+def _patch_fused_tkg_for_sigmoid():
+    """Patch MoEFusedTKG kernel to use ISA router fallback for sigmoid routing.
+
+    The SDK 2.28 fused MoE TKG NKI kernel's router_topk_kernel_nki only supports
+    softmax activation. Trinity uses sigmoid routing. The kernel also has an ISA
+    router fallback (router_topk_isa_kernel) that supports both sigmoid and softmax.
+
+    This patch wraps the selective-load kernel call to force
+    use_router_topk_nki_kernel=False, which uses the ISA router fallback.
+
+    NOTE: The fused TKG kernel does NOT support expert_selection_bias.
+    The compiled NKI router kernels and nkilib utilities are incompatible with
+    user-level @nki.jit kernel inlining (TensorView.get_view() requires .ap()
+    which is unavailable in the NKI trace context). For models that need
+    expert_bias (all Trinity models), use the non-fused path instead
+    (moe_fused_nki_kernel_enabled=False).
+
+    Must be called before model.compile().
+    """
+    try:
+        import neuronx_distributed.modules.moe.moe_fused_tkg as fused_tkg_mod
+
+        original_kernel = fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call
+        if original_kernel is None:
+            logger.warning(
+                "Fused TKG selective load kernel not available, skipping patch"
+            )
+            return
+
+        # The NKI kernel call object supports [grid](**kwargs) invocation.
+        # We wrap it to inject use_router_topk_nki_kernel=False.
+        class _PatchedKernelCall:
+            """Wrapper that injects use_router_topk_nki_kernel=False into kernel calls."""
+
+            def __init__(self, original):
+                self._original = original
+
+            def __getitem__(self, grid):
+                original_grid_call = self._original[grid]
+
+                def patched_call(*args, **kwargs):
+                    kwargs["use_router_topk_nki_kernel"] = False
+                    return original_grid_call(*args, **kwargs)
+
+                return patched_call
+
+        fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call = (
+            _PatchedKernelCall(original_kernel)
+        )
+
+        # Also patch the forward-all-experts kernel if it has the same issue
+        original_all = fused_tkg_mod._moe_tkg_forward_all_experts_nki_call
+        if original_all is not None:
+            fused_tkg_mod._moe_tkg_forward_all_experts_nki_call = _PatchedKernelCall(
+                original_all
+            )
+
+        logger.warning(
+            "Patched MoEFusedTKG for sigmoid routing (ISA fallback). "
+            "expert_bias NOT supported in fused TKG - TKG tokens may diverge from non-fused."
+        )
+    except ImportError:
+        logger.info("moe_fused_tkg module not available (SDK < 2.28), skipping patch")
+    except Exception as e:
+        logger.warning("Failed to patch MoEFusedTKG for sigmoid: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -390,9 +470,30 @@ class RouterTopKWithBias(RouterTopK):
         return router_logits, expert_affinities, expert_index
 
 
-def initialize_moe_with_expert_bias(config):
-    """Initialize MoE module with expert_bias support."""
-    moe = initialize_moe_module(config=config)
+def initialize_moe_with_expert_bias(config, init_tkg_module=False, rmsnorm=None):
+    """Initialize MoE module with expert_bias support.
+
+    Args:
+        config: TrinityInferenceConfig
+        init_tkg_module: If True, enable fused MoE TKG NKI kernel path.
+            Requires SDK 2.28+ and moe_intermediate_size/tp % 128 == 0.
+        rmsnorm: RMSNorm module to fuse into MoE (required when init_tkg_module=True).
+            The fused kernel applies this norm internally, so the caller must skip it.
+    """
+    if init_tkg_module:
+        try:
+            moe = initialize_moe_module(
+                config=config, init_tkg_module=True, rmsnorm=rmsnorm
+            )
+        except TypeError:
+            # SDK 2.27 or older: initialize_moe_module doesn't accept these args
+            logger.warning(
+                "Fused MoE TKG not supported by this SDK version. "
+                "Falling back to standard path."
+            )
+            moe = initialize_moe_module(config=config)
+    else:
+        moe = initialize_moe_module(config=config)
 
     old_router = moe.router
     new_router = RouterTopKWithBias(
@@ -513,9 +614,10 @@ class TrinityInferenceConfig(InferenceConfig):
         # attention creates masks of size sliding_window. These must match.
         if neuron_config is not None and hasattr(neuron_config, "seq_len"):
             if neuron_config.seq_len < self.sliding_window:
-                print(
-                    f"NOTE: Clamping sliding_window from {self.sliding_window} to "
-                    f"{neuron_config.seq_len} to match seq_len"
+                logger.info(
+                    "Clamping sliding_window from %d to %d to match seq_len",
+                    self.sliding_window,
+                    neuron_config.seq_len,
                 )
                 self.sliding_window = neuron_config.seq_len
 
@@ -569,6 +671,54 @@ class TrinityInferenceConfig(InferenceConfig):
     def add_derived_config(self):
         """Add derived configuration parameters."""
         self.num_cores_per_group = 1
+
+        # Enable fused MoE TKG kernel if alignment constraint is met.
+        # The fused NKI kernel requires intermediate_size_per_tp % 128 == 0.
+        # This is auto-validated; if the constraint fails, we fall back to
+        # the standard blockwise matmul path silently.
+        self._enable_fused_moe_tkg()
+
+    def _enable_fused_moe_tkg(self):
+        """Check and enable fused MoE TKG NKI kernel (SDK 2.28+).
+
+        The fused kernel combines RMSNorm + Router TopK + Expert MLP into a
+        single NKI kernel launch, reducing HBM round-trips during token gen.
+
+        Requires: moe_intermediate_size / moe_tp_degree % 128 == 0.
+        """
+        MOE_TKG_MK_INTERMEDIATE_PER_TP = 128
+        if not hasattr(self, "neuron_config") or self.neuron_config is None:
+            return
+
+        # Check if user explicitly requested fused kernel
+        fused_requested = getattr(
+            self.neuron_config, "moe_fused_nki_kernel_enabled", None
+        )
+        if fused_requested is None:
+            return  # Not requested, don't enable
+
+        moe_tp = getattr(self.neuron_config, "moe_tp_degree", None)
+        if moe_tp is None:
+            moe_tp = getattr(self.neuron_config, "tp_degree", 1)
+
+        i_per_tp = self.moe_intermediate_size // moe_tp
+        if i_per_tp % MOE_TKG_MK_INTERMEDIATE_PER_TP != 0:
+            logger.warning(
+                "Cannot enable fused MoE TKG kernel: "
+                "moe_intermediate_size/tp (%d/%d=%d) is not divisible by %d. "
+                "Falling back to standard blockwise matmul path.",
+                self.moe_intermediate_size,
+                moe_tp,
+                i_per_tp,
+                MOE_TKG_MK_INTERMEDIATE_PER_TP,
+            )
+            self.neuron_config.moe_fused_nki_kernel_enabled = None
+            self.moe_fused_nki_kernel_enabled = False
+        else:
+            self.moe_fused_nki_kernel_enabled = True
+            logger.info(
+                "Fused MoE TKG NKI kernel enabled (intermediate_per_tp=%d)", i_per_tp
+            )
 
     def get_required_attributes(self) -> List[str]:
         return [
@@ -709,8 +859,8 @@ class NeuronTrinityAttention(NeuronAttentionBase):
     ):
         """Override base class to insert gating before o_proj.
 
-        Copied from NeuronAttentionBase.standard_causal_attention_forward with
-        one change: the o_proj call is replaced with _apply_gated_o_proj.
+        Copied from NeuronAttentionBase.standard_causal_attention_forward (NxDI 0.8.0)
+        with one change: the o_proj call is replaced with _apply_gated_o_proj.
         """
         from neuronx_distributed_inference.modules.attention.attention_base import (
             NeuronAttentionBaseOutput,
@@ -943,8 +1093,8 @@ class NeuronTrinityAttention(NeuronAttentionBase):
     ):
         """Override base class to insert gating before o_proj.
 
-        Copied from NeuronAttentionBase.windowed_attention_forward with
-        one change: the o_proj call is replaced with _apply_gated_o_proj.
+        Copied from NeuronAttentionBase.windowed_attention_forward (NxDI 0.8.0)
+        with one change: the o_proj call is replaced with _apply_gated_o_proj.
         """
         from neuronx_distributed_inference.modules.attention.attention_base import (
             NeuronAttentionBaseOutput,
@@ -1223,8 +1373,29 @@ class NeuronTrinityDecoderLayer(nn.Module):
 
         # MoE for layers >= num_dense_layers, dense MLP otherwise
         self.moe_enabled = layer_idx >= config.num_dense_layers
+        self.moe_fused_tkg = getattr(config, "moe_fused_nki_kernel_enabled", False)
         if self.moe_enabled and MOE_V2_AVAILABLE:
-            self.mlp = initialize_moe_with_expert_bias(config=config)
+            self.mlp = initialize_moe_with_expert_bias(
+                config=config,
+                init_tkg_module=self.moe_fused_tkg,
+                # Pass rmsnorm=None so MoE's _forward_compute_bound does NOT
+                # re-normalize during CTE (we normalize in the decoder forward).
+                # For the TKG fused kernel, we provide a separate RMSNorm
+                # instance below so the kernel can access gamma/eps.
+                rmsnorm=None,
+            )
+            # For fused TKG: the kernel needs gamma/eps for its internal
+            # RMSNorm. Since we passed rmsnorm=None above, we must provide
+            # a separate (non-shared) RMSNorm instance on MoEFusedTKG.
+            # This avoids the shared-module aliasing issue that corrupted
+            # weight loading in the CTE path.
+            if self.moe_fused_tkg and hasattr(self.mlp, "moe_fused_tkg"):
+                fused_tkg = self.mlp.moe_fused_tkg
+                if fused_tkg is not None:
+                    moe_rmsnorm = rmsnorm_cls(
+                        config.hidden_size, eps=config.rms_norm_eps
+                    )
+                    fused_tkg.post_attention_layernorm = moe_rmsnorm
             # Shared expert: handled outside NxDI MoE to ensure reliable weight loading
             if config.num_shared_experts > 0:
                 self.shared_expert = NeuronTrinitySharedExpert(config)
@@ -1274,13 +1445,28 @@ class NeuronTrinityDecoderLayer(nn.Module):
 
         # MLP with dual norms
         residual = hidden_states
-        hidden_states = self.pre_mlp_layernorm(hidden_states)
+        # Normalization strategy for fused MoE TKG:
+        # - CTE (seq_len > 1): Decoder applies pre_mlp_layernorm.
+        #   MoE's _forward_compute_bound skips norm (rmsnorm=None).
+        # - TKG (seq_len == 1): Decoder skips pre_mlp_layernorm.
+        #   Fused kernel applies norm internally using its own RMSNorm.
+        #   MoEFusedTKG fallback also skips norm (post_attn_layernorm
+        #   handles it when kernel is disabled).
+        # When fused TKG is not enabled, decoder always applies norm.
+        is_tkg = self.moe_fused_tkg and hidden_states.shape[1] == 1
+        if not is_tkg:
+            hidden_states = self.pre_mlp_layernorm(hidden_states)
 
         if self.moe_enabled and MOE_V2_AVAILABLE:
             mlp_output = self.mlp(hidden_states, padding_mask)[0]
             # Add shared expert output (applied to every token)
             if self.shared_expert is not None:
-                shared_output = self.shared_expert(hidden_states)
+                # In TKG mode, hidden_states is un-normed (fused kernel
+                # handles norm internally). Shared expert needs normed input.
+                shared_input = (
+                    self.pre_mlp_layernorm(hidden_states) if is_tkg else hidden_states
+                )
+                shared_output = self.shared_expert(shared_input)
                 mlp_output = mlp_output + shared_output
             hidden_states = mlp_output
         else:
@@ -1319,6 +1505,12 @@ class NeuronTrinityModel(NeuronBaseModel):
         # Store layer_types and raw sliding_window for the custom KV cache manager.
         self._layer_types = config.layer_types
         self._config_sliding_window = getattr(config, "sliding_window", None)
+
+        # Patch fused MoE TKG kernel for sigmoid routing (must happen before compile).
+        # Trinity uses sigmoid routing but the fused NKI kernel's router_topk_kernel_nki
+        # only supports softmax. This forces the ISA router fallback which supports both.
+        if getattr(config, "moe_fused_nki_kernel_enabled", False):
+            _patch_fused_tkg_for_sigmoid()
 
     def init_inference_optimization(self, config: TrinityInferenceConfig):
         """Override to use TrinityKVCacheManager for per-layer KV cache sizing.
@@ -1530,31 +1722,26 @@ class NeuronTrinityForCausalLM(NeuronBaseForCausalLM):
                 tp_degree = neuron_config.tp_degree
                 num_heads = config.num_attention_heads
                 num_kv_heads = config.num_key_value_heads
-                head_dim = config.head_dim
                 if num_heads % tp_degree != 0:
-                    # Use interleaved padding matching Q layout
+                    # Use interleaved padding matching Q layout.
+                    # Gate weight is (num_heads, hidden_size) -- one row per head.
+                    # Split into KV groups, pad each group with zero rows,
+                    # then concatenate back to (padded_total_heads, hidden_size).
                     padded_total_heads = math.ceil(num_heads / tp_degree) * tp_degree
                     group_size = num_heads // num_kv_heads  # Q heads per KV group
-                    # Reshape gate to (num_heads, head_dim, hidden_size)
-                    gate_3d = gate_weight.view(num_heads, head_dim, -1)
-                    # Split into KV groups
-                    groups = gate_3d.split(group_size, dim=0)
+                    groups = gate_weight.split(group_size, dim=0)
                     pad_per_group = (padded_total_heads - num_heads) // num_kv_heads
-                    # Interleave with zero padding after each group
                     interleaved = []
                     for group in groups:
                         interleaved.append(group)
                         interleaved.append(
                             torch.zeros(
                                 pad_per_group,
-                                head_dim,
                                 gate_weight.shape[1],
                                 dtype=target_dtype,
                             )
                         )
-                    gate_weight = torch.cat(interleaved, dim=0).view(
-                        padded_total_heads * head_dim, -1
-                    )
+                    gate_weight = torch.cat(interleaved, dim=0)
                 neuron_state_dict[
                     f"{neuron_prefix}.self_attn.attn_gate_proj.weight"
                 ] = gate_weight
@@ -1636,6 +1823,36 @@ class NeuronTrinityForCausalLM(NeuronBaseForCausalLM):
                         neuron_state_dict[
                             f"{neuron_prefix}.shared_expert.{proj_name}.weight"
                         ] = state_dict[hf_key].to(target_dtype)
+
+                # Fused MoE TKG aliased weights.
+                # When init_tkg_module=True, the MoE module stores the
+                # pre_mlp_layernorm as moe.rmsnorm and also inside
+                # moe.moe_fused_tkg.post_attention_layernorm. These are the
+                # same Python object (aliased), but appear as separate keys in
+                # the state dict. We must provide both so the framework loads
+                # them correctly.
+                # Similarly, the router stores a transposed weight (weight_T)
+                # alongside linear_router.weight.
+                if getattr(config, "moe_fused_nki_kernel_enabled", False):
+                    # MoEFusedTKG has a separate (non-shared) RMSNorm that
+                    # needs the same weights as pre_mlp_layernorm. This is
+                    # a distinct module (not aliased) so we copy the weight.
+                    # Note: moe.rmsnorm is None (not a module), so we do NOT
+                    # provide mlp.rmsnorm.weight.
+                    pre_mlp_key = f"{neuron_prefix}.pre_mlp_layernorm.weight"
+                    if pre_mlp_key in neuron_state_dict:
+                        pre_mlp_w = neuron_state_dict[pre_mlp_key]
+                        neuron_state_dict[
+                            f"{neuron_prefix}.mlp.moe_fused_tkg.post_attention_layernorm.weight"
+                        ] = pre_mlp_w.clone()
+
+                    # Router transposed weight (generated by preshard_hook,
+                    # but we provide it here too for completeness)
+                    router_key = f"{neuron_prefix}.mlp.router.linear_router.weight"
+                    if router_key in neuron_state_dict:
+                        neuron_state_dict[f"{neuron_prefix}.mlp.router.weight_T"] = (
+                            neuron_state_dict[router_key].detach().T.clone()
+                        )
 
         # Rank utilities for tensor parallel
         tp_degree = neuron_config.tp_degree

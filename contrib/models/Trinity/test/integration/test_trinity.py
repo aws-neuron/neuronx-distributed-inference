@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Integration tests for Trinity (AfmoeForCausalLM) NeuronX implementation.
 
@@ -18,32 +31,47 @@ Prerequisites:
     - Appropriate instance for model size (see README.md)
 """
 
+import json
+import logging
 import os
+import sys
+import time
+from pathlib import Path
+
 import pytest
 import torch
-import json
-from pathlib import Path
 from transformers import AutoTokenizer
 
 from neuronx_distributed_inference.models.config import MoENeuronConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 
 # Import from src directory
-import sys
-
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from modeling_trinity import NeuronTrinityForCausalLM, TrinityInferenceConfig
 
+logger = logging.getLogger(__name__)
 
 # Configuration via environment variables
-MODEL_PATH = os.environ.get(
-    "TRINITY_MODEL_PATH",
-    "/home/ubuntu/trinity/model/",
-)
-COMPILED_MODEL_PATH = os.environ.get(
-    "TRINITY_COMPILED_PATH",
-    "/home/ubuntu/trinity/compiled/",
-)
+MODEL_PATH = os.environ.get("TRINITY_MODEL_PATH")
+COMPILED_MODEL_PATH = os.environ.get("TRINITY_COMPILED_PATH")
+
+# Performance thresholds (conservative upper bounds -- fail if exceeded)
+# These are generous limits to catch regressions, not tight benchmarks.
+# TTFT: max acceptable latency in ms per forward pass
+MAX_TTFT_MS = float(os.environ.get("TRINITY_MAX_TTFT_MS", "5000"))
+# Throughput: min acceptable tokens/second (naive loop, not CTE+TKG pipeline)
+MIN_THROUGHPUT_TOK_S = float(os.environ.get("TRINITY_MIN_THROUGHPUT_TOK_S", "0.5"))
+
+_MISSING_ENV = []
+if not MODEL_PATH:
+    _MISSING_ENV.append("TRINITY_MODEL_PATH")
+if not COMPILED_MODEL_PATH:
+    _MISSING_ENV.append("TRINITY_COMPILED_PATH")
+
+if _MISSING_ENV:
+    pytestmark = pytest.mark.skip(
+        reason=f"Required environment variables not set: {', '.join(_MISSING_ENV)}"
+    )
 
 
 def load_neuron_config_from_compiled(compiled_path: str):
@@ -149,7 +177,7 @@ def test_model_loads(compiled_model):
     """Test that model loads successfully (smoke test)."""
     assert compiled_model is not None
     assert hasattr(compiled_model, "config")
-    print("Smoke test passed - Model loaded successfully")
+    logger.info("Smoke test passed - Model loaded successfully")
 
 
 def test_model_generates(compiled_model, tokenizer):
@@ -163,8 +191,8 @@ def test_model_generates(compiled_model, tokenizer):
     output_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
 
     assert len(output_text) > len(prompt), "Output should be longer than prompt"
-    print(f"Generation test passed")
-    print(f"  Output: {output_text}")
+    logger.info("Generation test passed")
+    logger.info("  Output: %s", output_text)
 
 
 def test_output_coherence(compiled_model, tokenizer):
@@ -180,8 +208,8 @@ def test_output_coherence(compiled_model, tokenizer):
     assert len(output_text.split()) > 3, "Output should have multiple words"
     assert not _is_repetitive(output_text), "Output should not be repetitive"
 
-    print(f"Coherence test passed")
-    print(f"  Output: {output_text[:100]}...")
+    logger.info("Coherence test passed")
+    logger.info("  Output: %s...", output_text[:100])
 
 
 def test_top_token_valid(compiled_model, tokenizer):
@@ -212,13 +240,13 @@ def test_top_token_valid(compiled_model, tokenizer):
     top_token_id = torch.argmax(next_token_logits, dim=-1).item()
     top_token = tokenizer.decode([top_token_id]).strip()
 
-    print(f"Top token: '{top_token}' (id={top_token_id})")
-    print(f"Top logit: {next_token_logits[0, top_token_id].item():.2f}")
+    logger.info("Top token: '%s' (id=%d)", top_token, top_token_id)
+    logger.info("Top logit: %.2f", next_token_logits[0, top_token_id].item())
 
     # The top token should be a non-empty, printable string
     assert len(top_token) > 0, f"Top token should be non-empty, got '{top_token}'"
     assert top_token_id < tokenizer.vocab_size, "Token ID should be within vocab range"
-    print("Top token validation passed")
+    logger.info("Top token validation passed")
 
 
 def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
@@ -245,9 +273,11 @@ def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
 
 
 def test_performance_ttft(compiled_model, tokenizer):
-    """Test Time To First Token (TTFT) performance."""
-    import time
+    """Test Time To First Token (TTFT) performance.
 
+    Pass criteria: avg TTFT must be below MAX_TTFT_MS (default 5000ms).
+    Override with TRINITY_MAX_TTFT_MS environment variable.
+    """
     prompt = "Hello, how are you?"
     inputs = tokenizer(prompt, return_tensors="pt", padding=True)
     input_ids = inputs.input_ids
@@ -273,13 +303,29 @@ def test_performance_ttft(compiled_model, tokenizer):
         times.append((end - start) * 1000)
 
     avg_ttft = sum(times) / len(times)
-    print(f"TTFT: {avg_ttft:.2f}ms")
+    min_ttft = min(times)
+    max_ttft = max(times)
+    logger.info(
+        "TTFT: avg=%.2fms, min=%.2fms, max=%.2fms (threshold: %.0fms)",
+        avg_ttft,
+        min_ttft,
+        max_ttft,
+        MAX_TTFT_MS,
+    )
+    assert avg_ttft < MAX_TTFT_MS, (
+        f"TTFT regression: {avg_ttft:.1f}ms exceeds threshold {MAX_TTFT_MS:.0f}ms"
+    )
 
 
 def test_performance_throughput(compiled_model, tokenizer):
-    """Test token generation throughput."""
-    import time
+    """Test token generation throughput using naive forward loop.
 
+    Pass criteria: throughput must exceed MIN_THROUGHPUT_TOK_S (default 0.5 tok/s).
+    Override with TRINITY_MIN_THROUGHPUT_TOK_S environment variable.
+
+    NOTE: This uses a naive loop (re-encodes full context each token), so throughput
+    is much lower than proper CTE+TKG pipeline. The threshold is intentionally low.
+    """
     prompt = "Hello"
     inputs = tokenizer(prompt, return_tensors="pt", padding=True)
     input_ids = inputs.input_ids
@@ -295,20 +341,35 @@ def test_performance_throughput(compiled_model, tokenizer):
 
     total_time = end - start
     throughput = num_tokens / total_time
-    print(f"Throughput: {throughput:.2f} tok/s")
+    logger.info(
+        "Throughput: %.2f tok/s (%d tokens in %.1fs, threshold: %.1f tok/s)",
+        throughput,
+        num_tokens,
+        total_time,
+        MIN_THROUGHPUT_TOK_S,
+    )
+    assert throughput > MIN_THROUGHPUT_TOK_S, (
+        f"Throughput regression: {throughput:.2f} tok/s below threshold "
+        f"{MIN_THROUGHPUT_TOK_S:.1f} tok/s"
+    )
 
 
 if __name__ == "__main__":
-    print("=" * 80)
-    print("Trinity (AfmoeForCausalLM) Integration Tests")
-    print("=" * 80)
-    print(f"Model path: {MODEL_PATH}")
-    print(f"Compiled path: {COMPILED_MODEL_PATH}")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
 
-    print(f"\nLoading compiled model from {COMPILED_MODEL_PATH}...")
+    logger.info("=" * 80)
+    logger.info("Trinity (AfmoeForCausalLM) Integration Tests")
+    logger.info("=" * 80)
+    logger.info("Model path: %s", MODEL_PATH)
+    logger.info("Compiled path: %s", COMPILED_MODEL_PATH)
+
+    logger.info("Loading compiled model from %s...", COMPILED_MODEL_PATH)
     model, neuron_config = create_model_for_inference(COMPILED_MODEL_PATH, MODEL_PATH)
     model.load(COMPILED_MODEL_PATH)
-    print("Model loaded")
+    logger.info("Model loaded")
 
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_PATH, padding_side="right", trust_remote_code=True
@@ -316,22 +377,28 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print("\n" + "=" * 80)
-    print("Running Tests")
-    print("=" * 80)
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("Running Tests")
+    logger.info("=" * 80)
 
-    print("\n1. Smoke Test (Model Loading)...")
+    logger.info("")
+    logger.info("1. Smoke Test (Model Loading)...")
     test_model_loads(model)
 
-    print("\n2. Generation Test...")
+    logger.info("")
+    logger.info("2. Generation Test...")
     test_model_generates(model, tokenizer)
 
-    print("\n3. Coherence Test...")
+    logger.info("")
+    logger.info("3. Coherence Test...")
     test_output_coherence(model, tokenizer)
 
-    print("\n4. Top Token Validation...")
+    logger.info("")
+    logger.info("4. Top Token Validation...")
     test_top_token_valid(model, tokenizer)
 
-    print("\n" + "=" * 80)
-    print("All tests passed!")
-    print("=" * 80)
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("All tests passed!")
+    logger.info("=" * 80)

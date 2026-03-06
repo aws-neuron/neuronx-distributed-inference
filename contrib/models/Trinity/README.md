@@ -6,7 +6,7 @@ NeuronX Distributed Inference implementation of the Trinity model family (AfmoeF
 
 | Model | HuggingFace ID | Total Params | Active Params | Instance |
 |-------|----------------|-------------|---------------|----------|
-| **Nano** | `arcee-ai/Trinity-Nano-Preview` | ~6B | ~1B | inf2.8xlarge / trn2.3xlarge |
+| **Nano** | `arcee-ai/Trinity-Nano-Preview` | ~6B | ~1B | inf2.xlarge* / inf2.8xlarge / trn2.3xlarge |
 | **Mini** | `arcee-ai/Trinity-Mini` | ~26B | ~4.5B | trn2.3xlarge (TP=4) |
 | **Large** | `arcee-ai/Trinity-Large-Preview` | ~250B | ~15B | trn2.48xlarge (TP=64) |
 
@@ -45,10 +45,24 @@ NeuronX Distributed Inference implementation of the Trinity model family (AfmoeF
 
 ## Validation Results
 
-**Validated:** 2026-03-02
-**SDK:** NxDI 0.7.15063, neuronx-cc 2.22.12471, torch-neuronx 2.9.0.2.11, transformers 4.56.2
+**Validated:** 2026-03-06
+**SDK:** NxDI 0.8.0, neuronx-cc 2.23.6484, torch-neuronx 2.9.0.2.12, transformers 4.57.6 (SDK 2.28)
+**Benchmarked:** 2026-03-03 (Nano + Mini, trn2.3xlarge + inf2.8xlarge)
+**Neuron vs CPU accuracy verified:** 2026-03-06 (Nano, trn2.3xlarge TP=2)
 
-All results below are from the **unified `modeling_trinity.py`** (this code).
+All results below are from the **unified `modeling_trinity.py`** (this code). Original results from SDK 2.27; fused TKG results from SDK 2.28.
+
+### Neuron vs CPU Accuracy (Trinity-Nano, TP=2, SDK 2.28)
+
+Full-precision CPU reference comparison using HuggingFace `AutoModelForCausalLM` (bf16) vs Neuron compiled model:
+
+| Prompt | Neuron Top-1 | CPU Top-1 | Match | Top-20 Cosine | Full-Vocab Cosine |
+|--------|-------------|-----------|-------|---------------|-------------------|
+| "Hello, how are you?" | I | I | YES | 0.9995 | 0.9398 |
+| "Explain quantum computing in simple terms." | Answer | Answer | YES | 0.9995 | 0.9905 |
+| "Write a Python function that calculates the Fibonacci sequence." | The | The | YES | 0.9999 | 0.9835 |
+
+**Summary:** 3/3 top-1 match, avg top-20 cosine similarity 0.9996, avg full-vocab cosine similarity 0.9712. Lower full-vocab cosine (esp. prompt 1 at 0.94) is expected due to MoE bf16 accumulation in NKI blockwise matmul kernel -- the tail of the logit distribution diverges while the top of the distribution is preserved.
 
 ### Trinity-Nano on trn2.3xlarge (TP=2, LNC=2)
 
@@ -98,7 +112,7 @@ All results below are from the **unified `modeling_trinity.py`** (this code).
 | Load Time | 47.7s |
 | Forward Pass Latency | ~0.73s |
 
-**Note:** inf2.xlarge (16GB system RAM) cannot run Nano -- OOM killed at 15.3GB RSS during weight loading. inf2.8xlarge (123GB system RAM) works with TP=1. NxDI auto-converts GQA to MHA when `TP=1` and `num_kv_heads=2`.
+**Note:** inf2.xlarge (16GB system RAM) cannot run Nano with standard loading -- OOM killed at 15.3GB RSS during weight loading. However, **pre-sharded weights bypass this entirely** (see Pre-Sharded Deployment below). inf2.8xlarge (123GB system RAM) works with standard loading at TP=1. NxDI auto-converts GQA to MHA when `TP=1` and `num_kv_heads=2`.
 
 ### Trinity-Large on trn2.48xlarge (TP=64, LNC=2)
 
@@ -120,6 +134,95 @@ All results below are from the **unified `modeling_trinity.py`** (this code).
 - TP=32 is insufficient -- sharded weights consume ~23.5GB per logical NeuronCore, exceeding the ~24GB HBM per physical NC and leaving no room for scratchpad/KV cache. TP=64 (all 64 logical cores on trn2.48xlarge) is required.
 - Model is ~516GB on disk (31 safetensors in bf16). Root EBS volume (600GB) is insufficient -- NVMe instance store is required for model storage (`/mnt/nvme/`).
 - Set `TMPDIR`, `BASE_COMPILE_WORK_DIR`, and `NEURON_COMPILE_CACHE_URL` to NVMe paths to avoid filling root disk during compilation.
+
+## Performance Benchmarks
+
+**SDK 2.28**, seq_len=2048, BF16, measured with proper CTE+TKG pipeline (KV cache). TTFT averaged over 10 iterations (3 warmup). TKG averaged over 28 tokens (3 warmup discarded from 32 generated). Throughput includes all generated tokens across all sequences in the batch.
+
+### Trinity-Nano (~6B total, ~1B active)
+
+| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile |
+|----------|-----|------|-----------|-------------|-------------------|-----------------|---------|
+| inf2.xlarge* | 1 | 1 | 706 | 9.0 | 112 | 112 | N/A (pre-sharded) |
+| inf2.8xlarge | 1 | 1 | 707 | 9.1 | 110 | 110 | 7.9 min |
+| inf2.8xlarge | 1 | 2 | 901 | 13.1 | 154 | 77 | 8.7 min |
+| inf2.8xlarge | 1 | 4 | 1348 | 20.7 | 193 | 48 | 11.7 min |
+| trn2.3xlarge | 2 | 1 | 516 | 11.1 | 90 | 90 | 5.4 min |
+| trn2.3xlarge | 2 | 2 | 680 | 13.9 | 141 | 71 | 7.1 min |
+| trn2.3xlarge | 2 | 4 | 930 | 16.3 | 242 | 60 | 9.1 min |
+| trn2.3xlarge | 4 | 1 | 476 | 9.1 | 108 | 108 | 4.7 min |
+| trn2.3xlarge | 4 | 2 | 599 | 12.4 | 158 | 79 | 6.5 min |
+| trn2.3xlarge | 4 | 4 | 817 | 14.9 | 262 | 66 | 8.4 min |
+
+**Recommended config**: trn2.3xlarge TP=4 BS=4 for max aggregate throughput (262 tok/s), or inf2.8xlarge TP=1 BS=1 for lowest-cost single-sequence inference (110 tok/s). *inf2.xlarge requires pre-sharded weights (see Pre-Sharded Deployment).
+
+### Trinity-Mini (~26B total, ~4.5B active)
+
+| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile |
+|----------|-----|------|-----------|-------------|-------------------|-----------------|---------|
+| trn2.3xlarge | 4 | 1 | 370 | 11.5 | 86 | 86 | 3.7 min |
+| trn2.3xlarge | 4 | 2 | 598 | 11.5 | 170 | 85 | 6.7 min |
+| trn2.3xlarge | 4 | 4 | 804 | 13.4 | 293 | 73 | 8.8 min |
+| trn2.3xlarge | 4 | 8 | 1221 | 21.5 | 364 | 46 | 16.2 min |
+
+**Recommended config**: trn2.3xlarge TP=4 BS=4 for best throughput/latency balance (293 tok/s, 13.4ms TKG), or BS=1 for lowest TTFT (370 ms).
+
+### Trinity-Large (~250B total, ~15B active)
+
+| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile | Load |
+|----------|-----|------|-----------|-------------|-------------------|-----------------|---------|------|
+| trn2.48xlarge | 64 | 1 | 1161 | 14.7 | 68 | 68 | 9.2 min | 851s |
+| trn2.48xlarge | 64 | 2 | 1657 | 19.1 | 102 | 51 | 11.1 min | 867s |
+| trn2.48xlarge | 64 | 4 | 1980 | 29.0 | 137 | 34 | 14.0 min | 873s |
+
+**Recommended config**: trn2.48xlarge TP=64 BS=1 for lowest latency (1.16s TTFT, 14.7ms TKG), or BS=4 for max aggregate throughput (137 tok/s). NVMe instance store required for model storage (~743GB on disk).
+
+### GPU Comparison (g5.12xlarge, 4x NVIDIA A10G)
+
+Benchmarked via vLLM 0.16.0, bf16. Shows single-request latency and aggregate throughput at various concurrency levels. GPU uses continuous batching with CUDA graphs (PagedAttention v2).
+
+**Trinity-Nano** on 1x A10G (TP=1):
+
+| Concurrency | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) |
+|-------------|-----------|-------------|-------------------|
+| 1 | 20 | 6.9 | 137 |
+| 4 | 30 | -- | 400 |
+| 16 | 56 | -- | 1140 |
+| 64 | 65 | -- | 2782 |
+
+**Trinity-Mini** on 4x A10G (TP=4, max_num_seqs=32):
+
+| Concurrency | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) |
+|-------------|-----------|-------------|-------------------|
+| 1 | 24 | 6.7 | 138 |
+| 4 | 42 | -- | 337 |
+| 16 | 79 | -- | 857 |
+
+**GPU vs Neuron** (single-request, BS=1):
+
+| Model | Metric | GPU (A10G) | Neuron (best) | Notes |
+|-------|--------|-----------|---------------|-------|
+| Nano | TTFT | 20 ms | 476 ms | GPU 24x faster (CUDA graphs vs CTE forward) |
+| Nano | TKG | 6.9 ms | 9.1 ms | GPU 1.3x faster |
+| Mini | TTFT | 24 ms | 370 ms | GPU 15x faster |
+| Mini | TKG | 6.7 ms | 11.5 ms | GPU 1.7x faster |
+
+GPU TTFT advantage comes from vLLM's CUDA graph capture eliminating kernel launch overhead. Neuron TTFT is dominated by the CTE forward pass through compiled HLO graphs. A vLLM-Neuron serving stack would narrow this gap.
+
+### Key Observations
+
+- **Batching scales well**: BS=4 gives 2.0-3.4x aggregate throughput vs BS=1, with TKG latency increase of 30-100%
+- **Mini is fastest TTFT**: 370ms at TP=4 BS=1, vs 476ms (Nano TP=4) and 1161ms (Large TP=64)
+- **inf2.8xlarge is viable for Nano**: Matches trn2 TP=4 TKG latency (9.1ms) at lower cost
+- **TP=4 vs TP=2 for Nano**: 20% higher per-sequence throughput but variable load time
+- **Diminishing returns at BS=8**: Mini BS=8 gives 364 tok/s but per-sequence drops to 46 tok/s; TKG nearly doubles vs BS=4
+- **Compile time grows with batch size**: BS=8 takes 16 min (Mini) vs 3.7 min (BS=1); Nano BS=8 at TP=2 exceeds 30 min
+- **Large TKG is comparable to smaller models**: 14.7ms despite 250B total params -- MoE activates only 15B
+- **Load time dominates Large**: 14.2 min to shard 516GB across 64 cores; compile is only 9.2 min
+- **GPU has massive TTFT advantage**: 20-24ms vs 370-707ms (15-35x) due to CUDA graphs vs compiled HLO forward pass
+- **GPU aggregate throughput scales with concurrency**: 2782 tok/s (Nano, 64 concurrent) vs 262 tok/s (Neuron BS=4) -- continuous batching vs static batching
+- **GPU TKG is 1.3-1.7x faster**: 6.7-6.9ms vs 9.1-11.5ms on Neuron
+- **inf2.xlarge cannot run Nano**: 16GB system RAM is insufficient for 12GB bf16 model weight loading (OOM during sharding), even with pre-compiled artifacts. **Pre-sharded weights solve this** (1.39 GB RSS, 112 tok/s).
 
 ## Usage
 
@@ -170,7 +273,7 @@ neuron_config = MoENeuronConfig(
 )
 ```
 
-**Instance:** inf2.8xlarge (TP=1) or trn2.3xlarge (TP=2). Does NOT fit inf2.xlarge (16GB system RAM causes OOM).
+**Instance:** inf2.xlarge (TP=1, pre-sharded weights required), inf2.8xlarge (TP=1), or trn2.3xlarge (TP=2/4).
 
 ### Trinity-Mini (~26B total, ~4.5B active)
 
@@ -269,6 +372,62 @@ neuron_config = MoENeuronConfig(
 ```
 
 **Instance:** trn2.48xlarge only (TP=64, capacity block required, NVMe instance store for model storage).
+
+## Pre-Sharded Deployment (inf2.xlarge)
+
+The standard NxDI load path downloads the full HuggingFace checkpoint into CPU RAM, converts it to Neuron format, and shards weights by TP rank. For Trinity-Nano (~12GB bf16), this requires 15+ GB system RAM — exceeding inf2.xlarge's 16GB.
+
+**Pre-sharded weights** bypass this entirely. During compilation on a larger instance, setting `save_sharded_checkpoint=True` saves per-rank weight files (`weights/tp{rank}_sharded_checkpoint.safetensors`). During loading, NxDI reads directly from these files without loading the full HF checkpoint.
+
+### Workflow
+
+1. **Compile on a larger instance** (inf2.8xlarge or trn2):
+
+```python
+neuron_config = MoENeuronConfig(
+    tp_degree=1,
+    batch_size=1,
+    seq_len=2048,
+    torch_dtype=torch.bfloat16,
+    save_sharded_checkpoint=True,  # Key flag
+)
+config = TrinityInferenceConfig.from_pretrained(model_path, neuron_config=neuron_config)
+model = NeuronTrinityForCausalLM(model_path, config)
+model.compile(compiled_path)  # Saves model.pt, neuron_config.json, weights/tp0_sharded_checkpoint.safetensors
+```
+
+2. **Upload the compiled artifact** (model.pt + neuron_config.json + weights/) to HuggingFace or S3.
+
+3. **Load on inf2.xlarge** (16GB RAM):
+
+```python
+neuron_config = MoENeuronConfig(
+    tp_degree=1,
+    batch_size=1,
+    seq_len=2048,
+    torch_dtype=torch.bfloat16,
+    save_sharded_checkpoint=True,  # Must match compilation
+)
+config = TrinityInferenceConfig.from_pretrained(model_path, neuron_config=neuron_config)
+model = NeuronTrinityForCausalLM(model_path, config)
+model.load(compiled_artifact_path)  # Reads directly from sharded files — only 1.4 GB RSS
+```
+
+### Pre-Sharded Results (inf2.xlarge)
+
+| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Load | Peak RSS |
+|----------|-----|------|-----------|-------------|-------------------|------|----------|
+| inf2.xlarge | 1 | 1 | 706 | 9.0 | 112 | 18.4s | 1.39 GB |
+
+- **Memory**: 1.9 GB system RAM used (12.6%) vs 15+ GB that causes OOM with standard loading
+- **Performance**: Identical to inf2.8xlarge (706 vs 707ms TTFT, 9.0 vs 9.1ms TKG)
+- **Load time**: 18.4s (comparable to inf2.8xlarge's 11s pre-sharded / 48s standard)
+
+### Available Pre-Compiled Artifacts
+
+| Model | TP | BS | seq_len | SDK | HuggingFace Repo |
+|-------|-----|------|---------|-----|-----------------|
+| Nano | 1 | 1 | 2048 | 2.28 | `jburtoft/Trinity-Nano-Neuron-TP1` |
 
 ## Caveats
 
@@ -390,7 +549,7 @@ Trinity's mixed attention (sliding window + full attention every 4th layer) requ
 
 | Model | Instance | TP | LNC | Max seq_len | Status |
 |-------|----------|-----|-----|------------|--------|
-| Nano | inf2.xlarge | 1 | N/A | -- | FAIL (16GB system RAM OOM) |
+| Nano | inf2.xlarge | 1 | N/A | -- | PASS with pre-sharded weights (standard load OOMs at 16GB system RAM) |
 | Nano | inf2.8xlarge | 1 | N/A | -- | Validated (not seq_len tested) |
 | Nano | trn2.3xlarge | 2 | 2 | 40,960 | Validated |
 | Nano | trn2.3xlarge | 4 | 2 | 49,152 | Validated |
@@ -403,20 +562,22 @@ Trinity's mixed attention (sliding window + full attention every 4th layer) requ
 
 | Model | Min HBM | Min TP | Min Instance |
 |-------|---------|--------|-------------|
-| Nano | ~12GB bf16 | 1 | inf2.8xlarge (123GB system RAM required) |
+| Nano | ~12GB bf16 | 1 | inf2.xlarge (pre-sharded weights) or inf2.8xlarge |
 | Mini | ~48GB bf16 | 4 | trn2.3xlarge |
 | Large | ~500GB bf16 | 64 | trn2.48xlarge (capacity block, NVMe storage) |
 
 ### SDK Configuration
 
-| Component | Version |
-|-----------|---------|
-| NxDI | 0.7.15063 |
-| neuronx-cc | 2.22.12471 |
-| torch-neuronx | 2.9.0.2.11 |
-| torch | 2.9.0 |
-| transformers | 4.56.2 |
-| Venv | `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/` |
+| Component | SDK 2.27 | SDK 2.28 |
+|-----------|----------|----------|
+| NxDI | 0.7.15063 | 0.8.0 |
+| neuronx-cc | 2.22.12471 | 2.23.6484 |
+| torch-neuronx | 2.9.0.2.11 | 2.9.0.2.12.22436 |
+| torch | 2.9.0 | 2.9.0 |
+| transformers | 4.56.2 | 4.57.6 |
+| Venv | `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/` | same |
+
+Both SDK versions are validated. Fused MoE TKG requires SDK 2.28.
 
 ## Testing
 
@@ -451,6 +612,77 @@ This model required solving several non-trivial porting challenges:
 8. **Gate weight padding at high TP:** Interleaved padding matching Q projection layout (prevents wrong-head gating on 54/64 cores).
 9. **Shared expert weight loading:** Standalone module for reliable weight mapping vs NxDI built-in shared expert handling.
 
+## Fused MoE TKG NKI Kernel (SDK 2.28+)
+
+The SDK 2.28 fused MoE TKG kernel (`moe_token_gen_selective_load_kernel`) combines RMSNorm + Router TopK + Expert MLP into a single NKI kernel for token generation, reducing HBM round-trips.
+
+### Configuration
+
+```python
+neuron_config = MoENeuronConfig(
+    tp_degree=2,
+    batch_size=1,
+    seq_len=2048,
+    torch_dtype=torch.bfloat16,
+    moe_fused_nki_kernel_enabled=True,
+    router_topk_nki_kernel_enabled=False,  # Must be False for sigmoid routing
+    expert_mlp_nki_kernel_enabled=True,
+)
+```
+
+### Sigmoid Routing Support
+
+The fused kernel's NKI router asserts `router_act_fn == SOFTMAX`, but Trinity uses sigmoid. The implementation patches the kernel to use the ISA router fallback (`use_router_topk_nki_kernel=False`), which supports both sigmoid and softmax. This is done automatically via `_PatchedKernelCall` wrapper applied during `setup_attr_for_model()`.
+
+### Alignment Constraint
+
+The fused kernel requires `moe_intermediate_size / tp_degree % 128 == 0`:
+
+| Model | moe_intermediate | TP | Per-TP | Eligible? |
+|-------|-----------------|-----|--------|-----------|
+| Nano | 256 | 2 | 128 | YES |
+| Nano | 256 | 4 | 64 | NO |
+| Mini | 1024 | 4 | 256 | YES |
+| Large | 3072 | 64 | 48 | NO |
+
+The config class automatically enables/disables fused TKG based on this alignment check.
+
+### Test Results (SDK 2.28, Trinity-Nano, trn2.3xlarge, TP=2)
+
+**CTE (context encoding) -- exact match with non-fused baseline:**
+
+| Prompt | Non-fused Top-1 | Fused Top-1 | Match |
+|--------|----------------|-------------|-------|
+| Hello, how are you? | I | I | YES |
+| What is the capital of France? | ( | ( | YES |
+| 1 + 1 = | (newline) | (newline) | YES |
+
+**TKG (autoregressive generation, 8 tokens):**
+
+| Prompt | Non-fused TKG | Fused TKG | First Token |
+|--------|---------------|-----------|-------------|
+| Hello, how are you? | I am fine, thank you. And | I am fine, thanks! And you | MATCH (diverges at token 4) |
+| What is the capital of France? | (Answer: Paris)... | (A) Paris (B) London | MATCH (diverges at token 2) |
+| 1 + 1 = | 2, 1 + 2 = | 2, 2 + 1 = | MATCH (diverges at token 2) |
+
+TKG tokens diverge after the first token due to **expert_bias not being used by the fused kernel** (known limitation -- the fused kernel omits per-layer expert bias). Both paths produce coherent, sensible text. CTE outputs are identical because the CTE path always uses the non-fused compute-bound pipeline.
+
+**Latency:**
+
+| Metric | Non-fused | Fused | Notes |
+|--------|-----------|-------|-------|
+| Compile | 357s (5.9 min) | 258s (4.3 min) | Fused compiles faster |
+| CTE latency | ~0.52s | ~0.49s | Similar |
+| TKG latency | ~0.011s | ~0.014s | Fused is slower on Nano |
+
+The fused kernel does not improve TKG latency on Trinity-Nano (intermediate_size=256 is too small for the selective loading to pay off). The kernel is designed for larger models where expert weight loading from HBM is the bottleneck. Mini (intermediate=1024) is expected to benefit.
+
+### Known Limitations
+
+1. **Expert bias omitted** -- The fused NKI kernel does not apply per-layer `expert_bias` during routing. Non-fused routing uses `RouterTopKWithBias` which adds bias. This causes TKG output divergence after the first token.
+2. **Nano TP=4 and Large TP=64 ineligible** -- Alignment constraint `intermediate/TP % 128 != 0` prevents use.
+3. **No latency benefit on Nano** -- Expert weights (256 intermediate) are too small for selective loading overhead to pay off.
+
 ## NKI Kernels
 
 The NxDI framework uses several NKI (Neuron Kernel Interface) kernels during Trinity compilation and inference. These are hardware-accelerated kernels that execute directly on Neuron cores.
@@ -465,6 +697,7 @@ The NxDI framework uses several NKI (Neuron Kernel Interface) kernels during Tri
 | **Custom RMSNorm** | `neuronx_distributed_inference.modules.custom_calls.CustomRMSNorm` | Hardware-accelerated RMSNorm via `AwsNeuronRmsNorm` custom call. Used 4 times per decoder layer (input_norm, post_attn_norm, pre_ff_norm, post_ff_norm). |
 | **Cumsum** | `neuronxcc.nki.kernels.cumsum` | Attention mask computation for causal mask prefix sums. Used in both context encoding and token generation paths. |
 | **Router TopK** | `neuronx_distributed.kernels.router_topk_kernel` | Expert selection in MoE routing -- selects top-k experts from sigmoid routing scores. Used once per MoE layer. |
+| **Fused MoE TKG** | `neuronxcc.nki._pre_prod_kernels.moe_token_gen.moe_token_gen_selective_load_kernel` | Combines RMSNorm + Router TopK + Expert MLP for token generation. Selectively loads expert weights from HBM. SDK 2.28+. Uses ISA router fallback for sigmoid. |
 
 ### NKI Kernel Interaction with Trinity-Specific Features
 
@@ -482,4 +715,4 @@ The NxDI framework uses several NKI (Neuron Kernel Interface) kernels during Tri
 
 Jim Burtoft
 
-**Last Updated:** 2026-03-02
+**Last Updated:** 2026-03-06
