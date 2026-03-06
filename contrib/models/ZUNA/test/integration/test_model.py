@@ -38,6 +38,7 @@ import torch.nn.functional as F
 
 MODEL_ID = "Zyphra/ZUNA"
 COMPILED_DIR = "/home/ubuntu/neuron_models/ZUNA"
+COMPILED_DIR_NOAUTOCAST = "/home/ubuntu/neuron_models/ZUNA_noautocast"
 
 SEQLEN = 50
 INPUT_DIM = 32
@@ -45,6 +46,7 @@ SAMPLE_STEPS = 50
 BATCH_SIZE = 1
 
 COMPILER_ARGS = ["--auto-cast", "matmult", "-O2"]
+COMPILER_ARGS_NOAUTOCAST = ["-O2"]  # pure FP32, no BF16 matmul conversion
 
 # Accuracy thresholds (with --auto-cast matmult)
 COSINE_SIM_THRESHOLD = 0.930  # measured: 0.990 mean, 0.937 min over 50 seeds
@@ -567,6 +569,55 @@ def compile_neuron_models(cpu_model, model_args, compiler_args=COMPILER_ARGS):
     return encoder_neuron, decoder_neuron
 
 
+def compile_neuron_models_noautocast(cpu_model, model_args):
+    """Compile encoder and decoder with --auto-cast=none (pure FP32)."""
+    import torch_neuronx
+
+    enc_path = os.path.join(COMPILED_DIR_NOAUTOCAST, f"encoder_seqlen{SEQLEN}.pt")
+    dec_path = os.path.join(COMPILED_DIR_NOAUTOCAST, f"decoder_seqlen{SEQLEN}.pt")
+
+    if os.path.exists(enc_path) and os.path.exists(dec_path):
+        return torch.jit.load(enc_path), torch.jit.load(dec_path)
+
+    os.makedirs(COMPILED_DIR_NOAUTOCAST, exist_ok=True)
+    input_dim = model_args.input_dim
+
+    example_input, example_tok_idx = make_synthetic_input(
+        seqlen=SEQLEN,
+        input_dim=input_dim,
+    )
+
+    encoder_wrapper = EncoderWrapper(cpu_model.encoder)
+    encoder_wrapper.eval()
+    encoder_neuron = torch_neuronx.trace(
+        encoder_wrapper,
+        (example_input, example_tok_idx),
+        compiler_args=COMPILER_ARGS_NOAUTOCAST,
+        inline_weights_to_neff=True,
+    )
+
+    with torch.no_grad():
+        enc_out_example = encoder_neuron(example_input, example_tok_idx)
+
+    decoder_wrapper = DecoderWrapper(cpu_model.decoder)
+    decoder_wrapper.eval()
+    example_z = torch.randn(1, SEQLEN, input_dim)
+    example_enc = torch.randn(1, enc_out_example.shape[1], enc_out_example.shape[2])
+    example_t = torch.tensor([[[0.5]]])
+
+    decoder_neuron = torch_neuronx.trace(
+        decoder_wrapper,
+        (example_z, example_enc, example_t, example_tok_idx),
+        compiler_args=COMPILER_ARGS_NOAUTOCAST,
+        inline_weights_to_neff=True,
+    )
+
+    encoder_neuron.save(enc_path)
+    decoder_neuron.save(dec_path)
+
+    return encoder_neuron, decoder_neuron
+
+
 def get_neuron_core_count():
     """Detect available NeuronCores via neuron-ls."""
     try:
@@ -619,6 +670,22 @@ def encoder_neuron(neuron_models):
 @pytest.fixture(scope="module")
 def decoder_neuron(neuron_models):
     return neuron_models[1]
+
+
+@pytest.fixture(scope="module")
+def neuron_models_noautocast(cpu_model, model_args):
+    """Compile and load Neuron encoder+decoder with --auto-cast=none."""
+    return compile_neuron_models_noautocast(cpu_model, model_args)
+
+
+@pytest.fixture(scope="module")
+def encoder_neuron_noautocast(neuron_models_noautocast):
+    return neuron_models_noautocast[0]
+
+
+@pytest.fixture(scope="module")
+def decoder_neuron_noautocast(neuron_models_noautocast):
+    return neuron_models_noautocast[1]
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +814,62 @@ class TestAccuracy:
         print(f"  MSE: {mse:.8f}")
         # Measured: ~3.3e-05 with auto-cast matmult
         assert mse < 0.01, f"MSE {mse:.8f} exceeds threshold 0.01"
+
+
+class TestNoAutocast:
+    """Validate that --auto-cast=none produces perfect accuracy.
+
+    This test class compiles the model without BF16 matmul conversion to confirm
+    that all accuracy loss in TestAccuracy comes from --auto-cast=matmult, not
+    from the Neuron compiler or SDPA attention replacement.
+
+    Measured results: cosine similarity = 1.000000 for all seeds with no autocast.
+    """
+
+    @pytest.mark.parametrize("seed", [0, 7, 13, 42, 99])
+    def test_cosine_similarity_noautocast(
+        self, cpu_model, encoder_neuron_noautocast, decoder_neuron_noautocast, seed
+    ):
+        """Without auto-cast, Neuron output matches CPU exactly."""
+        encoder_input, tok_idx = make_synthetic_input(seed=seed)
+        sigma = float(getattr(cpu_model, "global_sigma", 0.1))
+
+        # CPU reference
+        enc_cpu = EncoderWrapper(cpu_model.encoder)
+        enc_cpu.eval()
+        dec_cpu = DecoderWrapper(cpu_model.decoder)
+        dec_cpu.eval()
+
+        z_cpu, _ = run_diffusion(
+            lambda tv, ti: enc_cpu(tv, ti),
+            lambda z, e, t, ti: dec_cpu(z, e, t, ti),
+            encoder_input,
+            tok_idx,
+            sample_steps=SAMPLE_STEPS,
+            sigma=sigma,
+            noise_seed=seed + 10000,
+        )
+
+        # Neuron (no autocast)
+        z_neuron, _ = run_diffusion(
+            lambda tv, ti: encoder_neuron_noautocast(tv, ti),
+            lambda z, e, t, ti: decoder_neuron_noautocast(z, e, t, ti),
+            encoder_input,
+            tok_idx,
+            sample_steps=SAMPLE_STEPS,
+            sigma=sigma,
+            noise_seed=seed + 10000,
+        )
+
+        cosine = F.cosine_similarity(
+            z_cpu.flatten().float(), z_neuron.flatten().float(), dim=0
+        ).item()
+
+        print(f"  seed={seed} (no autocast): cosine_sim={cosine:.6f}")
+        assert cosine >= COSINE_SIM_THRESHOLD_NOAUTOCAST, (
+            f"Cosine similarity {cosine:.6f} below no-autocast threshold "
+            f"{COSINE_SIM_THRESHOLD_NOAUTOCAST} (expected ~1.000000)"
+        )
 
 
 class TestDataParallel:

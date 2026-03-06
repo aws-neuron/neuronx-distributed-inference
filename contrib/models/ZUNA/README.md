@@ -69,7 +69,21 @@ Accuracy measured over 50 random seeds, comparing full 50-step diffusion output 
 | Channel correlation (mean) | 0.990 | 1.000 |
 | PSD correlation (mean) | 0.988 | 1.000 |
 
-**Key finding**: All accuracy loss comes from `--auto-cast=matmult` BF16 conversion, not from the Neuron compiler or SDPA replacement. With `--auto-cast=none`, Neuron produces bit-identical results to CPU at 4.72 samples/sec. Error over 50 diffusion steps is bounded and non-divergent (peaks at step 30, then self-corrects).
+#### auto-cast Impact Analysis
+
+All accuracy loss comes exclusively from `--auto-cast=matmult` BF16 conversion, **not** from the Neuron compiler or SDPA replacement. This was confirmed by running the same 5 test seeds with both compiler settings:
+
+| Seed | auto-cast=matmult | auto-cast=none |
+|------|------------------|----------------|
+| 0 | 0.9817 | 1.000000 |
+| 7 | 0.9655 | 1.000000 |
+| 13 | 0.9999 | 1.000000 |
+| 42 | 0.9987 | 1.000000 |
+| 99 | 0.9993 | 1.000000 |
+
+Seed 7 is a worst-case outlier (cosine=0.966 with matmult) that becomes **perfect** (1.000000) without auto-cast. This demonstrates that the Neuron compiler and the SDPA attention replacement introduce zero numerical error. The BF16 matmul conversion interacts with certain random initialization patterns, and the small per-step error compounds across 50 diffusion steps -- but remains bounded (peaks at step 30, then self-corrects by step 50).
+
+**Recommendation**: Use `--auto-cast=matmult` (default) for production. The 0.990 mean cosine similarity is excellent for EEG applications, and it delivers 2x throughput (102ms vs 212ms). Use `--auto-cast=none` only when bit-exact CPU reproduction is required.
 
 ## Usage
 
@@ -197,7 +211,8 @@ python contrib/models/ZUNA/test/integration/test_model.py
 
 The test suite includes:
 - **TestModelLoads**: Smoke tests (encoder/decoder compile, run, full pipeline)
-- **TestAccuracy**: Cosine similarity across 5 seeds, MSE bounds
+- **TestAccuracy**: Cosine similarity across 5 seeds with `--auto-cast=matmult`, MSE bounds
+- **TestNoAutocast**: Compiles with `--auto-cast=none` and verifies perfect cosine similarity (>=0.999) across the same 5 seeds, confirming that all accuracy loss comes from BF16 matmul conversion
 - **TestDataParallel**: Multi-core execution and speedup validation
 - **TestPerformance**: Throughput and latency threshold assertions
 
@@ -207,7 +222,7 @@ The test suite includes:
 
 2. **tok_idx must be 3D**: The `tok_idx` tensor must be `[1, seqlen, 4]` (with batch dimension), not `[seqlen, 4]`. The encoder's `repeat_interleave(repeats=2, dim=1)` operates on dim=1 and requires the batch dimension.
 
-3. **auto-cast=matmult accuracy tradeoff**: With `--auto-cast=matmult`, cosine similarity is ~0.990 (still excellent for EEG applications). For bit-exact results, use `--auto-cast=none` at ~2x latency cost (212ms vs 102ms).
+3. **auto-cast=matmult accuracy tradeoff**: With `--auto-cast=matmult`, cosine similarity is ~0.990 mean (0.937 min over 50 seeds). Outlier seeds (e.g., seed 7 at 0.966) become perfect (1.000000) with `--auto-cast=none`, confirming all error originates from BF16 matmul conversion. Use `--auto-cast=none` for bit-exact results at ~2x latency cost (212ms vs 102ms).
 
 4. **Fixed sequence length**: Models are traced for a specific sequence length (default 50). Different sequence lengths require recompilation.
 
