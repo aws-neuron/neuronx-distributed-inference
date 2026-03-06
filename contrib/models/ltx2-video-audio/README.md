@@ -25,6 +25,19 @@ Tested on trn2.3xlarge (1 NeuronDevice, 4 logical NeuronCores with LNC=2) with N
 
 The Neuron pipeline produces nearly identical output to the GPU reference.
 
+## Compatibility Matrix
+
+| Instance Type | Neuron SDK | Status |
+|--------------|-----------|--------|
+| trn2.3xlarge | 2.28 | Tested |
+| trn2.3xlarge | 2.27 | Tested |
+| Inf2 | — | Not tested |
+| Trn1 | — | Not tested (requires TP=4 with LNC=2) |
+
+## Example Checkpoints
+
+* [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) — HuggingFace Hub (downloaded automatically by the scripts)
+
 ## Requirements
 
 - **Instance**: trn2.3xlarge (sa-east-1 or ap-southeast-4)
@@ -85,10 +98,32 @@ cd /home/ubuntu/ltx2-neuron/notebooks
 jupyter notebook ltx2_neuron_inference.ipynb
 ```
 
+## Testing
+
+Run integration tests (requires compiled models — see Quick Start steps 1-2 first):
+
+```bash
+cd /home/ubuntu/ltx2-video-audio
+
+# With pytest
+NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
+  pytest test/integration/test_model.py -v --capture=tee-sys
+
+# Or standalone
+NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
+  python test/integration/test_model.py
+```
+
+The test suite includes:
+- **Smoke test**: Pipeline loads without errors
+- **Generation test**: Produces expected number of frames at correct resolution
+- **Accuracy test**: SSIM comparison between Neuron output and GPU reference frames (threshold: SSIM > 0.7)
+- **Performance test**: Warm generation completes within 120s
+
 ## File Structure
 
 ```
-ltx2-neuron/
+ltx2-video-audio/
 ├── README.md
 ├── src/                              # Core NxDI package
 │   ├── __init__.py
@@ -99,6 +134,9 @@ ltx2-neuron/
 │   ├── compile_gemma3.py             # Gemma3 encoder compilation script
 │   ├── shard_gemma3_weights.py       # Pre-shard Gemma3 weights to disk
 │   └── generate_ltx2.py             # CLI entry point with argument parsing
+├── test/
+│   └── integration/
+│       └── test_model.py             # Accuracy + performance integration tests
 ├── notebooks/
 │   └── ltx2_neuron_inference.ipynb   # Step-by-step compile + generate notebook
 ├── examples/
@@ -109,7 +147,7 @@ ltx2-neuron/
     │   ├── frame_0000.png
     │   ├── frame_0012.png
     │   └── frame_0024.png
-    └── gpu/                          # Output from GPU (g5.12xlarge)
+    └── gpu/                          # GPU reference (g5.12xlarge, same seed)
         ├── frame_0000.png
         ├── frame_0012.png
         └── frame_0024.png
