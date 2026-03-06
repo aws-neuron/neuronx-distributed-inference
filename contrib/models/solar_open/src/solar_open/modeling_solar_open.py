@@ -59,7 +59,18 @@ from neuronx_distributed.parallel_layers.layers import (
 )
 from neuronx_distributed.utils import cpu_mode
 from torch_neuronx.xla_impl.ops import nki_jit
-from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
+
+# transformers >= 5.0 renamed Sample*Output → Generate*Output; support both
+try:
+    from transformers.generation import (
+        GenerateDecoderOnlyOutput as SampleDecoderOnlyOutput,
+        GenerateEncoderDecoderOutput as SampleEncoderDecoderOutput,
+    )
+except ImportError:
+    from transformers.generation import (
+        SampleDecoderOnlyOutput,
+        SampleEncoderDecoderOutput,
+    )
 
 # MoE infrastructure
 from neuronx_distributed.modules.moe.model import MoE
@@ -576,27 +587,10 @@ class NeuronSolarOpenForCausalLM(NeuronBaseForCausalLM):
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
-        """
-        Solar Open has been merged into transformers main but is not yet available in
-        the current stable release. Load the safetensors checkpoint directly and return
-        a simple namespace with the state dict.
-        Note: application_base.py tries load_state_dict() first (safetensors),
-        so this method is a fallback and may not be called during normal flow.
-        """
-        from safetensors.torch import load_file as safetensors_load
-        import os
+        """Load Solar Open using transformers SolarOpenForCausalLM (available since 5.0.0)."""
+        from transformers import SolarOpenForCausalLM
 
-        safetensor_path = os.path.join(model_path, "model.safetensors")
-        if os.path.exists(safetensor_path):
-            state_dict = safetensors_load(safetensor_path)
-
-            # Return a simple object that behaves like a HF model for state_dict extraction
-            class _FakeModel:
-                def state_dict(self):
-                    return state_dict
-
-            return _FakeModel()
-        raise FileNotFoundError(f"No model.safetensors found at {model_path}")
+        return SolarOpenForCausalLM.from_pretrained(model_path, **kwargs)
 
     @classmethod
     def get_config_cls(cls):
@@ -647,7 +641,7 @@ class NeuronSolarOpenForCausalLM(NeuronBaseForCausalLM):
 
 
 # ---------------------------------------------------------------------------
-# Config loader (solar_open not yet in transformers stable → load JSON directly)
+# Config loader (transformers >= 5.0.0 includes solar_open)
 # ---------------------------------------------------------------------------
 
 
@@ -655,41 +649,55 @@ def load_solar_open_config(model_path: str):
     """
     Return a load_config hook for SolarOpenInferenceConfig.
 
-    Solar Open has been merged into transformers main but is not available in
-    the current stable release, so we cannot use AutoConfig.from_pretrained.
-    Instead we load config.json directly and populate InferenceConfig attributes manually.
+    Uses transformers.SolarOpenConfig.from_pretrained (available since transformers 5.0.0).
+    Converts rope_parameters → rope_theta/rope_scaling for NxDI compatibility and
+    sets fields that NxDI's InferenceConfig requires but SolarOpenConfig does not expose.
     """
-    import json as _json
     from neuronx_distributed_inference.models.config import to_torch_dtype
 
     def load_config(self: "SolarOpenInferenceConfig"):
-        import os as _os
+        from transformers import SolarOpenConfig
 
-        config_path = _os.path.join(model_path, "config.json")
-        with open(config_path) as f:
-            config_dict = _json.load(f)
+        hf_config = SolarOpenConfig.from_pretrained(model_path)
+        config_dict = hf_config.to_dict()
+
+        # rope_parameters → rope_theta / rope_scaling (NxDI uses these fields)
+        rope_params = config_dict.pop("rope_parameters", None)
+        if isinstance(rope_params, dict):
+            config_dict.setdefault(
+                "rope_theta", rope_params.get("rope_theta", 1_000_000.0)
+            )
+            rope_type = rope_params.get("rope_type", "default")
+            if rope_type != "default":
+                config_dict["rope_scaling"] = {"type": rope_type}
+            else:
+                config_dict.setdefault("rope_scaling", None)
+        else:
+            config_dict.setdefault("rope_theta", 1_000_000.0)
+            config_dict.setdefault("rope_scaling", None)
+
+        # Remove transformers-internal keys that InferenceConfig doesn't need
+        for key in (
+            "model_type",
+            "transformers_version",
+            "architectures",
+            "_attn_implementation",
+            "id2label",
+            "label2id",
+            "problem_type",
+            "return_dict",
+        ):
+            config_dict.pop(key, None)
 
         # Handle dtype
         hf_dtype = config_dict.pop("torch_dtype", config_dict.pop("dtype", None))
-        if hf_dtype is not None:
-            if (
-                self.neuron_config is not None
-                and not self.neuron_config.overrides_torch_dtype
-            ):
+        if hf_dtype is not None and self.neuron_config is not None:
+            if not self.neuron_config.overrides_torch_dtype:
                 self.neuron_config.torch_dtype = (
                     to_torch_dtype(hf_dtype) if isinstance(hf_dtype, str) else hf_dtype
                 )
 
         self.__dict__.update(config_dict)
-
-        # Set defaults for fields absent from upstage/Solar-Open-100B config.json
-        # (must be set BEFORE validate_config which runs in super().__init__)
-        if not hasattr(self, "hidden_act"):
-            self.hidden_act = "silu"  # Solar Open uses SiLU gating
-        if not hasattr(self, "n_group"):
-            self.n_group = 1  # no group constraint
-        if not hasattr(self, "topk_group"):
-            self.topk_group = 1  # no group constraint
 
         # Set _name_or_path so checkpoint_loader_fn can find the safetensors
         self._name_or_path = model_path
@@ -730,7 +738,7 @@ class SolarOpenInferenceConfig(InferenceConfig):
         # HuggingFaceGenerationAdapter copies this into generation_config.transformers_version.
         # Without it, transformers' _prepare_generation_config raises TypeError on version.parse(None).
         if not hasattr(self, "transformers_version"):
-            self.transformers_version = "4.56.2"
+            self.transformers_version = "5.0.0"
 
         # Fields that may be absent from upstage/Solar-Open-100B config.json → apply defaults
         # hidden_act: Solar Open uses SiLU gating (standard for SwiGLU-style MoE)

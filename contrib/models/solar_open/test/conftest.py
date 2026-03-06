@@ -1,41 +1,72 @@
 """Shared pytest fixtures for Solar Open MoE tests.
 
 Provides session-scoped fixtures for integration tests:
-- model_dir: tiny random checkpoint in a temp directory
+- model_dir: tiny random checkpoint created via SolarOpenForCausalLM.save_pretrained()
 - traced_dir: temp directory for compiled Neuron model
 - compiled_model: NeuronSolarOpenForCausalLM compiled once per test session
 - neuron_config: MoENeuronConfig for the integration tests
 """
 
 import sys
+import types
 from pathlib import Path
 
 import pytest
 import torch
 
+# ---------------------------------------------------------------------------
+# Compatibility shims for transformers 5.0.0
+#
+# transformers 5.0 made two breaking changes that affect NxDI library code:
+#
+# 1. neuronx_distributed.pipeline.trace imports transformers.utils.fx.HFTracer
+#    which was removed in transformers 5.0.  Register a stub module BEFORE
+#    neuronx_distributed is first imported so the import succeeds.
+#
+# 2. neuronx_distributed_inference.utils.hf_adapter imports
+#    transformers.generation.SampleDecoderOnlyOutput which was renamed to
+#    GenerateDecoderOnlyOutput in transformers 5.0.  Patch the live
+#    transformers.generation module to re-export the old name as an alias.
+#
+# These shims are applied at conftest collection time (before any test module
+# import) and do not affect runtime behaviour — the aliases/stubs are never
+# called during Solar Open inference.
+# ---------------------------------------------------------------------------
+
+# Shim 1: transformers.utils.fx.HFTracer stub
+if "transformers.utils.fx" not in sys.modules:
+    _fx_stub = types.ModuleType("transformers.utils.fx")
+
+    class _HFTracerStub:
+        """Stub replacing transformers.utils.fx.HFTracer (removed in transformers 5.0)."""
+
+    _fx_stub.HFTracer = _HFTracerStub  # type: ignore[attr-defined]
+    sys.modules["transformers.utils.fx"] = _fx_stub
+
+# Shim 2: transformers.generation.SampleDecoderOnlyOutput backward-compat alias
+import transformers.generation as _tg
+
+if not hasattr(_tg, "SampleDecoderOnlyOutput"):
+    # Renamed to GenerateDecoderOnlyOutput in transformers 5.0
+    _tg.SampleDecoderOnlyOutput = _tg.GenerateDecoderOnlyOutput  # type: ignore[attr-defined]
+if not hasattr(_tg, "SampleEncoderDecoderOutput"):
+    _tg.SampleEncoderDecoderOutput = _tg.GenerateEncoderDecoderOutput  # type: ignore[attr-defined]
+
 # Ensure contrib src is on path for all tests
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
-CONFIG_JSON = Path(__file__).parent / "integration" / "config_solar_open_2layers.json"
-
-
 @pytest.fixture(scope="session")
-def solar_open_config_dict():
-    """Load Solar Open test config (2 layers, reduced dims)."""
-    import json
+def model_dir(tmp_path_factory):
+    """Create a temporary tiny random Solar Open model directory.
 
-    with open(CONFIG_JSON) as f:
-        return json.load(f)
-
-
-@pytest.fixture(scope="session")
-def model_dir(tmp_path_factory, solar_open_config_dict):
-    """Create a temporary tiny random Solar Open model directory."""
+    Uses SolarOpenForCausalLM(config).save_pretrained() which writes
+    config.json, model.safetensors, and generation_config.json automatically.
+    """
     from test.integration.utils import create_tiny_solar_open_model
 
     tmpdir = tmp_path_factory.mktemp("solar_open_model")
-    create_tiny_solar_open_model(str(tmpdir), str(CONFIG_JSON))
+    create_tiny_solar_open_model(str(tmpdir))
     return str(tmpdir)
 
 
@@ -82,7 +113,9 @@ def compiled_model(model_dir, traced_dir, neuron_config):
     model = NeuronSolarOpenForCausalLM(model_dir, config)
     model.compile(traced_dir)
 
-    # Copy weights and generation_config so load() and HuggingFaceGenerationAdapter can find them
+    # Copy model weights to traced_dir so load() can find the safetensors checkpoint.
+    # generation_config.json is already written by save_pretrained() in model_dir;
+    # copy it so HuggingFaceGenerationAdapter can load it from traced_dir.
     import shutil
     import os
 
