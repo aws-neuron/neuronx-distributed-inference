@@ -25,7 +25,7 @@ import time
 
 import torch
 
-sys.path.insert(0, "/home/ubuntu/gemma3_encoder")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 TP_DEGREE = 4
 OUTPUT_DIR = "/home/ubuntu/gemma3_encoder_sharded"

@@ -16,20 +16,19 @@ Both the text encoder and DiT transformer backbone are compiled for Neuron. They
 
 ## Performance
 
-Tested on trn2.3xlarge (1 NeuronDevice, 4 logical NeuronCores with LNC=2):
+Tested on trn2.3xlarge (1 NeuronDevice, 4 logical NeuronCores with LNC=2) with Neuron SDK 2.28:
 
-| Metric | Neuron (trn2, spot) | GPU (g5.12xlarge) |
-|--------|--------------------|--------------------|
-| Generation (CFG, 8 steps) | ~66s | ~48s |
-| Hardware cost/hr | ~$0.90 | ~$5.67 |
-| Cost per generation | ~$0.016 | ~$0.076 |
+| Metric | Neuron (trn2) | GPU (g5.12xlarge) |
+|--------|--------------|-------------------|
+| Generation time (warm, CFG, 8 steps) | ~22s | ~48s |
+| First generation (includes warmup) | ~64s | ~48s |
 
-The Neuron pipeline produces nearly identical output to the GPU at **~5x lower cost per generation**.
+The Neuron pipeline produces nearly identical output to the GPU reference.
 
 ## Requirements
 
 - **Instance**: trn2.3xlarge (sa-east-1 or ap-southeast-4)
-- **AMI**: Deep Learning AMI Neuron (Ubuntu 24.04) 20260227
+- **AMI**: Deep Learning AMI Neuron (Ubuntu 24.04) 20260227 (SDK 2.28)
 - **Python env**: `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/`
 - **Diffusers**: 0.37.0.dev0 (install from git main)
 - **Disk**: ~100GB for model weights + compilation cache

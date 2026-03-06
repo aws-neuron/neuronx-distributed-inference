@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Full 48-layer Gemma3 text encoder: compile, load, forward test.
-Run from: /home/ubuntu/gemma3_encoder/
 """
 
 import gc
@@ -14,7 +13,7 @@ import torch
 os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0"
 
-sys.path.insert(0, ".")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 TP_DEGREE = 4
 SEQ_LEN = 1024
