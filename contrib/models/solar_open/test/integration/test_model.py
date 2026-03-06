@@ -94,7 +94,18 @@ class TestSolarOpenPerformance:
         attention_mask = torch.ones_like(input_ids)
 
         adapter = HuggingFaceGenerationAdapter(compiled_model)
-        gen_config = GenerationConfig(do_sample=False, top_k=1, max_new_tokens=4)
+        # HuggingFaceGenerationAdapter copies model's transformers_version into
+        # generation_config.  Solar Open is not in transformers, so the config has
+        # no version → fix it here so _prepare_generation_config doesn't raise.
+        if (
+            hasattr(adapter, "generation_config")
+            and adapter.generation_config is not None
+            and adapter.generation_config.transformers_version is None
+        ):
+            adapter.generation_config.transformers_version = "4.56.2"
+        gen_config = GenerationConfig(
+            do_sample=False, top_k=1, max_new_tokens=4, transformers_version="4.56.2"
+        )
 
         outputs = adapter.generate(
             input_ids,

@@ -614,6 +614,21 @@ class NeuronSolarOpenForCausalLM(NeuronBaseForCausalLM):
         self.compile_tag = TOKEN_GENERATION_MODEL_TAG
         super().enable_token_generation()
 
+    def _construct_output(self, logits_or_next_tokens):
+        """Override to ensure logits is always a tensor, not a list.
+
+        NxDI's base _construct_output only unwraps list->tensor when async_mode=True.
+        Solar Open uses sync mode, so logits can arrive as a list of per-bucket tensors
+        from the Neuron runtime.  Unwrap here so that HuggingFaceGenerationAdapter can
+        slice ``outputs.logits[:, -1, :]`` without a TypeError.
+        """
+        if (
+            isinstance(logits_or_next_tokens, (list, tuple))
+            and len(logits_or_next_tokens) > 0
+        ):
+            logits_or_next_tokens = logits_or_next_tokens[0]
+        return super()._construct_output(logits_or_next_tokens)
+
     def get_compiler_args(self):
         optimization_level = "-O1"
         compiler_args = (
@@ -709,6 +724,10 @@ class SolarOpenInferenceConfig(InferenceConfig):
             self.output_hidden_states = False
         if not hasattr(self, "is_encoder_decoder"):
             self.is_encoder_decoder = False
+        # HuggingFaceGenerationAdapter copies this into generation_config.transformers_version.
+        # Without it, transformers' _prepare_generation_config raises TypeError on version.parse(None).
+        if not hasattr(self, "transformers_version"):
+            self.transformers_version = "4.56.2"
 
         # Fields that may be absent from upstage/Solar-Open-100B config.json → apply defaults
         # hidden_act: Solar Open uses SiLU gating (standard for SwiGLU-style MoE)

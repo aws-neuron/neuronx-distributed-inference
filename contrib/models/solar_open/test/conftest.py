@@ -82,14 +82,15 @@ def compiled_model(model_dir, traced_dir, neuron_config):
     model = NeuronSolarOpenForCausalLM(model_dir, config)
     model.compile(traced_dir)
 
-    # Copy weights so load() can find safetensors
+    # Copy weights and generation_config so load() and HuggingFaceGenerationAdapter can find them
     import shutil
     import os
 
-    src = os.path.join(model_dir, "model.safetensors")
-    dst = os.path.join(traced_dir, "model.safetensors")
-    if os.path.exists(src) and not os.path.exists(dst):
-        shutil.copy2(src, dst)
+    for fname in ("model.safetensors", "generation_config.json"):
+        src = os.path.join(model_dir, fname)
+        dst = os.path.join(traced_dir, fname)
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copy2(src, dst)
 
     # Load compiled model
     model = NeuronSolarOpenForCausalLM(traced_dir)

@@ -166,6 +166,16 @@ def create_tiny_solar_open_model(model_dir: str, config_json_path: str) -> None:
     with open(os.path.join(model_dir, "config.json"), "w") as f:
         json.dump(config_data, f, indent=2)
 
+    # Write generation_config.json — required by HuggingFaceGenerationAdapter
+    # (transformers_version must not be None)
+    generation_config = {
+        "transformers_version": "4.56.2",
+        "eos_token_id": config_data.get("eos_token_id", 2),
+        "pad_token_id": config_data.get("pad_token_id", 2),
+    }
+    with open(os.path.join(model_dir, "generation_config.json"), "w") as f:
+        json.dump(generation_config, f, indent=2)
+
 
 # ---------------------------------------------------------------------------
 # Pure PyTorch CPU reference model (copied from test_solar_open_accuracy.py)
@@ -551,7 +561,15 @@ def check_logit_accuracy(
 
     with torch.no_grad():
         # NeuronSolarOpenForCausalLM forward: context encoding on full input
-        neuron_logits = neuron_model(input_ids).logits.float()  # [1, seq, vocab]
+        # position_ids must be passed explicitly (cannot be None in model_base forward)
+        position_ids = torch.arange(input_ids.shape[1], dtype=torch.long).unsqueeze(0)
+        output = neuron_model(input_ids, position_ids=position_ids)
+        # NxDI model may return logits as a list/tuple of tensors (one per bucket)
+        # or as a single tensor — handle both cases.
+        raw_logits = output.logits if hasattr(output, "logits") else output[0]
+        if isinstance(raw_logits, (list, tuple)):
+            raw_logits = raw_logits[0]
+        neuron_logits = raw_logits.float()  # [1, seq, vocab]
 
     # Compare last-token logits (most stable)
     ref_last = ref_logits[:, -1, :]  # [1, vocab]
