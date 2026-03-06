@@ -3,8 +3,9 @@
 These tests require Neuron hardware (NeuronCores). The `compiled_model` fixture
 in conftest.py skips automatically when Neuron hardware is unavailable.
 
-Solar Open is NOT in transformers — logit accuracy uses the custom
-SolarOpenReferenceModel (pure PyTorch CPU) for comparison.
+Solar Open has been merged into transformers main but is not yet in the current
+stable release. Logit accuracy uses the custom SolarOpenReferenceModel
+(pure PyTorch CPU) for comparison.
 """
 
 import sys
@@ -95,8 +96,9 @@ class TestSolarOpenPerformance:
 
         adapter = HuggingFaceGenerationAdapter(compiled_model)
         # HuggingFaceGenerationAdapter copies model's transformers_version into
-        # generation_config.  Solar Open is not in transformers, so the config has
-        # no version → fix it here so _prepare_generation_config doesn't raise.
+        # generation_config.  Solar Open is not yet in the stable transformers release,
+        # so the config may have no version → fix it here so _prepare_generation_config
+        # doesn't raise.
         if (
             hasattr(adapter, "generation_config")
             and adapter.generation_config is not None

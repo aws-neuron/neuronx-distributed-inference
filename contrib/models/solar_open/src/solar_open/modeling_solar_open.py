@@ -26,7 +26,8 @@ Architecture notes vs GLM-4.5 MoE (which is the primary template):
   - rope_scaling: None → plain RotaryEmbedding; {"type":"yarn"} → YaRN RoPE
   - Router: same sigmoid + group routing + e_score_correction_bias + routed_scaling_factor
     as GLM-4.5 (NeuronGlm4MoeRouter is reused directly)
-  - solar_open is NOT in transformers; load_hf_model loads safetensors directly
+  - solar_open is not in transformers stable releases (≤4.56.2) but has been merged
+    into transformers main; load_hf_model loads safetensors directly for now
 """
 
 import gc
@@ -576,8 +577,9 @@ class NeuronSolarOpenForCausalLM(NeuronBaseForCausalLM):
     @staticmethod
     def load_hf_model(model_path, **kwargs):
         """
-        Solar Open is not in transformers. Load the safetensors checkpoint directly
-        and return a simple namespace with the state dict.
+        Solar Open has been merged into transformers main but is not yet available in
+        the current stable release. Load the safetensors checkpoint directly and return
+        a simple namespace with the state dict.
         Note: application_base.py tries load_state_dict() first (safetensors),
         so this method is a fallback and may not be called during normal flow.
         """
@@ -645,7 +647,7 @@ class NeuronSolarOpenForCausalLM(NeuronBaseForCausalLM):
 
 
 # ---------------------------------------------------------------------------
-# Config loader (solar_open not in transformers → load JSON directly)
+# Config loader (solar_open not yet in transformers stable → load JSON directly)
 # ---------------------------------------------------------------------------
 
 
@@ -653,9 +655,9 @@ def load_solar_open_config(model_path: str):
     """
     Return a load_config hook for SolarOpenInferenceConfig.
 
-    solar_open is not registered in transformers, so we cannot use
-    AutoConfig.from_pretrained. Instead we load config.json directly and
-    populate InferenceConfig attributes manually.
+    Solar Open has been merged into transformers main but is not available in
+    the current stable release, so we cannot use AutoConfig.from_pretrained.
+    Instead we load config.json directly and populate InferenceConfig attributes manually.
     """
     import json as _json
     from neuronx_distributed_inference.models.config import to_torch_dtype
@@ -715,8 +717,9 @@ class SolarOpenInferenceConfig(InferenceConfig):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Set transformers PretrainedConfig defaults if not already present
-        # (solar_open is not in transformers, so these aren't set by AutoConfig)
+        # Set transformers PretrainedConfig defaults if not already present.
+        # Solar Open has been merged into transformers main but is not yet available
+        # in the current stable release, so AutoConfig does not set these fields.
         # Note: use_return_dict is a property on PretrainedConfig, skip it here
         if not hasattr(self, "output_attentions"):
             self.output_attentions = False

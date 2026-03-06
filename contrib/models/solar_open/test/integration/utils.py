@@ -1,6 +1,7 @@
 """Integration test utilities for Solar Open MoE.
 
-Solar Open is NOT in transformers — this module provides:
+Solar Open has been merged into transformers main but is not yet in the current
+stable release, so this module provides standalone test utilities:
 - create_tiny_solar_open_model(): writes a minimal safetensors checkpoint
 - get_neuron_config(): returns MoENeuronConfig for integration tests
 - SolarOpenReferenceModel: pure PyTorch CPU reference for logit accuracy checks
