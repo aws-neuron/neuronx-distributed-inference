@@ -1,0 +1,18 @@
+# vLLM integration for GLM-4.5 MoE on AWS Neuron
+#
+# vllm-neuronx is the AWS Neuron port of vLLM.
+# It is not yet available on PyPI; install from the upstream development branch
+# or the AWS Neuron SDK release channel.
+#
+# Tested version: 0.9.0.dev0+neuron222 (commit-pinned dev build)
+# Install command (from the NxDI documentation):
+#
+#   pip install vllm-neuronx==<version>
+#
+# Or for development / edge builds:
+#   git clone https://github.com/aws/vllm-neuronx
+#   pip install -e .
+#
+# Other requirements are pulled in transitively by vllm-neuronx:
+#   torch-neuronx, neuronx-distributed, transformers>=4.56.0
+vllm-neuronx>=0.9.0.dev0
