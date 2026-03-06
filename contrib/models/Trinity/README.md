@@ -47,10 +47,10 @@ NeuronX Distributed Inference implementation of the Trinity model family (AfmoeF
 
 **Validated:** 2026-03-06
 **SDK:** NxDI 0.8.0, neuronx-cc 2.23.6484, torch-neuronx 2.9.0.2.12, transformers 4.57.6 (SDK 2.28)
-**Benchmarked:** 2026-03-03 (Nano + Mini, trn2.3xlarge + inf2.8xlarge)
+**Benchmarked:** 2026-03-06 (Nano + Mini, trn2.3xlarge + inf2.8xlarge, with bucketing)
 **Neuron vs CPU accuracy verified:** 2026-03-06 (Nano, trn2.3xlarge TP=2)
 
-All results below are from the **unified `modeling_trinity.py`** (this code). Original results from SDK 2.27; fused TKG results from SDK 2.28.
+All results below are from the **unified `modeling_trinity.py`** (this code), SDK 2.28 with bucketing enabled. Fused TKG results from SDK 2.28.
 
 ### Neuron vs CPU Accuracy (Trinity-Nano, TP=2, SDK 2.28)
 
@@ -137,35 +137,50 @@ Full-precision CPU reference comparison using HuggingFace `AutoModelForCausalLM`
 
 ## Performance Benchmarks
 
-**SDK 2.28**, seq_len=2048, BF16, measured with proper CTE+TKG pipeline (KV cache). TTFT averaged over 10 iterations (3 warmup). TKG averaged over 28 tokens (3 warmup discarded from 32 generated). Throughput includes all generated tokens across all sequences in the batch.
+**SDK 2.28**, seq_len=2048, BF16, bucketing enabled, measured with proper CTE+TKG pipeline (KV cache). TTFT averaged over 10 iterations (3 warmup). TKG averaged over 28 tokens (3 warmup discarded from 32 generated). Throughput = `batch_size * (1000 / avg_tkg_ms)` (steady-state TKG-based).
 
 ### Trinity-Nano (~6B total, ~1B active)
 
 | Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile |
 |----------|-----|------|-----------|-------------|-------------------|-----------------|---------|
 | inf2.xlarge* | 1 | 1 | 706 | 9.0 | 112 | 112 | N/A (pre-sharded) |
-| inf2.8xlarge | 1 | 1 | 707 | 9.1 | 110 | 110 | 7.9 min |
-| inf2.8xlarge | 1 | 2 | 901 | 13.1 | 154 | 77 | 8.7 min |
-| inf2.8xlarge | 1 | 4 | 1348 | 20.7 | 193 | 48 | 11.7 min |
-| trn2.3xlarge | 2 | 1 | 516 | 11.1 | 90 | 90 | 5.4 min |
-| trn2.3xlarge | 2 | 2 | 680 | 13.9 | 141 | 71 | 7.1 min |
-| trn2.3xlarge | 2 | 4 | 930 | 16.3 | 242 | 60 | 9.1 min |
-| trn2.3xlarge | 4 | 1 | 476 | 9.1 | 108 | 108 | 4.7 min |
-| trn2.3xlarge | 4 | 2 | 599 | 12.4 | 158 | 79 | 6.5 min |
-| trn2.3xlarge | 4 | 4 | 817 | 14.9 | 262 | 66 | 8.4 min |
+| inf2.8xlarge | 1 | 1 | 706 | 9.2 | 109 | 109 | 7.9 min |
+| inf2.8xlarge | 1 | 2 | 901 | 13.3 | 150 | 75 | 8.8 min |
+| inf2.8xlarge | 1 | 4 | 1347 | 20.8 | 192 | 48 | 11.7 min |
+| inf2.8xlarge | 2 | 1 | 516 | 7.6 | 131 | 131 | 4.8 min |
+| inf2.8xlarge | 2 | 2 | 674 | 9.4 | 212 | 106 | 6.6 min |
+| inf2.8xlarge | 2 | 4 | 993 | 13.6 | 294 | 74 | 8.5 min |
+| trn2.3xlarge | 2 | 1 | 516 | 10.8 | 93 | 93 | 4.9 min |
+| trn2.3xlarge | 2 | 2 | 680 | 13.9 | 144 | 72 | 7.4 min |
+| trn2.3xlarge | 2 | 4 | 930 | 16.3 | 245 | 61 | 9.4 min |
+| trn2.3xlarge | 4 | 1 | 476 | 9.2 | 109 | 109 | 5.0 min |
+| trn2.3xlarge | 4 | 2 | 600 | 12.4 | 161 | 81 | 6.5 min |
+| trn2.3xlarge | 4 | 4 | 817 | 14.9 | 269 | 67 | 8.5 min |
 
-**Recommended config**: trn2.3xlarge TP=4 BS=4 for max aggregate throughput (262 tok/s), or inf2.8xlarge TP=1 BS=1 for lowest-cost single-sequence inference (110 tok/s). *inf2.xlarge requires pre-sharded weights (see Pre-Sharded Deployment).
+**Whole-instance throughput** (TP x DP = all available cores):
+
+| Instance | Config | BS | Throughput (tok/s) | Notes |
+|----------|--------|----|--------------------|-------|
+| inf2.8xlarge | TP=2 DP=1 | 4 | **294** | Best (use all 2 cores, single replica) |
+| inf2.8xlarge | TP=1 DP=2 | 1 | 218* | Calculated: 2 x 109 tok/s |
+| trn2.3xlarge | TP=4 DP=1 | 4 | **269** | Best (use all 4 cores, single replica) |
+| trn2.3xlarge | TP=2 DP=2 | 1 | 186* | Calculated: 2 x 93 tok/s |
+
+*DP throughput calculated mathematically (replicas are independent on separate NeuronCores).
+
+**Recommended config**: inf2.8xlarge TP=2 BS=4 for max throughput (294 tok/s) with lowest TTFT on inf2 (516ms), or trn2.3xlarge TP=4 BS=4 for max throughput on trn2 (269 tok/s). *inf2.xlarge requires pre-sharded weights (see Pre-Sharded Deployment).
 
 ### Trinity-Mini (~26B total, ~4.5B active)
 
 | Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile |
 |----------|-----|------|-----------|-------------|-------------------|-----------------|---------|
-| trn2.3xlarge | 4 | 1 | 370 | 11.5 | 86 | 86 | 3.7 min |
-| trn2.3xlarge | 4 | 2 | 598 | 11.5 | 170 | 85 | 6.7 min |
-| trn2.3xlarge | 4 | 4 | 804 | 13.4 | 293 | 73 | 8.8 min |
-| trn2.3xlarge | 4 | 8 | 1221 | 21.5 | 364 | 46 | 16.2 min |
+| trn2.3xlarge | 4 | 1 | 371 | 11.8 | 85 | 85 | 3.9 min |
+| trn2.3xlarge | 4 | 2 | 598 | 11.5 | 174 | 87 | 6.8 min |
+| trn2.3xlarge | 4 | 4 | 805 | 13.6 | 295 | 74 | 9.1 min |
 
-**Recommended config**: trn2.3xlarge TP=4 BS=4 for best throughput/latency balance (293 tok/s, 13.4ms TKG), or BS=1 for lowest TTFT (370 ms).
+Mini requires TP=4 (all cores on trn2.3xlarge), so DP is not applicable.
+
+**Recommended config**: trn2.3xlarge TP=4 BS=4 for best throughput/latency balance (295 tok/s, 13.6ms TKG), or BS=1 for lowest TTFT (371 ms).
 
 ### Trinity-Large (~250B total, ~15B active)
 
@@ -203,25 +218,26 @@ Benchmarked via vLLM 0.16.0, bf16. Shows single-request latency and aggregate th
 | Model | Metric | GPU (A10G) | Neuron (best) | Notes |
 |-------|--------|-----------|---------------|-------|
 | Nano | TTFT | 20 ms | 476 ms | GPU 24x faster (CUDA graphs vs CTE forward) |
-| Nano | TKG | 6.9 ms | 9.1 ms | GPU 1.3x faster |
-| Mini | TTFT | 24 ms | 370 ms | GPU 15x faster |
+| Nano | TKG | 6.9 ms | 7.6 ms | GPU 1.1x faster (inf2 TP=2) |
+| Mini | TTFT | 24 ms | 371 ms | GPU 15x faster |
 | Mini | TKG | 6.7 ms | 11.5 ms | GPU 1.7x faster |
 
 GPU TTFT advantage comes from vLLM's CUDA graph capture eliminating kernel launch overhead. Neuron TTFT is dominated by the CTE forward pass through compiled HLO graphs. A vLLM-Neuron serving stack would narrow this gap.
 
 ### Key Observations
 
-- **Batching scales well**: BS=4 gives 2.0-3.4x aggregate throughput vs BS=1, with TKG latency increase of 30-100%
-- **Mini is fastest TTFT**: 370ms at TP=4 BS=1, vs 476ms (Nano TP=4) and 1161ms (Large TP=64)
-- **inf2.8xlarge is viable for Nano**: Matches trn2 TP=4 TKG latency (9.1ms) at lower cost
-- **TP=4 vs TP=2 for Nano**: 20% higher per-sequence throughput but variable load time
-- **Diminishing returns at BS=8**: Mini BS=8 gives 364 tok/s but per-sequence drops to 46 tok/s; TKG nearly doubles vs BS=4
-- **Compile time grows with batch size**: BS=8 takes 16 min (Mini) vs 3.7 min (BS=1); Nano BS=8 at TP=2 exceeds 30 min
+- **Batching scales well**: BS=4 gives 2.0-3.5x aggregate throughput vs BS=1, with TKG latency increase of 30-100%
+- **Mini is fastest TTFT**: 371ms at TP=4 BS=1, vs 476ms (Nano TP=4) and 1161ms (Large TP=64)
+- **inf2.8xlarge TP=2 is best for Nano**: 294 tok/s (BS=4) with 516ms TTFT -- better throughput than trn2 TP=4 (269 tok/s)
+- **TP=2 on inf2 outperforms TP=1**: 21-53% higher throughput across batch sizes (TKG drops from 9.2ms to 7.6ms at BS=1)
+- **DP gives higher throughput than TP for small models**: trn2 TP=2 DP=2 at BS=1 yields 186 tok/s vs TP=4 DP=1 BS=1 at 109 tok/s, but at higher per-token latency
+- **TP=4 vs TP=2 on trn2**: TP=4 has 15-17% lower TKG latency (better per-sequence), but TP=2 enables DP=2 for higher aggregate throughput
+- **Compile time grows with batch size**: BS=4 takes 8.5-9.4 min vs 3.9-5.0 min (BS=1)
 - **Large TKG is comparable to smaller models**: 14.7ms despite 250B total params -- MoE activates only 15B
 - **Load time dominates Large**: 14.2 min to shard 516GB across 64 cores; compile is only 9.2 min
-- **GPU has massive TTFT advantage**: 20-24ms vs 370-707ms (15-35x) due to CUDA graphs vs compiled HLO forward pass
-- **GPU aggregate throughput scales with concurrency**: 2782 tok/s (Nano, 64 concurrent) vs 262 tok/s (Neuron BS=4) -- continuous batching vs static batching
-- **GPU TKG is 1.3-1.7x faster**: 6.7-6.9ms vs 9.1-11.5ms on Neuron
+- **GPU has massive TTFT advantage**: 20-24ms vs 371-706ms (15-35x) due to CUDA graphs vs compiled HLO forward pass
+- **GPU aggregate throughput scales with concurrency**: 2782 tok/s (Nano, 64 concurrent) vs 294 tok/s (Neuron inf2 TP=2 BS=4) -- continuous batching vs static batching
+- **GPU TKG is 1.1-1.7x faster**: 6.7-6.9ms vs 7.6-11.8ms on Neuron
 - **inf2.xlarge cannot run Nano**: 16GB system RAM is insufficient for 12GB bf16 model weight loading (OOM during sharding), even with pre-compiled artifacts. **Pre-sharded weights solve this** (1.39 GB RSS, 112 tok/s).
 
 ## Usage
@@ -551,6 +567,7 @@ Trinity's mixed attention (sliding window + full attention every 4th layer) requ
 |-------|----------|-----|-----|------------|--------|
 | Nano | inf2.xlarge | 1 | N/A | -- | PASS with pre-sharded weights (standard load OOMs at 16GB system RAM) |
 | Nano | inf2.8xlarge | 1 | N/A | -- | Validated (not seq_len tested) |
+| Nano | inf2.8xlarge | 2 | N/A | -- | Validated (best throughput on inf2) |
 | Nano | trn2.3xlarge | 2 | 2 | 40,960 | Validated |
 | Nano | trn2.3xlarge | 4 | 2 | 49,152 | Validated |
 | Mini | inf2.8xlarge | -- | -- | -- | Does NOT fit |
@@ -715,4 +732,4 @@ The NxDI framework uses several NKI (Neuron Kernel Interface) kernels during Tri
 
 Jim Burtoft
 
-**Last Updated:** 2026-03-06
+**Last Updated:** 2026-03-06 (re-benchmarked Nano + Mini with bucketing, added inf2 TP=2 and whole-instance throughput)
