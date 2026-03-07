@@ -3,7 +3,7 @@
 LTX-2.3 E2E Generation on Neuron
 ==================================
 Full end-to-end video+audio generation pipeline:
-  1. Text encoding (Gemma 3 12B on CPU, or random embeddings for testing)
+  1. Text encoding (Gemma 3 12B on Neuron TP=4, CPU fallback, or random embeddings)
   2. Denoising loop (48-block DiT on Neuron TP=4, 8 Euler steps)
   3. Optional latent upscaling (spatial x2 + temporal x2 on CPU)
   4. Video decode (VideoDecoder on CPU)
@@ -17,7 +17,14 @@ Usage:
   # With random embeddings (no Gemma required):
   python3 generate_ltx23.py --no-text-encoder
 
-  # With real text encoder:
+  # With Neuron-compiled Gemma3 (fastest, recommended):
+  python3 generate_ltx23.py --neuron-gemma \
+    --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
+    --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
+    --gemma-path /home/ubuntu/models/gemma-3-12b \
+    --prompt "A dog plays in a meadow"
+
+  # With CPU Gemma3 (slow, no compilation needed):
   python3 generate_ltx23.py --gemma-path /path/to/gemma-3-12b --prompt "A dog plays in a meadow"
 
   # With upscaling (384x512 @ 25 frames -> 768x1024 @ 49 frames):
@@ -49,6 +56,11 @@ COMPILE_DIR = "/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_v2"
 OUTPUT_DIR = "/home/ubuntu/ltx23_output"
 TP_DEGREE = 4
 TEXT_SEQ = 256
+
+# Gemma3 Neuron defaults
+GEMMA3_COMPILED_DIR = "/home/ubuntu/gemma3_encoder_compiled"
+GEMMA3_SHARDED_DIR = "/home/ubuntu/gemma3_encoder_sharded"
+GEMMA3_SEQ_LEN = 1024
 
 # Default upscaler paths
 SPATIAL_UPSCALER_PATH = (
@@ -296,6 +308,105 @@ def load_neuron_backbone(compile_dir, model_path, tp_degree=4):
     return TensorParallelNeuronModel(models)
 
 
+def load_neuron_gemma3(compiled_dir, sharded_dir, tp_degree=4):
+    """Load Neuron-compiled Gemma3 encoder with pre-sharded weights.
+
+    Both models (DiT backbone and Gemma3 encoder) share the same 4 NeuronCores
+    and execute sequentially.
+    """
+    import torch_neuronx
+    from neuronx_distributed.trace.trace import (
+        TensorParallelNeuronModel,
+        replace_weights,
+    )
+
+    tp_0_path = os.path.join(compiled_dir, "tp_0.pt")
+    if not os.path.exists(tp_0_path):
+        raise FileNotFoundError(
+            f"Compiled Gemma3 not found at {tp_0_path}. Run compile_gemma3.py first."
+        )
+
+    models = []
+    t0 = time.time()
+    for rank in range(tp_degree):
+        logger.info("  Loading Gemma3 Neuron rank %d...", rank)
+        rank_path = os.path.join(sharded_dir, "rank_%d.pt" % rank)
+        if not os.path.exists(rank_path):
+            raise FileNotFoundError(
+                f"Sharded weights not found at {rank_path}. "
+                "Run shard_gemma3_weights.py first."
+            )
+        ckpt = torch.load(rank_path, weights_only=True)
+        tp_path = os.path.join(compiled_dir, "tp_%d.pt" % rank)
+        with torch_neuronx.contexts.disable_nrt_load():
+            traced_model = torch.jit.load(tp_path)
+        replace_weights(traced_model, ckpt)
+        models.append(traced_model)
+        del ckpt
+        gc.collect()
+
+    logger.info("  Gemma3 encoder loaded in %.1fs", time.time() - t0)
+    return TensorParallelNeuronModel(models)
+
+
+def encode_text_neuron(
+    neuron_gemma3, tokenizer_path, prompt, text_seq, embeddings_processor
+):
+    """Encode text using Neuron-compiled Gemma3 encoder.
+
+    The Neuron encoder returns stacked hidden states (B, seq_len, 3840, 49).
+    We convert to a tuple of per-layer tensors for process_hidden_states().
+    """
+    from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
+
+    tokenizer = LTXVGemmaTokenizer(
+        tokenizer_path=tokenizer_path,
+        max_length=text_seq,
+    )
+
+    token_pairs = tokenizer.tokenize_with_weights(prompt)["gemma"]
+    input_ids = torch.tensor([[t[0] for t in token_pairs]], dtype=torch.int64)
+    attention_mask = torch.tensor([[w[1] for w in token_pairs]], dtype=torch.int64)
+    actual_len = input_ids.shape[1]
+
+    compiled_seq_len = GEMMA3_SEQ_LEN
+    if actual_len < compiled_seq_len:
+        pad_len = compiled_seq_len - actual_len
+        input_ids = torch.cat(
+            [torch.zeros(1, pad_len, dtype=torch.int64), input_ids], dim=1
+        )
+        attention_mask = torch.cat(
+            [torch.zeros(1, pad_len, dtype=torch.int64), attention_mask], dim=1
+        )
+    elif actual_len > compiled_seq_len:
+        input_ids = input_ids[:, :compiled_seq_len]
+        attention_mask = attention_mask[:, :compiled_seq_len]
+
+    logger.info(
+        "  Tokenized: %d tokens -> padded to %d", actual_len, input_ids.shape[1]
+    )
+
+    t0 = time.time()
+    with torch.no_grad():
+        stacked = neuron_gemma3(input_ids, attention_mask)
+    logger.info("  Neuron Gemma3 forward: %.1fs", time.time() - t0)
+
+    # Trim back to actual token length if we padded
+    if actual_len < compiled_seq_len:
+        pad_len = compiled_seq_len - actual_len
+        stacked = stacked[:, pad_len:, :, :]
+        attention_mask = attention_mask[:, pad_len:]
+
+    # Convert stacked tensor to tuple of per-layer tensors
+    hidden_states = tuple(stacked[:, :, :, i] for i in range(stacked.shape[-1]))
+
+    result = embeddings_processor.process_hidden_states(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+    )
+    return result.video_encoding, result.audio_encoding, result.attention_mask
+
+
 def load_upscalers(spatial_path, temporal_path, dtype=torch.bfloat16):
     """Load spatial and temporal latent upscalers from separate safetensors files.
 
@@ -444,6 +555,42 @@ def generate(args):
         audio_context = torch.randn(1, args.text_seq, 2048, dtype=dtype)
         context_mask = torch.ones(1, args.text_seq, dtype=torch.int64)
         context_mask[:, 50:] = 0  # mask out most tokens
+    elif args.neuron_gemma:
+        logger.info("\n=== Running text encoder on Neuron ===")
+        logger.info("Loading Neuron-compiled Gemma3 encoder...")
+        t0 = time.time()
+        neuron_gemma3 = load_neuron_gemma3(
+            args.gemma_compiled_dir, args.gemma_sharded_dir, args.tp_degree
+        )
+        logger.info("Gemma3 encoder ready in %.1fs", time.time() - t0)
+
+        # Warmup pass
+        logger.info("  Warmup forward pass...")
+        t0 = time.time()
+        warmup_ids = torch.zeros(1, GEMMA3_SEQ_LEN, dtype=torch.int64)
+        warmup_mask = torch.ones(1, GEMMA3_SEQ_LEN, dtype=torch.int64)
+        with torch.no_grad():
+            _ = neuron_gemma3(warmup_ids, warmup_mask)
+        logger.info("  Warmup done in %.1fs", time.time() - t0)
+
+        t0 = time.time()
+        video_context, audio_context, context_mask = encode_text_neuron(
+            neuron_gemma3,
+            args.gemma_path,
+            args.prompt,
+            args.text_seq,
+            cpu["embeddings_processor"],
+        )
+        logger.info("Text encoded on Neuron in %.1fs", time.time() - t0)
+        logger.info(
+            "  video_context: %s, audio_context: %s",
+            video_context.shape,
+            audio_context.shape,
+        )
+
+        # Free Gemma3 Neuron model
+        del neuron_gemma3
+        gc.collect()
     else:
         logger.info("\n=== Running text encoder ===")
         # Load Gemma 3 12B
@@ -766,6 +913,21 @@ def main():
         help="Use random embeddings instead of Gemma 3",
     )
     parser.add_argument("--gemma-path", default=None, help="Path to Gemma 3 12B model")
+    parser.add_argument(
+        "--neuron-gemma",
+        action="store_true",
+        help="Use Neuron-compiled Gemma3 encoder (requires compile_gemma3.py + shard_gemma3_weights.py)",
+    )
+    parser.add_argument(
+        "--gemma-compiled-dir",
+        default=GEMMA3_COMPILED_DIR,
+        help="Directory with compiled Gemma3 encoder (from compile_gemma3.py)",
+    )
+    parser.add_argument(
+        "--gemma-sharded-dir",
+        default=GEMMA3_SHARDED_DIR,
+        help="Directory with pre-sharded Gemma3 weights (from shard_gemma3_weights.py)",
+    )
     parser.add_argument("--height", type=int, default=384, help="Video height")
     parser.add_argument("--width", type=int, default=512, help="Video width")
     parser.add_argument(
@@ -800,7 +962,10 @@ def main():
     args = parser.parse_args()
 
     if not args.no_text_encoder and args.gemma_path is None:
-        parser.error("Either --no-text-encoder or --gemma-path must be specified")
+        parser.error(
+            "Either --no-text-encoder or --gemma-path must be specified. "
+            "Use --neuron-gemma for Neuron-compiled Gemma3 (fastest)."
+        )
 
     generate(args)
 

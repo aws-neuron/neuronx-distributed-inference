@@ -5,6 +5,10 @@ from .modeling_ltx23 import (
     ModelWrapperLTX23Backbone,
     DistributedRMSNorm,
 )
+from .modeling_gemma3_encoder import (
+    Gemma3TextEncoderModel,
+    convert_hf_gemma3_to_encoder_state_dict,
+)
 from .pipeline import NeuronTransformerWrapper
 
 __all__ = [
@@ -14,4 +18,6 @@ __all__ = [
     "ModelWrapperLTX23Backbone",
     "NeuronTransformerWrapper",
     "DistributedRMSNorm",
+    "Gemma3TextEncoderModel",
+    "convert_hf_gemma3_to_encoder_state_dict",
 ]
