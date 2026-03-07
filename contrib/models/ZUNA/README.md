@@ -238,7 +238,7 @@ The test suite includes 46 tests across 7 classes:
 4. **Fixed sequence length**: Models are traced for a specific sequence length (default 50). Different sequence lengths require recompilation.
 
 ## Maintainer
-
+Jim Burtoft
 Community contribution
 
 **Last Updated:** 2026-03-05
