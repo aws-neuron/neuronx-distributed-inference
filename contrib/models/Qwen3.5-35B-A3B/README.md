@@ -60,7 +60,8 @@ Key implementation details:
 | 2,048 (context) + 128 (new tokens) | 10,088 ms | 18.2 ms/tok | 54.9 tok/s | ~2,530 s (~42 min) | 661 s |
 
 Notes:
-- TTFT at seq_len=2048 is high because NKI flash attention does not support head_dim=256 (see Known Issues). The non-NKI attention path is used via `attn_kernel_enabled=False`.
+- TTFT at seq_len=2048 is high because the model uses the PyTorch softmax attention path for head_dim=256 layers (the NxDI NKI kernel requires head_dim<=128). The `perform_prefill()` override handles this automatically.
+- A custom NKI kernel (`nki_flash_attn_d256.py`) was benchmarked but is ~2.4x slower due to layout conversion overhead (TTFT: 23,772ms vs 10,088ms baseline).
 - TKG throughput is consistent across sequence lengths (~18 ms/tok).
 - Compilation time scales with sequence length due to DeltaNet recurrence unrolling during HLO generation (O(seq_len)).
 - Each (batch_size, seq_len) combination requires a separate compilation.
@@ -127,8 +128,9 @@ neuron_config = MoENeuronConfig(
 ### Long context (seq_len>=1024)
 
 ```python
-# For seq_len >= 1024, the NKI flash attention kernel does not support
-# head_dim=256. You MUST disable it to avoid compilation failure.
+# For seq_len >= 1024, the model automatically falls back to the PyTorch
+# softmax attention path for head_dim=256 layers (NKI kernel asserts
+# head_dim <= 128). No special configuration is needed.
 neuron_config = MoENeuronConfig(
     tp_degree=4,
     max_batch_size=1,
@@ -141,7 +143,6 @@ neuron_config = MoENeuronConfig(
     moe_tp_degree=4,
     moe_ep_degree=1,
     blockwise_matmul_config={"block_size": 32768},  # Must be > seq_len * top_k
-    attn_kernel_enabled=False,       # REQUIRED: NKI flash attention asserts head_dim <= 128
 )
 ```
 
@@ -197,7 +198,7 @@ print(f"Next token: {tokenizer.decode(next_token)}")  # " Paris"
 ### Known Issues
 
 - **MoE blockwise bug (SDK 2.28)**: The `forward_blockwise` code path in NxDI's `expert_mlps_v2.py` produces incorrect output on trn2. Workaround: set `blockwise_matmul_config={"block_size": N}` where N > total_tokens * top_k to force the `forward_all_experts` path. Use `block_size=2048` for seq_len=128, `block_size=32768` for seq_len=2048.
-- **NKI flash attention head_dim>128 (SDK 2.28)**: The NKI flash attention kernel (`CausalAttentionMMSoftmaxMMWithoutSwap`) asserts `head_dim <= 128`. Qwen3.5 uses head_dim=256. At seq_len>=1024, NxDI auto-selects `FlashAttentionStrategy.SHARDED_KERNEL`, which invokes this kernel and fails. Workaround: set `attn_kernel_enabled=False` in NeuronConfig. This uses the non-NKI PyTorch attention path, which works correctly but results in higher TTFT (~10s at seq_len=2048 vs ~1s at seq_len=128).
+- **NKI flash attention head_dim>128 (SDK 2.28)**: The NKI flash attention kernel (`CausalAttentionMMSoftmaxMMWithoutSwap`) asserts `head_dim <= 128`. Qwen3.5 uses head_dim=256. The model's `perform_prefill()` override automatically falls back to the PyTorch softmax attention path, so no manual `attn_kernel_enabled=False` is required. A custom NKI kernel (`nki_flash_attn_d256.py`) is included that supports head_dim=256 by tiling the QK contraction in 2x128 chunks. However, benchmarks show it is ~2.4x slower than the PyTorch path due to layout conversion overhead (BHSD->BHDS permute). To experiment with it, set `QWEN35_USE_FLASH_ATTN_D256=1`.
 - **NEURON_PLATFORM_TARGET_OVERRIDE**: Must set `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` when running with NKI v2 `@nki.jit` kernels on trn2.
 - **Memory**: The full model in BF16 is ~67GB. trn2.3xlarge (124GB system RAM) can load it but requires careful memory management during compilation.
 - **Compilation time**: DeltaNet recurrence is unrolled during HLO generation, making compile time O(seq_len). seq_len=2048 takes ~42 minutes vs ~12 minutes for seq_len=128. Each (batch_size, seq_len) combination requires a separate compilation.
@@ -235,6 +236,7 @@ python3 test/integration/test_model.py
 |------|-------------|
 | `src/modeling_qwen35_moe.py` | Main NxDI model: DeltaNet, attention, MoE, config, state dict converter |
 | `src/nki_deltanet.py` | NKI v2 kernels for DeltaNet gated delta rule recurrence |
+| `src/nki_flash_attn_d256.py` | Custom NKI flash attention kernel for head_dim=256 (opt-in, experimental) |
 | `src/__init__.py` | Re-exports public classes |
 | `test/integration/test_model.py` | Integration tests (accuracy + performance) |
 

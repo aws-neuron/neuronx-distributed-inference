@@ -11,6 +11,7 @@ from .modeling_qwen35_moe import (
     Qwen35DecoderModelInstance,
     Qwen35ModelWrapper,
 )
+from .nki_flash_attn_d256 import flash_attn_d256
 
 __all__ = [
     "Qwen35MoeInferenceConfig",
@@ -22,4 +23,5 @@ __all__ = [
     "SigmoidGatedSharedExperts",
     "Qwen35DecoderModelInstance",
     "Qwen35ModelWrapper",
+    "flash_attn_d256",
 ]

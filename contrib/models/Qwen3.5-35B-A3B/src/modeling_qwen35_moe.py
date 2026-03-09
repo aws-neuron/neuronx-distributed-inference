@@ -19,6 +19,7 @@ Architecture details:
 import gc
 import math
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -53,6 +54,24 @@ except ImportError:
     from nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
     from nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
 
+# Custom NKI flash attention kernel for head_dim=256
+# (standard NxDI kernel asserts head_dim <= 128)
+# Opt-in only: set QWEN35_USE_FLASH_ATTN_D256=1 to enable
+try:
+    from .nki_flash_attn_d256 import flash_attn_d256 as _flash_attn_d256_raw
+except ImportError:
+    try:
+        from nki_flash_attn_d256 import flash_attn_d256 as _flash_attn_d256_raw
+    except ImportError:
+        _flash_attn_d256_raw = None
+
+if _flash_attn_d256_raw is not None:
+    _flash_attn_d256_kernel = nki_jit()(_flash_attn_d256_raw)
+else:
+    _flash_attn_d256_kernel = None
+
+_USE_FLASH_ATTN_D256 = os.environ.get("QWEN35_USE_FLASH_ATTN_D256", "0") == "1"
+
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
     MoENeuronConfig,
@@ -66,6 +85,7 @@ from neuronx_distributed_inference.models.model_wrapper import (
     ModelWrapper,
 )
 from neuronx_distributed_inference.modules.attention.attention_base import (
+    FlashAttentionStrategy,
     NeuronAttentionBase,
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
@@ -783,6 +803,73 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         K = torch.cat([k_rope, k_pass], dim=-1)
 
         return Q, K, cos_cache, sin_cache
+
+    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
+        """Override to handle head_dim=256 safely.
+
+        The standard NxDI NKI flash attention kernel asserts head_dim <= 128.
+        This override either:
+        1. Uses a custom NKI kernel (flash_attn_d256) if explicitly opted in
+           via QWEN35_USE_FLASH_ATTN_D256=1 env var, OR
+        2. Forces the PyTorch softmax path by temporarily disabling attn_kernel
+
+        The custom kernel is functional but ~2.4x slower than the PyTorch softmax
+        path due to layout conversion overhead (BHSD -> BHDS permute+contiguous).
+        It is included for reference and future optimization.
+        """
+        use_custom_kernel = (
+            _USE_FLASH_ATTN_D256
+            and _flash_attn_d256_kernel is not None
+            and self.head_dim == 256
+            and q_len % 512 == 0
+            and q_len >= 512
+        )
+        if use_custom_kernel:
+            # Kernel expects:
+            #   Q: (bs, n_heads, 256, seq_q) -- BHDS
+            #   K: (bs, nk_heads, 256, seq_k) -- BHDS
+            #   V: (bs, nv_heads, seq_v, 256) -- BHSD
+            #   O: (bs, n_heads, seq_q, 256) -- BHSD (pre-allocated output)
+            # Input Q, K, V are all BHSD: (B, H, S, D)
+            Q_kernel = (
+                Q.permute(0, 1, 3, 2).contiguous().to(self.torch_dtype)
+            )  # BHSD -> BHDS
+            K_kernel = (
+                K.permute(0, 1, 3, 2).contiguous().to(self.torch_dtype)
+            )  # BHSD -> BHDS
+            V_kernel = V.to(self.torch_dtype)  # already BHSD
+
+            # Pre-allocate output tensor (nki_jit kernels don't support return)
+            attn_output = torch.zeros(
+                bsz,
+                self.num_heads,
+                q_len,
+                self.head_dim,
+                dtype=self.torch_dtype,
+                device=Q.device,
+            )
+
+            # Launch with grid [bs, nk_heads] -- GQA handled inside kernel
+            _flash_attn_d256_kernel[bsz, self.num_key_value_heads](
+                Q_kernel,
+                K_kernel,
+                V_kernel,
+                attn_output,
+                use_causal_mask=(attention_mask is not None),
+            )
+            # Output is BHSD (B, n_heads, seq_q, 256)
+            # Return NONE strategy to signal BHSD layout to the caller
+            return attn_output, FlashAttentionStrategy.NONE
+
+        # Default: force PyTorch softmax path for head_dim > 128
+        # (standard NxDI NKI kernel asserts head_dim <= 128)
+        if self.head_dim > 128:
+            saved = self.attn_kernel_enabled
+            self.attn_kernel_enabled = False
+            result = super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+            self.attn_kernel_enabled = saved
+            return result
+        return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
 
     def forward(
         self,
