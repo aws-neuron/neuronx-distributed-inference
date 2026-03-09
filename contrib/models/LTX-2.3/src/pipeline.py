@@ -339,20 +339,19 @@ class NeuronLTX23Pipeline:
             SpatioTemporalScaleFactors,
         )
         from ltx_core.model.transformer.modality import Modality
-        from ltx_core.components.schedulers import LTX2Scheduler
-        from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 
         # Compute latent dimensions
-        # Video: VAE downsamples by 8x spatial, 1x temporal for patchsize=1
-        latent_h = height // 8 // 2  # patchify x2
-        latent_w = width // 8 // 2
+        # LTX-2.3 VAE downsamples spatially by 32x (not 16x)
+        # For 384x512 -> height=12, width=16 latent grid
+        latent_h = height // 32
+        latent_w = width // 32
         latent_f = (num_frames - 1) // 8 + 1  # temporal downsampling
 
         video_shape = VideoLatentShape(
             batch=1, channels=128, frames=latent_f, height=latent_h, width=latent_w
         )
         v_patchifier = VideoLatentPatchifier(patch_size=1)
-        v_scale = SpatioTemporalScaleFactors(time=1, width=8, height=8)
+        v_scale = SpatioTemporalScaleFactors.default()  # time=8, height=32, width=32
         video_tools = VideoLatentTools(
             target_shape=video_shape,
             patchifier=v_patchifier,
@@ -389,9 +388,25 @@ class NeuronLTX23Pipeline:
             video_noise = torch.randn_like(video_state.latent)
             audio_noise = torch.randn_like(audio_state.latent)
 
-        # Compute sigma schedule
-        scheduler = LTX2Scheduler()
-        sigmas = scheduler.execute(steps=num_inference_steps, latent=video_state.latent)
+        # Sigma schedule — use distilled values for the distilled model
+        # The distilled model was trained with these exact sigma values
+        # See: ltx_pipelines/utils/constants.py DISTILLED_SIGMA_VALUES
+        DISTILLED_SIGMA_VALUES = [
+            1.0,
+            0.99375,
+            0.9875,
+            0.98125,
+            0.975,
+            0.909375,
+            0.725,
+            0.421875,
+            0.0,
+        ]
+        sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, dtype=torch.float32)
+        assert len(sigmas) == num_inference_steps + 1, (
+            f"Distilled sigma values have {len(sigmas)} entries "
+            f"but {num_inference_steps} steps require {num_inference_steps + 1}"
+        )
 
         # Start from pure noise (sigma=1)
         video_sample = video_noise.clone()
@@ -400,7 +415,7 @@ class NeuronLTX23Pipeline:
         logger.info(
             "Starting denoising: %d steps, sigmas=%s",
             num_inference_steps,
-            sigmas.tolist(),
+            [f"{s:.4f}" for s in sigmas.tolist()],
         )
 
         # Denoising loop

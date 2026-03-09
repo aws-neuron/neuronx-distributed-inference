@@ -254,36 +254,99 @@ def build_cpu_components(config, model_path, dtype=torch.bfloat16):
     }
 
 
-def load_neuron_backbone(compile_dir, model_path, tp_degree=4):
-    """Load compiled Neuron backbone with real weights."""
+def load_neuron_backbone(compile_dir, model_path, tp_degree=4, sharded_dir=None):
+    """Load compiled Neuron backbone with real weights.
+
+    If sharded_dir is provided, loads pre-sharded per-rank .pt files (~5GB each)
+    instead of reading the full 41GB safetensors. This reduces peak CPU memory
+    from ~80GB to ~15GB, eliminating swap thrashing on trn2.3xlarge.
+
+    Pre-shard weights with: python3 shard_backbone_weights.py
+    """
     import torch_neuronx
     from neuronx_distributed.trace.trace import TensorParallelNeuronModel
-    from load_with_weights import shard_weight
-    from safetensors.torch import load_file
 
     tp_0_path = os.path.join(compile_dir, "tp_0.pt")
 
-    # Load and shard weights
-    logger.info("Loading safetensors for weight injection...")
-    full_sd = load_file(model_path)
-    prefix = "model.diffusion_model."
-    backbone_prefixes = (
-        "transformer_blocks.",
-        "norm_out.",
-        "proj_out.",
-        "scale_shift_table",
-        "audio_norm_out.",
-        "audio_proj_out.",
-        "audio_scale_shift_table",
-    )
-    backbone_sd = {}
-    for k, v in full_sd.items():
-        stripped = k[len(prefix) :] if k.startswith(prefix) else k
-        if stripped.startswith(backbone_prefixes):
-            backbone_sd[stripped] = v.to(torch.bfloat16).contiguous()
-    backbone_sd["spmd_rank.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
-    del full_sd
+    if sharded_dir and os.path.isdir(sharded_dir):
+        # Fast path: load pre-sharded weights (~5GB per rank)
+        logger.info("Loading pre-sharded backbone weights from %s...", sharded_dir)
+        rank_sds = []
+        for rank in range(tp_degree):
+            rank_path = os.path.join(sharded_dir, "rank_%d.pt" % rank)
+            if not os.path.exists(rank_path):
+                raise FileNotFoundError(
+                    f"Sharded weights not found at {rank_path}. "
+                    "Run shard_backbone_weights.py first."
+                )
+            ckpt = torch.load(rank_path, weights_only=True)
+            rank_sds.append(ckpt)
+            if rank == 0:
+                logger.info("  rank_0: %d keys", len(ckpt))
+    else:
+        # Fallback: load from safetensors (slower, more memory)
+        from safetensors import safe_open
+        from load_with_weights import shard_weight
+
+        logger.info("Loading backbone weights (memory-mapped)...")
+        prefix = "model.diffusion_model."
+        backbone_prefixes = (
+            "transformer_blocks.",
+            "norm_out.",
+            "proj_out.",
+            "scale_shift_table",
+            "audio_norm_out.",
+            "audio_proj_out.",
+            "audio_scale_shift_table",
+        )
+        backbone_sd = {}
+        with safe_open(model_path, framework="pt") as f:
+            for k in f.keys():
+                stripped = k[len(prefix) :] if k.startswith(prefix) else k
+                if stripped.startswith(backbone_prefixes):
+                    backbone_sd[stripped] = (
+                        f.get_tensor(k).to(torch.bfloat16).contiguous()
+                    )
+        backbone_sd["spmd_rank.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
+        logger.info("  Loaded %d backbone tensors", len(backbone_sd))
+
+        def sf_key_to_jit_key(sf_key):
+            return "weights." + sf_key.replace(".", "->")
+
+        rank_sds = [{} for _ in range(tp_degree)]
+        for sf_key, full_weight in backbone_sd.items():
+            jit_key = sf_key_to_jit_key(sf_key)
+            for rank in range(tp_degree):
+                rank_sds[rank][jit_key] = shard_weight(
+                    full_weight, jit_key, rank, tp_degree
+                )
+        del backbone_sd
+        gc.collect()
+
+    # Load compiled models and inject weights
+    models = []
+    t0 = time.time()
+    for rank in range(tp_degree):
+        logger.info("  Loading Neuron rank %d...", rank)
+        with torch_neuronx.contexts.disable_nrt_load():
+            model = torch.jit.load(tp_0_path)
+        model_sd = dict(model.named_parameters())
+        injected = 0
+        for jit_key, sharded_weight in rank_sds[rank].items():
+            if jit_key in model_sd and model_sd[jit_key].shape == sharded_weight.shape:
+                model_sd[jit_key].data.copy_(sharded_weight)
+                injected += 1
+        if rank == 0:
+            logger.info("    Injected %d/%d weights", injected, len(rank_sds[rank]))
+        models.append(model)
+        # Free this rank's weights immediately after injection
+        rank_sds[rank] = None
+
+    logger.info("  All Neuron models loaded in %.1fs", time.time() - t0)
+    del rank_sds
     gc.collect()
+
+    return TensorParallelNeuronModel(models)
 
     def sf_key_to_jit_key(sf_key):
         return "weights." + sf_key.replace(".", "->")
@@ -321,6 +384,52 @@ def load_neuron_backbone(compile_dir, model_path, tp_degree=4):
     gc.collect()
 
     return TensorParallelNeuronModel(models)
+
+
+def unload_neuron_model(tp_model, name="model"):
+    """Fully unload a TensorParallelNeuronModel from NeuronCores.
+
+    The simple `del model; gc.collect()` pattern is insufficient because:
+    1. torch.jit.ScriptModule holds NRT (Neuron Runtime) resources
+    2. Python's GC may not immediately release the underlying NEFF allocations
+    3. The NRT resources occupy HBM even after Python references are dropped
+
+    This function explicitly destroys each rank's model and forces cleanup,
+    ensuring the NeuronCores are fully free for the next model to load.
+    """
+    logger.info("Unloading %s from NeuronCores...", name)
+    t0 = time.time()
+
+    # Access the underlying per-rank models
+    if hasattr(tp_model, "models"):
+        models = tp_model.models
+    elif hasattr(tp_model, "model_list"):
+        models = tp_model.model_list
+    else:
+        # Fallback: just delete the top-level object
+        logger.warning("  Cannot access per-rank models, using simple delete")
+        del tp_model
+        gc.collect()
+        return
+
+    # Delete each rank's model individually
+    for i in range(len(models)):
+        models[i] = None
+    del models
+    del tp_model
+    gc.collect()
+
+    # Force Python GC to run multiple generations
+    gc.collect(0)
+    gc.collect(1)
+    gc.collect(2)
+
+    # Give NRT time to release resources
+    import time as _time
+
+    _time.sleep(2)
+
+    logger.info("  %s unloaded in %.1fs", name, time.time() - t0)
 
 
 def load_neuron_gemma3(compiled_dir, sharded_dir, tp_degree=4):
@@ -546,20 +655,13 @@ def generate(args):
     logger.info("\n=== Building CPU components ===")
     cpu = build_cpu_components(config, args.model_path)
 
-    # Load Neuron backbone
-    logger.info("\n=== Loading Neuron backbone ===")
-    neuron_backbone = load_neuron_backbone(
-        args.compile_dir, args.model_path, args.tp_degree
-    )
-
-    # Build pipeline wrapper
-    from pipeline import NeuronTransformerWrapper
-
-    wrapper = NeuronTransformerWrapper(
-        compiled_backbone=neuron_backbone,
-        cpu_ltx_model=cpu["ltx_model"],
-        text_seq=args.text_seq,
-    )
+    # When using Neuron Gemma3, we must load/run/unload Gemma3 BEFORE loading
+    # the DiT backbone, since both share the same 4 NeuronCores. Loading both
+    # simultaneously causes memory contention and extreme swap thrashing
+    # (144s+ for the first denoising step instead of 0.3s).
+    #
+    # Sequence: CPU components -> Gemma3 on Neuron -> encode -> unload Gemma3
+    #           -> DiT on Neuron -> denoise -> decode
 
     # Get context embeddings
     dtype = torch.bfloat16
@@ -603,9 +705,10 @@ def generate(args):
             audio_context.shape,
         )
 
-        # Free Gemma3 Neuron model
+        # Free Gemma3 Neuron model — must fully release NeuronCores
+        # before loading the DiT backbone which shares the same 4 cores
+        unload_neuron_model(neuron_gemma3, "Gemma3 encoder")
         del neuron_gemma3
-        gc.collect()
     else:
         logger.info("\n=== Running text encoder ===")
         # Load Gemma 3 12B
@@ -666,7 +769,26 @@ def generate(args):
         del gemma_model, text_encoder
         gc.collect()
 
-    # Setup latent tools
+    # Load Neuron backbone — AFTER text encoding to avoid NeuronCore contention
+    # When using --neuron-gemma, Gemma3 was already unloaded above
+    logger.info("\n=== Loading Neuron backbone ===")
+    neuron_backbone = load_neuron_backbone(
+        args.compile_dir,
+        args.model_path,
+        args.tp_degree,
+        sharded_dir=args.backbone_sharded_dir,
+    )
+
+    # Build pipeline wrapper
+    from pipeline import NeuronTransformerWrapper
+
+    wrapper = NeuronTransformerWrapper(
+        compiled_backbone=neuron_backbone,
+        cpu_ltx_model=cpu["ltx_model"],
+        text_seq=args.text_seq,
+    )
+
+    # Setup latent tools (needed for warmup and denoising)
     from ltx_core.tools import (
         VideoLatentTools,
         VideoLatentPatchifier,
@@ -711,6 +833,54 @@ def generate(args):
 
     video_sample = torch.randn(video_state.latent.shape, dtype=dtype, generator=gen)
     audio_sample = torch.randn(audio_state.latent.shape, dtype=dtype, generator=gen)
+
+    # Warmup the DiT backbone — first call loads NEFF onto NeuronCores
+    # Without this, the first 1-2 denoising steps take 100-200s instead of 0.3s
+    logger.info("\n=== Warming up DiT backbone ===")
+    warmup_sigma = torch.tensor([1.0])
+    warmup_v_ts = warmup_sigma.unsqueeze(0).expand(1, video_state.latent.shape[1])
+    warmup_a_ts = warmup_sigma.unsqueeze(0).expand(1, audio_state.latent.shape[1])
+    warmup_ctx = (
+        video_context
+        if video_context is not None
+        else torch.randn(1, args.text_seq, 4096, dtype=dtype)
+    )
+    warmup_actx = (
+        audio_context
+        if audio_context is not None
+        else torch.randn(1, args.text_seq, 2048, dtype=dtype)
+    )
+    warmup_mask = (
+        context_mask
+        if context_mask is not None
+        else torch.ones(1, args.text_seq, dtype=torch.int64)
+    )
+
+    warmup_video_mod = Modality(
+        latent=torch.randn_like(video_sample),
+        sigma=warmup_sigma,
+        timesteps=warmup_v_ts,
+        positions=video_state.positions,
+        context=warmup_ctx,
+        enabled=True,
+        context_mask=warmup_mask,
+        attention_mask=None,
+    )
+    warmup_audio_mod = Modality(
+        latent=torch.randn_like(audio_sample),
+        sigma=warmup_sigma,
+        timesteps=warmup_a_ts,
+        positions=audio_state.positions,
+        context=warmup_actx,
+        enabled=True,
+        context_mask=warmup_mask.clone(),
+        attention_mask=None,
+    )
+    t0 = time.time()
+    with torch.no_grad():
+        _ = wrapper(warmup_video_mod, warmup_audio_mod)
+    logger.info("  DiT backbone warmup done in %.1fs", time.time() - t0)
+    del warmup_video_mod, warmup_audio_mod
 
     logger.info("\n=== Denoising (%d steps) ===", args.num_steps)
     logger.info(
@@ -918,6 +1088,12 @@ def main():
     )
     parser.add_argument(
         "--compile-dir", default=COMPILE_DIR, help="Compiled model directory"
+    )
+    parser.add_argument(
+        "--backbone-sharded-dir",
+        default="/home/ubuntu/backbone_sharded",
+        help="Directory with pre-sharded backbone weights (from shard_backbone_weights.py). "
+        "Falls back to safetensors loading if not found.",
     )
     parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Output directory")
     parser.add_argument(
