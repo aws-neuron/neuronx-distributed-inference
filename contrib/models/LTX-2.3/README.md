@@ -13,7 +13,7 @@ LTX-2.3 22B parameter DiT audio-video diffusion transformer running on AWS Train
 
 ## Validation Results
 
-**Validated:** 2026-03-07
+**Validated:** 2026-03-09
 **Instance:** trn2.3xlarge (TP=4, LNC=2, 4 logical NeuronCores)
 **SDK:** Neuron SDK 2.28, PyTorch 2.9, Deep Learning AMI Neuron (Ubuntu 24.04) 20260227
 
@@ -31,21 +31,24 @@ All accuracy numbers measured against CPU reference (unsharded BF16, native ltx-
 
 | Stage | Time | Notes |
 |-------|------|-------|
-| CPU component loading | 23.6s | LTXModel, VideoDecoder, AudioDecoder, Vocoder, EmbeddingsProcessor |
-| Neuron backbone loading (4 ranks) | 144.6s | 4135 weights per rank, 9.3 GB compiled model |
-| Gemma3 encoder loading (4 ranks) | 362.0s | Pre-sharded weights, ~5.9 GB per rank |
-| Text encoding — Neuron Gemma3 (warm) | 6.6s | After warmup, includes tokenization + post-processing |
-| Text encoding — Neuron Gemma3 (warmup) | 16.4s | First forward pass on NeuronCores |
+| CPU component loading | 24.9s | LTXModel, VideoDecoder, AudioDecoder, Vocoder, EmbeddingsProcessor |
+| Gemma3 encoder loading (4 ranks) | 362s | Pre-sharded weights, NEFF rehydration (cold start) |
+| Text encoding — Neuron Gemma3 (warm) | 6.7s | After warmup, includes tokenization + post-processing |
+| Text encoding — Neuron Gemma3 (warmup) | 16.3s | First forward pass on NeuronCores |
 | Text encoding — CPU fallback | ~162s | Without Neuron compilation |
-| Denoising step (warm) | 0.3s | Steps 3-8 after warmup |
-| Denoising step (cold, step 1) | 143.7s | Includes Neuron device initialization |
-| Denoising step (warmup, step 2) | 177.1s | Second pass warmup |
-| Total denoising (8 steps) | 322.7s | 40.3s/step average (dominated by cold start) |
-| Spatial upscaler (CPU) | 0.6s | 498M params, (1,128,4,12,16) -> (1,128,4,24,32) |
-| Temporal upscaler (CPU) | 0.4s | 131M params, (1,128,4,24,32) -> (1,128,7,24,32) |
-| Video decode (CPU, no upscale) | 7.2s | 25 frames @ 384x512 |
-| Video decode (CPU, with upscale) | 32.4s | 49 frames @ 768x1024 |
-| Audio decode (CPU) | 2.4s | Stereo WAV, 48kHz |
+| Gemma3 unload | 2.6s | Explicit NRT resource cleanup |
+| Neuron backbone weight loading | 70s | Pre-sharded weights, 4×9.3 GB rank files |
+| Neuron backbone NEFF loading | 84s | Compiled model loaded onto 4 NeuronCores |
+| **Denoising step (warm, steps 2-8)** | **0.3s** | **Steady-state per-step latency** |
+| Denoising step (cold, step 1) | 174.6s | Includes Neuron device initialization |
+| DiT warmup (1st inference) | 138.5s | Forces NRT to load NEFF onto cores |
+| Total denoising (8 steps) | 176.9s | 22.1s/step average (dominated by cold start) |
+| Video decode (CPU) | 7.2s | 25 frames @ 384×512 |
+| Audio decode (CPU) | 2.5s | Stereo WAV, 48kHz |
+| Spatial upscaler (CPU) | 0.6s | 498M params, (1,128,4,12,16) → (1,128,4,24,32) |
+| Temporal upscaler (CPU) | 0.4s | 131M params, (1,128,4,24,32) → (1,128,7,24,32) |
+
+Note: Gemma3 and DiT backbone share the same 4 NeuronCores and are loaded sequentially. The cold start latency (NEFF rehydration) is a one-time cost when the compiled model is first loaded onto a fresh instance. Subsequent generations reuse the loaded model.
 
 ### Component Distribution
 
@@ -58,7 +61,7 @@ All accuracy numbers measured against CPU reference (unsharded BF16, native ltx-
 | Spatial/Temporal upscalers | CPU | Sub-second each |
 | EmbeddingsProcessor | CPU | Connectors + feature extraction |
 
-Both the DiT backbone and Gemma3 encoder are compiled for TP=4 and share the same 4 NeuronCores. They execute sequentially: text encoding runs once, then the denoising loop runs 8 steps. CPU fallback for Gemma3 is available but ~30x slower.
+Both the DiT backbone and Gemma3 encoder are compiled for TP=4 and share the same 4 NeuronCores. They execute sequentially: Gemma3 loads, encodes text, and unloads; then the DiT backbone loads and runs the 8-step denoising loop. CPU fallback for Gemma3 is available but ~25x slower.
 
 ## Usage
 
@@ -93,9 +96,21 @@ NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
   torchrun --nproc_per_node=4 src/compile_transformer.py
 ```
 
-Compilation takes approximately 30-60 minutes. The compiled model is saved to `compiler_workdir_tp4_lnc2_v2/tp_0.pt` (9.3 GB).
+Compilation takes approximately 60 seconds. The compiled model is saved to `compiler_workdir_tp4_lnc2_v2/tp_0.pt` (8.7 GB).
 
-### Step 2: Compile and Shard Gemma3 Encoder (Recommended)
+### Step 2: Pre-shard Backbone Weights
+
+Pre-sharding avoids loading the full 41 GB safetensors file during generation:
+
+```bash
+python3 src/shard_backbone_weights.py \
+  --model-path /home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+  --output-dir /home/ubuntu/backbone_sharded
+```
+
+This produces 4 rank files (~9.3 GB each) that are loaded directly during generation.
+
+### Step 3: Compile and Shard Gemma3 Encoder (Recommended)
 
 Compiling Gemma3 for Neuron eliminates the ~162s CPU text encoding bottleneck:
 
@@ -113,7 +128,7 @@ python3 src/shard_gemma3_weights.py \
 
 The Gemma3 encoder uses stricter compiler flags (`--auto-cast=none --enable-saturate-infinity --enable-mixed-precision-accumulation`) to preserve text encoder precision.
 
-### Step 3: Generate Video + Audio
+### Step 4: Generate Video + Audio
 
 ```bash
 # With Neuron-compiled Gemma3 (recommended, fastest)
@@ -122,18 +137,23 @@ python3 src/generate_ltx23.py \
   --gemma-path /home/ubuntu/models/gemma-3-12b \
   --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
   --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
+  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
   --prompt "A golden retriever puppy runs across a sunny green meadow"
 
 # With upscaling (384x512 @ 25 frames -> 768x1024 @ 49 frames)
 python3 src/generate_ltx23.py \
   --neuron-gemma \
   --gemma-path /home/ubuntu/models/gemma-3-12b \
+  --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
+  --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
+  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
   --prompt "A golden retriever puppy runs across a sunny green meadow" \
   --upscale
 
 # With CPU Gemma3 (slower, no compilation needed)
 python3 src/generate_ltx23.py \
   --gemma-path /home/ubuntu/models/gemma-3-12b \
+  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
   --prompt "A golden retriever puppy runs across a sunny green meadow"
 
 # Quick test with random embeddings (no Gemma needed)
@@ -214,7 +234,7 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 
 ## Known Issues
 
-- **Cold start latency**: First two denoising steps are slow (~144s + ~177s) due to Neuron device initialization and warmup. Subsequent steps run at ~0.3s each.
+- **Cold start latency**: The DiT warmup pass takes ~139s and the first denoising step takes ~175s due to Neuron device initialization. Subsequent steps run at ~0.3s each. Gemma3 encoder NEFF rehydration adds ~362s on first load (one-time per instance).
 - **CPU text encoding fallback**: Without Neuron-compiled Gemma3, text encoding takes ~162s on CPU. Use `--neuron-gemma` for 6.6s warm text encoding (83x faster).
 - **Single-stage only**: This submission includes Stage 1 generation with optional latent upscaling but not Stage 2 refinement denoising. Stage 2 requires recompiling the backbone at a larger latent shape and merging distilled LoRA weights.
 - **BF16 TP accumulation**: The 0.972 cosine similarity over 8 denoising steps (vs CPU) is due to normal BF16 rounding across TP=4 ranks. Single forward pass accuracy is 0.9999.
@@ -230,5 +250,6 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 | `src/compile_transformer.py` | DiT backbone compilation script (torchrun --nproc_per_node=4) |
 | `src/compile_gemma3.py` | Gemma3 encoder compilation script (parallel_model_trace) |
 | `src/shard_gemma3_weights.py` | Pre-shard Gemma3 weights to per-rank files for fast loading |
+| `src/shard_backbone_weights.py` | Pre-shard DiT backbone weights to per-rank files for fast loading |
 | `src/load_with_weights.py` | DiT backbone weight sharding and injection utilities |
 | `src/generate_ltx23.py` | E2E generation pipeline (text encoding, denoising, VAE decode, upscaling) |
