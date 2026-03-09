@@ -70,6 +70,21 @@ TEMPORAL_UPSCALER_PATH = (
     "/home/ubuntu/models/LTX-2.3/upscalers/ltx-2.3-temporal-upscaler-x2-1.0.safetensors"
 )
 
+# Distilled sigma values from the reference LTX-2.3 pipeline
+# See: ltx_pipelines/utils/constants.py DISTILLED_SIGMA_VALUES
+DISTILLED_SIGMA_VALUES = [
+    1.0,
+    0.99375,
+    0.9875,
+    0.98125,
+    0.975,
+    0.909375,
+    0.725,
+    0.421875,
+    0.0,
+]
+STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+
 
 def load_config(model_path):
     from safetensors import safe_open
@@ -662,7 +677,6 @@ def generate(args):
         SpatioTemporalScaleFactors,
     )
     from ltx_core.model.transformer.modality import Modality
-    from ltx_core.components.schedulers import LTX2Scheduler
 
     # Compute latent dimensions
     # LTX-2.3 VAE downsamples spatially by 32x (not 16x as in some other models)
@@ -675,7 +689,7 @@ def generate(args):
         batch=1, channels=128, frames=latent_f, height=latent_h, width=latent_w
     )
     v_patchifier = VideoLatentPatchifier(patch_size=1)
-    v_scale = SpatioTemporalScaleFactors(time=1, width=8, height=8)
+    v_scale = SpatioTemporalScaleFactors.default()  # time=8, height=32, width=32
     video_tools = VideoLatentTools(
         target_shape=video_shape,
         patchifier=v_patchifier,
@@ -703,9 +717,13 @@ def generate(args):
         "  Video latent: %s, Audio latent: %s", video_sample.shape, audio_sample.shape
     )
 
-    # Sigma schedule
-    scheduler = LTX2Scheduler()
-    sigmas = scheduler.execute(steps=args.num_steps, latent=video_state.latent)
+    # Sigma schedule — use distilled values for the distilled model
+    # The distilled model was trained with these exact sigma values
+    sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, dtype=torch.float32)
+    assert len(sigmas) == args.num_steps + 1, (
+        f"Distilled sigma values have {len(sigmas)} entries "
+        f"but {args.num_steps} steps require {args.num_steps + 1}"
+    )
     logger.info("  Sigmas: %s", [f"{s:.4f}" for s in sigmas.tolist()])
 
     # Denoising loop
@@ -961,7 +979,7 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.no_text_encoder and args.gemma_path is None:
+    if not args.no_text_encoder and not args.neuron_gemma and args.gemma_path is None:
         parser.error(
             "Either --no-text-encoder or --gemma-path must be specified. "
             "Use --neuron-gemma for Neuron-compiled Gemma3 (fastest)."

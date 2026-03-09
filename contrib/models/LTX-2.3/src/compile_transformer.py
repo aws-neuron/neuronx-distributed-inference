@@ -36,6 +36,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 TP_DEGREE = 4
 BATCH = 1
 VIDEO_SEQ = 768  # 4 frames * 12 * 16 patches (384x512 resolution, patchsize=1x2x2)
+LATENT_H = 12  # 384 / 32
+LATENT_W = 16  # 512 / 32
 AUDIO_SEQ = 26  # audio tokens for ~2s
 TEXT_SEQ = 256  # max text sequence length
 
@@ -103,10 +105,10 @@ def precompute_inputs(config):
     # Video: patch_size=1 (no spatial patchification in DiT), VAE channels=128
     # 768 tokens = 4 frames * 12h * 16w in the VAE latent grid
     video_shape = VideoLatentShape(
-        batch=BATCH, channels=128, frames=4, height=12, width=16
+        batch=BATCH, channels=128, frames=4, height=LATENT_H, width=LATENT_W
     )
     v_patchifier = VideoLatentPatchifier(patch_size=1)
-    v_scale = SpatioTemporalScaleFactors(time=1, width=8, height=8)
+    v_scale = SpatioTemporalScaleFactors.default()  # time=8, height=32, width=32
     video_tools = VideoLatentTools(
         target_shape=video_shape,
         patchifier=v_patchifier,
