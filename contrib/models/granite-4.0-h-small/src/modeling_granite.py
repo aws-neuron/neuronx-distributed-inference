@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 # accelerated scan using nisa.tensor_tensor_scan on Trainium2.
 # Set USE_NKI_SCAN = False to fall back to the quadratic implementation.
 
-USE_NKI_SCAN = True
+USE_NKI_SCAN = False
 
 try:
     import nki

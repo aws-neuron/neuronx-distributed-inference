@@ -56,7 +56,9 @@ Prefill uses a full-sequence parallel scan via cumulative sum in log-space (L x 
 
 ### NKI Selective Scan Kernel (Optional)
 
-The model includes an optional NKI (Neuron Kernel Interface) kernel that replaces the O(L^2) quadratic parallel scan with an O(L) hardware-accelerated scan using `nisa.tensor_tensor_scan`. This is controlled by the `USE_NKI_SCAN` flag in `modeling_granite.py` (default: `True`).
+The model includes an optional NKI (Neuron Kernel Interface) kernel that replaces the O(L^2) quadratic parallel scan with an O(L) hardware-accelerated scan using `nisa.tensor_tensor_scan`. This is controlled by the `USE_NKI_SCAN` flag in `modeling_granite.py` (default: `False`).
+
+**Performance note:** At `max_context_length=128`, the quadratic scan is ~30% faster than the NKI kernel because the compiler efficiently vectorizes the 128x128 weight matrix operations, while the NKI kernel incurs overhead from 8,192 individual `tensor_tensor_scan` invocations (one per head_dim x ssm_state_size combination). The NKI kernel is expected to outperform the quadratic scan at larger sequence lengths (L >= 512) where the O(L^2) cost dominates. See the Performance Benchmarks section for details.
 
 **How it works:**
 
@@ -73,7 +75,7 @@ The kernel processes all 32 heads (TP-sharded from 128) in the partition dimensi
 - NKI Beta 2 / SDK 2.28+ (`import nki`, `import nki.language as nl`, `import nki.isa as nisa`)
 - Neuron hardware (Trainium or Inferentia with NKI support)
 
-**To disable:** Set `USE_NKI_SCAN = False` in `modeling_granite.py` to fall back to the quadratic scan.
+**To enable:** Set `USE_NKI_SCAN = True` in `modeling_granite.py`. Recommended only for `max_context_length >= 512`.
 
 ## Validation Results
 
@@ -134,12 +136,38 @@ The NKI selective scan kernel produces nearly identical results to the quadratic
 
 The small difference between V15 and V16-NKI is due to different floating-point accumulation order (parallel quadratic vs sequential scan). Both produce correct text generation.
 
-## Usage
+## Performance Benchmarks
 
-```bash
-# Required for NKI kernel compilation — set to your target platform
-export NEURON_PLATFORM_TARGET_OVERRIDE=trn2  # or trn1, inf2, etc.
-```
+**Benchmarked:** 2026-03-10
+**Configuration:** TP=4, batch_size=1, seq_len=2048, max_context_length=128, bfloat16
+**Instance:** trn2.3xlarge (LNC=2, SDK 2.28)
+
+### Latency Comparison: Quadratic Scan vs NKI Scan
+
+| Metric | Quadratic (default) | NKI Scan | Delta |
+|--------|-------------------|----------|-------|
+| **Prefill latency** | **717 ms** | 935 ms | +30% slower |
+| **Decode per-token** | 50.3 ms | 50.3 ms | identical |
+| **100-token throughput** | **17.6 tok/s** | 16.9 tok/s | -4% |
+| **100-token total** | 5694 ms | 5915 ms | +3.9% |
+
+**Analysis:**
+- Prefill latency is constant regardless of prompt length (1-23 tokens) because NxDI pads all inputs to `max_context_length=128`
+- The quadratic scan wins at L=128 because the compiler efficiently vectorizes the 128x128 weight matrix, while the NKI kernel has overhead from 8,192 individual `tensor_tensor_scan` calls
+- Decode latency is identical because the NKI kernel only affects prefill (decode uses O(1) recurrence)
+- The NKI kernel is expected to win at L >= 512 where O(L^2) memory/compute dominates
+- **Recommendation:** Use the default quadratic scan for `max_context_length <= 256`. Enable NKI scan for larger contexts.
+
+### Latency Breakdown (Quadratic, default)
+
+| Phase | Latency | Notes |
+|-------|---------|-------|
+| Prefill (any prompt up to 128 tokens) | 717 ms | Constant due to padding to max_context_length |
+| Decode (per token, steady state) | ~50 ms | Measured from 100-token generation |
+| Model load (from compiled) | ~71 s | One-time cost, includes weight sharding |
+| Compilation | ~16-20 min | One-time cost |
+
+## Usage
 
 ```python
 from transformers import AutoTokenizer
@@ -221,7 +249,7 @@ python test/unit/test_nki_selective_scan.py
 
 1. **No on-device sampling tested** — current validation uses raw logits (`on_device_sampling_config=None`). Enabling on-device sampling for production use needs testing.
 2. **Batch size 1 only** — batch_size > 1 has not been validated.
-3. **NKI kernel requires SDK 2.28+** — the `USE_NKI_SCAN` kernel uses `nisa.tensor_tensor_scan` which requires NKI Beta 2. Set `USE_NKI_SCAN = False` to fall back to the O(L^2) quadratic scan on older SDKs or non-Neuron hardware.
+3. **NKI scan slower at short contexts** — the optional `USE_NKI_SCAN` kernel is ~30% slower than the default quadratic scan at `max_context_length=128` due to per-invocation overhead. It is disabled by default. Enable only for `max_context_length >= 512` where the O(L) asymptotic advantage outweighs the constant overhead.
 4. **Conv1d workaround** — manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK bug is fixed.
 
 ## Source Files
