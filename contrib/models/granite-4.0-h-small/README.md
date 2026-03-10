@@ -58,7 +58,7 @@ Prefill uses a full-sequence parallel scan via cumulative sum in log-space (L x 
 
 The model includes an optional NKI (Neuron Kernel Interface) kernel that replaces the O(L^2) quadratic parallel scan with an O(L) hardware-accelerated scan using `nisa.tensor_tensor_scan`. This is controlled by the `USE_NKI_SCAN` flag in `modeling_granite.py` (default: `False`).
 
-**Performance note:** At `max_context_length=128`, the quadratic scan is ~30% faster than the NKI kernel because the compiler efficiently vectorizes the 128x128 weight matrix operations, while the NKI kernel incurs overhead from 8,192 individual `tensor_tensor_scan` invocations (one per head_dim x ssm_state_size combination). The NKI kernel is expected to outperform the quadratic scan at larger sequence lengths (L >= 512) where the O(L^2) cost dominates. See the Performance Benchmarks section for details.
+**Performance note:** At `max_context_length=128`, the quadratic scan is ~30% faster than the NKI kernel because the compiler efficiently vectorizes the 128x128 weight matrix operations, while the NKI kernel incurs overhead from 8,192 individual `tensor_tensor_scan` invocations (one per head_dim x ssm_state_size combination). At larger context lengths, the NKI kernel has a significant **compilation** advantage: at `max_context_length=256`, the NKI kernel compiles successfully while the quadratic scan causes compiler OOM (see Context Length Scaling section). The NKI kernel is expected to outperform the quadratic scan at runtime for L >= 256 on instances with sufficient HBM. See the Performance Benchmarks section for details.
 
 **How it works:**
 
@@ -75,7 +75,7 @@ The kernel processes all 32 heads (TP-sharded from 128) in the partition dimensi
 - NKI Beta 2 / SDK 2.28+ (`import nki`, `import nki.language as nl`, `import nki.isa as nisa`)
 - Neuron hardware (Trainium or Inferentia with NKI support)
 
-**To enable:** Set `USE_NKI_SCAN = True` in `modeling_granite.py`. Recommended only for `max_context_length >= 512`.
+**To enable:** Set `USE_NKI_SCAN = True` in `modeling_granite.py`. Recommended for `max_context_length >= 256` on instances with sufficient HBM, or when the quadratic scan fails to compile.
 
 ## Validation Results
 
@@ -155,8 +155,29 @@ The small difference between V15 and V16-NKI is due to different floating-point 
 - Prefill latency is constant regardless of prompt length (1-23 tokens) because NxDI pads all inputs to `max_context_length=128`
 - The quadratic scan wins at L=128 because the compiler efficiently vectorizes the 128x128 weight matrix, while the NKI kernel has overhead from 8,192 individual `tensor_tensor_scan` calls
 - Decode latency is identical because the NKI kernel only affects prefill (decode uses O(1) recurrence)
-- The NKI kernel is expected to win at L >= 512 where O(L^2) memory/compute dominates
-- **Recommendation:** Use the default quadratic scan for `max_context_length <= 256`. Enable NKI scan for larger contexts.
+- The NKI kernel is required for L >= 256 where the quadratic scan fails to compile (compiler OOM)
+- **Recommendation:** Use the default quadratic scan for `max_context_length <= 128`. Enable NKI scan for larger contexts where the quadratic scan fails to compile.
+
+### Context Length Scaling
+
+The model's compilation and runtime behavior varies significantly with context length due to the large MoE architecture (72 experts × 40 layers). Testing was performed on trn2.3xlarge (96 GB HBM total, 24 GB per logical core with LNC=2).
+
+| max_context_length | Quadratic Compile | NKI Compile | Runtime Load | Notes |
+|--------------------|-------------------|-------------|-------------|-------|
+| **128** | OK (~16 min) | OK (~20 min) | OK (both) | Fully benchmarked, quadratic faster |
+| **256** | **FAILED** (compiler OOM) | **OK** (~19 min) | **FAILED** (HBM OOM) | NKI compiles where quadratic cannot |
+| **512** | FAILED (compiler OOM) | FAILED (compiler OOM) | N/A | Graph too large for 124 GB host RAM |
+| **1024** | FAILED (compiler OOM) | FAILED (compiler OOM) | N/A | Graph too large for 124 GB host RAM |
+
+**Key findings:**
+
+1. **NKI kernel enables longer compilation:** At L=256, the NKI kernel produces a compiler-friendlier HLO graph (avoids the 256×256 quadratic weight matrix expansion), allowing successful compilation where the quadratic approach causes `neuronx-cc` to OOM (exit code 70, >74 GB host RAM).
+
+2. **HBM is the runtime bottleneck:** Even when the NKI kernel compiles at L=256, the model cannot be loaded on trn2.3xlarge because the compiled graph requires more HBM than the 24 GB available per logical core. The error is a 1 GB transpose buffer allocation failure on HBM.
+
+3. **MoE dominates memory:** The 72 experts × 40 layers = 2,880 expert weight sets are the primary memory consumer, not the Mamba SSM states or KV caches.
+
+4. **Larger instances unlock longer contexts:** trn2.48xlarge (32 devices, up to 3 TB total HBM) should support `max_context_length=256+` by distributing experts across more cores. The NKI kernel's compilation advantage becomes essential at these scales.
 
 ### Latency Breakdown (Quadratic, default)
 
@@ -247,10 +268,11 @@ python test/unit/test_nki_selective_scan.py
 
 ## Known Limitations
 
-1. **No on-device sampling tested** — current validation uses raw logits (`on_device_sampling_config=None`). Enabling on-device sampling for production use needs testing.
-2. **Batch size 1 only** — batch_size > 1 has not been validated.
-3. **NKI scan slower at short contexts** — the optional `USE_NKI_SCAN` kernel is ~30% slower than the default quadratic scan at `max_context_length=128` due to per-invocation overhead. It is disabled by default. Enable only for `max_context_length >= 512` where the O(L) asymptotic advantage outweighs the constant overhead.
-4. **Conv1d workaround** — manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK bug is fixed.
+1. **max_context_length=128 on trn2.3xlarge** — compiler OOM prevents L=256+ with quadratic scan; NKI compiles at L=256 but HBM is insufficient for runtime. Larger instances (trn2.48xlarge) are needed for longer contexts.
+2. **No on-device sampling tested** — current validation uses raw logits (`on_device_sampling_config=None`). Enabling on-device sampling for production use needs testing.
+3. **Batch size 1 only** — batch_size > 1 has not been validated.
+4. **NKI scan slower at short contexts** — the optional `USE_NKI_SCAN` kernel is ~30% slower than the default quadratic scan at `max_context_length=128` due to per-invocation overhead. It is disabled by default. Enable for `max_context_length >= 256` where it is required for compilation.
+5. **Conv1d workaround** — manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK bug is fixed.
 
 ## Source Files
 
