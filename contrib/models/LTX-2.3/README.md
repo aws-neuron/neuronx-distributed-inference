@@ -44,8 +44,9 @@ All accuracy numbers measured against CPU reference (unsharded BF16, native ltx-
 | DiT warmup (1st inference) | 138.5s | Forces NRT to load NEFF onto cores |
 | Total denoising (8 steps) | 176.9s | 22.1s/step average (dominated by cold start) |
 | Video decode (CPU) | 7.2s | 25 frames @ 384×512 |
+| Video decode (CPU, upscaled) | 33.3s | 49 frames @ 768×1024 |
 | Audio decode (CPU) | 2.5s | Stereo WAV, 48kHz |
-| Spatial upscaler (CPU) | 0.6s | 498M params, (1,128,4,12,16) → (1,128,4,24,32) |
+| Spatial upscaler (CPU) | 0.7s | 498M params, (1,128,4,12,16) → (1,128,4,24,32) |
 | Temporal upscaler (CPU) | 0.4s | 131M params, (1,128,4,24,32) → (1,128,7,24,32) |
 
 Note: Gemma3 and DiT backbone share the same 4 NeuronCores and are loaded sequentially. The cold start latency (NEFF rehydration) is a one-time cost when the compiled model is first loaded onto a fresh instance. Subsequent generations reuse the loaded model.
@@ -82,7 +83,7 @@ huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-22b-distilled.safetensors \
 huggingface-cli download google/gemma-3-12b-it \
   --local-dir /home/ubuntu/models/gemma-3-12b
 
-# Download upscaler weights (optional)
+# Download upscaler weights (for --upscale, spatial x2 + temporal x2)
 huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-spatial-upscaler-x2-1.0.safetensors \
   --local-dir /home/ubuntu/models/LTX-2.3/upscalers/
 huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-temporal-upscaler-x2-1.0.safetensors \
@@ -236,7 +237,7 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 
 - **Cold start latency**: The DiT warmup pass takes ~139s and the first denoising step takes ~175s due to Neuron device initialization. Subsequent steps run at ~0.3s each. Gemma3 encoder NEFF rehydration adds ~362s on first load (one-time per instance).
 - **CPU text encoding fallback**: Without Neuron-compiled Gemma3, text encoding takes ~162s on CPU. Use `--neuron-gemma` for 6.6s warm text encoding (83x faster).
-- **Single-stage only**: This submission includes Stage 1 generation with optional latent upscaling but not Stage 2 refinement denoising. Stage 2 requires recompiling the backbone at a larger latent shape and merging distilled LoRA weights.
+- **No Stage 2 refinement**: The `--upscale` flag applies latent-space spatial x2 + temporal x2 upscaling (384×512 @ 25 frames → 768×1024 @ 49 frames), which is validated and functional. However, Stage 2 *refinement denoising* (re-running the DiT at the upscaled resolution for sharper details) is not included. Stage 2 would require recompiling the backbone at the larger latent shape and merging distilled LoRA weights.
 - **BF16 TP accumulation**: The 0.972 cosine similarity over 8 denoising steps (vs CPU) is due to normal BF16 rounding across TP=4 ranks. Single forward pass accuracy is 0.9999.
 - **No EFA**: The trn2.3xlarge single-instance setup does not use EFA for inter-node communication. NCCL/OFI warnings about EFA can be safely ignored.
 
