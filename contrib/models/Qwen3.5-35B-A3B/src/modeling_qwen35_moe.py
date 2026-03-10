@@ -56,7 +56,7 @@ except ImportError:
 
 # Custom NKI flash attention kernel for head_dim=256
 # (standard NxDI kernel asserts head_dim <= 128)
-# Opt-in only: set QWEN35_USE_FLASH_ATTN_D256=1 to enable
+# Opt-in only: set QWEN35_USE_FLASH_ATTN_D256=1 to enable (external kernel, has TTFT regression)
 try:
     from .nki_flash_attn_d256 import flash_attn_d256 as _flash_attn_d256_raw
 except ImportError:
@@ -71,6 +71,28 @@ else:
     _flash_attn_d256_kernel = None
 
 _USE_FLASH_ATTN_D256 = os.environ.get("QWEN35_USE_FLASH_ATTN_D256", "0") == "1"
+
+# Monkey-patch NxDI's flash attention kernel with our modified nkilib kernel.
+# This replaces the bundled _pre_prod_kernels kernel (head_dim<=128) with our
+# nkilib kernel that supports head_dim up to 256 via d-tiling.
+# Requires: pip install git+https://github.com/jimburtoft/nki-library.git@feature/head-dim-256
+# Set QWEN35_PATCH_FLASH_ATTN=1 to enable (default: disabled)
+_PATCH_FLASH_ATTN = os.environ.get("QWEN35_PATCH_FLASH_ATTN", "0") == "1"
+_FLASH_ATTN_PATCHED = False
+if _PATCH_FLASH_ATTN:
+    try:
+        from .nkilib_kernel_patch import patch_flash_attention_kernel
+
+        _FLASH_ATTN_PATCHED = patch_flash_attention_kernel()
+    except ImportError:
+        try:
+            from nkilib_kernel_patch import patch_flash_attention_kernel
+
+            _FLASH_ATTN_PATCHED = patch_flash_attention_kernel()
+        except ImportError:
+            logging.getLogger(__name__).warning(
+                "QWEN35_PATCH_FLASH_ATTN=1 but nkilib_kernel_patch module not found"
+            )
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -808,15 +830,24 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         """Override to handle head_dim=256 safely.
 
         The standard NxDI NKI flash attention kernel asserts head_dim <= 128.
-        This override either:
-        1. Uses a custom NKI kernel (flash_attn_d256) if explicitly opted in
-           via QWEN35_USE_FLASH_ATTN_D256=1 env var, OR
-        2. Forces the PyTorch softmax path by temporarily disabling attn_kernel
+        This override handles three paths (in priority order):
 
-        The custom kernel is functional but ~2.4x slower than the PyTorch softmax
-        path due to layout conversion overhead (BHSD -> BHDS permute+contiguous).
-        It is included for reference and future optimization.
+        1. If QWEN35_PATCH_FLASH_ATTN=1 and the nkilib kernel patch was applied:
+           Let the base class handle it normally -- the patched kernel supports
+           head_dim up to 256 with zero layout conversion overhead.
+
+        2. If QWEN35_USE_FLASH_ATTN_D256=1: Uses a custom external NKI kernel
+           (flash_attn_d256). Functional but ~2.4x slower TTFT due to layout
+           conversion overhead (BHSD -> BHDS permute+contiguous).
+
+        3. Default fallback: Forces the PyTorch softmax path by temporarily
+           disabling attn_kernel for head_dim > 128.
         """
+        # Path 1: nkilib kernel patch is active -- base class can handle head_dim=256
+        if _FLASH_ATTN_PATCHED and self.head_dim > 128:
+            return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+
+        # Path 2: Custom external NKI kernel (opt-in, has TTFT regression)
         use_custom_kernel = (
             _USE_FLASH_ATTN_D256
             and _flash_attn_d256_kernel is not None
@@ -861,7 +892,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             # Return NONE strategy to signal BHSD layout to the caller
             return attn_output, FlashAttentionStrategy.NONE
 
-        # Default: force PyTorch softmax path for head_dim > 128
+        # Path 3: Default fallback -- force PyTorch softmax path for head_dim > 128
         # (standard NxDI NKI kernel asserts head_dim <= 128)
         if self.head_dim > 128:
             saved = self.attn_kernel_enabled
