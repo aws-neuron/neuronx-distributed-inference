@@ -1,0 +1,112 @@
+model_name: "Qwen3-VL-8B-Thinking"
+modality: "vision-text"
+batch_size: &batch_size 1
+max_seq_len: &max_seq_len 32768 # >= text max_context_len >= VISION_SEQ_LENGTH // (spatial_merge_size**2)
+max_num_images: &max_num_images 20
+vision_max_seq_len: &vision_max_seq_len 16384
+
+quantization: &dtype "bfloat16"
+platform: "trn2.48xlarge"
+parallelism:
+  tp_degree: &tp_degree 16
+
+inference_features: []
+
+inference_config:
+  neuron_config: &neuron_config
+
+    text_neuron_config:
+      # Batch Size
+      batch_size: *batch_size
+      ctx_batch_size: 1
+      tkg_batch_size: *batch_size
+      
+      # Sequence Lengths
+      seq_len: *max_seq_len
+      max_context_length: *max_seq_len
+
+      # Buckets
+      enable_bucketing: True
+      context_encoding_buckets: [2048, 5120, *max_seq_len]
+      token_generation_buckets: [2048, 5120, *max_seq_len]
+
+      # Parallelism
+      world_size: *tp_degree
+      tp_degree: *tp_degree
+      sequence_parallel_enabled: False
+
+      # Sampling
+
+      # Others
+      torch_dtype: *dtype
+      rpl_reduce_dtype: *dtype
+      attention_dtype: *dtype
+      cast_type: "as-declared"
+      logical_neuron_cores: 2
+      cc_pipeline_tiling_factor: 2
+      async_mode: False
+      flash_decoding_enabled: False
+
+      # Kernels
+      fused_qkv: True
+      qkv_kernel_enabled: True
+      mlp_kernel_enabled: True
+      attn_kernel_enabled: True
+
+    vision_neuron_config:
+      # Batch Size
+      batch_size: 1
+
+      # Sequence Lengths
+      seq_len: *vision_max_seq_len
+      max_context_length: *vision_max_seq_len
+
+      # Buckets
+      enable_bucketing: True
+      buckets: [1024, *vision_max_seq_len]
+
+      # Parallelism
+      world_size: *tp_degree
+      tp_degree: *tp_degree
+
+      # Others
+      torch_dtype: *dtype
+      rpl_reduce_dtype: *dtype
+      cast_type: "as-declared"
+      logical_neuron_cores: 2
+      cc_pipeline_tiling_factor: 2
+      async_mode: False
+
+      # Kernels
+      fused_qkv: True
+      qkv_kernel_enabled: False
+      attn_kernel_enabled: False
+      mlp_kernel_enabled: False
+
+serving_config:
+  max_concurrent_requests: *batch_size
+  health_check_interval_in_second: 30
+  health_check_timeout_in_second: 14400
+  tensor_parallel_size: *tp_degree
+  max_model_len: *max_seq_len
+  max_num_seqs: *batch_size
+  override_neuron_config: *neuron_config
+  use_v2_block_manager: True
+  disable-log-requests: True
+  limit_mm_per_prompt:
+    image: *max_num_images
+
+env_vars:
+  NEURON_RT_EXEC_TIMEOUT: "600"
+  NEURON_RT_INSPECT_ENABLE: "0"
+  NEURON_RT_NUM_CORES: "64"
+  NEURON_RT_VIRTUAL_CORE_SIZE: "2"
+  NEURON_RT_LOG_LEVEL: "ERROR"
+
+  XLA_DENSE_GATHER_FACTOR: "0"
+  XLA_HLO_DEBUG: "1"
+  XLA_IR_DEBUG: "1"
+
+  DISABLE_NUMERIC_CC_TOKEN: "1"
+  
+  NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE: "146800640" # for 32k seq len

@@ -110,6 +110,7 @@ def initialize_moe_module(
             shared_mlp_kernel_enabled=config.neuron_config.shared_mlp_nki_kernel_enabled,
             norm_topk_prob=config.neuron_config.normalize_top_k_affinities,
             is_mxfp4_compute=config.neuron_config.is_mxfp4_compute,
+            router_mm_dtype=config.neuron_config.router_config.dtype,
         )
     else:
         tkg_config = None

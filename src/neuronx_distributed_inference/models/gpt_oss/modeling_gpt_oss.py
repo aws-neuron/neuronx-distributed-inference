@@ -52,7 +52,7 @@ from neuronx_distributed_inference.modules.attention.gqa import (
 )
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
-from neuronx_distributed_inference.modules.generation.sampling import Sampler
+from neuronx_distributed_inference.modules.generation.sampling import create_sampler
 from neuronx_distributed_inference.modules.kvcache.gpt_oss_kv_cache_manager import GptOssKVCacheManager
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
@@ -189,7 +189,7 @@ def convert_hf_format_state_dict_bf16_compute(state_dict: dict, config: Inferenc
         state_dict[f"layers.{layer}.self_attn.learned_sinks.sink"] = state_dict[f"layers.{layer}.self_attn.sinks"]
         # If attention is run in two different parallelisms across CTE and TKG, we duplicate the weights
         if config.neuron_config.attention_dp_degree != config.neuron_config.cp_degree:
-            state_dict[f"layers.{layer}.self_attn.tkg_learned_sinks.sink"] = state_dict[f"layers.{layer}.self_attn.sinks"]
+            state_dict[f"layers.{layer}.self_attn.tkg_learned_sinks.sink"] = state_dict[f"layers.{layer}.self_attn.sinks"].clone().contiguous()
         del state_dict[f"layers.{layer}.self_attn.sinks"]
 
         # Router
@@ -202,7 +202,7 @@ def convert_hf_format_state_dict_bf16_compute(state_dict: dict, config: Inferenc
         # Down Projection
         for proj in ["down_proj", "gate_up_proj"]:
             # TODO: check the dimension against the neuron implementation
-            # convert FP4 back to BF16, the dimension will x2. Revisit when we support FP4 on neuron
+            # convert FP4 back to BF16, the dimension will x2
             dequantized_weights = convert_moe_packed_tensors(
                 state_dict[f"layers.{layer}.mlp.experts.{proj}_blocks"],
                 state_dict[f"layers.{layer}.mlp.experts.{proj}_scales"]
@@ -672,7 +672,6 @@ class NeuronGptOssMoE(nn.Module):
         super().__init__()
 
         # TODO: Handle architecture related configuration separately from NeuronConfig
-        config.neuron_config.router_config.dtype = torch.float32
         config.neuron_config.router_config.act_fn = "softmax"
         config.neuron_config.transpose_shared_experts_weights = False
         config.neuron_config.early_expert_affinity_modulation = False
@@ -692,15 +691,16 @@ class NeuronGptOssMoE(nn.Module):
                                          experts_bias=True,
                                          apply_act_fn_over_topk=True)
 
-    def forward(self, hidden_states, is_speculative_decoding=False):
+    def forward(self, hidden_states, is_speculative_decoding=False, residual=None):
         """Forward pass for the MOE module"""
-        # return router_logit and expert_index for testing
-        result = self.moe(hidden_states, is_speculative_decoding=is_speculative_decoding)
+        result = self.moe(hidden_states, is_speculative_decoding=is_speculative_decoding, residual=residual)
         hidden_states = result[0]
+        # router_logits and expert_index can optionally be returned for testing
         router_logits = result[1] if self.moe.return_router_logits else None
-        expert_index = result[-1] if self.moe.return_expert_index else None
+        expert_index = result[-2] if (self.moe.return_expert_index and residual is not None) else (result[-1] if self.moe.return_expert_index else None)
+        residual_out = result[-1] if residual is not None else None
 
-        return tuple(x for x in (hidden_states, router_logits, expert_index) if x is not None)
+        return tuple(x for x in (hidden_states, router_logits, expert_index, residual_out) if x is not None)
 
 
 class DecodeGptOssRotaryCacheManager():
@@ -799,14 +799,8 @@ class NeuronGptOssDecoderLayer(nn.Module):
             kwargs.pop("cos_cache")
             kwargs.pop("sin_cache")
 
+        # Residual Connection
         residual = hidden_states.clone()
-
-        # Shuffle H dim of residual when using mxfp4 weights, to ensure that residual add result is correct and shuffled. This is required
-        #   because attention block input is unshuffled but attention block output is shuffled.
-        # FIXME: remove hidden states shuffle/unshuffle logic once we have validated full model accuracy with mxfp4. Once we have
-        #   validated full model accuracy, we will shuffle the H dim for the full model to avoid online shuffling/unshuffling hidden_states.
-        if self.config.neuron_config.is_mxfp4_compute and not self.config.neuron_config.is_full_model_shuffled:
-            residual = shuffle_hidden_dim(residual, dim=-1)
 
         # RMSNorm (fused with QKV kernel when SP is disabled)
         if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm:
@@ -828,18 +822,20 @@ class NeuronGptOssDecoderLayer(nn.Module):
             sin_cache=sin_cache,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
-        residual = hidden_states.clone()
 
-        # Unshuffle H dim of residual when using mxfp4 weights, to ensure that residual add result is correct and unshuffled. This is required
-        #   because MoE block input is shuffled but MoE block output is unshuffled.
-        # FIXME: remove hidden states shuffle/unshuffle logic once we have validated full model accuracy with mxfp4. Once we have
-        #   validated full model accuracy, we will shuffle the H dim for the full model to avoid online shuffling/unshuffling hidden_states.
+        # Shuffle H dim of residual when using mxfp4 weights, if is_full_model_shuffled=False. This is useful for debugging, with a performance penalty.
+        if self.config.neuron_config.is_mxfp4_compute and not self.config.neuron_config.is_full_model_shuffled:
+            residual = shuffle_hidden_dim(residual, dim=-1)
+
+        # MoE (residual + attention output is computed inside MoE)
+        is_speculative_decoding = self.config.neuron_config.enable_fused_speculation and (not self.config.neuron_config.is_prefill_stage)
+        hidden_states, *_, residual = self.feed_forward(hidden_states, is_speculative_decoding, residual)
+
+        # Shuffle H dim of residual when using mxfp4 weights, if is_full_model_shuffled=False. This is useful for debugging, with a performance penalty.
         if self.config.neuron_config.is_mxfp4_compute and not self.config.neuron_config.is_full_model_shuffled:
             residual = unshuffle_hidden_dim(residual, dim=-1)
 
-        is_speculative_decoding = self.config.neuron_config.enable_fused_speculation and (not self.config.neuron_config.is_prefill_stage)
-        hidden_states = self.feed_forward(hidden_states, is_speculative_decoding)[0]
+        # Residual + MoE output
         hidden_states = residual + hidden_states
 
         if not self.config.neuron_config.is_prefill_stage:
@@ -975,7 +971,10 @@ class NeuronGptOssModel(NeuronBaseModel):
 
     def init_inference_optimization(self, config: InferenceConfig):
         if self.on_device_sampling:
-            self.sampler = Sampler(config.neuron_config)
+            lm_head_tp_degree = None
+            if hasattr(self, "lm_head") and hasattr(self.lm_head, "tensor_parallel_group"):
+                lm_head_tp_degree = self.lm_head.tensor_parallel_group.size()
+            self.sampler = create_sampler(config.neuron_config, lm_head_tp_degree)
 
         self.kv_mgr = GptOssKVCacheManager(config, num_kv_head=self.num_key_value_heads, global_rank=self.rank_util, sliding_window=self.sliding_window)
 

@@ -1,23 +1,13 @@
-from argparse import Namespace
 import os
-import pytest
+import shutil
 import tempfile
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
 
 from neuronx_distributed_inference.models.config import MoENeuronConfig
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeInferenceConfig, NeuronQwen3MoeForCausalLM
-from neuronx_distributed_inference.utils.accuracy import check_accuracy_logits
-from neuronx_distributed_inference.utils.constants import TEST_PROMPT
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
-
-from neuronx_distributed.utils.tensor_capture.model_modification import (
-    modify_hf_eager_model_for_tensor_capture,
-    find_available_modules)
-
-import torch.nn as nn
-import types
-from typing import List, Dict, Any, Optional, Union, Callable
+from neuronx_distributed.utils.tensor_capture.model_modification import modify_hf_eager_model_for_tensor_capture
 
 
 def save_checkpoint(config_path):
@@ -64,18 +54,18 @@ def test_hf_tensor_capture():
     tensor_capture_save_dir= os.path.dirname(os.path.abspath(__file__)) + "/tensor_capture_hf/"
     hf_model, hooks, _ = modify_hf_eager_model_for_tensor_capture(hf_model, modules_to_capture, tensor_capture_save_dir)
 
-    prompts = [TEST_PROMPT]
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-235B-A22B-Instruct-2507")
-    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
-    num_tokens_to_check=512
+    input_len = 15
+    input_ids = (torch.rand((1, input_len)) * c.vocab_size).to(dtype=torch.int32)
+    attention_mask = torch.ones((1, input_len), dtype=torch.int32)
+    num_tokens_to_check = 512
     generation_config = GenerationConfig(do_sample=False, pad_token_id=0)
 
     hf_model.generate(
-        inputs.input_ids,
+        input_ids,
         max_new_tokens=num_tokens_to_check,
         min_new_tokens=num_tokens_to_check,
         do_sample=False,
-        attention_mask=inputs.attention_mask,
+        attention_mask=attention_mask,
         return_dict_in_generate=True,
         output_scores=True,
         generation_config=generation_config
@@ -98,8 +88,7 @@ def test_hf_tensor_capture():
 
     print("All tensor files have the expected shape.")
 
-    # Optionally clean up
-    import shutil
+    # Clean up
     shutil.rmtree(tensor_capture_save_dir)
     print(f"Deleted directory: {tensor_capture_save_dir}")
 

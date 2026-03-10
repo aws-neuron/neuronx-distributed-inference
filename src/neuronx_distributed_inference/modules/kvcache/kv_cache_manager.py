@@ -3,11 +3,12 @@ from typing import List, Optional, Tuple
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state, utils
-from neuronx_distributed.quantization import dequantize, quantize
 from torch import Tensor, nn
 from torch_neuronx.xla_impl.ops import ConcatenateOp
 
 from neuronx_distributed_inference.models.config import InferenceConfig
+from neuronx_distributed.quantization.quantization_config import QuantizationType
+from neuronx_distributed.quantization.quantization_utils import quantize_static_quant_activations
 from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402; noqa: E402; noqa: E402
     determine_sharding_strategy,
     get_shardable_head_counts,
@@ -134,30 +135,34 @@ class KVCacheManager(nn.Module):
         # NOTE: Tiling the sequence dimension of the KV cache enables specific compiler optimizations like cascaded reductions
         self.is_kv_cache_tiled = config.neuron_config.kv_cache_tiling
         self._init_kv_shape(config, layer_to_cache_size_mapping)
-        self.quant = config.neuron_config.kv_cache_quant
+
+        self.kv_quant_config = config.neuron_config.kv_quant_config
 
         num_layer = config.num_hidden_layers
         dtype = config.neuron_config.attention_dtype if config.neuron_config.attention_dtype is not None else config.neuron_config.torch_dtype
-        if self.quant:
-            self.quant_dtype = torch.float8_e4m3fn
-            self.dequant_dtype = dtype
+
+        # Initialize quantization state
+        self.cache_dtype = dtype
+        if self.kv_quant_config:
+            self.cache_dtype = self.kv_quant_config.quant_dtype
+
+            if not self.kv_quant_config.direct_cast:
+                self._init_scale_buffers(num_layer)
 
         if layer_to_cache_size_mapping:
             self.past_key_values = nn.ParameterList(
                 [
-                    nn.Parameter(torch.zeros(k_or_v_shape, dtype=dtype), requires_grad=False)
+                    nn.Parameter(torch.zeros(k_or_v_shape, dtype=self.cache_dtype), requires_grad=False)
                     for layer_idx in range(num_layer) for k_or_v_shape in [self.k_shapes[layer_idx], self.v_shapes[layer_idx]]
                 ]
             )
         else:
             self.past_key_values = nn.ParameterList(
                 [
-                    nn.Parameter(torch.zeros(k_or_v_shape, dtype=dtype), requires_grad=False)
+                    nn.Parameter(torch.zeros(k_or_v_shape, dtype=self.cache_dtype), requires_grad=False)
                     for _ in range(num_layer) for k_or_v_shape in [self.k_shape, self.v_shape]
                 ]
             )
-        if self.quant:
-            self.past_key_values = self.past_key_values.to(self.quant_dtype)
 
     def _get_num_kv_heads_per_rank(self, config: InferenceConfig):
         tp_degree = config.neuron_config.tp_degree
@@ -295,6 +300,17 @@ class KVCacheManager(nn.Module):
             updated_seq_ids = self.get_cache_update_index_for_seq_ids(seq_ids)
             k_cache = k_cache[updated_seq_ids]
             v_cache = v_cache[updated_seq_ids]
+        # Handle batch bucketing: slice KV cache when seq_ids batch size is less than max
+        elif (
+            self.neuron_config.token_generation_batches is not None
+            and seq_ids is not None
+            and seq_ids.shape[0] != self.neuron_config.max_batch_size
+        ):
+            # TODO: Merge into spec decoding path once supported
+            # Slice KV cache to match the batch size of seq_ids
+            updated_seq_ids = self.get_cache_update_index_for_seq_ids(seq_ids)
+            k_cache = k_cache[updated_seq_ids]
+            v_cache = v_cache[updated_seq_ids]
         elif self.kv_cache_padding_size > 0:
             k_cache = k_cache[: -self.kv_cache_padding_size]
             v_cache = v_cache[: -self.kv_cache_padding_size]
@@ -319,9 +335,11 @@ class KVCacheManager(nn.Module):
         if not skip_slice:
             k_cache = _slice_kv_cacheline(self.padding_side, seq_len, k_cache, self.k_cache_transposed)
             v_cache = _slice_kv_cacheline(self.padding_side, seq_len, v_cache, False)
-        if self.quant:
-            k_cache = dequantize.direct_cast_dequantize(k_cache, self.dequant_dtype)
-            v_cache = dequantize.direct_cast_dequantize(v_cache, self.dequant_dtype)
+
+        if self.kv_quant_config:
+            k_cache = self._dequantize_cache(k_cache, idx, is_key=True)
+            v_cache = self._dequantize_cache(v_cache, idx, is_key=False)
+
         if windowed_context_encoding_window_idx >= 1:
             if not self.sliding_window:
                 k_cache = k_cache[:, :, 0 : windowed_context_encoding_window_idx * self.windowed_context_encoding_size, :]
@@ -431,9 +449,10 @@ class KVCacheManager(nn.Module):
         **kwargs,
     ):
         latest_k, latest_v = kv_per_layer[0], kv_per_layer[1]
-        if self.quant:
-            latest_k = quantize.direct_cast_quantize(latest_k, self.quant_dtype)
-            latest_v = quantize.direct_cast_quantize(latest_v, self.quant_dtype)
+
+        if self.kv_quant_config:
+            latest_k = self._quantize_cache(latest_k, idx, is_key=True)
+            latest_v = self._quantize_cache(latest_v, idx, is_key=False)
 
         k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer)
 
@@ -442,7 +461,7 @@ class KVCacheManager(nn.Module):
             cte_rank_ordering = get_cp8_tp8_rank_ordering(self.neuron_config.tp_degree, self.neuron_config.cp_degree, switch_cc=self.neuron_config.switch_cc)
 
         if not is_for_context_encoding and self.neuron_config.attention_dp_degree > 1:
-            dp_rank = get_dp_rank(self.get_rank(device=seq_ids.device), self.neuron_config.tp_degree // self.neuron_config.attention_dp_degree, self.neuron_config.attention_dp_degree, switch_cc=self.neuron_config.switch_cc)
+            dp_rank = get_dp_rank(self.global_rank.get_rank(), self.neuron_config.tp_degree // self.neuron_config.attention_dp_degree, self.neuron_config.attention_dp_degree, switch_cc=self.neuron_config.switch_cc)
             seq_ids = split_along_dim(seq_ids, dim=0, rank=dp_rank, num_partitions=self.neuron_config.attention_dp_degree)
             position_ids = split_along_dim(position_ids, dim=0, rank=dp_rank, num_partitions=self.neuron_config.attention_dp_degree)
 
@@ -619,3 +638,61 @@ class KVCacheManager(nn.Module):
             return torch.index_select(rank_ordering, dim=0, index=rank)
 
         return rank
+
+    def _init_scale_buffers_for_k_or_v(self, num_layer, method):
+        # TODO: these scales assume fp32, we can add dtype to support other dtypes quantization support such as MX.
+
+        scales = nn.ParameterList()
+        for _ in range(num_layer):
+            # init scales based on method
+            if method == QuantizationType.PER_TENSOR_SYMMETRIC:
+                # Single scale per layer
+                scales.append(nn.Parameter(torch.ones(1), requires_grad=False))
+            elif method == QuantizationType.PER_KEY_SYMMETRIC:
+                # Scale per key head
+                num_heads = self._get_num_kv_heads_per_rank(self.config)
+                scales.append(nn.Parameter(torch.ones(num_heads, 1, 1), requires_grad=False))
+            elif method == QuantizationType.PER_CHANNEL_SYMMETRIC:
+                # Scale per head dimension
+                head_dim = self._get_hidden_dim_per_head(self.config)
+                scales.append(nn.Parameter(torch.ones(1, 1, head_dim), requires_grad=False))
+            else:
+                raise ValueError(f"{method} is not a supported KV Quantization method")
+
+        return scales
+
+    def _init_scale_buffers(self, num_layer):
+        k_method = self.kv_quant_config.k_quant_method
+        v_method = self.kv_quant_config.v_quant_method
+
+        self.k_scales = self._init_scale_buffers_for_k_or_v(num_layer, k_method)
+        self.v_scales = self._init_scale_buffers_for_k_or_v(num_layer, v_method)
+
+    def _dequantize_tensor(self, tensor, scale, target_dtype):
+        dequantized = tensor.to(torch.float32)
+        dequantized = dequantized * scale
+        return dequantized.to(target_dtype)
+
+    def _quantize_cache(self, cache_tensor, layer_idx, is_key=True):
+        if not self.kv_quant_config:
+            return cache_tensor
+
+        if self.kv_quant_config.direct_cast:
+            return cache_tensor.to(self.cache_dtype)
+
+        scale = self.k_scales[layer_idx] if is_key else self.v_scales[layer_idx]
+
+        return quantize_static_quant_activations(cache_tensor, scale, self.cache_dtype)
+
+    def _dequantize_cache(self, cache_tensor, layer_idx, is_key=True):
+        if not self.kv_quant_config:
+            return cache_tensor
+
+        target_dtype = self.config.neuron_config.attention_dtype if self.config.neuron_config.attention_dtype is not None else self.config.neuron_config.torch_dtype
+
+        if self.kv_quant_config.direct_cast:
+            return cache_tensor.to(target_dtype)
+
+        scale = self.k_scales[layer_idx] if is_key else self.v_scales[layer_idx]
+
+        return self._dequantize_tensor(cache_tensor, scale, target_dtype)

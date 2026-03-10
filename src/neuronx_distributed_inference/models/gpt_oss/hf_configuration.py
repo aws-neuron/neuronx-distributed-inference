@@ -44,7 +44,6 @@ class GptOssConfig(PretrainedConfig):
         self.rope_scaling_factor = rope_config.get("factor", rope_scaling_factor)
         self.rope_ntk_alpha = rope_config.get("beta_slow", rope_ntk_alpha)
         self.rope_ntk_beta = rope_config.get("beta_fast", rope_ntk_beta)
-        # Related Ticket: https://aws-neuron.atlassian.net/jira/software/projects/NS/boards/34/backlog?selectedIssue=NS-139
         # Fake HF configs to disable the code reading the sliding_window_size during max length validation.
         # v0.9.0 vLLM reads sliding_window settings from HF config of the model (presumably to setup K/V cache management for vLLM's own modeling code).
         # This causes a block allocation which fails for our current Neuron integration because we only have 1 block per TKG batch size.

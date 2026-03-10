@@ -1,9 +1,12 @@
 import os
-
+import math
+import neuronxcc.nki as nki
+import neuronxcc.nki.language as nl
 import torch
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
 from neuronx_distributed.parallel_layers.utils import divide
 from neuronx_distributed_inference.modules.attention.attention_process_groups import tp_mesh_8_by_8
+from neuronxcc.nki._pre_prod_kernels.util.kernel_helpers import get_verified_program_sharding_info
 
 
 def get_init_world_size() -> int:
@@ -81,15 +84,69 @@ def split_along_dim(tensor: torch.tensor, dim: int, rank: int, num_partitions: i
     return tensor
 
 
+@nki.jit
+def split_along_dim0_kernel(tensor, rank, num_partitions):
+    """
+    NKI kernel that returns the rank-th partition of tensor split along dimension 0.
+    Equivalent to split_along_dim(tensor, 0, rank, num_partitions).
+
+    :param tensor: Input tensor in HBM
+    :param rank: Single-element tensor (shape (1,)) indicating which partition to return
+    :param num_partitions: Number of partitions to split tensor into
+    :return: Tensor partition with shape (tensor.shape[0] // num_partitions, *tensor.shape[1:])
+    """
+    num_per_partition = divide(tensor.shape[0], num_partitions)
+    output_shape = (num_per_partition, *tensor.shape[1:])
+    rank_sb = nl.load(rank.reshape((1, 1)))
+
+    # Size of the remaining dim after leading num_partitions dim.
+    F = num_per_partition * math.prod(tensor.shape[1:])
+    tensor = tensor.reshape((num_partitions, F))
+    out_tensor = nl.ndarray((1, F), dtype=tensor.dtype, buffer=nl.shared_hbm)
+
+    # LNC-shard on remaining dim F, last NC takes all remainder in case F indivisible by n_prgs.
+    _, n_prgs, prg_id = get_verified_program_sharding_info("split_along_dim0_kernel", (0, 1), 2)
+    sharded_F = F // n_prgs
+    F_offset = sharded_F * prg_id
+    i_p, i_f = nl.mgrid[:1, :F]
+    if prg_id == n_prgs - 1:
+        i_p, i_f = nl.mgrid[:1, :(F - (n_prgs - 1) * sharded_F)]
+
+    nki.isa.dma_copy(src=tensor[rank_sb, F_offset + i_f], dst=out_tensor[i_p, F_offset + i_f])
+
+    return out_tensor.reshape(output_shape)
+
+
+def split_along_dim0_kernel_wrapper(tensor, rank, num_partitions, lnc):
+    """Wrapper for split_along_dim0_kernel and fall back to flat-torch if on CPU"""
+    if tensor.device == torch.device("cpu"):
+        return split_along_dim(tensor, 0, rank, num_partitions)
+    return split_along_dim0_kernel[(nl.nc(lnc),)](tensor, rank, num_partitions)
+
+
 def get_rank_8_by_8(global_rank, switch_cc: bool = False):
     """
     Get the row index of a global rank in an 8x8 mesh topology.
     Args:
         global_rank: The global rank to locate in the mesh
-        switch_cc: If True, use PDS topology; otherwise use base TRN2 topology
+        switch_cc: If True, use switch topology; otherwise use base TRN2 topology
     Returns:
         torch.Tensor: The row index (0-7) where the global rank is found in the 8x8 mesh
     """
     mesh = torch.tensor(tp_mesh_8_by_8(switch_cc), device=global_rank.device)
+    return _get_rank_row_index(mesh, global_rank)
+
+
+def _get_rank_row_index(mesh, global_rank):
+    """
+    Get the row index of a global rank in a mesh topology.
+
+    Args:
+        mesh: The mesh
+        global_rank: The global rank to locate in the mesh
+
+    Returns:
+        torch.Tensor: The row index where the global rank is found in the mesh
+    """
     matches = (mesh == global_rank).any(dim=1)
-    return torch.argmax(matches.int())
+    return torch.argmax(matches.int()).to(torch.int32)

@@ -272,8 +272,8 @@ class TestRegisterSnapshotHooks:
         assert neuron_app.models[0].model == mock_wrapper_instance1
         assert neuron_app.models[1].model == mock_wrapper_instance2
         
-        mock_wrapper_instance1.register_forward_hook.assert_called_once_with(mock_hook1)
-        mock_wrapper_instance2.register_forward_hook.assert_called_once_with(mock_hook2)
+        mock_wrapper_instance1.register_forward_pre_hook.assert_called_once_with(mock_hook1)
+        mock_wrapper_instance2.register_forward_pre_hook.assert_called_once_with(mock_hook2)
     
     def test_register_snapshot_hooks_model_not_loaded(self, neuron_app):
         """Test assertion when model is not loaded to neuron."""

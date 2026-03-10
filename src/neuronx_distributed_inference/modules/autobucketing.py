@@ -200,6 +200,29 @@ def generate_buckets_for_cte(inference_config: InferenceConfig):
     return buckets
 
 
+def generate_2d_buckets_for_batch_bucketing(neuron_config, buckets):
+    """
+    Generate 2D buckets list of 2D buckets in format [batch_size, seq_len],
+    sorted with largest batch sizes first.
+    """
+    # Generate batch buckets (reverse sorted for first-fit to work correctly)
+    batch_buckets = list(neuron_config.token_generation_batches)
+    # Always include the max batch size
+    if neuron_config.tkg_batch_size not in batch_buckets:
+        batch_buckets.append(neuron_config.tkg_batch_size)
+    batch_buckets = sorted(batch_buckets, reverse=True)
+
+    # Combine batch and sequence buckets into 2D buckets
+    # Format: [batch_size, seq_len]
+    # Iterate batch buckets first (largest to smallest), then seq buckets
+    batch_seq_buckets = []
+    for batch_bucket in batch_buckets:
+        for seq_bucket in buckets:
+            batch_seq_buckets.append([batch_bucket, seq_bucket])
+
+    return batch_seq_buckets
+
+
 def generate_buckets_for_tkg(inference_config: InferenceConfig):
     """
     Generate buckets for token generation model
@@ -210,40 +233,50 @@ def generate_buckets_for_tkg(inference_config: InferenceConfig):
     TODO: Extract prefix caching bucketing logics out for a cleaner
     code base.
     """
-    if not inference_config.neuron_config.enable_bucketing:
-        if inference_config.neuron_config.is_prefix_caching:
+    neuron_config = inference_config.neuron_config
+
+    if not neuron_config.enable_bucketing:
+        if neuron_config.is_prefix_caching:
             buckets = generate_2d_buckets_for_prefix_caching(
                 1,
                 1,
-                inference_config.neuron_config.max_length,
-                inference_config.neuron_config.max_length
+                neuron_config.max_length,
+                neuron_config.max_length
             )
         else:
             buckets = generate_buckets(
-                inference_config.neuron_config.max_length,
-                inference_config.neuron_config.max_length
+                neuron_config.max_length,
+                neuron_config.max_length
             )
     else:
-        if inference_config.neuron_config.token_generation_buckets is not None:
-            if inference_config.neuron_config.is_prefix_caching:
-                buckets = inference_config.neuron_config.token_generation_buckets
+        if neuron_config.token_generation_buckets is not None:
+            buckets = neuron_config.token_generation_buckets
+            if neuron_config.is_prefix_caching:
                 new_buckets = []
                 for i in buckets:
                     new_buckets.append([1, i])
                 buckets = new_buckets
-            else:
-                buckets = inference_config.neuron_config.token_generation_buckets
         else:
-            if inference_config.neuron_config.is_prefix_caching:
+            if neuron_config.is_prefix_caching:
                 # currently we have a requirement of minimal 256 to use the block attn nki kernel
                 buckets = generate_2d_buckets_for_prefix_caching(
-                    1, 1, 256, inference_config.neuron_config.max_length
+                    1, 1, 256, neuron_config.max_length
                 )
             else:
                 buckets = generate_buckets(
-                    128, inference_config.neuron_config.max_length
+                    128, neuron_config.max_length
                 )
-    return buckets
+
+    # If batch bucketing is not enabled return sequence buckets as-is
+    if neuron_config.token_generation_batches is not None:
+        if neuron_config.is_prefix_caching:
+            # TODO: Handle prefix caching with batch bucketing
+            raise NotImplementedError(
+                "Batch bucketing is not yet supported with prefix caching enabled."
+            )
+        return generate_2d_buckets_for_batch_bucketing(neuron_config, buckets)
+    else:
+        return buckets
 
 
 def generate_buckets_for_fused_spec(inference_config: InferenceConfig):
