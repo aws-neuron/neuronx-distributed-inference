@@ -64,6 +64,224 @@ from neuronx_distributed.utils import cpu_mode
 
 logger = logging.getLogger(__name__)
 
+# ==============================================================================
+# NKI Selective Scan Kernel for Mamba2 prefill
+# ==============================================================================
+# When enabled, replaces the O(L²) quadratic parallel scan with O(L) hardware-
+# accelerated scan using nisa.tensor_tensor_scan on Trainium2.
+# Set USE_NKI_SCAN = False to fall back to the quadratic implementation.
+
+USE_NKI_SCAN = True
+
+try:
+    import nki
+    import nki.language as nl
+    import nki.isa as nisa
+
+    HAS_NKI = True
+except ImportError:
+    HAS_NKI = False
+    if USE_NKI_SCAN:
+        logger.warning("NKI not available, falling back to quadratic scan")
+        USE_NKI_SCAN = False
+
+if HAS_NKI and USE_NKI_SCAN:
+    P_MAX = 128
+
+    @nki.jit
+    def nki_scan_kernel(
+        dA_exp_t,  # (NH, SL) — pre-transposed decay coefficients
+        dBx_t,  # (NH * HD * SS, SL) — flattened+transposed
+        C_t,  # (NH * SS, SL) — flattened+transposed
+        Dx_t,  # (NH * HD, SL) — pre-computed D*x, flattened+transposed
+        x_t,  # (NH * HD, SL) — flattened+transposed (unused, for shape)
+        hd_range,  # (HD,) — dummy tensor for head_dim
+        ss_range,  # (SS,) — dummy tensor for ssm_state_size
+    ):
+        """NKI O(L) selective scan using tensor_tensor_scan."""
+        NH = dA_exp_t.shape[0]
+        SL = dA_exp_t.shape[1]
+        HD = hd_range.shape[0]
+        SS = ss_range.shape[0]
+
+        y_out = nl.ndarray((NH * HD, SL), dtype=nl.float32, buffer=nl.shared_hbm)
+        final_state_out = nl.ndarray(
+            (NH * HD * SS, 1), dtype=nl.float32, buffer=nl.shared_hbm
+        )
+
+        dA_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=dA_sb, value=0.0)
+        nisa.dma_copy(dst=dA_sb[0:NH, 0:SL], src=dA_exp_t[0:NH, 0:SL])
+
+        for d in nl.affine_range(HD):
+            y_acc_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(dst=y_acc_sb, value=0.0)
+            Dx_row = d * NH
+            nisa.dma_copy(
+                dst=y_acc_sb[0:NH, 0:SL],
+                src=Dx_t[Dx_row : Dx_row + NH, 0:SL],
+            )
+
+            for s in nl.affine_range(SS):
+                dBx_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.memset(dst=dBx_sb, value=0.0)
+                dBx_row = (d * SS + s) * NH
+                nisa.dma_copy(
+                    dst=dBx_sb[0:NH, 0:SL],
+                    src=dBx_t[dBx_row : dBx_row + NH, 0:SL],
+                )
+
+                init_sb = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.memset(dst=init_sb, value=0.0)
+
+                state_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor_scan(
+                    dst=state_sb[0:NH, 0:SL],
+                    data0=dA_sb[0:NH, 0:SL],
+                    data1=dBx_sb[0:NH, 0:SL],
+                    initial=init_sb[0:NH, 0:1],
+                    op0=nl.multiply,
+                    op1=nl.add,
+                )
+
+                final_sb = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(
+                    dst=final_sb[0:NH, 0:1],
+                    src=state_sb[0:NH, SL - 1 : SL],
+                )
+                fs_row = (d * SS + s) * NH
+                nisa.dma_copy(
+                    dst=final_state_out[fs_row : fs_row + NH, 0:1],
+                    src=final_sb[0:NH, 0:1],
+                )
+
+                C_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.memset(dst=C_sb, value=0.0)
+                C_row = s * NH
+                nisa.dma_copy(
+                    dst=C_sb[0:NH, 0:SL],
+                    src=C_t[C_row : C_row + NH, 0:SL],
+                )
+
+                Cs_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(
+                    dst=Cs_sb[0:NH, 0:SL],
+                    data1=C_sb[0:NH, 0:SL],
+                    data2=state_sb[0:NH, 0:SL],
+                    op=nl.multiply,
+                )
+                nisa.tensor_tensor(
+                    dst=y_acc_sb[0:NH, 0:SL],
+                    data1=y_acc_sb[0:NH, 0:SL],
+                    data2=Cs_sb[0:NH, 0:SL],
+                    op=nl.add,
+                )
+
+            y_row = d * NH
+            nisa.dma_copy(
+                dst=y_out[y_row : y_row + NH, 0:SL],
+                src=y_acc_sb[0:NH, 0:SL],
+            )
+
+        return y_out, final_state_out
+
+
+def _nki_selective_scan(
+    hidden_states_ssm, dt_processed, A, B, C, D, num_heads, head_dim, ssm_state_size
+):
+    """
+    NKI-accelerated selective scan for Mamba2 prefill.
+
+    Replaces the O(L²) quadratic scan with O(L) hardware scan.
+    Handles data layout transformation (PyTorch → NKI partition-first).
+
+    Args:
+        hidden_states_ssm: (batch, seq_len, num_heads, head_dim) float32
+        dt_processed: (batch, seq_len, num_heads) float32
+        A: (num_heads,) float32 — negative
+        B: (batch, seq_len, num_heads, ssm_state_size) float32
+        C: (batch, seq_len, num_heads, ssm_state_size) float32
+        D: (num_heads,) float32
+        num_heads, head_dim, ssm_state_size: ints
+
+    Returns:
+        y: (batch, seq_len, num_heads, head_dim)
+        final_state: (batch, num_heads, head_dim, ssm_state_size)
+    """
+    batch, seq_len = hidden_states_ssm.shape[:2]
+
+    # Pre-compute on PyTorch side (traced as XLA ops)
+    dA_exp = torch.exp(dt_processed * A.view(1, 1, -1))  # (B, L, H)
+    dB = dt_processed.unsqueeze(-1) * B  # (B, L, H, S)
+    dBx = dB.unsqueeze(3) * hidden_states_ssm.unsqueeze(-1)  # (B, L, H, D, S)
+
+    # Transpose to NKI partition-first layout (squeeze batch=1)
+    dA_exp_t = dA_exp[0].transpose(0, 1).contiguous()  # (H, L)
+
+    dBx_0 = dBx[0]  # (L, H, D, S)
+    dBx_t = (
+        dBx_0.permute(0, 2, 3, 1)
+        .reshape(seq_len, head_dim * ssm_state_size * num_heads)
+        .transpose(0, 1)
+        .contiguous()
+    )  # (D*S*H, L)
+
+    C_t = (
+        C[0]
+        .permute(0, 2, 1)
+        .reshape(seq_len, ssm_state_size * num_heads)
+        .transpose(0, 1)
+        .contiguous()
+    )  # (S*H, L)
+
+    x_t = (
+        hidden_states_ssm[0]
+        .permute(0, 2, 1)
+        .reshape(seq_len, head_dim * num_heads)
+        .transpose(0, 1)
+        .contiguous()
+    )  # (D*H, L)
+
+    Dx_t = (
+        (D.view(1, -1, 1) * hidden_states_ssm[0])
+        .permute(0, 2, 1)
+        .reshape(seq_len, head_dim * num_heads)
+        .transpose(0, 1)
+        .contiguous()
+    )  # (D*H, L)
+
+    hd_range = torch.zeros(head_dim, dtype=torch.float32, device=dA_exp_t.device)
+    ss_range = torch.zeros(ssm_state_size, dtype=torch.float32, device=dA_exp_t.device)
+
+    # Call NKI kernel
+    y_flat, state_flat = nki_scan_kernel(
+        dA_exp_t,
+        dBx_t,
+        C_t,
+        Dx_t,
+        x_t,
+        hd_range,
+        ss_range,
+    )
+
+    # Unpack: y_flat (D*H, L) → (1, L, H, D)
+    y = (
+        y_flat.reshape(head_dim, num_heads, seq_len)
+        .permute(2, 1, 0)
+        .unsqueeze(0)
+        .contiguous()
+    )
+
+    # state_flat (D*S*H, 1) → (1, H, D, S)
+    final_state = (
+        state_flat.reshape(head_dim, ssm_state_size, num_heads)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .contiguous()
+    )
+
+    return y, final_state
+
 
 # ==============================================================================
 # Configuration
@@ -486,42 +704,62 @@ class NeuronMamba2Layer(nn.Module):
         B = B.repeat_interleave(self.num_heads // self.n_groups, dim=2)
         C = C.repeat_interleave(self.num_heads // self.n_groups, dim=2)
 
-        dA_log = dt_processed * A.view(1, 1, -1)
-        dB = dt_processed.unsqueeze(-1) * B
-        dBx = dB.unsqueeze(3) * hidden_states_ssm.unsqueeze(-1)
-
-        log_dA_cumsum = torch.cumsum(dA_log, dim=1)
-
-        causal_mask = torch.tril(
-            torch.ones(
-                seq_len,
-                seq_len,
-                device=hidden_states_ssm.device,
-                dtype=hidden_states_ssm.dtype,
+        if USE_NKI_SCAN:
+            # NKI O(L) hardware-accelerated selective scan
+            y, ssm_state_new = _nki_selective_scan(
+                hidden_states_ssm,
+                dt_processed,
+                A,
+                B,
+                C,
+                self.D.float(),
+                self.num_heads,
+                self.head_dim,
+                self.ssm_state_size,
             )
-        )
-
-        log_diff = log_dA_cumsum.unsqueeze(2) - log_dA_cumsum.unsqueeze(1)
-        log_diff = log_diff.masked_fill(
-            causal_mask.unsqueeze(0).unsqueeze(-1) == 0, -1e9
-        )
-        weights = torch.exp(log_diff)
-
-        states = torch.einsum("btih,bihds->bthds", weights, dBx)
-
-        # Save final SSM state from last real token position
-        if padding_mask is not None:
-            real_len = padding_mask[:, :seq_len].sum(dim=1, keepdim=True).long()
-            last_real_idx = (real_len - 1).clamp(min=0)
-            gather_idx = last_real_idx.view(batch_size, 1, 1, 1, 1).expand(
-                -1, -1, self.num_heads, self.head_dim, self.ssm_state_size
-            )
-            ssm_state_new = torch.gather(states, 1, gather_idx).squeeze(1).contiguous()
+            # Note: NKI path returns final state from last position.
+            # padding_mask handling for variable-length is not yet supported
+            # with NKI — assumes no padding (full sequences).
         else:
-            ssm_state_new = states[:, -1, :, :, :].contiguous()
+            # O(L²) quadratic parallel scan (fallback)
+            dA_log = dt_processed * A.view(1, 1, -1)
+            dB = dt_processed.unsqueeze(-1) * B
+            dBx = dB.unsqueeze(3) * hidden_states_ssm.unsqueeze(-1)
 
-        y = torch.einsum("blhs,blhds->blhd", C, states)
-        y = y + self.D.view(1, 1, -1, 1) * hidden_states_ssm
+            log_dA_cumsum = torch.cumsum(dA_log, dim=1)
+
+            causal_mask = torch.tril(
+                torch.ones(
+                    seq_len,
+                    seq_len,
+                    device=hidden_states_ssm.device,
+                    dtype=hidden_states_ssm.dtype,
+                )
+            )
+
+            log_diff = log_dA_cumsum.unsqueeze(2) - log_dA_cumsum.unsqueeze(1)
+            log_diff = log_diff.masked_fill(
+                causal_mask.unsqueeze(0).unsqueeze(-1) == 0, -1e9
+            )
+            weights = torch.exp(log_diff)
+
+            states = torch.einsum("btih,bihds->bthds", weights, dBx)
+
+            # Save final SSM state from last real token position
+            if padding_mask is not None:
+                real_len = padding_mask[:, :seq_len].sum(dim=1, keepdim=True).long()
+                last_real_idx = (real_len - 1).clamp(min=0)
+                gather_idx = last_real_idx.view(batch_size, 1, 1, 1, 1).expand(
+                    -1, -1, self.num_heads, self.head_dim, self.ssm_state_size
+                )
+                ssm_state_new = (
+                    torch.gather(states, 1, gather_idx).squeeze(1).contiguous()
+                )
+            else:
+                ssm_state_new = states[:, -1, :, :, :].contiguous()
+
+            y = torch.einsum("blhs,blhds->blhd", C, states)
+            y = y + self.D.view(1, 1, -1, 1) * hidden_states_ssm
         y = y.reshape(batch_size, seq_len, -1)
 
         scan_output = self.norm(y, gate)

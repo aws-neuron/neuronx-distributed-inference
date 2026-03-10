@@ -54,6 +54,27 @@ Granite applies the gate BEFORE normalization (`norm_before_gate=False` in Mamba
 
 Prefill uses a full-sequence parallel scan via cumulative sum in log-space (L x L weight matrix). This is mathematically equivalent to HF's chunk-based SSD (chunk_size=256) but produces slightly different floating-point results due to BF16 precision and different accumulation order. Average Pearson=0.9968, average Cosine=0.9987 across 10 diverse prompts.
 
+### NKI Selective Scan Kernel (Optional, Trainium2)
+
+The model includes an optional NKI (Neuron Kernel Interface) kernel that replaces the O(L^2) quadratic parallel scan with an O(L) hardware-accelerated scan using `nisa.tensor_tensor_scan` on Trainium2. This is controlled by the `USE_NKI_SCAN` flag in `modeling_granite.py` (default: `True`).
+
+**How it works:**
+
+`tensor_tensor_scan` computes: `result[i] = op0(data0[i], result[i-1]) op1 data1[i]`
+
+For the Mamba2 SSM recurrence `state[t] = exp(dA[t]) * state[t-1] + dBx[t]`:
+- `data0 = exp(dA)`, `op0 = multiply`
+- `data1 = dBx`, `op1 = add`
+
+The kernel processes all 32 heads (TP-sharded from 128) in the partition dimension, with seq_len in the free dimension. An outer loop iterates over `head_dim(64) x ssm_state_size(128) = 8,192` scan invocations. Inputs are pre-transposed to `(num_heads, seq_len)` layout for efficient SBUF tiling.
+
+**Requirements:**
+- Set `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` environment variable during compilation
+- NKI Beta 2 / SDK 2.28+ (`import nki`, `import nki.language as nl`, `import nki.isa as nisa`)
+- Trainium2 hardware
+
+**To disable:** Set `USE_NKI_SCAN = False` in `modeling_granite.py` to fall back to the quadratic scan.
+
 ## Validation Results
 
 **Validated:** 2026-03-10
@@ -95,10 +116,30 @@ Both models produce coherent, factually correct text. Token-level divergence dur
 ### Compilation
 | Metric | Value |
 |--------|-------|
-| Compile time | ~16 min (trn2.3xlarge) |
+| Compile time | ~16-20 min (trn2.3xlarge) |
 | Compiler flags | `-O1 --auto-cast=none --enable-mixed-precision-accumulation` |
 
+**Note:** When using the NKI kernel (`USE_NKI_SCAN=True`), you must set `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` before compilation.
+
+### NKI Kernel Accuracy (V16-NKI vs V15 Quadratic)
+
+The NKI selective scan kernel produces nearly identical results to the quadratic scan:
+
+| Metric | V15 (Quadratic) | V16 (NKI) |
+|--------|-----------------|-----------|
+| **Avg Pearson** | 0.9880 | 0.9872 |
+| **Avg Cosine** | 0.9800 | 0.9782 |
+| **Greedy match** | 100% | 100% |
+| **Generation quality** | Coherent | Matches V15 |
+
+The small difference between V15 and V16-NKI is due to different floating-point accumulation order (parallel quadratic vs sequential scan). Both produce correct text generation.
+
 ## Usage
+
+```bash
+# Required for NKI kernel compilation (Trainium2)
+export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+```
 
 ```python
 from transformers import AutoTokenizer
@@ -164,28 +205,33 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ## Testing
 
 ```bash
-# Run with pytest
+# Integration tests (requires Neuron hardware + model weights)
 cd contrib/models/granite-4.0-h-small/
 pytest test/integration/test_model.py -v
 
 # Or run directly
 python test/integration/test_model.py
+
+# NKI kernel unit test (requires Neuron hardware)
+export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+python test/unit/test_nki_selective_scan.py
 ```
 
 ## Known Limitations
 
 1. **No on-device sampling tested** — current validation uses raw logits (`on_device_sampling_config=None`). Enabling on-device sampling for production use needs testing.
 2. **Batch size 1 only** — batch_size > 1 has not been validated.
-3. **Full-sequence parallel scan** — the prefill SSM uses an O(L^2) parallel scan. For very long sequences, a chunk-based approach or NKI kernel would be more efficient.
+3. **NKI kernel requires Trainium2** — the `USE_NKI_SCAN` kernel uses `nisa.tensor_tensor_scan` which is Trainium2-specific. Set `USE_NKI_SCAN = False` for other hardware (falls back to O(L^2) quadratic scan).
 4. **Conv1d workaround** — manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK bug is fixed.
 
 ## Source Files
 
 | File | Description | Lines |
 |------|-------------|-------|
-| `src/modeling_granite.py` | Full model implementation (config, Mamba layer, attention, MoE, model wrapper, state dict conversion) | ~930 |
+| `src/modeling_granite.py` | Full model implementation with NKI selective scan kernel (config, Mamba layer, attention, MoE, NKI kernel, model wrapper, state dict conversion) | ~1600 |
 | `src/__init__.py` | Public exports | ~30 |
 | `test/integration/test_model.py` | Integration tests (compile, load, generate, coherence, throughput) | ~260 |
+| `test/unit/test_nki_selective_scan.py` | Standalone NKI selective scan kernel with CPU reference, quadratic reference, and validation tests | ~750 |
 
 ## Example Checkpoints
 
