@@ -1,11 +1,11 @@
 # Contrib Model: LTX-2.3
 
-LTX-2.3 22B parameter DiT audio-video diffusion transformer running on AWS Trainium 2 via NxD Inference. Generates synchronized video + audio from text prompts.
+LTX-2.3 22B parameter DiT audio-video diffusion transformer running on AWS Trainium 2 via NxD Inference. Generates synchronized video + audio from text prompts, with optional image-to-video conditioning.
 
 ## Model Information
 
 - **HuggingFace ID:** [`Lightricks/LTX-2.3`](https://huggingface.co/Lightricks/LTX-2.3)
-- **Model Type:** DiT (Diffusion Transformer) for joint audio-video generation
+- **Model Type:** DiT (Diffusion Transformer) for joint audio-video generation (text-to-video and image-to-video)
 - **Parameters:** 22B (BF16) — 48 transformer blocks, 32 heads, 4096 video dim, 2048 audio dim
 - **Architecture:** Bidirectional audio-video cross-attention, gated attention, QK-RMSNorm, split RoPE, flow matching
 - **License:** See HuggingFace model card
@@ -161,6 +161,24 @@ python3 src/generate_ltx23.py \
 python3 src/generate_ltx23.py --no-text-encoder
 ```
 
+#### Image-to-Video Generation
+
+Add `--image` to condition the video on an input photograph. Frame 0 is encoded from the image and preserved throughout denoising; subsequent frames are generated to match the prompt while maintaining visual consistency with the input.
+
+```bash
+# Image-to-video with Neuron Gemma3
+python3 src/generate_ltx23.py \
+  --neuron-gemma \
+  --gemma-path /home/ubuntu/models/gemma-3-12b \
+  --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
+  --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
+  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
+  --prompt "The woman turns and smiles warmly at the camera" \
+  --image /path/to/photo.png
+```
+
+The image encoder uses the ltx-core `VideoEncoder` loaded from the same safetensors checkpoint (no additional downloads needed). No recompilation of the DiT backbone is required — the same compiled model handles both T2V and I2V since the tensor shapes are identical.
+
 Output: PNG frames, MP4 video (if ffmpeg available), WAV audio.
 
 ## Compatibility Matrix
@@ -253,4 +271,4 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 | `src/shard_gemma3_weights.py` | Pre-shard Gemma3 weights to per-rank files for fast loading |
 | `src/shard_backbone_weights.py` | Pre-shard DiT backbone weights to per-rank files for fast loading |
 | `src/load_with_weights.py` | DiT backbone weight sharding and injection utilities |
-| `src/generate_ltx23.py` | E2E generation pipeline (text encoding, denoising, VAE decode, upscaling) |
+| `src/generate_ltx23.py` | E2E generation pipeline (text encoding, denoising, VAE decode, upscaling, image-to-video) |

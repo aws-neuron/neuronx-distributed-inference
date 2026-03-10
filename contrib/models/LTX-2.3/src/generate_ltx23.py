@@ -4,25 +4,34 @@ LTX-2.3 E2E Generation on Neuron
 ==================================
 Full end-to-end video+audio generation pipeline:
   1. Text encoding (Gemma 3 12B on Neuron TP=4, CPU fallback, or random embeddings)
-  2. Denoising loop (48-block DiT on Neuron TP=4, 8 Euler steps)
-  3. Optional latent upscaling (spatial x2 + temporal x2 on CPU)
-  4. Video decode (VideoDecoder on CPU)
-  5. Audio decode (AudioDecoder + VocoderWithBWE on CPU)
+  2. Optional image encoding for image-to-video (Diffusers VAE encoder on CPU)
+  3. Denoising loop (48-block DiT on Neuron TP=4, 8 Euler steps)
+  4. Optional latent upscaling (spatial x2 + temporal x2 on CPU)
+  5. Video decode (VideoDecoder on CPU)
+  6. Audio decode (AudioDecoder + VocoderWithBWE on CPU)
 
 Outputs: video frames (PNG), MP4 video, WAV audio.
 
 Usage:
   source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
 
-  # With random embeddings (no Gemma required):
+  # Text-to-Video with random embeddings (no Gemma required):
   python3 generate_ltx23.py --no-text-encoder
 
-  # With Neuron-compiled Gemma3 (fastest, recommended):
+  # Text-to-Video with Neuron-compiled Gemma3 (fastest, recommended):
   python3 generate_ltx23.py --neuron-gemma \
     --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
     --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
     --gemma-path /home/ubuntu/models/gemma-3-12b \
     --prompt "A dog plays in a meadow"
+
+  # Image-to-Video with Neuron Gemma3:
+  python3 generate_ltx23.py --neuron-gemma \
+    --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
+    --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
+    --gemma-path /home/ubuntu/models/gemma-3-12b \
+    --prompt "The woman turns and smiles at the camera" \
+    --image /path/to/photo.png
 
   # With CPU Gemma3 (slow, no compilation needed):
   python3 generate_ltx23.py --gemma-path /path/to/gemma-3-12b --prompt "A dog plays in a meadow"
@@ -84,6 +93,85 @@ DISTILLED_SIGMA_VALUES = [
     0.0,
 ]
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+
+
+def encode_image(image_path, model_path, height, width, dtype=torch.bfloat16):
+    """Encode an input image into normalized latent space for image-to-video.
+
+    Uses ltx-core's native VideoEncoder loaded from the same safetensors
+    checkpoint (which contains both encoder and decoder weights under
+    vae.encoder.* and vae.decoder.* prefixes). The encoder includes
+    per_channel_statistics and outputs PCS-normalized latents (mean~0, std~1)
+    matching the scale of Gaussian noise in the denoising loop.
+
+    Args:
+        image_path: Path to input image file
+        model_path: Path to LTX-2.3 safetensors checkpoint
+        height: Target video height (image will be resized to this)
+        width: Target video width (image will be resized to this)
+        dtype: Tensor dtype (default bf16)
+
+    Returns:
+        Latent tensor of shape (1, 128, 1, H//32, W//32)
+    """
+    from PIL import Image
+    from ltx_core.model.video_vae.model_configurator import VideoEncoderConfigurator
+    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from ltx_core.loader.sd_ops import SDOps
+
+    logger.info("Encoding image: %s", image_path)
+    t0 = time.time()
+
+    # Load and preprocess image
+    img = Image.open(image_path).convert("RGB")
+    img = img.resize((width, height), Image.LANCZOS)
+    logger.info("  Image resized to %dx%d", width, height)
+
+    # Convert to tensor: (H, W, 3) uint8 -> (1, 3, 1, H, W) bf16 [-1, 1]
+    img_tensor = torch.from_numpy(np.array(img)).float() / 255.0
+    img_tensor = img_tensor * 2.0 - 1.0  # [0, 1] -> [-1, 1]
+    img_tensor = img_tensor.permute(2, 0, 1)  # (3, H, W)
+    img_tensor = img_tensor.unsqueeze(0).unsqueeze(2)  # (1, 3, 1, H, W)
+    img_tensor = img_tensor.to(dtype=dtype)
+    logger.info("  Image tensor: %s", img_tensor.shape)
+
+    # Build ltx-core VideoEncoder from the safetensors checkpoint
+    # The encoder weights are stored under vae.encoder.* and vae.per_channel_statistics.*
+    logger.info("  Building ltx-core VideoEncoder...")
+    ve_ops = (
+        SDOps("ve")
+        .with_matching(prefix="vae.encoder.")
+        .with_matching(prefix="vae.per_channel_statistics.")
+        .with_replacement("vae.encoder.", "")
+        .with_replacement("vae.per_channel_statistics.", "per_channel_statistics.")
+    )
+    ve_builder = SingleGPUModelBuilder(
+        model_class_configurator=VideoEncoderConfigurator,
+        model_path=model_path,
+        model_sd_ops=ve_ops,
+    )
+    video_encoder = ve_builder.build(device=torch.device("cpu"), dtype=dtype)
+    video_encoder.eval()
+
+    # Encode image — the ltx-core VideoEncoder includes per_channel_statistics
+    # and outputs latents already PCS-normalized (mean~0, std~1), matching
+    # the scale of Gaussian noise used in the T2V denoising loop.
+    # No additional normalization is needed.
+    with torch.no_grad():
+        latent = video_encoder(img_tensor)
+    logger.info(
+        "  Encoded latent: %s (mean=%.3f, std=%.3f) in %.1fs",
+        latent.shape,
+        latent.float().mean().item(),
+        latent.float().std().item(),
+        time.time() - t0,
+    )
+
+    # Free the encoder
+    del video_encoder
+    gc.collect()
+
+    return latent
 
 
 def load_config(model_path):
@@ -834,6 +922,48 @@ def generate(args):
     video_sample = torch.randn(video_state.latent.shape, dtype=dtype, generator=gen)
     audio_sample = torch.randn(audio_state.latent.shape, dtype=dtype, generator=gen)
 
+    # Image-to-Video conditioning: encode input image, replace frame 0 tokens,
+    # build denoise_mask for per-token sigma control
+    denoise_mask = None  # None = text-to-video mode (all tokens denoised equally)
+    clean_latent = None
+    if args.image:
+        logger.info("\n=== Image-to-Video conditioning ===")
+        # Encode the input image into normalized latent space
+        # Returns (1, 128, 1, latent_h, latent_w) normalized latent
+        image_latent_5d = encode_image(
+            args.image, args.model_path, args.height, args.width, dtype
+        )
+
+        # Patchify the image latent to get token representation
+        # Same patchifier as video — patch_size=1 so it's rearrange(b c f h w -> b (f*h*w) c)
+        image_tokens = v_patchifier.patchify(image_latent_5d)
+        # image_tokens shape: (1, latent_h * latent_w, 128)
+        frame_0_tokens = latent_h * latent_w
+        logger.info(
+            "  Image patchified: %s (frame 0 = %d tokens)",
+            image_tokens.shape,
+            frame_0_tokens,
+        )
+
+        # Replace frame 0 noise tokens with encoded image tokens
+        video_sample[:, :frame_0_tokens] = image_tokens[:, :frame_0_tokens]
+
+        # Build denoise_mask: 0.0 for conditioned frame 0, 1.0 for unconditioned rest
+        # Shape: (1, video_seq_len, 1) — broadcastable with latent (1, seq, C)
+        video_seq_len = video_sample.shape[1]
+        denoise_mask = torch.ones(1, video_seq_len, 1, dtype=dtype)
+        denoise_mask[:, :frame_0_tokens, :] = 0.0
+        logger.info(
+            "  Denoise mask: %d conditioned tokens, %d unconditioned tokens",
+            frame_0_tokens,
+            video_seq_len - frame_0_tokens,
+        )
+
+        # Store clean latent for post-step preservation of frame 0
+        clean_latent = video_sample.clone()
+
+        logger.info("  I2V conditioning applied")
+
     # Warmup the DiT backbone — first call loads NEFF onto NeuronCores
     # Without this, the first 1-2 denoising steps take 100-200s instead of 0.3s
     logger.info("\n=== Warming up DiT backbone ===")
@@ -904,7 +1034,14 @@ def generate(args):
 
         video_seq_len = video_state.latent.shape[1]
         audio_seq_len = audio_state.latent.shape[1]
-        v_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, video_seq_len)
+
+        # Per-token timesteps: in I2V mode, frame 0 tokens get timestep=0
+        # (already clean), while all other tokens get timestep=sigma
+        if denoise_mask is not None:
+            # denoise_mask: (1, video_seq, 1), squeeze last dim for timesteps
+            v_ts = denoise_mask.squeeze(-1) * sigma  # (1, video_seq)
+        else:
+            v_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, video_seq_len)
         a_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, audio_seq_len)
 
         video_mod = Modality(
@@ -939,6 +1076,15 @@ def generate(args):
         dt = sigma_next - sigma
         video_sample = (video_sample.float() + video_velocity.float() * dt).to(dtype)
         audio_sample = (audio_sample.float() + audio_velocity.float() * dt).to(dtype)
+
+        # I2V: preserve frame 0 tokens (conditioned) after each Euler step
+        # This ensures the clean image latent is never corrupted by denoising
+        if denoise_mask is not None and clean_latent is not None:
+            # denoise_mask: (1, seq, 1), video_sample: (1, seq, C)
+            # Where mask=0 (frame 0): use clean_latent; where mask=1: keep denoised
+            video_sample = (
+                video_sample * denoise_mask + clean_latent * (1.0 - denoise_mask)
+            ).to(dtype)
 
         logger.info(
             "  Step %d/%d: sigma %.4f -> %.4f (%.1fs)",
@@ -1151,6 +1297,13 @@ def main():
         "--temporal-upscaler-path",
         default=TEMPORAL_UPSCALER_PATH,
         help="Path to temporal upscaler x2 safetensors",
+    )
+    parser.add_argument(
+        "--image",
+        default=None,
+        help="Path to input image for image-to-video generation. "
+        "When specified, frame 0 is conditioned on the encoded image "
+        "and only subsequent frames are denoised.",
     )
 
     args = parser.parse_args()
