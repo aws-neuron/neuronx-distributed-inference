@@ -72,27 +72,31 @@ else:
 
 _USE_FLASH_ATTN_D256 = os.environ.get("QWEN35_USE_FLASH_ATTN_D256", "0") == "1"
 
-# Monkey-patch NxDI's flash attention kernel with our modified nkilib kernel.
-# This replaces the bundled _pre_prod_kernels kernel (head_dim<=128) with our
-# nkilib kernel that supports head_dim up to 256 via d-tiling.
+# Modified nkilib flash attention kernel for head_dim up to 256.
+# Uses the nki-library kernel (standalone override) with d-tiling, called directly
+# from perform_prefill with tp_out=False (tp_out=True not supported for d>128).
 # Requires: pip install git+https://github.com/jimburtoft/nki-library.git@feature/head-dim-256
 # Set QWEN35_PATCH_FLASH_ATTN=1 to enable (default: disabled)
 _PATCH_FLASH_ATTN = os.environ.get("QWEN35_PATCH_FLASH_ATTN", "0") == "1"
-_FLASH_ATTN_PATCHED = False
+_nkilib_flash_kernel = None
 if _PATCH_FLASH_ATTN:
     try:
-        from .nkilib_kernel_patch import patch_flash_attention_kernel
+        from .nkilib_kernel_patch import get_nkilib_flash_attention_kernel, is_available
 
-        _FLASH_ATTN_PATCHED = patch_flash_attention_kernel()
+        _nkilib_flash_kernel = get_nkilib_flash_attention_kernel()
     except ImportError:
         try:
-            from nkilib_kernel_patch import patch_flash_attention_kernel
+            from nkilib_kernel_patch import (
+                get_nkilib_flash_attention_kernel,
+                is_available,
+            )
 
-            _FLASH_ATTN_PATCHED = patch_flash_attention_kernel()
+            _nkilib_flash_kernel = get_nkilib_flash_attention_kernel()
         except ImportError:
             logging.getLogger(__name__).warning(
                 "QWEN35_PATCH_FLASH_ATTN=1 but nkilib_kernel_patch module not found"
             )
+_FLASH_ATTN_PATCHED = _nkilib_flash_kernel is not None
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -832,9 +836,11 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         The standard NxDI NKI flash attention kernel asserts head_dim <= 128.
         This override handles three paths (in priority order):
 
-        1. If QWEN35_PATCH_FLASH_ATTN=1 and the nkilib kernel patch was applied:
-           Let the base class handle it normally -- the patched kernel supports
-           head_dim up to 256 with zero layout conversion overhead.
+        1. If QWEN35_PATCH_FLASH_ATTN=1 and the nkilib kernel is available:
+           Calls our modified nkilib kernel directly with tp_out=False and
+           tp_q=True, tp_k=True (native GQA). The kernel returns output in
+           (B*H, seqlen, d) format which we reshape to BHSD.
+           Zero layout conversion overhead (no permute needed for inputs).
 
         2. If QWEN35_USE_FLASH_ATTN_D256=1: Uses a custom external NKI kernel
            (flash_attn_d256). Functional but ~2.4x slower TTFT due to layout
@@ -843,9 +849,57 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         3. Default fallback: Forces the PyTorch softmax path by temporarily
            disabling attn_kernel for head_dim > 128.
         """
-        # Path 1: nkilib kernel patch is active -- base class can handle head_dim=256
-        if _FLASH_ATTN_PATCHED and self.head_dim > 128:
-            return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+        # Path 1: nkilib kernel (d-tiling, tp_out=False)
+        # Calls the modified nkilib attention_cte kernel directly.
+        # Uses tp_q=True, tp_k=True (native GQA path -- same input format as NxDI base class)
+        # Uses tp_out=False because tp_out=True is not supported for d>128.
+        # Output: (B*H, seqlen, d) -> reshape to (B, H, seqlen, d) = BHSD
+        if (
+            _FLASH_ATTN_PATCHED
+            and self.head_dim > 128
+            and q_len >= 512
+            and q_len % 512 == 0
+        ):
+            from neuronx_distributed.parallel_layers.parallel_state import (
+                get_tensor_model_parallel_size,
+            )
+            from torch_neuronx.xla_impl.ops import nc
+
+            # Prepare Q: (B, H, S, D) -> (B*H, S, D) with tp_q=True format
+            Q_kernel = Q.reshape(bsz * self.num_heads, q_len, self.head_dim).to(
+                self.torch_dtype
+            )
+            Q_kernel = Q_kernel / math.sqrt(self.head_dim)
+
+            # Prepare K: (B, Hkv, S, D) -> (B*Hkv, S, D) with tp_k=True format
+            K_kernel = K.reshape(
+                bsz * self.num_key_value_heads, q_len, self.head_dim
+            ).to(self.torch_dtype)
+
+            # Prepare V: (B, Hkv, S, D) -> (B*Hkv, S, D)
+            V_kernel = V.reshape(
+                bsz * self.num_key_value_heads, q_len, self.head_dim
+            ).to(self.torch_dtype)
+
+            # Call nkilib kernel with grid for LNC2 sharding
+            grid = (nc(self.logical_nc_config),)
+            attn_output = _nkilib_flash_kernel[grid](
+                Q_kernel,
+                K_kernel,
+                V_kernel,
+                1.0,  # scale (Q already scaled above)
+                causal_mask=(attention_mask is not None),
+                tp_q=True,
+                tp_k=True,
+                tp_out=False,  # d>128: must use tp_out=False
+            )
+
+            # Output is (B*H, seqlen, d) with tp_out=False
+            # Reshape to BHSD: (B, H, S, D)
+            attn_output = attn_output.reshape(bsz, self.num_heads, q_len, self.head_dim)
+
+            # Return NONE strategy to signal BHSD layout (not BHDS)
+            return attn_output, FlashAttentionStrategy.NONE
 
         # Path 2: Custom external NKI kernel (opt-in, has TTFT regression)
         use_custom_kernel = (
