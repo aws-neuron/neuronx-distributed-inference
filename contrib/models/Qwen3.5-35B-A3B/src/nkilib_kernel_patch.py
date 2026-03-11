@@ -35,24 +35,22 @@ _max_head_dim = None
 
 
 def _build_kernel():
-    """Build the nkilib attention kernel with NxDI's decorator stack.
+    """Build the nkilib attention kernel wrapped for PyTorch XLA execution.
 
-    The kernel is prepared with NxDI's required decorators (peel @nki.jit,
-    re-jit with mode='torchxla', skip_middle_end_transformations, and
-    enable_stack_allocator).
+    Uses torch_neuronx.nki_jit() to wrap the nkilib GenericKernel directly.
+    This avoids the peel+re-jit approach which causes tracing issues:
+    - nki.jit(mode='torchxla') re-traces from scratch, and sub-function
+      inlining doesn't properly propagate the trace context (builtin,
+      address= support, etc.)
+    - nki_jit() wraps the already-traced GenericKernel for XLA execution,
+      preserving the original trace with all sub-function contexts intact.
 
     Returns the decorated kernel function, or None if nkilib is not available
     or does not support head_dim > 128.
     """
     global _max_head_dim
 
-    from neuronx_distributed_inference.utils.decorator_peeling import peel_decorations
-    from neuronxcc.nki import jit
-    from neuronxcc.nki.compiler import (
-        skip_middle_end_transformations,
-        enable_stack_allocator,
-    )
-    from torch_neuronx.utils import get_platform_target
+    from torch_neuronx import nki_jit
     import nkilib.core.attention.attention_cte as cte_module
 
     # Verify our modified kernel is loaded (not the bundled one)
@@ -69,29 +67,17 @@ def _build_kernel():
         f"nkilib attention_cte._MAX_HEAD_DIM = {_max_head_dim} -- modified kernel detected"
     )
 
-    # Peel @nki.jit from attention_cte to get the raw kernel function
-    attention_cte_raw = peel_decorations(cte_module.attention_cte)
-    logger.info(f"Peeled attention_cte, raw function: {attention_cte_raw}")
-
-    # Apply NxDI's decorator stack (same as import_nki_cte_attention_kernel does):
-    #   1. jit(mode='torchxla') -- fixes platform detection bug
-    #   2. skip_middle_end_transformations -- required for CTE kernels
-    #   3. enable_stack_allocator -- required for CTE kernels
-    #
-    # NOTE: We use mode='torchxla' which enables PyTorch XLA integration.
-    # The kernel will be compiled as part of the XLA computation graph.
-    platform_target = get_platform_target()
-    logger.info(f"Applying NxDI decorator stack with platform_target={platform_target}")
-
-    decorated = jit(
-        attention_cte_raw,
-        mode="torchxla",
-        platform_target=platform_target,
-        show_compiler_tb=True,
-        debug_kernel=True,
+    # Wrap the GenericKernel with nki_jit for PyTorch XLA execution.
+    # nki_jit() takes the already-decorated @nki.jit GenericKernel and wraps
+    # it as a PyTorchXLAKernel. This preserves the original trace context
+    # (including sub-function inlining, builtin injection, and address= support).
+    attention_cte = cte_module.attention_cte
+    logger.info(
+        f"Wrapping attention_cte ({type(attention_cte).__name__}) with nki_jit()"
     )
-    decorated = skip_middle_end_transformations(decorated)
-    decorated = enable_stack_allocator(decorated, log_level=logging.INFO)
+
+    decorated = nki_jit()(attention_cte)
+    logger.info(f"Wrapped kernel type: {type(decorated).__name__}")
 
     return decorated
 
