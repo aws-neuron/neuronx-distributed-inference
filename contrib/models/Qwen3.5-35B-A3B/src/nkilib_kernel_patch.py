@@ -77,6 +77,9 @@ def _build_kernel():
     #   1. jit(mode='torchxla') -- fixes platform detection bug
     #   2. skip_middle_end_transformations -- required for CTE kernels
     #   3. enable_stack_allocator -- required for CTE kernels
+    #
+    # NOTE: We use mode='torchxla' which enables PyTorch XLA integration.
+    # The kernel will be compiled as part of the XLA computation graph.
     platform_target = get_platform_target()
     logger.info(f"Applying NxDI decorator stack with platform_target={platform_target}")
 
