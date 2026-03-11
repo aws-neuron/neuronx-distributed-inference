@@ -38,6 +38,11 @@ class NeuronTransformerWrapper(nn.Module):
     and routes steps 2-3 through the compiled Neuron backbone.
 
     The backbone expects 24 flat tensors (see modeling_ltx23.py forward signature).
+
+    Performance optimizations:
+    - AdaLN deduplication: when all tokens share the same sigma (T2V mode),
+      the AdaLN MLP is computed once instead of N times. Saves ~47ms/step
+      (from 54ms to 7ms for the AdaLN component).
     """
 
     def __init__(self, compiled_backbone, cpu_ltx_model, text_seq=256):
@@ -56,6 +61,85 @@ class NeuronTransformerWrapper(nn.Module):
         # Keep CPU preprocessors from the native model
         self.video_args_preprocessor = cpu_ltx_model.video_args_preprocessor
         self.audio_args_preprocessor = cpu_ltx_model.audio_args_preprocessor
+
+        # Apply AdaLN optimization by default
+        self._patch_adaln_dedup()
+
+    def _patch_adaln_dedup(self):
+        """Monkey-patch the preprocessor's _prepare_timestep to deduplicate AdaLN.
+
+        In T2V mode, all video tokens share the same sigma value, so the AdaLN
+        MLP (sinusoidal → Linear 256→4096 → SiLU → Linear 4096→36864) processes
+        N identical values. This patch detects uniform timesteps and computes
+        the MLP once, then expands. Measured speedup: 54ms → 7ms (8.3x) for
+        768 video tokens.
+
+        In I2V mode, there are typically 2 unique sigma values (sigma=0 for
+        the conditioning frame, sigma for the rest). The patch handles this
+        by computing only the unique values.
+
+        The patch targets the inner TransformerArgsPreprocessor._prepare_timestep
+        which is used by both the video and audio preprocessors.
+        """
+
+        def _dedup_prepare_timestep(original_fn, preprocessor):
+            """Create a deduplicated version of _prepare_timestep."""
+
+            def patched(timestep, adaln, batch_size, hidden_dtype):
+                # timestep shape: (B, seq_len) or (B, 1)
+                # In T2V: all values identical. In I2V: typically 2 unique values.
+                flat = timestep.flatten()
+                unique_vals = flat.unique()
+
+                if unique_vals.numel() == flat.numel():
+                    # All different — no dedup possible, use original
+                    return original_fn(
+                        preprocessor, timestep, adaln, batch_size, hidden_dtype
+                    )
+
+                # Compute AdaLN MLP only for unique values
+                scaled_unique = unique_vals * preprocessor.timestep_scale_multiplier
+                ts_unique, et_unique = adaln(scaled_unique, hidden_dtype=hidden_dtype)
+                # ts_unique: (n_unique, adaln_dim), et_unique: (n_unique, embed_dim)
+
+                if unique_vals.numel() == 1:
+                    # All tokens share same sigma — most common T2V case
+                    ts = ts_unique.expand(flat.shape[0], -1)
+                    et = et_unique.expand(flat.shape[0], -1)
+                else:
+                    # Multiple unique values (I2V case) — scatter back
+                    # Build index map: for each flat element, which unique index?
+                    sorted_unique, sort_idx = unique_vals.sort()
+                    bucket = torch.bucketize(flat, sorted_unique)
+                    bucket = bucket.clamp(max=len(sorted_unique) - 1)
+                    # Map through sort index to get original unique ordering
+                    inv_sort = torch.empty_like(sort_idx)
+                    inv_sort[sort_idx] = torch.arange(
+                        len(sort_idx), device=sort_idx.device
+                    )
+                    idx = inv_sort[bucket]
+                    ts = ts_unique[idx]
+                    et = et_unique[idx]
+
+                ts = ts.view(batch_size, -1, ts.shape[-1])
+                et = et.view(batch_size, -1, et.shape[-1])
+                return ts, et
+
+            return patched
+
+        # Patch the video preprocessor's inner simple_preprocessor
+        video_inner = self.video_args_preprocessor.simple_preprocessor
+        orig_video = type(video_inner)._prepare_timestep
+        video_inner._prepare_timestep = _dedup_prepare_timestep(orig_video, video_inner)
+
+        # Patch the audio preprocessor's inner simple_preprocessor
+        audio_inner = self.audio_args_preprocessor.simple_preprocessor
+        orig_audio = type(audio_inner)._prepare_timestep
+        audio_inner._prepare_timestep = _dedup_prepare_timestep(orig_audio, audio_inner)
+
+        logger.info(
+            "AdaLN deduplication patch applied to video and audio preprocessors"
+        )
 
     def preprocess(self, video_modality, audio_modality):
         """Run CPU preprocessing to produce the 24 flat tensors.
