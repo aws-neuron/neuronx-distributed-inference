@@ -51,6 +51,26 @@ All accuracy numbers measured against CPU reference (unsharded BF16, native ltx-
 
 Note: Gemma3 and DiT backbone share the same 4 NeuronCores and are loaded sequentially. The cold start latency (NEFF rehydration) is a one-time cost when the compiled model is first loaded onto a fresh instance. Subsequent generations reuse the loaded model.
 
+### Two-Stage Pipeline Benchmarks
+
+| Stage | Time | Notes |
+|-------|------|-------|
+| Stage 1 backbone loading (4 ranks) | 83.6s | Pre-sharded weights from full-res sharding |
+| Stage 1 warmup (1st inference) | 107.9s | Forces NRT to load half-res NEFF |
+| **S1 denoising step (warm, steps 2-8)** | **0.3s** | **192×256 latent, VIDEO_SEQ=192** |
+| S1 denoising step (cold, step 1) | 142.1s | Includes Neuron device initialization |
+| S1 total (8 steps) | 143.9s | 18.0s/step average |
+| Spatial upscaler loading (CPU) | 8.1s | 498M params |
+| Spatial upsample (CPU) | 0.3s | (1,128,4,6,8) → (1,128,4,12,16) |
+| Stage 2 backbone loading (4 ranks) | 17.2s | Same pre-sharded weights, cached |
+| Stage 2 warmup (1st inference) | 110.6s | Forces NRT to load full-res NEFF |
+| **S2 denoising step (warm, steps 2-3)** | **0.3s** | **384×512 latent, VIDEO_SEQ=768** |
+| S2 denoising step (cold, step 1) | 143.0s | Includes Neuron device initialization |
+| S2 total (3 steps) | 143.7s | 47.9s/step average |
+| **Combined denoising (S1+S2)** | **287.6s** | **2.7s actual compute after warmup** |
+
+Two-stage mode generates at half resolution (192×256) with 8 denoising steps, spatially upscales x2, then refines at full resolution (384×512) with 3 additional steps. The same backbone weights are used for both stages — only the compiled shapes differ.
+
 ### Component Distribution
 
 | Component | Location | Notes |
@@ -93,11 +113,22 @@ huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-temporal-upscaler-x2-1.0.saf
 ### Step 1: Compile the DiT Backbone
 
 ```bash
+# Full-resolution backbone (384x512, VIDEO_SEQ=768)
 NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
   torchrun --nproc_per_node=4 src/compile_transformer.py
 ```
 
 Compilation takes approximately 60 seconds. The compiled model is saved to `compiler_workdir_tp4_lnc2_v2/tp_0.pt` (8.7 GB).
+
+For two-stage mode, also compile the half-resolution backbone:
+
+```bash
+# Half-resolution backbone (192x256, VIDEO_SEQ=192) — for two-stage mode
+NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
+  torchrun --nproc_per_node=4 src/compile_transformer_halfres.py
+```
+
+This compiles the same architecture at the half-res latent shape (4×6×8 instead of 4×12×16). Output: `compiler_workdir_tp4_lnc2_halfres/tp_0.pt` (~8.7 GB).
 
 ### Step 2: Pre-shard Backbone Weights
 
@@ -179,6 +210,25 @@ python3 src/generate_ltx23.py \
 
 The image encoder uses the ltx-core `VideoEncoder` loaded from the same safetensors checkpoint (no additional downloads needed). No recompilation of the DiT backbone is required — the same compiled model handles both T2V and I2V since the tensor shapes are identical.
 
+#### Two-Stage Generation (Refinement Denoising)
+
+Two-stage mode follows the LTX-2.3 `DistilledPipeline` reference: generate at half resolution (192×256) with 8 steps, spatially upsample x2, then refine at full resolution (384×512) with 3 additional denoising steps. This produces sharper output than single-stage generation. Requires the half-res backbone compilation from Step 1.
+
+```bash
+# Two-stage with Neuron Gemma3
+python3 src/generate_ltx23.py \
+  --neuron-gemma \
+  --gemma-path /home/ubuntu/models/gemma-3-12b \
+  --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
+  --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
+  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
+  --prompt "A golden retriever puppy runs across a sunny green meadow" \
+  --two-stage \
+  --halfres-compiled-dir /home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_halfres
+```
+
+The pipeline sequence: Gemma3 encode → unload → half-res DiT (8 steps) → unload → spatial upsample x2 → full-res DiT (3 refinement steps) → unload → VAE decode. The same pre-sharded backbone weights are used for both stages (the model weights are identical; only the compiled shapes differ). The spatial upscaler weights are downloaded as part of the prerequisites.
+
 Output: PNG frames, MP4 video (if ffmpeg available), WAV audio.
 
 ## Compatibility Matrix
@@ -255,7 +305,7 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 
 - **Cold start latency**: The DiT warmup pass takes ~139s and the first denoising step takes ~175s due to Neuron device initialization. Subsequent steps run at ~0.3s each. Gemma3 encoder NEFF rehydration adds ~362s on first load (one-time per instance).
 - **CPU text encoding fallback**: Without Neuron-compiled Gemma3, text encoding takes ~162s on CPU. Use `--neuron-gemma` for 6.6s warm text encoding (83x faster).
-- **No Stage 2 refinement**: The `--upscale` flag applies latent-space spatial x2 + temporal x2 upscaling (384×512 @ 25 frames → 768×1024 @ 49 frames), which is validated and functional. However, Stage 2 *refinement denoising* (re-running the DiT at the upscaled resolution for sharper details) is not included. Stage 2 would require recompiling the backbone at the larger latent shape and merging distilled LoRA weights.
+- **Two-stage cold start**: Two-stage mode loads two separate Neuron backbones sequentially (half-res and full-res), each with its own NEFF warmup. Total cold start overhead is ~2x single-stage.
 - **BF16 TP accumulation**: The 0.972 cosine similarity over 8 denoising steps (vs CPU) is due to normal BF16 rounding across TP=4 ranks. Single forward pass accuracy is 0.9999.
 - **No EFA**: The trn2.3xlarge single-instance setup does not use EFA for inter-node communication. NCCL/OFI warnings about EFA can be safely ignored.
 
@@ -266,9 +316,10 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 | `src/modeling_ltx23.py` | Core backbone: TP sharding, DistributedRMSNorm, SDPA replacement, TransformerArgs construction |
 | `src/modeling_gemma3_encoder.py` | Custom Gemma3 encoder-only model: returns all 49 hidden states stacked, no KV cache |
 | `src/pipeline.py` | NeuronTransformerWrapper: CPU preprocessing, backbone routing, mask handling |
-| `src/compile_transformer.py` | DiT backbone compilation script (torchrun --nproc_per_node=4) |
+| `src/compile_transformer.py` | DiT backbone compilation script — full-res 384×512 (torchrun --nproc_per_node=4) |
+| `src/compile_transformer_halfres.py` | DiT backbone compilation script — half-res 192×256 for two-stage mode |
 | `src/compile_gemma3.py` | Gemma3 encoder compilation script (parallel_model_trace) |
 | `src/shard_gemma3_weights.py` | Pre-shard Gemma3 weights to per-rank files for fast loading |
 | `src/shard_backbone_weights.py` | Pre-shard DiT backbone weights to per-rank files for fast loading |
 | `src/load_with_weights.py` | DiT backbone weight sharding and injection utilities |
-| `src/generate_ltx23.py` | E2E generation pipeline (text encoding, denoising, VAE decode, upscaling, image-to-video) |
+| `src/generate_ltx23.py` | E2E generation pipeline (text encoding, single/two-stage denoising, VAE decode, upscaling, image-to-video) |

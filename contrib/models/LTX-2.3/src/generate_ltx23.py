@@ -94,6 +94,10 @@ DISTILLED_SIGMA_VALUES = [
 ]
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
+# Default half-res compilation paths (for two-stage mode)
+HALFRES_COMPILE_DIR = "/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_halfres"
+HALFRES_SHARDED_DIR = "/home/ubuntu/backbone_sharded_halfres"
+
 
 def encode_image(image_path, model_path, height, width, dtype=torch.bfloat16):
     """Encode an input image into normalized latent space for image-to-video.
@@ -436,43 +440,6 @@ def load_neuron_backbone(compile_dir, model_path, tp_degree=4, sharded_dir=None)
 
     return TensorParallelNeuronModel(models)
 
-    def sf_key_to_jit_key(sf_key):
-        return "weights." + sf_key.replace(".", "->")
-
-    # Create per-rank state dicts
-    rank_sds = [{} for _ in range(tp_degree)]
-    for sf_key, full_weight in backbone_sd.items():
-        jit_key = sf_key_to_jit_key(sf_key)
-        for rank in range(tp_degree):
-            rank_sds[rank][jit_key] = shard_weight(
-                full_weight, jit_key, rank, tp_degree
-            )
-    del backbone_sd
-    gc.collect()
-
-    # Load compiled models and inject weights
-    models = []
-    t0 = time.time()
-    for rank in range(tp_degree):
-        logger.info("  Loading Neuron rank %d...", rank)
-        with torch_neuronx.contexts.disable_nrt_load():
-            model = torch.jit.load(tp_0_path)
-        model_sd = dict(model.named_parameters())
-        injected = 0
-        for jit_key, sharded_weight in rank_sds[rank].items():
-            if jit_key in model_sd and model_sd[jit_key].shape == sharded_weight.shape:
-                model_sd[jit_key].data.copy_(sharded_weight)
-                injected += 1
-        if rank == 0:
-            logger.info("    Injected %d/%d weights", injected, len(rank_sds[rank]))
-        models.append(model)
-
-    logger.info("  All Neuron models loaded in %.1fs", time.time() - t0)
-    del rank_sds
-    gc.collect()
-
-    return TensorParallelNeuronModel(models)
-
 
 def unload_neuron_model(tp_model, name="model"):
     """Fully unload a TensorParallelNeuronModel from NeuronCores.
@@ -731,6 +698,92 @@ def upscale_video_latent(
     return latent
 
 
+def load_spatial_upscaler(spatial_path, dtype=torch.bfloat16):
+    """Load only the spatial upscaler (for two-stage mode).
+
+    Two-stage mode uses spatial-only upscaling between stages (no temporal).
+    This follows the DistilledPipeline reference which calls upsample_video()
+    with only the spatial upsampler.
+    """
+    import json as _json
+
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+    from ltx_core.model.upsampler.model_configurator import LatentUpsamplerConfigurator
+
+    logger.info("Loading spatial upsampler from %s...", spatial_path)
+    t0 = time.time()
+
+    with safe_open(spatial_path, framework="pt") as f:
+        metadata = f.metadata()
+    upsampler_config = _json.loads(metadata["config"])
+
+    upsampler = LatentUpsamplerConfigurator.from_config(upsampler_config)
+    upsampler = upsampler.to(dtype=dtype)
+    upsampler.eval()
+
+    sd = load_file(spatial_path)
+    sd = {k: v.to(dtype) if v.is_floating_point() else v for k, v in sd.items()}
+    upsampler.load_state_dict(sd, strict=False)
+    total_params = sum(p.numel() for p in upsampler.parameters())
+    logger.info(
+        "  Spatial upsampler: %.1fM params, loaded in %.1fs",
+        total_params / 1e6,
+        time.time() - t0,
+    )
+    del sd
+    return upsampler
+
+
+def spatial_upscale_latent(video_latent_5d, video_decoder, spatial_upsampler):
+    """Spatial-only upscale for two-stage pipeline.
+
+    Doubles H and W while preserving frame count F.
+    Flow: un_normalize -> spatial upsample x2 -> re_normalize.
+
+    This follows the DistilledPipeline reference (ltx-core upsample_video):
+      latent = video_encoder.per_channel_statistics.un_normalize(latent)
+      latent = upsampler(latent)
+      latent = video_encoder.per_channel_statistics.normalize(latent)
+
+    Args:
+        video_latent_5d: (B, C, F, H, W) normalized video latent
+        video_decoder: VideoDecoder with per_channel_statistics
+        spatial_upsampler: LatentUpsampler for spatial x2
+
+    Returns:
+        (B, C, F, H*2, W*2) normalized video latent (F unchanged)
+    """
+    pcs = video_decoder.per_channel_statistics
+    logger.info("  Input latent: %s", video_latent_5d.shape)
+
+    # Un-normalize to raw latent space
+    latent = pcs.un_normalize(video_latent_5d)
+    logger.info(
+        "  Un-normalized: %s (mean=%.3f, std=%.3f)",
+        latent.shape,
+        latent.float().mean().item(),
+        latent.float().std().item(),
+    )
+
+    # Spatial upsample only (H, W doubled, F unchanged)
+    t0 = time.time()
+    with torch.no_grad():
+        latent = spatial_upsampler(latent)
+    logger.info("  After spatial x2: %s in %.1fs", latent.shape, time.time() - t0)
+
+    # Re-normalize
+    latent = pcs.normalize(latent)
+    logger.info(
+        "  Re-normalized: %s (mean=%.3f, std=%.3f)",
+        latent.shape,
+        latent.float().mean().item(),
+        latent.float().std().item(),
+    )
+
+    return latent
+
+
 def generate(args):
     """Main generation pipeline."""
     config = load_config(args.model_path)
@@ -856,6 +909,484 @@ def generate(args):
         # Free Gemma to save RAM
         del gemma_model, text_encoder
         gc.collect()
+
+    # =========================================================================
+    # TWO-STAGE PIPELINE
+    # =========================================================================
+    if args.two_stage:
+        logger.info("\n" + "=" * 60)
+        logger.info("TWO-STAGE GENERATION")
+        logger.info(
+            "  Stage 1: %dx%d (%d steps)",
+            args.height // 2,
+            args.width // 2,
+            args.num_steps,
+        )
+        logger.info("  Stage 2: %dx%d (3 steps, refinement)", args.height, args.width)
+        logger.info("=" * 60)
+
+        from ltx_core.tools import (
+            VideoLatentTools,
+            VideoLatentPatchifier,
+            VideoLatentShape,
+            AudioLatentTools,
+            AudioPatchifier,
+            AudioLatentShape,
+            SpatioTemporalScaleFactors,
+        )
+        from ltx_core.model.transformer.modality import Modality
+        from pipeline import NeuronTransformerWrapper
+
+        # --- Stage 1: Half-res generation ---
+        logger.info("\n=== Stage 1: Half-resolution generation ===")
+
+        # Half-res latent dimensions
+        s1_height = args.height // 2
+        s1_width = args.width // 2
+        s1_latent_h = s1_height // 32
+        s1_latent_w = s1_width // 32
+        s1_latent_f = (args.num_frames - 1) // 8 + 1
+        logger.info(
+            "  Half-res: %dx%d, latent %dx%dx%d",
+            s1_height,
+            s1_width,
+            s1_latent_f,
+            s1_latent_h,
+            s1_latent_w,
+        )
+
+        s1_video_shape = VideoLatentShape(
+            batch=1,
+            channels=128,
+            frames=s1_latent_f,
+            height=s1_latent_h,
+            width=s1_latent_w,
+        )
+        v_patchifier = VideoLatentPatchifier(patch_size=1)
+        v_scale = SpatioTemporalScaleFactors.default()
+        s1_video_tools = VideoLatentTools(
+            target_shape=s1_video_shape,
+            patchifier=v_patchifier,
+            scale_factors=v_scale,
+            causal_fix=False,
+            fps=args.fps,
+        )
+        audio_shape = AudioLatentShape(
+            batch=1, channels=8, frames=args.audio_num_frames, mel_bins=16
+        )
+        a_patchifier = AudioPatchifier(patch_size=16)
+        audio_tools = AudioLatentTools(
+            patchifier=a_patchifier, target_shape=audio_shape
+        )
+
+        # Create initial noise at half-res
+        gen = torch.Generator().manual_seed(args.seed)
+        s1_video_state = s1_video_tools.create_initial_state(device="cpu", dtype=dtype)
+        audio_state = audio_tools.create_initial_state(device="cpu", dtype=dtype)
+        video_sample = torch.randn(
+            s1_video_state.latent.shape, dtype=dtype, generator=gen
+        )
+        audio_sample = torch.randn(audio_state.latent.shape, dtype=dtype, generator=gen)
+
+        # Load half-res Neuron backbone
+        logger.info("Loading half-res backbone from %s...", args.halfres_compiled_dir)
+        neuron_backbone = load_neuron_backbone(
+            args.halfres_compiled_dir,
+            args.model_path,
+            args.tp_degree,
+            sharded_dir=args.halfres_sharded_dir
+            if os.path.isdir(args.halfres_sharded_dir)
+            else args.backbone_sharded_dir,
+        )
+        wrapper = NeuronTransformerWrapper(
+            compiled_backbone=neuron_backbone,
+            cpu_ltx_model=cpu["ltx_model"],
+            text_seq=args.text_seq,
+        )
+
+        # Warmup half-res backbone
+        logger.info("Warming up half-res DiT backbone...")
+        warmup_sigma = torch.tensor([1.0])
+        warmup_v_ts = warmup_sigma.unsqueeze(0).expand(
+            1, s1_video_state.latent.shape[1]
+        )
+        warmup_a_ts = warmup_sigma.unsqueeze(0).expand(1, audio_state.latent.shape[1])
+        warmup_video_mod = Modality(
+            latent=torch.randn_like(video_sample),
+            sigma=warmup_sigma,
+            timesteps=warmup_v_ts,
+            positions=s1_video_state.positions,
+            context=video_context,
+            enabled=True,
+            context_mask=context_mask,
+            attention_mask=None,
+        )
+        warmup_audio_mod = Modality(
+            latent=torch.randn_like(audio_sample),
+            sigma=warmup_sigma,
+            timesteps=warmup_a_ts,
+            positions=audio_state.positions,
+            context=audio_context,
+            enabled=True,
+            context_mask=context_mask.clone(),
+            attention_mask=None,
+        )
+        t0 = time.time()
+        with torch.no_grad():
+            _ = wrapper(warmup_video_mod, warmup_audio_mod)
+        logger.info("  Half-res warmup done in %.1fs", time.time() - t0)
+        del warmup_video_mod, warmup_audio_mod
+
+        # Stage 1 denoising (8 steps at half-res)
+        logger.info(
+            "\n=== Stage 1 Denoising (%d steps at %dx%d) ===",
+            args.num_steps,
+            s1_height,
+            s1_width,
+        )
+        sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, dtype=torch.float32)
+        s1_total_time = 0.0
+        for step_idx in range(args.num_steps):
+            sigma = sigmas[step_idx]
+            sigma_next = sigmas[step_idx + 1]
+            video_seq_len = s1_video_state.latent.shape[1]
+            audio_seq_len = audio_state.latent.shape[1]
+            v_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, video_seq_len)
+            a_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, audio_seq_len)
+            video_mod = Modality(
+                latent=video_sample,
+                sigma=sigma.unsqueeze(0),
+                timesteps=v_ts,
+                positions=s1_video_state.positions,
+                context=video_context,
+                enabled=True,
+                context_mask=context_mask,
+                attention_mask=None,
+            )
+            audio_mod = Modality(
+                latent=audio_sample,
+                sigma=sigma.unsqueeze(0),
+                timesteps=a_ts,
+                positions=audio_state.positions,
+                context=audio_context,
+                enabled=True,
+                context_mask=context_mask.clone(),
+                attention_mask=None,
+            )
+            t0 = time.time()
+            with torch.no_grad():
+                video_velocity, audio_velocity = wrapper(video_mod, audio_mod)
+            step_time = time.time() - t0
+            s1_total_time += step_time
+            dt = sigma_next - sigma
+            video_sample = (video_sample.float() + video_velocity.float() * dt).to(
+                dtype
+            )
+            audio_sample = (audio_sample.float() + audio_velocity.float() * dt).to(
+                dtype
+            )
+            logger.info(
+                "  S1 Step %d/%d: sigma %.4f -> %.4f (%.1fs)",
+                step_idx + 1,
+                args.num_steps,
+                sigma.item(),
+                sigma_next.item(),
+                step_time,
+            )
+
+        logger.info(
+            "  Stage 1 total: %.1fs (%.1fs/step)",
+            s1_total_time,
+            s1_total_time / args.num_steps,
+        )
+
+        # Unload half-res backbone
+        unload_neuron_model(neuron_backbone, "half-res DiT backbone")
+        del neuron_backbone, wrapper
+
+        # Unpatchify Stage 1 output to spatial format
+        s1_video_latent = v_patchifier.unpatchify(video_sample, s1_video_shape)
+        logger.info("  Stage 1 video latent: %s", s1_video_latent.shape)
+
+        # --- Spatial upsample x2 ---
+        logger.info("\n=== Spatial Upsample x2 ===")
+        spatial_up = load_spatial_upscaler(args.spatial_upscaler_path, dtype=dtype)
+        s2_video_latent = spatial_upscale_latent(
+            s1_video_latent, cpu["video_decoder"], spatial_up
+        )
+        logger.info(
+            "  Upscaled: %s -> %s", s1_video_latent.shape, s2_video_latent.shape
+        )
+        del spatial_up, s1_video_latent
+        gc.collect()
+
+        # --- Stage 2: Full-res refinement ---
+        logger.info("\n=== Stage 2: Full-resolution refinement ===")
+
+        # Full-res latent dimensions
+        s2_latent_h = args.height // 32
+        s2_latent_w = args.width // 32
+        s2_latent_f = s2_video_latent.shape[2]  # Same frame count as Stage 1
+        s2_video_shape = VideoLatentShape(
+            batch=1,
+            channels=128,
+            frames=s2_latent_f,
+            height=s2_latent_h,
+            width=s2_latent_w,
+        )
+        s2_video_tools = VideoLatentTools(
+            target_shape=s2_video_shape,
+            patchifier=v_patchifier,
+            scale_factors=v_scale,
+            causal_fix=False,
+            fps=args.fps,
+        )
+        s2_video_state = s2_video_tools.create_initial_state(device="cpu", dtype=dtype)
+
+        # Patchify the upscaled latent for Stage 2 denoising
+        s2_upscaled_tokens = v_patchifier.patchify(s2_video_latent)
+        logger.info("  S2 upscaled tokens: %s", s2_upscaled_tokens.shape)
+
+        # Noise injection: mix upscaled latent with noise at sigma=0.909375
+        s2_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32)
+        noise_scale = s2_sigmas[0].item()
+        gen_s2 = torch.Generator().manual_seed(args.seed + 42)
+        s2_noise = torch.randn(s2_upscaled_tokens.shape, dtype=dtype, generator=gen_s2)
+        video_sample = (
+            noise_scale * s2_noise + (1.0 - noise_scale) * s2_upscaled_tokens
+        ).to(dtype)
+        logger.info(
+            "  Noise injected at sigma=%.4f: %.1f%% noise + %.1f%% signal",
+            noise_scale,
+            noise_scale * 100,
+            (1 - noise_scale) * 100,
+        )
+        del s2_noise, s2_upscaled_tokens, s2_video_latent
+
+        # Load full-res Neuron backbone (same compiled model, same weights)
+        logger.info("Loading full-res backbone from %s...", args.compile_dir)
+        neuron_backbone = load_neuron_backbone(
+            args.compile_dir,
+            args.model_path,
+            args.tp_degree,
+            sharded_dir=args.backbone_sharded_dir,
+        )
+        wrapper = NeuronTransformerWrapper(
+            compiled_backbone=neuron_backbone,
+            cpu_ltx_model=cpu["ltx_model"],
+            text_seq=args.text_seq,
+        )
+
+        # Warmup full-res backbone
+        logger.info("Warming up full-res DiT backbone...")
+        warmup_sigma = torch.tensor([1.0])
+        warmup_v_ts = warmup_sigma.unsqueeze(0).expand(
+            1, s2_video_state.latent.shape[1]
+        )
+        warmup_a_ts = warmup_sigma.unsqueeze(0).expand(1, audio_state.latent.shape[1])
+        warmup_video_mod = Modality(
+            latent=torch.randn(1, s2_video_state.latent.shape[1], 128, dtype=dtype),
+            sigma=warmup_sigma,
+            timesteps=warmup_v_ts,
+            positions=s2_video_state.positions,
+            context=video_context,
+            enabled=True,
+            context_mask=context_mask,
+            attention_mask=None,
+        )
+        warmup_audio_mod = Modality(
+            latent=torch.randn_like(audio_sample),
+            sigma=warmup_sigma,
+            timesteps=warmup_a_ts,
+            positions=audio_state.positions,
+            context=audio_context,
+            enabled=True,
+            context_mask=context_mask.clone(),
+            attention_mask=None,
+        )
+        t0 = time.time()
+        with torch.no_grad():
+            _ = wrapper(warmup_video_mod, warmup_audio_mod)
+        logger.info("  Full-res warmup done in %.1fs", time.time() - t0)
+        del warmup_video_mod, warmup_audio_mod
+
+        # Stage 2 denoising (3 steps at full-res, no CFG)
+        s2_num_steps = len(s2_sigmas) - 1
+        logger.info(
+            "\n=== Stage 2 Denoising (%d steps at %dx%d) ===",
+            s2_num_steps,
+            args.height,
+            args.width,
+        )
+        s2_total_time = 0.0
+        for step_idx in range(s2_num_steps):
+            sigma = s2_sigmas[step_idx]
+            sigma_next = s2_sigmas[step_idx + 1]
+            video_seq_len = s2_video_state.latent.shape[1]
+            audio_seq_len = audio_state.latent.shape[1]
+            v_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, video_seq_len)
+            a_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, audio_seq_len)
+            video_mod = Modality(
+                latent=video_sample,
+                sigma=sigma.unsqueeze(0),
+                timesteps=v_ts,
+                positions=s2_video_state.positions,
+                context=video_context,
+                enabled=True,
+                context_mask=context_mask,
+                attention_mask=None,
+            )
+            audio_mod = Modality(
+                latent=audio_sample,
+                sigma=sigma.unsqueeze(0),
+                timesteps=a_ts,
+                positions=audio_state.positions,
+                context=audio_context,
+                enabled=True,
+                context_mask=context_mask.clone(),
+                attention_mask=None,
+            )
+            t0 = time.time()
+            with torch.no_grad():
+                video_velocity, audio_velocity = wrapper(video_mod, audio_mod)
+            step_time = time.time() - t0
+            s2_total_time += step_time
+            dt = sigma_next - sigma
+            video_sample = (video_sample.float() + video_velocity.float() * dt).to(
+                dtype
+            )
+            audio_sample = (audio_sample.float() + audio_velocity.float() * dt).to(
+                dtype
+            )
+            logger.info(
+                "  S2 Step %d/%d: sigma %.4f -> %.4f (%.1fs)",
+                step_idx + 1,
+                s2_num_steps,
+                sigma.item(),
+                sigma_next.item(),
+                step_time,
+            )
+
+        logger.info(
+            "  Stage 2 total: %.1fs (%.1fs/step)",
+            s2_total_time,
+            s2_total_time / s2_num_steps,
+        )
+        logger.info(
+            "\n  Combined denoising: S1=%.1fs + S2=%.1fs = %.1fs",
+            s1_total_time,
+            s2_total_time,
+            s1_total_time + s2_total_time,
+        )
+
+        # Unpatchify and decode (reuse the existing decode path)
+        video_latent_spatial = v_patchifier.unpatchify(video_sample, s2_video_shape)
+        audio_latent_spatial = a_patchifier.unpatchify(audio_sample, audio_shape)
+        video_shape = s2_video_shape  # for the decode path below
+
+        # Unload full-res backbone before decode
+        unload_neuron_model(neuron_backbone, "full-res DiT backbone")
+        del neuron_backbone, wrapper
+
+        # Skip to decode section (jump past single-stage code)
+        # Set these for the shared decode path
+        logger.info("\n=== Decoding ===")
+        video_latent_4d = video_latent_spatial[0]
+        logger.info("  Video latent for VAE: %s", video_latent_4d.shape)
+
+        # Video decode
+        os.makedirs(args.output_dir, exist_ok=True)
+        logger.info("  Decoding video...")
+        t0 = time.time()
+        from ltx_core.model.video_vae.video_vae import decode_video
+
+        video_chunks = []
+        with torch.no_grad():
+            for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
+                video_chunks.append(chunk)
+        video_frames = torch.cat(video_chunks, dim=0)
+        logger.info(
+            "  Video decoded: %s in %.1fs", video_frames.shape, time.time() - t0
+        )
+
+        from PIL import Image
+
+        for i in range(video_frames.shape[0]):
+            frame = video_frames[i].numpy()
+            img = Image.fromarray(frame)
+            img.save(os.path.join(args.output_dir, f"frame_{i:04d}.png"))
+        logger.info("  Saved %d frames to %s", video_frames.shape[0], args.output_dir)
+
+        # Save as MP4
+        try:
+            import subprocess
+
+            frame_pattern = os.path.join(args.output_dir, "frame_%04d.png")
+            mp4_path = os.path.join(args.output_dir, "output.mp4")
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-framerate",
+                    str(int(args.fps)),
+                    "-i",
+                    frame_pattern,
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    mp4_path,
+                ],
+                capture_output=True,
+                check=True,
+            )
+            logger.info("  Saved MP4: %s", mp4_path)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warning("  ffmpeg not available, skipping MP4: %s", e)
+
+        # Audio decode
+        logger.info("  Decoding audio...")
+        t0 = time.time()
+        from ltx_core.model.audio_vae.audio_vae import decode_audio
+
+        with torch.no_grad():
+            audio_result = decode_audio(
+                audio_latent_spatial.float(),
+                cpu["audio_decoder"].float(),
+                cpu["vocoder"],
+            )
+        logger.info(
+            "  Audio decoded: waveform %s, sr=%d in %.1fs",
+            audio_result.waveform.shape,
+            audio_result.sampling_rate,
+            time.time() - t0,
+        )
+
+        try:
+            import torchaudio
+
+            wav_path = os.path.join(args.output_dir, "output.wav")
+            torchaudio.save(
+                wav_path, audio_result.waveform.cpu(), audio_result.sampling_rate
+            )
+            logger.info("  Saved WAV: %s", wav_path)
+        except ImportError:
+            wav_path = os.path.join(args.output_dir, "audio_waveform.pt")
+            torch.save(
+                {
+                    "waveform": audio_result.waveform.cpu(),
+                    "sr": audio_result.sampling_rate,
+                },
+                wav_path,
+            )
+            logger.info("  Saved audio tensor: %s", wav_path)
+
+        logger.info("\n=== Done! Two-stage output saved to %s ===", args.output_dir)
+        return
+
+    # =========================================================================
+    # SINGLE-STAGE PIPELINE (original path)
+    # =========================================================================
 
     # Load Neuron backbone — AFTER text encoding to avoid NeuronCore contention
     # When using --neuron-gemma, Gemma3 was already unloaded above
@@ -1304,6 +1835,24 @@ def main():
         help="Path to input image for image-to-video generation. "
         "When specified, frame 0 is conditioned on the encoded image "
         "and only subsequent frames are denoised.",
+    )
+    parser.add_argument(
+        "--two-stage",
+        action="store_true",
+        help="Two-stage generation: Stage 1 at half-res (192x256), spatial upsample x2, "
+        "then Stage 2 refinement at full-res (384x512). Produces sharper output than "
+        "single-stage at the cost of additional compilation + denoising steps.",
+    )
+    parser.add_argument(
+        "--halfres-compiled-dir",
+        default=HALFRES_COMPILE_DIR,
+        help="Directory with half-res compiled backbone (from compile_transformer_halfres.py)",
+    )
+    parser.add_argument(
+        "--halfres-sharded-dir",
+        default=HALFRES_SHARDED_DIR,
+        help="Directory with pre-sharded backbone weights for half-res model "
+        "(same weights, different compiled shape)",
     )
 
     args = parser.parse_args()
