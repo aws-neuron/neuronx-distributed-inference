@@ -40,7 +40,18 @@ Biomolecular structure prediction on AWS Trainium 2 using NKI custom kernels for
 
 ### Benchmark Results
 
-**Pairformer compilation (trn2.3xlarge):**
+**Fused NKI Mega-Kernel (SPMD grid=[2], single NKI kernel per layer):**
+
+The fused mega-kernel combines ALL 7 sub-operations of a PairformerLayer into a single NKI kernel call, eliminating host-device round trips and sync overhead between operations.
+
+| Approach | N=256 Per Layer | 64 Layers (est.) | Speedup vs Traced |
+|---|---|---|---|
+| Traced + weight replacement (original) | 173 ms | 11.08s | 1.0x |
+| **Fused mega-kernel (SPMD)** | **65.9 ms** | **~4.2s** | **2.63x** |
+
+Mega-kernel correctness at N=256: s_cos=0.999995, z_cos=0.999245 — PASS.
+
+**Pairformer compilation (traced approach, trn2.3xlarge):**
 
 | N | Compile Layer 0 | Weight Swaps (63 layers) | Total Setup |
 |---|-----------------|-------------------------|-------------|
@@ -169,12 +180,22 @@ PYTHONPATH=src pytest test/integration/test_model.py -v -s
 
 ### Approach
 
-This contribution uses a different approach from typical NxDI contrib models:
+This contribution includes two approaches for running the Boltz-2 pairformer on Trainium 2:
+
+**Approach 1: Traced + NKI Kernels (original)**
 
 1. **torch_neuronx.trace()** (not NxDI model classes) for compilation
 2. **NKI custom kernels** for the four O(N^3) triangular operations
 3. **Weight replacement** pattern: compile one layer, clone 63 times with `replace_weights()`
 4. **Monkey-patching** to inject NKI kernels into the upstream Boltz-2 codebase
+
+**Approach 2: Fused Mega-Kernel (2.63x faster)**
+
+A single NKI kernel (`full_pairformer_layer_spmd.py`) covers ALL 7 sub-operations of a PairformerLayer, including PairBiasAttention, both TriMul ops, both TriAttn ops, and both Transitions. SPMD grid=[2] uses both physical NeuronCores. This eliminates all host-device round trips within a layer, reducing latency from 173ms to 65.9ms at N=256.
+
+- Requires N >= 256 (SPMD split needs at least 2 s-tiles)
+- Compile time: ~5 min at N=256
+- NEFF size: 24.2 MB at N=256
 
 ### NKI Kernels
 
@@ -226,8 +247,12 @@ Each kernel is called twice per pairformer layer (starting node + ending node va
 
 | File | Description |
 |------|-------------|
-| `src/modeling_boltz2.py` | Main module: monkey-patching, compilation, inference |
+| `src/modeling_boltz2.py` | Main module: monkey-patching, compilation, inference (traced approach) |
 | `src/nki_triangular_attention.py` | NKI kernel: triangular attention with online softmax |
 | `src/nki_triangular_mul.py` | NKI kernel: triangular multiplicative update (einsum) |
+| `src/fused_z_ops_spmd.py` | Fused mega-kernel: z-only operations (TriMul, TriAttn, Transition_z) |
+| `src/full_pairformer_layer_spmd.py` | Fused mega-kernel: full PairformerLayer (all 7 ops, SPMD grid=[2]) |
 | `src/__init__.py` | Package exports |
-| `test/integration/test_model.py` | Accuracy + latency tests |
+| `test/integration/test_model.py` | Accuracy + latency tests (traced approach) |
+| `test/integration/compile_full_layer_spmd.py` | Compile script for fused mega-kernel |
+| `test/integration/test_full_layer_spmd.py` | Correctness test for fused mega-kernel vs CPU reference |
