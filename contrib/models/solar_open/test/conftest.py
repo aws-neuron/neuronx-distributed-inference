@@ -15,9 +15,9 @@ import pytest
 import torch
 
 # ---------------------------------------------------------------------------
-# Compatibility shims for transformers 5.0.0
+# Compatibility shims for transformers 5.0.0 + NxDI library quirks
 #
-# transformers 5.0 made two breaking changes that affect NxDI library code:
+# Three issues are resolved here before any test-module import occurs:
 #
 # 1. neuronx_distributed.pipeline.trace imports transformers.utils.fx.HFTracer
 #    which was removed in transformers 5.0.  Register a stub module BEFORE
@@ -28,9 +28,14 @@ import torch
 #    GenerateDecoderOnlyOutput in transformers 5.0.  Patch the live
 #    transformers.generation module to re-export the old name as an alias.
 #
-# These shims are applied at conftest collection time (before any test module
-# import) and do not affect runtime behaviour — the aliases/stubs are never
-# called during Solar Open inference.
+# 3. hf_adapter.prepare_inputs_for_generation references a local variable
+#    `tensor_capture_hook` that is never assigned in the function body.
+#    Python resolves unassigned names via LOAD_GLOBAL, so injecting None
+#    into the hf_adapter module's globals makes the reference resolve cleanly
+#    without modifying the library file.
+#
+# All shims are applied at conftest collection time and do not affect
+# Solar Open inference behaviour.
 # ---------------------------------------------------------------------------
 
 # Shim 1: transformers.utils.fx.HFTracer stub
@@ -51,6 +56,34 @@ if not hasattr(_tg, "SampleDecoderOnlyOutput"):
     _tg.SampleDecoderOnlyOutput = _tg.GenerateDecoderOnlyOutput  # type: ignore[attr-defined]
 if not hasattr(_tg, "SampleEncoderDecoderOutput"):
     _tg.SampleEncoderDecoderOutput = _tg.GenerateEncoderDecoderOutput  # type: ignore[attr-defined]
+
+# Shim 3: Fix hf_adapter.prepare_inputs_for_generation upstream issue where
+# `tensor_capture_hook` is (a) referenced as an undefined variable and
+# (b) included in model_inputs passed to NeuronBaseForCausalLM.forward() which
+# does not accept that kwarg.
+#
+# Fix (a): inject None into the module globals so the LOAD_GLOBAL bytecode
+#           instruction resolves the name without raising NameError.
+# Fix (b): wrap prepare_inputs_for_generation to strip the key from model_inputs
+#           before it reaches forward().
+import neuronx_distributed_inference.utils.hf_adapter as _hfa_mod  # noqa: E402
+
+if not hasattr(_hfa_mod, "tensor_capture_hook"):
+    _hfa_mod.tensor_capture_hook = None  # type: ignore[attr-defined]  # fix (a)
+
+_HFGAdapter = _hfa_mod.HuggingFaceGenerationAdapter
+_orig_prepare_inputs = _HFGAdapter.prepare_inputs_for_generation
+
+
+def _patched_prepare_inputs(self, *args, **kwargs):  # type: ignore[misc]
+    """Remove tensor_capture_hook from model_inputs (fix b)."""
+    result = _orig_prepare_inputs(self, *args, **kwargs)
+    if isinstance(result, dict):
+        result.pop("tensor_capture_hook", None)
+    return result
+
+
+_HFGAdapter.prepare_inputs_for_generation = _patched_prepare_inputs
 
 # Ensure contrib src is on path for all tests
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
