@@ -863,7 +863,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             from neuronx_distributed.parallel_layers.parallel_state import (
                 get_tensor_model_parallel_size,
             )
-            from torch_neuronx.xla_impl.ops import nc
+            from neuronxcc.nki.language import nc
 
             # Prepare Q: (B, H, S, D) -> (B*H, S, D) with tp_q=True format
             Q_kernel = Q.reshape(bsz * self.num_heads, q_len, self.head_dim).to(
