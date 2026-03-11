@@ -22,10 +22,16 @@ class NeuronInference(Inference):
         padded_tokens, last_pos, pad_mask = self.model._prepare_decoder_inputs(tokens)
 
         if tokens.shape[-1] > self.initial_token_length:
-            # only need to use the last token except in the first forward pass
+            # Decode: only need the last token, pass dummy xa since
+            # cross-attention K/V caches were populated during prefill
             tokens = tokens[:, -1:]
-            return self.model.decoder(tokens, audio_features, last_pos, pad_mask)
+            dummy_audio = torch.zeros(
+                audio_features.shape[0], 1, audio_features.shape[2],
+                dtype=audio_features.dtype,
+            )
+            return self.model.decoder(tokens, dummy_audio, last_pos, pad_mask)
         else:
+            # Prefill: pass full audio features
             tokens = padded_tokens
         return self.model.decoder(tokens, audio_features, last_pos, pad_mask)[:, : last_pos + 1]
 
