@@ -860,11 +860,6 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             and q_len >= 512
             and q_len % 512 == 0
         ):
-            from neuronx_distributed.parallel_layers.parallel_state import (
-                get_tensor_model_parallel_size,
-            )
-            from neuronxcc.nki.language import nc
-
             # Prepare Q: (B, H, S, D) -> (B*H, S, D) with tp_q=True format
             Q_kernel = Q.reshape(bsz * self.num_heads, q_len, self.head_dim).to(
                 self.torch_dtype
@@ -881,9 +876,11 @@ class NeuronQwen35Attention(NeuronAttentionBase):
                 bsz * self.num_key_value_heads, q_len, self.head_dim
             ).to(self.torch_dtype)
 
-            # Call nkilib kernel with grid for LNC2 sharding
-            grid = (nc(self.logical_nc_config),)
-            attn_output = _nkilib_flash_kernel[grid](
+            # Call nkilib kernel without grid (UNSHARDED mode).
+            # The kernel will process all batch elements on a single core.
+            # TODO: Enable grid-based (SHARDED) invocation once the SPMD
+            #       grid propagation issue is resolved.
+            attn_output = _nkilib_flash_kernel(
                 Q_kernel,
                 K_kernel,
                 V_kernel,
