@@ -199,6 +199,7 @@ print(f"Next token: {tokenizer.decode(next_token)}")  # " Paris"
 
 - **MoE blockwise bug (SDK 2.28)**: The `forward_blockwise` code path in NxDI's `expert_mlps_v2.py` produces incorrect output on trn2. Workaround: set `blockwise_matmul_config={"block_size": N}` where N > total_tokens * top_k to force the `forward_all_experts` path. Use `block_size=2048` for seq_len=128, `block_size=32768` for seq_len=2048.
 - **NKI flash attention head_dim>128 (SDK 2.28)**: The NKI flash attention kernel (`CausalAttentionMMSoftmaxMMWithoutSwap`) asserts `head_dim <= 128`. Qwen3.5 uses head_dim=256. The model's `perform_prefill()` override automatically falls back to the PyTorch softmax attention path, so no manual `attn_kernel_enabled=False` is required. A custom NKI kernel (`nki_flash_attn_d256.py`) is included that supports head_dim=256 by tiling the QK contraction in 2x128 chunks. However, benchmarks show it is ~2.4x slower than the PyTorch path due to layout conversion overhead (BHSD->BHDS permute). To experiment with it, set `QWEN35_USE_FLASH_ATTN_D256=1`.
+- **nkilib kernel integration blocked by NKI compiler bug**: The nki-library flash attention kernel has been extended to support head_dim up to 256 (see [nki-library fork, feature/head-dim-256](https://github.com/jimburtoft/nki-library/tree/feature/head-dim-256)). All standalone unit tests pass. However, integrating it with NxDI is blocked by an NKI compiler bug: `TraceKernel.inline_function` does not propagate the trace context (`builtin` injection) to sub-functions, causing `NameError: name 'builtin' is not defined` for all `nisa.*` ISA operations. The `nkilib_kernel_patch.py` module is included and ready to enable once the compiler bug is fixed (set `QWEN35_PATCH_FLASH_ATTN=1`). Multiple additional torchxla compatibility fixes were made in the nki-library fork (symbolic tile_size, num_programs returning None, address= fallback).
 - **NEURON_PLATFORM_TARGET_OVERRIDE**: Must set `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` when running with NKI v2 `@nki.jit` kernels on trn2.
 - **Memory**: The full model in BF16 is ~67GB. trn2.3xlarge (124GB system RAM) can load it but requires careful memory management during compilation.
 - **Compilation time**: DeltaNet recurrence is unrolled during HLO generation, making compile time O(seq_len). seq_len=2048 takes ~42 minutes vs ~12 minutes for seq_len=128. Each (batch_size, seq_len) combination requires a separate compilation.
@@ -237,6 +238,7 @@ python3 test/integration/test_model.py
 | `src/modeling_qwen35_moe.py` | Main NxDI model: DeltaNet, attention, MoE, config, state dict converter |
 | `src/nki_deltanet.py` | NKI v2 kernels for DeltaNet gated delta rule recurrence |
 | `src/nki_flash_attn_d256.py` | Custom NKI flash attention kernel for head_dim=256 (opt-in, experimental) |
+| `src/nkilib_kernel_patch.py` | nkilib kernel integration for NxDI (blocked by NKI compiler bug, see Known Issues) |
 | `src/__init__.py` | Re-exports public classes |
 | `test/integration/test_model.py` | Integration tests (accuracy + performance) |
 
