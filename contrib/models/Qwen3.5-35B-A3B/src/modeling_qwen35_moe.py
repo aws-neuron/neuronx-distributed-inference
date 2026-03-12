@@ -2129,14 +2129,33 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
         7-8 instead of 22-23. We override to fill positions 7-21 with torch.empty(0) and
         place vision inputs at positions 22-23.
 
-        llava_args: list of [vision_embeddings, vision_mask] for CTE,
-                    or [] / [torch.empty(0), torch.empty(0)] for TKG.
+        For CTE: vision_embeddings must be (BS, seq_len, hidden_size) and vision_mask
+                 must be (BS, seq_len, 1) -- even for text-only (use zeros/fill values).
+        For TKG: both must be torch.zeros((0,)) to match the traced TKG signature.
         """
+        is_prefill = self._is_prefill(position_ids)
+
         # Extract vision inputs from llava_args
         if llava_args and len(llava_args) >= 2:
             vision_embeddings = llava_args[0]
             vision_mask = llava_args[1]
+        elif is_prefill:
+            # Text-only CTE: generate dummy vision inputs matching compiled shape.
+            # The compiled CTE expects (BS, seq_len, hidden_size) and (BS, seq_len, 1).
+            # Use zeros for embeddings and fill_value=seq_len-1 for mask (safe scatter target).
+            seq_len = input_ids.shape[1]
+            batch_size = input_ids.shape[0]
+            vision_embeddings = torch.zeros(
+                (batch_size, seq_len, self.config.hidden_size),
+                dtype=self.config.neuron_config.torch_dtype,
+            )
+            vision_mask = torch.full(
+                (batch_size, seq_len, 1),
+                fill_value=seq_len - 1,
+                dtype=torch.int32,
+            )
         else:
+            # TKG: empty tensors (no vision injection during decode)
             vision_embeddings = torch.zeros((0,), dtype=torch.float32)
             vision_mask = torch.zeros((0,), dtype=torch.int32)
 
