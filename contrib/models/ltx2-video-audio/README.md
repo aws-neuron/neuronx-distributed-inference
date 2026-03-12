@@ -10,9 +10,12 @@ LTX-2 generates synchronized video + audio from text prompts. The model has thre
 |-----------|-----------|---------|-------|
 | Text encoder (Gemma 3-12B) | 12B | **Neuron TP=4** | Compiled with custom encoder |
 | DiT transformer (48 blocks) | ~6B | **Neuron TP=4** | The denoising bottleneck |
-| Video + Audio VAE decoders | ~1B | CPU | Run once per generation |
+| Video VAE decoder | ~1B | **Neuron TP=4** | Tiled decode with rectangular 4x16 tiles |
+| Audio VAE decoder + vocoder | ~0.1B | CPU | Run once per generation |
 
 Both the text encoder and DiT transformer backbone are compiled for Neuron. They coexist on the same 4 NeuronCores (TP=4) and execute sequentially: text encoding then denoising.
+
+The video VAE decoder is also compiled for Neuron using tensor-parallel tiled decoding. The optimal tile shape is 4x16 latent (128x512 pixels), which fits within the 64-element SRAM budget while minimizing tile count for large resolutions.
 
 ## Performance
 
@@ -76,6 +79,12 @@ NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
 
 # Pre-shard Gemma3 weights for fast loading (~2 minutes)
 python shard_gemma3_weights.py
+
+# Compile VAE decoder for Neuron (~30 minutes on trn2.48xlarge)
+# Default: 4x16 tile (128x512 px), optimal for 1024x1536 output
+NEURON_RT_VISIBLE_CORES=0-3 python compile_vae.py \
+  --tp-degree 4 --height 128 --width 512 \
+  --output-dir /home/ubuntu/ltx2_vae_tp4_128x512
 ```
 
 The DiT backbone is compiled automatically on first use by the E2E script.
@@ -128,10 +137,13 @@ ltx2-video-audio/
 ├── src/                              # Core NxDI package
 │   ├── __init__.py
 │   ├── modeling_ltx2.py              # DiT backbone: TP sharding, SPMD, config
+│   ├── modeling_vae.py               # VAE decoder: TP Conv3d, tiled compilation
 │   ├── modeling_gemma3_encoder.py    # Gemma3 text encoder for Neuron
 │   ├── application.py                # NeuronLTX2Application orchestrator
 │   ├── pipeline.py                   # NeuronTransformerWrapper (CFG batch-split)
 │   ├── compile_gemma3.py             # Gemma3 encoder compilation script
+│   ├── compile_vae.py                # VAE decoder compilation script
+│   ├── tiled_vae_decode.py           # Tiled VAE decode runtime (standalone + library)
 │   ├── shard_gemma3_weights.py       # Pre-shard Gemma3 weights to disk
 │   └── generate_ltx2.py             # CLI entry point with argument parsing
 ├── test/
@@ -214,6 +226,29 @@ The compiled Neuron DiT model takes 22 positional tensor arguments, all preproce
 --enable-mixed-precision-accumulation --lnc=2
 --tensorizer-options='--enable-ccop-compute-overlap'
 ```
+
+VAE decoder uses different compiler flags:
+```
+--model-type=unet-inference -O1 --auto-cast none --enable-fast-loading-neuron-binaries
+```
+
+### Neuron VAE Decoder (Tiled Decode)
+
+The LTX-2 VAE decoder (128 input channels, 3D convolutions with 3 upsampler blocks) cannot be compiled at full resolution due to SRAM limits. Instead, we compile it at a small tile size and decode the full image by tiling with overlap blending.
+
+**Compilation boundary**: `H_latent * W_latent <= 64` elements. Above this, the compiler fails with `NCC_IGCA030` (SRAM allocation failure).
+
+**Optimal tile**: 4x16 latent (128x512 pixels) — maximizes spatial area within the budget.
+
+**Tiled decode performance (1024x1536, 121 frames, trn2.48xlarge)**:
+
+| Tile | Overlap (h×w) | Tiles | Neuron | CPU | Speedup | Cos Sim |
+|------|--------------|-------|--------|-----|---------|---------|
+| 8×8 | 4×4 | 77 | 111.5s | 100s | 0.90x | 0.901 |
+| **4×16** | **1×0** | **33** | **42.4s** | **99s** | **2.3x** | **0.892** |
+| 4×16 | 0×0 | 24 | 30.9s | 98s | 3.2x | 0.872 |
+
+Recommended configuration: `--tile-latent-h 4 --tile-latent-w 16 --overlap-h 1 --overlap-w 0`
 
 Environment variables:
 ```bash
