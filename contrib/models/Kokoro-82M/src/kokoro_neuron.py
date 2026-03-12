@@ -536,8 +536,13 @@ class KokoroNeuron:
 
         max_bucket = max(self._neuron_parts.keys())
 
-        for _, phonemes, _ in self._pipeline(text, voice=voice, speed=speed):
-            # KPipeline yields phoneme chunks up to 510 phonemes.
+        for _, phonemes, _ in self._pipeline(
+            text, voice=voice, speed=speed, split_pattern=r"\n\n+"
+        ):
+            # KPipeline splits text on the split_pattern, then further chunks
+            # by phoneme count (waterfall at 510 phonemes).
+            # We use '\n\n+' to split on paragraph boundaries only, not on
+            # soft line wraps within paragraphs (default '\n+' breaks mid-sentence).
             # When model=False, audio is None — we only need phonemes.
             # Each chunk may still produce more frames than our max bucket.
             # Run CPU forward to get actual frame count, then sub-chunk if needed.
@@ -630,7 +635,9 @@ class KokoroNeuron:
         total_audio_samples = 0
         num_chunks = 0
 
-        for _, phonemes, _ in self._pipeline(text, voice=voice, speed=speed):
+        for _, phonemes, _ in self._pipeline(
+            text, voice=voice, speed=speed, split_pattern=r"\n\n+"
+        ):
             try:
                 t0 = time.time()
                 audio_cpu, pred_dur, intermediates = self._cpu_forward(
