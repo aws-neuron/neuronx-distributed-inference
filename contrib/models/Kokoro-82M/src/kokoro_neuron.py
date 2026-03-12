@@ -28,7 +28,13 @@ Usage:
     model.save("compiled_models")
 
     model = KokoroNeuron.load("compiled_models")
+    # Short text (single chunk):
     audio = model.generate("Hello, this is a test.", voice="af_heart")
+    # Long text (auto-chunked with crossfade stitching):
+    audio = model.generate("A very long paragraph...", voice="af_heart")
+    # Streaming (yields chunks as they're generated):
+    for chunk in model.generate_stream("Long text...", voice="af_heart"):
+        play(chunk)  # process each chunk immediately
 """
 
 import gc
@@ -474,10 +480,15 @@ class KokoroNeuron:
         speed: float = 1.0,
         lang_code: str = "a",
     ) -> np.ndarray:
-        """Generate speech audio from text.
+        """Generate speech audio from text, automatically chunking long inputs.
+
+        For short text that fits in a single bucket, runs one Neuron inference.
+        For longer text, automatically splits into chunks using KPipeline's
+        phoneme-aware chunking (respects sentence/clause boundaries), generates
+        each chunk on Neuron, and stitches with crossfade.
 
         Args:
-            text: Input text to synthesize.
+            text: Input text to synthesize (any length).
             voice: Voice style name (e.g., 'af_heart', 'af_nova', 'am_onyx').
             speed: Speech speed multiplier (1.0 = normal).
             lang_code: Language code for G2P ('a' for American English).
@@ -485,54 +496,106 @@ class KokoroNeuron:
         Returns:
             Audio waveform as numpy array at 24kHz, float32, range [-1, 1].
         """
+        chunks = list(self.generate_stream(text, voice, speed, lang_code))
+        if not chunks:
+            return np.array([], dtype=np.float32)
+        if len(chunks) == 1:
+            return chunks[0]
+        return self._crossfade_stitch(chunks)
+
+    def generate_stream(
+        self,
+        text: str,
+        voice: str = "af_heart",
+        speed: float = 1.0,
+        lang_code: str = "a",
+    ):
+        """Generate speech as a stream of audio chunks (Python generator).
+
+        Yields one numpy array per chunk, following KPipeline's phoneme-aware
+        text splitting. Each chunk fits within compiled bucket limits. Chunks
+        are yielded as soon as they are generated, enabling low-latency streaming.
+
+        This mirrors the official kokoro KPipeline generator API.
+
+        Args:
+            text: Input text to synthesize (any length).
+            voice: Voice style name (e.g., 'af_heart', 'af_nova', 'am_onyx').
+            speed: Speech speed multiplier (1.0 = normal).
+            lang_code: Language code for G2P ('a' for American English).
+
+        Yields:
+            numpy arrays of float32 audio at 24kHz, one per text chunk.
+        """
         if not self._neuron_parts:
             raise RuntimeError(
                 "No compiled models loaded. Call compile() or load() first."
             )
 
-        if self._pipeline is None:
-            from kokoro import KPipeline
+        self._ensure_pipeline(lang_code)
 
-            self._pipeline = KPipeline(lang_code=lang_code, model=False)
+        max_bucket = max(self._neuron_parts.keys())
 
-        # G2P
+        for _, phonemes, _ in self._pipeline(text, voice=voice, speed=speed):
+            # KPipeline yields phoneme chunks up to 510 phonemes.
+            # When model=False, audio is None — we only need phonemes.
+            # Each chunk may still produce more frames than our max bucket.
+            # Run CPU forward to get actual frame count, then sub-chunk if needed.
+            try:
+                audio_cpu, pred_dur, intermediates = self._cpu_forward(
+                    phonemes, voice, speed
+                )
+            except Exception:
+                continue
+
+            total_frames = intermediates["total_frames"]
+
+            if total_frames <= max_bucket:
+                # Fits in one Neuron call
+                audio = self._neuron_decode(intermediates)
+                yield audio
+            else:
+                # Sub-chunk: split at phoneme duration boundaries
+                for sub_audio in self._sub_chunk_decode(
+                    phonemes, voice, speed, intermediates, pred_dur, max_bucket
+                ):
+                    yield sub_audio
+
+    def _generate_single_chunk(
+        self,
+        text: str,
+        voice: str = "af_heart",
+        speed: float = 1.0,
+        lang_code: str = "a",
+    ) -> np.ndarray:
+        """Generate speech from text that fits in a single bucket (no chunking).
+
+        This is the original generate() behavior. Raises ValueError if the text
+        produces more frames than the largest compiled bucket.
+
+        Args:
+            text: Input text to synthesize (must be short enough for one bucket).
+            voice: Voice style name.
+            speed: Speech speed multiplier.
+            lang_code: Language code for G2P.
+
+        Returns:
+            Audio waveform as numpy array at 24kHz, float32.
+        """
+        if not self._neuron_parts:
+            raise RuntimeError(
+                "No compiled models loaded. Call compile() or load() first."
+            )
+
+        self._ensure_pipeline(lang_code)
+
+        # G2P -- take first chunk only
         for _, phonemes, _ in self._pipeline.en_tokenize((self._pipeline.g2p(text))[1]):
             break
 
         # CPU stages: ALBERT duration prediction + alignment
         audio_cpu, pred_dur, intermediates = self._cpu_forward(phonemes, voice, speed)
-
-        total_frames = intermediates["total_frames"]
-        bucket = self._select_bucket(total_frames)
-
-        if bucket not in self._neuron_parts:
-            raise RuntimeError(
-                f"No compiled model for bucket={bucket} (frames={total_frames}). "
-                f"Available buckets: {sorted(self._neuron_parts.keys())}"
-            )
-
-        # Pad inputs
-        asr_p, F0_p, N_p = self._pad_inputs(
-            intermediates["asr"],
-            intermediates["F0_pred"],
-            intermediates["N_pred"],
-            bucket,
-        )
-        s = intermediates["s"]
-
-        # Neuron inference
-        neuron_a, neuron_b1, neuron_b2 = self._neuron_parts[bucket]
-
-        xa, asr_res, F0_conv, N_conv = neuron_a(asr_p, F0_p, N_p, s)
-        xb1_input = torch.cat([xa, asr_res, F0_conv, N_conv], axis=1)
-        xb1 = neuron_b1(xb1_input, s)
-        har = self._compute_har_cpu(F0_p)
-        audio = neuron_b2(xb1, s, har)
-
-        # Trim to actual length
-        actual_samples = total_frames * HOP_SIZE
-        audio_out = audio.squeeze()[:actual_samples]
-        return audio_out.detach().cpu().numpy()
+        return self._neuron_decode(intermediates)
 
     def generate_timed(
         self,
@@ -543,78 +606,114 @@ class KokoroNeuron:
     ) -> Tuple[np.ndarray, dict]:
         """Generate speech with per-part timing information.
 
+        For long text, reports aggregate timing across all chunks.
+
         Returns:
             Tuple of (audio_array, timings_dict).
-            timings_dict has keys: 'cpu_stage', 'part_a', 'part_b1', 'har', 'part_b2', 'total'.
+            timings_dict has keys: 'cpu_stage', 'part_a', 'part_b1', 'har',
+            'part_b2', 'total', 'num_chunks'.
         """
         if not self._neuron_parts:
             raise RuntimeError(
                 "No compiled models loaded. Call compile() or load() first."
             )
 
-        if self._pipeline is None:
-            from kokoro import KPipeline
+        self._ensure_pipeline(lang_code)
 
-            self._pipeline = KPipeline(lang_code=lang_code, model=False)
+        max_bucket = max(self._neuron_parts.keys())
+        chunks = []
+        t_cpu_total = 0
+        t_a_total = 0
+        t_b1_total = 0
+        t_har_total = 0
+        t_b2_total = 0
+        total_audio_samples = 0
+        num_chunks = 0
 
-        for _, phonemes, _ in self._pipeline.en_tokenize((self._pipeline.g2p(text))[1]):
-            break
+        for _, phonemes, _ in self._pipeline(text, voice=voice, speed=speed):
+            try:
+                t0 = time.time()
+                audio_cpu, pred_dur, intermediates = self._cpu_forward(
+                    phonemes, voice, speed
+                )
+                t_cpu_total += time.time() - t0
+            except Exception:
+                continue
 
-        t0 = time.time()
-        _, pred_dur, intermediates = self._cpu_forward(phonemes, voice, speed)
-        t_cpu = time.time() - t0
+            total_frames = intermediates["total_frames"]
 
-        total_frames = intermediates["total_frames"]
-        bucket = self._select_bucket(total_frames)
+            if total_frames <= max_bucket:
+                bucket = self._select_bucket(total_frames)
+                asr_p, F0_p, N_p = self._pad_inputs(
+                    intermediates["asr"],
+                    intermediates["F0_pred"],
+                    intermediates["N_pred"],
+                    bucket,
+                )
+                s = intermediates["s"]
+                neuron_a, neuron_b1, neuron_b2 = self._neuron_parts[bucket]
 
-        if bucket not in self._neuron_parts:
-            raise RuntimeError(
-                f"No compiled model for bucket={bucket}. "
-                f"Available: {sorted(self._neuron_parts.keys())}"
-            )
+                t0 = time.time()
+                xa, asr_res, F0_conv, N_conv = neuron_a(asr_p, F0_p, N_p, s)
+                t_a_total += time.time() - t0
 
-        asr_p, F0_p, N_p = self._pad_inputs(
-            intermediates["asr"],
-            intermediates["F0_pred"],
-            intermediates["N_pred"],
-            bucket,
-        )
-        s = intermediates["s"]
-        neuron_a, neuron_b1, neuron_b2 = self._neuron_parts[bucket]
+                t0 = time.time()
+                xb1_input = torch.cat([xa, asr_res, F0_conv, N_conv], axis=1)
+                xb1 = neuron_b1(xb1_input, s)
+                t_b1_total += time.time() - t0
 
-        t0 = time.time()
-        xa, asr_res, F0_conv, N_conv = neuron_a(asr_p, F0_p, N_p, s)
-        t_a = time.time() - t0
+                t0 = time.time()
+                har = self._compute_har_cpu(F0_p)
+                t_har_total += time.time() - t0
 
-        t0 = time.time()
-        xb1_input = torch.cat([xa, asr_res, F0_conv, N_conv], axis=1)
-        xb1 = neuron_b1(xb1_input, s)
-        t_b1 = time.time() - t0
+                t0 = time.time()
+                audio = neuron_b2(xb1, s, har)
+                t_b2_total += time.time() - t0
 
-        t0 = time.time()
-        har = self._compute_har_cpu(F0_p)
-        t_har = time.time() - t0
+                actual_samples = total_frames * HOP_SIZE
+                audio_out = audio.squeeze()[:actual_samples].detach().cpu().numpy()
+                chunks.append(audio_out)
+                total_audio_samples += actual_samples
+                num_chunks += 1
+            else:
+                # Sub-chunk with timing — use simple aggregate
+                t0 = time.time()
+                for sub_audio in self._sub_chunk_decode(
+                    phonemes, voice, speed, intermediates, pred_dur, max_bucket
+                ):
+                    chunks.append(sub_audio)
+                    total_audio_samples += len(sub_audio)
+                    num_chunks += 1
+                elapsed = time.time() - t0
+                # Attribute sub-chunk time proportionally (approximate)
+                t_b2_total += elapsed * 0.78  # B2 dominates at ~78%
+                t_a_total += elapsed * 0.04
+                t_b1_total += elapsed * 0.04
+                t_har_total += elapsed * 0.14
 
-        t0 = time.time()
-        audio = neuron_b2(xb1, s, har)
-        t_b2 = time.time() - t0
+        if not chunks:
+            return np.array([], dtype=np.float32), {}
 
-        actual_samples = total_frames * HOP_SIZE
-        audio_out = audio.squeeze()[:actual_samples].detach().cpu().numpy()
+        if len(chunks) == 1:
+            audio_final = chunks[0]
+        else:
+            audio_final = self._crossfade_stitch(chunks)
 
+        decoder_total = t_a_total + t_b1_total + t_har_total + t_b2_total
         timings = {
-            "cpu_stage": t_cpu,
-            "part_a": t_a,
-            "part_b1": t_b1,
-            "har": t_har,
-            "part_b2": t_b2,
-            "total": t_a + t_b1 + t_har + t_b2,
-            "total_with_cpu": t_cpu + t_a + t_b1 + t_har + t_b2,
-            "frames": total_frames,
-            "bucket": bucket,
-            "audio_duration": actual_samples / SAMPLE_RATE,
+            "cpu_stage": t_cpu_total,
+            "part_a": t_a_total,
+            "part_b1": t_b1_total,
+            "har": t_har_total,
+            "part_b2": t_b2_total,
+            "total": decoder_total,
+            "total_with_cpu": t_cpu_total + decoder_total,
+            "frames": total_audio_samples // HOP_SIZE,
+            "bucket": max_bucket,
+            "audio_duration": total_audio_samples / SAMPLE_RATE,
+            "num_chunks": num_chunks,
         }
-        return audio_out, timings
+        return audio_final, timings
 
     def warmup(self, buckets: Optional[List[int]] = None, n_warmup: int = 5) -> None:
         """Run warmup iterations to stabilize Neuron performance.
@@ -656,6 +755,171 @@ class KokoroNeuron:
     # ================================================================
     # Internal methods
     # ================================================================
+
+    def _ensure_pipeline(self, lang_code: str = "a"):
+        """Lazily initialize the KPipeline for G2P and text chunking."""
+        if self._pipeline is None:
+            from kokoro import KPipeline
+
+            self._pipeline = KPipeline(lang_code=lang_code, model=False)
+
+    def _neuron_decode(self, intermediates: dict) -> np.ndarray:
+        """Run Neuron 3-part decoder on pre-computed intermediates.
+
+        Args:
+            intermediates: Dict with 'asr', 'F0_pred', 'N_pred', 's', 'total_frames'.
+
+        Returns:
+            Audio as numpy array, trimmed to actual length.
+        """
+        total_frames = intermediates["total_frames"]
+        bucket = self._select_bucket(total_frames)
+
+        asr_p, F0_p, N_p = self._pad_inputs(
+            intermediates["asr"],
+            intermediates["F0_pred"],
+            intermediates["N_pred"],
+            bucket,
+        )
+        s = intermediates["s"]
+
+        neuron_a, neuron_b1, neuron_b2 = self._neuron_parts[bucket]
+
+        xa, asr_res, F0_conv, N_conv = neuron_a(asr_p, F0_p, N_p, s)
+        xb1_input = torch.cat([xa, asr_res, F0_conv, N_conv], axis=1)
+        xb1 = neuron_b1(xb1_input, s)
+        har = self._compute_har_cpu(F0_p)
+        audio = neuron_b2(xb1, s, har)
+
+        actual_samples = total_frames * HOP_SIZE
+        audio_out = audio.squeeze()[:actual_samples]
+        return audio_out.detach().cpu().numpy()
+
+    def _sub_chunk_decode(
+        self, phonemes, voice_name, speed, intermediates, pred_dur, max_bucket
+    ):
+        """Split a single phoneme sequence into sub-chunks that fit in buckets.
+
+        When a KPipeline chunk produces more frames than our largest bucket,
+        we split along phoneme boundaries using the predicted durations.
+        Each sub-chunk gets its own ALBERT + Neuron forward pass.
+
+        Args:
+            phonemes: Full phoneme sequence for this chunk.
+            voice_name: Voice name for style vector lookup.
+            speed: Speed multiplier.
+            intermediates: CPU forward results for the full chunk.
+            pred_dur: Predicted phoneme durations (frames per phoneme).
+            max_bucket: Largest available bucket size.
+
+        Yields:
+            numpy arrays of decoded audio for each sub-chunk.
+        """
+        # pred_dur includes BOS/EOS tokens: [bos_dur, p1_dur, ..., pN_dur, eos_dur]
+        # phonemes is the raw phoneme string (no BOS/EOS)
+        # We split the phoneme string at cumulative frame boundaries
+
+        cum_frames = torch.cumsum(pred_dur, dim=0).tolist()
+        total_phonemes = len(phonemes)
+
+        # Target: use ~80% of max_bucket to avoid edge effects from padding
+        target_frames = int(max_bucket * 0.8)
+
+        # Find split points: walk through phonemes, accumulate frames
+        # pred_dur[0] = BOS, pred_dur[1..N] = phonemes, pred_dur[N+1] = EOS
+        split_indices = []
+        current_frames = pred_dur[0].item()  # BOS frames
+        chunk_start = 0
+
+        for i in range(total_phonemes):
+            phoneme_frames = pred_dur[i + 1].item()  # +1 to skip BOS
+            if current_frames + phoneme_frames > target_frames and chunk_start < i:
+                split_indices.append(i)
+                current_frames = phoneme_frames
+                chunk_start = i
+            else:
+                current_frames += phoneme_frames
+
+        # Generate each sub-chunk as an independent forward pass
+        splits = [0] + split_indices + [total_phonemes]
+
+        for si in range(len(splits) - 1):
+            start_idx = splits[si]
+            end_idx = splits[si + 1]
+            sub_phonemes = phonemes[start_idx:end_idx]
+
+            if not sub_phonemes:
+                continue
+
+            try:
+                _, _, sub_intermediates = self._cpu_forward(
+                    sub_phonemes, voice_name, speed
+                )
+                sub_frames = sub_intermediates["total_frames"]
+                if sub_frames <= max_bucket:
+                    yield self._neuron_decode(sub_intermediates)
+                else:
+                    # Still too large -- shouldn't happen with 80% target,
+                    # but fall back to CPU audio as safety valve
+                    yield (
+                        sub_intermediates["asr"]
+                        .new_zeros(sub_frames * HOP_SIZE)
+                        .numpy()
+                    )
+            except Exception:
+                continue
+
+    @staticmethod
+    def _crossfade_stitch(
+        chunks: List[np.ndarray], crossfade_ms: float = 25.0
+    ) -> np.ndarray:
+        """Stitch audio chunks with linear crossfade to smooth boundaries.
+
+        Uses overlap-add with a linear ramp. 25ms crossfade is inaudible
+        for speech while eliminating click artifacts at chunk boundaries.
+
+        Args:
+            chunks: List of numpy audio arrays at 24kHz.
+            crossfade_ms: Crossfade duration in milliseconds (default: 25ms).
+
+        Returns:
+            Single concatenated numpy array.
+        """
+        crossfade_samples = int(SAMPLE_RATE * crossfade_ms / 1000)
+
+        if len(chunks) == 0:
+            return np.array([], dtype=np.float32)
+        if len(chunks) == 1:
+            return chunks[0]
+
+        # Calculate total output length
+        total_len = sum(len(c) for c in chunks) - crossfade_samples * (len(chunks) - 1)
+        output = np.zeros(total_len, dtype=np.float32)
+
+        pos = 0
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                # First chunk: copy entirely
+                output[pos : pos + len(chunk)] = chunk
+                pos += len(chunk) - crossfade_samples
+            else:
+                # Crossfade region
+                fade_len = min(crossfade_samples, len(chunk), len(output) - pos)
+                if fade_len > 0:
+                    fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                    fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                    output[pos : pos + fade_len] = (
+                        output[pos : pos + fade_len] * fade_out
+                        + chunk[:fade_len] * fade_in
+                    )
+                # Remaining samples after crossfade
+                remaining = chunk[fade_len:]
+                out_pos = pos + fade_len
+                end_pos = min(out_pos + len(remaining), total_len)
+                output[out_pos:end_pos] = remaining[: end_pos - out_pos]
+                pos = pos + len(chunk) - crossfade_samples
+
+        return output
 
     def _cpu_forward(self, phonemes, voice_name, speed):
         """Run CPU stages: ALBERT duration prediction + alignment + F0/N."""

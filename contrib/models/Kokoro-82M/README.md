@@ -99,13 +99,34 @@ model.save("compiled_models")
 model = KokoroNeuron.load("compiled_models")
 model.warmup()
 
-# Generate speech
+# Generate speech (short text, single chunk)
 audio = model.generate("Hello, this is Kokoro running on Neuron!", voice="af_heart")
 # audio: numpy array, float32, 24kHz
+
+# Generate speech (long text, auto-chunked with crossfade stitching)
+long_text = """The quick brown fox jumps over the lazy dog. This sentence is just
+the beginning of a much longer passage that demonstrates Kokoro's ability to handle
+arbitrarily long text inputs by automatically splitting at sentence boundaries."""
+audio = model.generate(long_text, voice="af_heart")
 
 # With timing information
 audio, timings = model.generate_timed("Performance test.")
 print(f"Decoder: {timings['total']*1000:.1f}ms, {timings['audio_duration']:.2f}s audio")
+print(f"Chunks: {timings['num_chunks']}")
+```
+
+### Long-Form Generation
+
+`generate()` automatically handles text of any length by delegating to KPipeline's
+phoneme-aware text chunking (splits at sentence/clause boundaries: `!.?` > `:;` > `,`).
+Each chunk is decoded on Neuron, then chunks are stitched with a 25ms linear crossfade
+to eliminate click artifacts at boundaries.
+
+For streaming (low-latency, process-as-you-go), use the generator API:
+
+```python
+for audio_chunk in model.generate_stream("Very long text...", voice="af_heart"):
+    play(audio_chunk)  # each chunk is a numpy array at 24kHz
 ```
 
 ### Saving Audio
@@ -179,11 +200,12 @@ python test_model.py
 
 ## Known Limitations
 
-1. **Max bucket size: 192 frames (~2.4s audio) on trn2, 160 frames (~2.0s audio) on inf2** -- Generator State Buffer limits.
+1. **Per-chunk max: 192 frames (~2.4s audio) on trn2, 160 frames (~2.0s audio) on inf2** -- Generator State Buffer limits per Neuron inference call. Long text is automatically split into chunks and stitched (see Long-Form Generation above).
 2. **inf2 requires `-O1` compiler flag** -- Default `-O2` causes SB overflow. Buckets 64 and 192 fail on inf2 even at `-O1`.
 3. **CPU preprocessing required** -- ALBERT duration prediction and harmonic precomputation run on CPU. These add ~5-15ms depending on text length but are not the bottleneck.
 4. **Single-utterance batch size** -- Model traces at bs=1. Use DataParallel for throughput scaling.
 5. **F.interpolate not traceable** -- The `har` computation uses F.interpolate(scale_factor=300) which the XLA tracer drops silently. Workaround: precompute on CPU.
+6. **No cross-chunk prosody** -- Each chunk gets an independent style vector from the voice pack, selected by its phoneme count. Prosody does not carry across chunk boundaries (same limitation as the official Kokoro package).
 
 ## Example Checkpoints
 

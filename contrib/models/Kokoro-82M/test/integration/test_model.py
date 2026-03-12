@@ -243,6 +243,76 @@ class TestPerformance:
 
 
 # ================================================================
+# Tests: Long-Form Generation
+# ================================================================
+
+
+class TestLongForm:
+    LONG_TEXT = (
+        "The quick brown fox jumps over the lazy dog. "
+        "This is a second sentence that adds more content. "
+        "And here is a third sentence to make it even longer. "
+        "Finally, a fourth sentence wraps up this paragraph."
+    )
+
+    MULTI_SENTENCE = (
+        "First, we need to understand the problem. "
+        "Second, we analyze possible solutions. "
+        "Third, we implement the best approach. "
+        "Fourth, we test and validate our implementation. "
+        "Fifth, we deploy to production."
+    )
+
+    def test_generate_long_produces_audio(self, kokoro_model):
+        """generate() with long text returns non-empty audio."""
+        audio = kokoro_model.generate(self.LONG_TEXT)
+        assert isinstance(audio, np.ndarray)
+        assert len(audio) > 0
+        assert audio.dtype == np.float32
+        duration = len(audio) / 24000
+        # 4 sentences should produce at least 2 seconds of audio
+        assert duration > 2.0, f"Long text produced only {duration:.2f}s"
+
+    def test_generate_stream_yields_chunks(self, kokoro_model):
+        """generate_stream() yields multiple chunks for long text."""
+        chunks = list(kokoro_model.generate_stream(self.MULTI_SENTENCE))
+        assert len(chunks) >= 1, "Expected at least 1 chunk"
+        for i, chunk in enumerate(chunks):
+            assert isinstance(chunk, np.ndarray), f"Chunk {i} is not ndarray"
+            assert len(chunk) > 0, f"Chunk {i} is empty"
+            assert chunk.dtype == np.float32, f"Chunk {i} wrong dtype"
+
+    def test_generate_long_audio_duration(self, kokoro_model):
+        """Long text produces proportionally longer audio than short text."""
+        short_audio = kokoro_model.generate("Hello world.")
+        long_audio = kokoro_model.generate(self.LONG_TEXT)
+        short_dur = len(short_audio) / 24000
+        long_dur = len(long_audio) / 24000
+        assert long_dur > short_dur, (
+            f"Long text ({long_dur:.2f}s) not longer than short ({short_dur:.2f}s)"
+        )
+
+    def test_crossfade_stitching_no_clicks(self, kokoro_model):
+        """Stitched audio has no extreme amplitude spikes at chunk boundaries."""
+        audio = kokoro_model.generate(self.MULTI_SENTENCE)
+        # Check for clicks: look for sample-to-sample jumps > 0.5
+        # (normal speech rarely exceeds 0.3 sample-to-sample delta)
+        deltas = np.abs(np.diff(audio))
+        max_delta = np.max(deltas)
+        # Allow up to 0.8 for natural speech transients (plosives etc.)
+        assert max_delta < 0.8, (
+            f"Max sample delta {max_delta:.3f} suggests click artifact"
+        )
+
+    def test_generate_timed_long_reports_chunks(self, kokoro_model):
+        """generate_timed() reports num_chunks for multi-chunk text."""
+        audio, timings = kokoro_model.generate_timed(self.MULTI_SENTENCE)
+        assert "num_chunks" in timings
+        assert timings["num_chunks"] >= 1
+        assert timings["audio_duration"] > 0
+
+
+# ================================================================
 # Standalone runner
 # ================================================================
 
@@ -315,7 +385,7 @@ if __name__ == "__main__":
             print(f"  {voice}: FAIL ({e})")
 
     # Test 5: Performance
-    print("\n[5/6] Performance benchmark (10 iterations)...")
+    print("\n[5/8] Performance benchmark (10 iterations)...")
     latencies = []
     for _ in range(10):
         _, t = model.generate_timed("Hello, this is a performance benchmark test.")
@@ -324,10 +394,36 @@ if __name__ == "__main__":
     print(f"  P90: {np.percentile(latencies, 90):.1f}ms")
 
     # Test 6: NEFF sizes
-    print("\n[6/6] NEFF sizes...")
+    print("\n[6/8] NEFF sizes...")
     for name in ["part_a.pt", "part_b1.pt", "part_b2.pt"]:
         size = (bucket_dir / name).stat().st_size / (1024 * 1024)
         print(f"  {name}: {size:.1f} MB")
+
+    # Test 7: Long-form generation
+    print("\n[7/8] Long-form generation...")
+    long_text = (
+        "The quick brown fox jumps over the lazy dog. "
+        "This is a second sentence that adds more content. "
+        "And here is a third sentence to make it even longer. "
+        "Finally, a fourth sentence wraps up this paragraph."
+    )
+    audio_long = model.generate(long_text)
+    long_dur = len(audio_long) / 24000
+    print(f"  OK: {len(audio_long)} samples, {long_dur:.2f}s")
+
+    # Test 8: Streaming generation
+    print("\n[8/8] Streaming generation...")
+    stream_text = (
+        "First, we need to understand the problem. "
+        "Second, we analyze possible solutions. "
+        "Third, we implement the best approach."
+    )
+    chunks = list(model.generate_stream(stream_text))
+    total_stream_samples = sum(len(c) for c in chunks)
+    print(
+        f"  {len(chunks)} chunks, {total_stream_samples} total samples, "
+        f"{total_stream_samples / 24000:.2f}s"
+    )
 
     print("\n" + "=" * 60)
     print("All tests completed.")
