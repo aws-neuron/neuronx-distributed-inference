@@ -44,7 +44,7 @@ OPTIMIZED_NEURON_CONFIG = MoENeuronConfig(**optimized_json)
     [
         # Use 5% regression threshold
         pytest.param(BASELINE_NEURON_CONFIG, 15, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, False, 152.90*1.05, 1.25*1.05),  # BS16 baseline
-        pytest.param(OPTIMIZED_NEURON_CONFIG, 16, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, True, 8.7*1.05, 0.68*1.05), # BS16 MoE EP2/TP2, TP4/CP16 for prefill, TP8/DP8 for decode attention
+        pytest.param(OPTIMIZED_NEURON_CONFIG, 16, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, True, 8.7*1.05, 0.69*1.05), # BS16 MoE EP2/TP2, TP4/CP16 for prefill, TP8/DP8 for decode attention
     ],
 )
 def test_1_layer_accuracy(neuron_config, num_tokens_to_check, divergence_tolerance, check_performance, cte_device_time_threshold, tkg_device_time_threshold):

@@ -270,7 +270,7 @@ def get_snapshot_hook(
 
     submodel_bucket_request_counts: Dict[str, Dict[int, int]] = {}
 
-    def snapshot_hook(traced_model, args, output):
+    def snapshot_hook(traced_model, args):
         """
         Capture arguments, states, and weights.
         """
@@ -425,8 +425,8 @@ def register_nxd_model_hook(traced_model, func_name, hook):
     func = getattr(nxd_model, func_name)
 
     def wrapped_func(*args, **kwargs):
+        hook(traced_model, args)
         output = func(*args, **kwargs)
-        hook(traced_model, args, output)
         return output
 
     setattr(nxd_model, func_name, wrapped_func)

@@ -521,13 +521,25 @@ class TestLayers(TestCase):
             num_attention_heads=self.config.num_attention_heads,
             attention_head_dim=self.config.attention_head_dim,
         )
+        # HuggingFace FluxSingleTransformerBlock.forward signature: (hidden_states, temb, image_rotary_emb)
+        # Note: FluxSingleTransformerBlock does NOT take separate encoder_hidden_states
+        hidden_states = torch.randn([1, 4096, 3072], dtype=dtype)
+        encoder_hidden_states = torch.randn([1, 512, 3072], dtype=dtype)
+        concatenated_hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        temb = torch.randn([1, 3072], dtype=dtype)
+        image_rotary_emb = torch.randn([4608, 128, 2], dtype=dtype)
+        
+        e1, e2 = torch.unbind(image_rotary_emb, dim=-1)
+        hf_test_inputs = (concatenated_hidden_states, temb, (e1, e2))
+        
+        # Neuron model expects concatenated hidden_states (encoder + image)
+        # NeuronFluxSingleTransformerBlock.forward signature: (hidden_states, temb, image_rotary_emb, ...)
         neuron_test_inputs = (
-            torch.randn([1, 4608, 3072], dtype=dtype),
-            torch.randn([1, 3072], dtype=dtype),
-            torch.randn([4608, 128, 2], dtype=dtype),
+            concatenated_hidden_states,  # [1, 4608, 3072] - already concatenated
+            temb,                         # [1, 3072]
+            image_rotary_emb,             # [4608, 128, 2]
         )
-        e1, e2 = torch.unbind(neuron_test_inputs[-1], dim=-1)
-        hf_test_inputs = (neuron_test_inputs[0], neuron_test_inputs[1], (e1, e2))
+        
         expected_output = run_on_cpu(
             test_inputs=hf_test_inputs,
             model_cls=FluxSingleTransformerBlock,
@@ -609,7 +621,7 @@ class TestLayers(TestCase):
         backbone_neuron_config = NeuronConfig(
             tp_degree = 2,
             world_size = 2,
-            torch_type = dtype
+            torch_dtype = dtype,
         )
         backbone_config = FluxBackboneInferenceConfig(
             neuron_config = backbone_neuron_config,

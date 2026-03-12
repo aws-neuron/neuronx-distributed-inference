@@ -126,6 +126,7 @@ class NeuronQwen2DecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        adapter_ids=None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -137,13 +138,14 @@ class NeuronQwen2DecoderLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
+            adapter_ids=adapter_ids,
             **kwargs,
         )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)[0]
+        hidden_states = self.mlp(hidden_states, adapter_ids=adapter_ids)[0]
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)

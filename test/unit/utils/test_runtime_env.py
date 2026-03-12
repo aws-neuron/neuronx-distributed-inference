@@ -62,6 +62,21 @@ class TestRuntimeEnv(unittest.TestCase):
         # Cleanup
         clear_flags()
 
+    def test_set_env_vars_mxfp4(self):
+        # Setup
+        clear_flags()
+        neuron_config = NeuronConfig(is_mxfp4_compute=True)
+
+        # Act
+        set_env_vars(neuron_config)
+
+        # Verify
+        assert os.environ.get('NEURON_RT_ENABLE_OCP') == '1'
+        assert os.environ.get('NEURON_RT_ENABLE_OCP_SATURATION') == '1'
+
+        # Cleanup
+        clear_flags()
+
 
 if __name__ == '__main__':
     unittest.main()

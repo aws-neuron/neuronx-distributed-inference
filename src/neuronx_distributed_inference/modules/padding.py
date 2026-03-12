@@ -62,3 +62,24 @@ def unpad_tensor(padded_tensor: torch.Tensor, original_idx_slices: List[List]) -
     unpadded_tensor = padded_tensor[tuple(slice(start, end) for start, end in original_idx_slices)]
 
     return unpadded_tensor
+
+
+def pad_with_first_batchline(unpadded_tensor: torch.Tensor, target_shape: List[int]) -> torch.Tensor:
+    """
+    Pad tensor by repeating the first batch line to fill target batch size.
+
+    Args:
+        unpadded_tensor (torch.Tensor): Input tensor to pad.
+        target_shape (List[int]): Target shape for the padded tensor.
+
+    Returns:
+        torch.Tensor: Padded tensor with target batch size.
+    """
+    # Create padded tensor by repeating first batch line
+    repeat_dims = [target_shape[0]] + [1] * (len(unpadded_tensor.shape) - 1)
+    padded_tensor = unpadded_tensor[0].unsqueeze(0).repeat(*repeat_dims).to(unpadded_tensor.dtype)
+
+    # Copy original data to the beginning
+    padded_tensor[:unpadded_tensor.shape[0]] = unpadded_tensor
+
+    return padded_tensor

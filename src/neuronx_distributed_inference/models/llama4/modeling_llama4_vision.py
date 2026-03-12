@@ -1461,3 +1461,8 @@ class NeuronLlama4ForImageEncoding(NeuronApplicationBase):
         new_state_dict["vision_encoder.conv1.conv.weight"] = conv1_linear_weight.reshape(new_shape)
 
         return new_state_dict
+
+    @classmethod
+    def get_config_cls(cls):
+        from neuronx_distributed_inference.models.llama4.modeling_llama4 import Llama4InferenceConfig
+        return Llama4InferenceConfig

@@ -292,7 +292,7 @@ class NeuronPixtralForCausalLM(NeuronBaseForImageToText):
         image_sizes: Optional[torch.FloatTensor] = None
     ):
         if image_sizes is None:
-            assert len(pixel_values.shape) == 4, "Pixel value shape is expected to be [batch_size, num_channels, img_height, img_width]"
+            assert len(pixel_values.shape) == 4, f"Pixel value shape is expected to be [batch_size, num_channels, img_height, img_width], got shape {pixel_values.shape}"
             img_hight = pixel_values.shape[2]
             img_width = pixel_values.shape[3]
             image_sizes = torch.tensor([[img_hight, img_width]], dtype=torch.int32)
@@ -305,6 +305,10 @@ class NeuronPixtralForCausalLM(NeuronBaseForImageToText):
             vision_mask.dtype == torch.bool
         ), f"Parameter `vision_mask` must be of type bool, recieved {vision_mask.dtype}"
         vision_mask = generate_positions_from_mask(vision_mask.squeeze())
+
+        assert (
+            image_sizes.dtype in [torch.int, torch.int32, torch.int64]
+        ), f"Parameter `image_sizes` must be of type int, recieved {image_sizes.dtype}"
 
         vision_embeddings = self.vision_encoder_model(
             pixel_values.to(self.vision_config.neuron_config.torch_dtype), image_sizes

@@ -11,7 +11,10 @@ from neuronx_distributed.utils.medusa_utils import (
     update_inference_inputs,
 )
 from transformers import AutoConfig, GenerationConfig, GenerationMixin, PretrainedConfig, PreTrainedModel
+from transformers.generation.streamers import BaseStreamer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.generation import GenerateDecoderOnlyOutput, SampleDecoderOnlyOutput
+from transformers.generation.utils import GenerateNonBeamOutput
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.modeling_outputs import ModelOutput
@@ -112,7 +115,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             # is set to the installed version (rather than the model's version), which causes
             # the v4.50+ behavior to apply even for models defined before v4.50.
             # To mitigate this issue, we fix the transformers version on self.generation_config.
-            self.generation_config.transformers_version = hf_config.transformers_version
+            if hf_config.transformers_version is not None:
+                self.generation_config.transformers_version = hf_config.transformers_version
 
         self.neuron_model = model
         self.neuron_config = model.config.neuron_config
@@ -139,7 +143,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         stopping_criteria: StoppingCriteriaList,
         generation_config: GenerationConfig,
         **model_kwargs,
-    ) -> Union[SampleDecoderOnlyOutput, torch.LongTensor]:
+    ) -> GenerateNonBeamOutput | torch.LongTensor:
         r"""
         We override the GenerationMixin sample function (_sample for transformers>=4.39.0) to add support for right side padding.
         """
@@ -178,8 +182,18 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         this_peer_finished = False
         # auto-regressive generation
         while not this_peer_finished:
+            if self.neuron_config.tensor_replacement_config:
+                if hasattr(self, 'generation_step'):
+                    if model_kwargs['divergence_idx']:
+                        self.generation_step = 1 + model_kwargs['divergence_idx']
+                    else:
+                        self.generation_step += 1
+                else:
+                    self.generation_step = 1
+
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            model_kwargs['divergence_idx'] = None
             model_kwargs["attention_mask"] = model_inputs.get("attention_mask")
 
             # forward pass to get next token
@@ -250,6 +264,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         inputs_embeds=None,
         sampling_params=None,
         adapter_ids=None,
+        divergence_idx=None,
         **kwargs,
     ):
         # Store KV cache flag before forward pass.
@@ -302,12 +317,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
 
         tf_args = []
         if self.neuron_config.tensor_replacement_config:
-            if hasattr(self, 'generation_step'):
-                self.generation_step += 1
-            else:
-                self.generation_step = 1
             reg = TensorReplacementRegister.get_instance()
-            tf , masks = reg.step_args(self.generation_step)
+            tf , masks = reg.step_args(self.generation_step, divergence_idx=True if divergence_idx else False)
             tf_args = tf + masks
 
         # Only add tf_args if not empty
@@ -427,14 +438,29 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
     def _assisted_decoding(
         self,
         input_ids: torch.LongTensor,
-        candidate_generator: "CandidateGenerator",  # noqa
+        logits_processor: LogitsProcessorList,
         stopping_criteria: StoppingCriteriaList,
         generation_config: GenerationConfig,
+        synced_gpus: bool = False,
+        streamer: Optional["BaseStreamer"] = None,
+        inputs_tensor: torch.FloatTensor | None = None,
+        assistant_model: Optional["PreTrainedModel"] = None,
+        assistant_tokenizer: Optional["PreTrainedTokenizerBase"] = None,
+        tokenizer: Optional["PreTrainedTokenizerBase"] = None,
         **model_kwargs,
-    ):
+    ) -> GenerateNonBeamOutput | torch.LongTensor:
         pad_token_id = generation_config.pad_token_id
         eos_token_id = generation_config.eos_token_id
+
         if not self.neuron_config.enable_fused_speculation:
+            candidate_generator = self._get_candidate_generator(
+                generation_config=generation_config,
+                input_ids=input_ids,
+                inputs_tensor=input_ids,
+                assistant_model=assistant_model,
+                logits_processor=logits_processor,
+                model_kwargs=model_kwargs,
+            )
             assistant_model = candidate_generator.assistant_model
         if self.neuron_config.is_medusa:
             # TODO: move this to sampling
@@ -475,10 +501,6 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         **model_kwargs,
     ):
         # Init values
-        if eos_token_id is not None and pad_token_id is None:
-            raise ValueError(
-                "If `eos_token_id` is defined, make sure that `pad_token_id` is defined."
-            )
         if not isinstance(eos_token_id, list):
             eos_token_id_list = list([eos_token_id])
         else:
@@ -578,7 +600,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                     if self.capture_draft_logits:
                         scores += tuple(outputs.fused_outputs[-2][:, :, :])
                     else:
-                        scores += tuple(outputs.fused_outputs[-1][:, i, :] for i in range(n_matches))
+                        # Only add logits for accepted token positions (not including the extra prediction)
+                        scores += tuple(outputs.fused_outputs[-1][:, i, :] for i in range(accepted_tokens.shape[1]))
 
                 if output_logits:
                     raw_logits += (outputs.fused_outputs[-1],)

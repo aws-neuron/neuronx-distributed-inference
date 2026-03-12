@@ -20,6 +20,7 @@ import logging
 import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -210,10 +211,12 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
             _HARDWARE == hardware.TRN2 and self.config.neuron_config.world_size != self.config.neuron_config.tp_degree
         )  # only supports 1024x1024 inputs for now
 
-        self.out_channels = self.config.in_channels
-        self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
+        if (out_channels := getattr(self.config, "out_channels", None)) is not None:
+            self.out_channels = out_channels
+        else:
+            self.out_channels = self.config.in_channels
 
-        self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=(16, 56, 56))
+        self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
 
         text_time_guidance_cls = (
             NeuronCombinedTimestepGuidanceTextProjEmbeddings
@@ -430,9 +433,11 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
 
         hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
 
+        hidden_states = ModuleMarkerStartWrapper()(hidden_states)
         hidden_states = self.norm_out(hidden_states, temb)
 
         output = self.proj_out(hidden_states)
+        output = ModuleMarkerEndWrapper()(output)
 
         if self.context_parallel_enabled:
             # gather output
@@ -1159,7 +1164,7 @@ class NeuronFluxAttention(nn.Module):
             if self.enable_out_proj_kernel:     # Executing out projection kernel.
                 grid = (nc(2),)
                 hidden_states = matmul_o_proj_kernel[grid](
-                    hidden_states.transpose(1, 2), self.to_out[0].weight
+                    hidden_states.reshape(batch_size, -1, self.heads, head_dim).permute(0, 2, 3, 1), self.to_out[0].weight
                 )
             else:
                 hidden_states = self.to_out[0](hidden_states)
@@ -1222,6 +1227,9 @@ class ModelWrapperFluxBackbone(ModelWrapper):
             config, model_cls, tag, compiler_args, priority_model_idx, model_init_kwargs
         )
         self.bucket_config = None
+        self.image_rotary_emb = None
+        self.cache_image_rotary_emb = False
+        self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=(16, 56, 56))
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
         joint_attention_dim = self.config.joint_attention_dim
@@ -1264,10 +1272,11 @@ class ModelWrapperFluxBackbone(ModelWrapper):
         encoder_hidden_states=None,
         pooled_projections=None,
         timestep=None,
+        img_ids=None,
+        txt_ids=None,
         guidance=None,
-        image_rotary_emb=None,
         joint_attention_kwargs=None,
-        return_dict=True,
+        return_dict=False,
     ):
         """
         Override ModelWrapper.forward().
@@ -1276,7 +1285,30 @@ class ModelWrapperFluxBackbone(ModelWrapper):
             raise RuntimeError(
                 "Forward called before load. Run load() or load_state_dict() making calling forward"
             )
-        guidance = guidance if self.config.guidance_embeds else torch.tensor([], dtype=self.config.neuron_config.torch_dtype)
+        guidance = [] if guidance is None else [guidance]
+        guidance = torch.tensor(guidance, dtype=self.config.neuron_config.torch_dtype)
+
+        # Calculate image_rotary_embedding before the denoising loop
+        image_rotary_emb = self.image_rotary_emb
+        if image_rotary_emb is None:
+            if txt_ids.ndim == 3:
+                logger.warning(
+                    "Passing `txt_ids` 3d torch.Tensor is deprecated."
+                    "Please remove the batch dimension and pass it as a 2d torch Tensor"
+                )
+                txt_ids = txt_ids[0]
+            if img_ids.ndim == 3:
+                logger.warning(
+                    "Passing `img_ids` 3d torch.Tensor is deprecated."
+                    "Please remove the batch dimension and pass it as a 2d torch Tensor"
+                )
+                img_ids = img_ids[0]
+            ids = torch.cat((txt_ids, img_ids), dim=0)
+            image_rotary_emb = torch.stack(self.pos_embed(ids), dim=2).to(dtype=self.config.neuron_config.torch_dtype)
+
+        if self.cache_image_rotary_emb:
+            self.image_rotary_emb = image_rotary_emb
+
         output = self._forward(
             hidden_states,
             encoder_hidden_states,
@@ -1317,6 +1349,19 @@ class NeuronFluxBackboneApplication(NeuronApplicationBase):
 
     def forward(self, *model_inputs, **kwargs):
         return self.models[0](*model_inputs, **kwargs)
+
+    @contextmanager
+    def cache_context(self, name: str):
+        """ Cache context for matching huggingface FluxPipeline implementation. Currently a no-op."""
+        yield
+
+    @contextmanager
+    def image_rotary_emb_cache_context(self):
+        self.model.cache_image_rotary_emb = True
+        self.model.image_rotary_emb = None
+        yield
+        self.model.cache_image_rotary_emb = False
+        self.model.image_rotary_emb = None
 
     def get_compiler_args(self):
         compiler_args = "--model-type=transformer -O1"

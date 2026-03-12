@@ -98,7 +98,6 @@ class VAEDecoderInferenceConfig(InferenceConfig):
             "mid_block_add_attention",
             "height",
             "width",
-            "transformer_in_channels",
         ]
 
     @property
@@ -123,10 +122,14 @@ class ModelWrapperVAEDecoder(ModelWrapper):
         self.bucket_config = None  # Set to None if you don't have bucketing
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
+        if hasattr(self.config, "transformer_in_channels"):
+            in_channels = self.config.transformer_in_channels // 4
+        else:
+            in_channels = self.config.latent_channels
         model_inputs = torch.rand(
             [
                 1,
-                self.config.transformer_in_channels // 4,
+                in_channels,
                 self.config.height // self.config.vae_scale_factor,
                 self.config.width // self.config.vae_scale_factor,
             ],

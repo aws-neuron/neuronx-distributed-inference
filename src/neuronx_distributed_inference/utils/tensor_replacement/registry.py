@@ -1,7 +1,7 @@
 import os
 import re
+from neuronx_distributed_inference.modules.attention.utils import order_strided_tensor, stride_tensor
 import torch
-import torch.nn.functional as F
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
 
@@ -31,74 +31,63 @@ _FN = re.compile(
 # ------------------------------------------------------------------------------------
 # Shape normalization utilities
 # ------------------------------------------------------------------------------------
-def _pad_to_shape_right(t: torch.Tensor, target: torch.Size) -> torch.Tensor:
-    """
-    Right-pad each dimension to reach `target` shape (NEVER truncates).
-    - If any target dimension is smaller than source -> raises (we don't shrink).
-    - Pads the *end* of each dimension, preserving "prefix" semantics.
-
-    Args:
-      t:       input tensor
-      target:  desired shape
-
-    Returns:
-      Tensor with shape == target (same dtype/device as input).
-    """
-    if t.dim() != len(target):
-        raise ValueError(f"rank mismatch: {tuple(t.shape)} vs {tuple(target)}")
-
-    pads: List[int] = []
-    # F.pad expects pairs reversed by dimension order:
-    # (dim_n_right, dim_n_left, dim_{n-1}_right, ...)
-    # We only add "right" pads, so each pair is (0, need) and we push them in reverse dim order.
-    for d in reversed(range(t.dim())):
-        need = target[d] - t.size(d)
-        if need < 0:
-            raise ValueError(
-                f"cannot shrink tensor from {tuple(t.shape)} to {tuple(target)}"
-            )
-        pads.extend([0, need])
-
-    return F.pad(t, pads) if any(pads) else t
+def _overlap_slices(src_shape, dst_shape):
+    """Tuple of slices covering the per-dim overlap between src and dst."""
+    return tuple(slice(0, min(s, d)) for s, d in zip(src_shape, dst_shape))
 
 
 def _ensure_rank_and_pad_ref_to_target(
     t: torch.Tensor,
-    target: torch.Size,
-    assume_batch_dim0: bool = True,
+    neu_t: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Normalize a *reference* (CPU/golden) capture to match a Neuron tensor shape.
+    Normalize CPU tensor `t` to match a 3D Neuron tensor `neu_t`'s shape [B_neu, S_neu, D_neu].
 
-    Steps:
-      1) If the reference is missing a leading batch dimension (common in offline
-         captures) and we allow it, unsqueeze at dim 0. (e.g., (S,H)->(1,S,H))
-      2) Enforce same rank as target (we never guess missing middle dims).
-      3) Right-pad each dimension to match the target exactly (never truncate).
+    Accepted ref shapes:
+      • [S, D]                 (single prompt)
+      • [S*B, D]               (flattened multi-prompt)
+      • [B, S, D]              (already batched)
 
-    Rationale:
-      Neuron shapes are authoritative. Reference captures may be smaller (e.g.,
-      shorter sequence, missing batch dim). We pad *only to the right* to align.
-
-    Args:
-      t: reference tensor to normalize
-      target: final shape to match (from Neuron capture)
-      assume_batch_dim0: whether to auto-insert a missing leading batch dim
-
-    Returns:
-      Tensor with shape == target.
+    Behavior:
+      • We reshape 2D refs to 3D using S_neu/B candidates; we never reshape `neu_t`.
+      • Overlay rules:
+          - If B_ref == B_neu → write overlap for all batches.
+          - If B_ref == 1 and B_neu > 1 → write only batch 0.
+      • No zero padding — any non-overlap remains from `neu_t`.
     """
-    # Add missing batch dim (allowed only when target batch is 1)
-    if t.dim() == len(target) - 1 and assume_batch_dim0:
-        t = t.unsqueeze(0)  # e.g., (S,H) -> (1,S,H)
+    if neu_t.dim() != 3:
+        raise ValueError(f"Expected neu_t to be 3D, got dim={neu_t.dim()} with shape {tuple(neu_t.shape)}")
 
-    # Rank must match now; we never attempt to infer middle dims
-    if t.dim() != len(target):
-        raise ValueError(
-            f"After batch fix-up, rank mismatch: src={tuple(t.shape)} vs tgt={tuple(target)}"
-        )
+    B_neu, S_neu, D_neu = neu_t.shape
+    out = neu_t.to(dtype=t.dtype)
 
-    return _pad_to_shape_right(t, target)
+    # Convert t -> 3D if needed
+    if t.dim() == 2:
+        S_flat, D_ref = t.shape
+        if D_ref != D_neu:
+            raise ValueError(f"Expected ref {D_ref} and neuron tensors {D_neu} to have same hidden states")
+    else:
+        raise ValueError(f"Expected ref shape {t.shape} to be 2D")
+
+    if B_neu == 1:
+        # Rule 1: just unsqueeze to [1, S, D]
+        t = t.unsqueeze(0)
+    else:
+        # Rule 2: unpack S into B,S using B_neu (source of truth)
+        if S_flat % B_neu != 0:
+            raise ValueError(
+                f"Cannot unpack 2D ref {tuple(t.shape)} into B={B_neu}: "
+                f"S_flat={S_flat} is not divisible by B_neu={B_neu}."
+            )
+        S_ref = S_flat // B_neu
+        t = t.reshape(B_neu, S_ref, D_ref)
+
+    if t.shape[0] == B_neu:
+        sl = _overlap_slices(t.shape, out.shape)
+        out[sl] = t[sl].to(device=out.device, dtype=out.dtype)
+        return out
+    else:
+        raise ValueError(f"Ref {t.shape} and neuron {B_neu} batch sizes do not match: ")
 
 
 # ------------------------------------------------------------------------------------
@@ -170,6 +159,7 @@ class TensorReplacementRegister:
         ref_dir: Optional[str] = None,
         neuron_dir: Optional[str] = None,
         tr_map: Optional[Dict[int, List[str]]] = None,
+        config=None,
         ref_equiv_map: Optional[Dict[str, str]] = None,
     ) -> "TensorReplacementRegister":
         """
@@ -183,14 +173,13 @@ class TensorReplacementRegister:
           ref_equiv_map (optional): name mapping to reconcile reference->neuron
         """
         if cls._instance is None:
-            obj = super().__new__(cls)  # bypass __init__
+            obj = super().__new__(cls)            # bypass __init__
             cls._instance = obj
-            if any(x is None for x in (ref_dir, neuron_dir, tr_map)):
+            if any(x is None for x in (ref_dir, neuron_dir, tr_map, config)):
                 raise ValueError(
-                    "ref_dir, neuron_dir, and tr_map are required args when register has not been instantiated"
+                    "ref_dir, neuron_dir, and tr_map, config are required args when register has not been instantiated"
                 )
-            # Populate internal state (dirs, maps, superset, shapes, tensors, masks)
-            obj._configure(ref_dir, neuron_dir, tr_map, ref_equiv_map)
+            obj._configure(ref_dir, neuron_dir, tr_map, config, ref_equiv_map)
         return cls._instance
 
     # Prevent direct instantiation: enforce singleton usage
@@ -235,6 +224,7 @@ class TensorReplacementRegister:
         ref_dir: str,
         neuron_dir: str,
         tr_map: Dict[int, List[str]],
+        config,
         ref_equiv_map: Optional[Dict[str, str]] = None,
     ):
         """
@@ -264,6 +254,9 @@ class TensorReplacementRegister:
         self.masks_step: Dict[int, Dict[str, torch.Tensor]] = {}
         # optional: place to store teardown handles
         self.hooks: List[Any] = []
+        self.tensors_neuron = []
+        self.tensors_ref = []
+        self.config = config
         self._build()
 
     def _build(self):
@@ -293,12 +286,12 @@ class TensorReplacementRegister:
         # ---- 2. Scan directories (returns per-module per-step tensors)
         # NOTE: Neuron tensors carry the final compiled layout/shape; reference captures
         # may be smaller and require padding, so we always shape-match to Neuron.
-        tensors_neuron = self._scan_dir(self.neuron_dir, source="neuron")
-        tensors_ref = self._scan_dir(self.ref_dir, source="ref")
+        self.tensors_neuron = self._scan_dir(self.neuron_dir, source="neuron")
+        self.tensors_ref = self._scan_dir(self.ref_dir, source="ref")
 
         # Capture the set of steps for which neuron tensors exist (authoritative)
         steps = sorted(
-            {s for mod, step_map in tensors_neuron.items() for s in step_map.keys()}
+            {s for mod, step_map in self.tensors_neuron.items() for s in step_map.keys()}
         )
 
         # ---- 3. Infer and validate step-scoped shapes (from Neuron captures)
@@ -307,9 +300,9 @@ class TensorReplacementRegister:
         for s in steps:
             self.step_shapes.setdefault(s, {})
             for m in self.module_superset:
-                if m not in tensors_neuron or s not in tensors_neuron[m]:
+                if m not in self.tensors_neuron or s not in self.tensors_neuron[m]:
                     raise ValueError(f"Missing Neuron shape for module '{m}' at tkg step {s}.")
-                shp = torch.Size(tensors_neuron[m][s].shape)
+                shp = torch.Size(self.tensors_neuron[m][s].shape)
                 self.step_shapes[s][m] = shp
 
         # Validate: each module must have consistent shape across all steps, and constant rank.
@@ -339,11 +332,11 @@ class TensorReplacementRegister:
             dtypes: List[torch.dtype] = []
             for s in steps:
                 self.ref_step_dtypes.setdefault(s, {})
-                if m not in tensors_ref or s not in tensors_ref[m]:
+                if m not in self.tensors_ref or s not in self.tensors_ref[m]:
                     raise ValueError(
                         f"Missing CPU tensor to infer dtype for step {s}, module '{m}'"
                     )
-                t_ref = tensors_ref[m][s]
+                t_ref = self.tensors_ref[m][s]
                 dtypes.append(t_ref.dtype)
                 self.ref_step_dtypes[s][m] = t_ref.dtype
 
@@ -365,13 +358,15 @@ class TensorReplacementRegister:
             self.packed_step.setdefault(s, {})
             self.masks_step.setdefault(s, {})
             for m in self.module_superset:
-                shp = self.step_shapes[s][m]          # final shape from Neuron
+                neu_t = self.tensors_neuron[m][s]          # final shape from Neuron
                 dt = self.ref_step_dtypes[s][m]       # desired dtype from reference
-                ref_t = tensors_ref[m][s]
-
-                # Align ref capture to neuron shape (right-pad, allow missing leading batch)
-                ref_t = _ensure_rank_and_pad_ref_to_target(ref_t, shp)
-
+                ref_t = self.tensors_ref[m][s]
+                if self.config.strided_context_parallel_kernel_enabled and s == 1:
+                    neu_t_unstrided = order_strided_tensor(neu_t, dim=1, stride=self.config.cp_degree)
+                    ref_t = _ensure_rank_and_pad_ref_to_target(ref_t, neu_t_unstrided)
+                    ref_t = stride_tensor(ref_t, dim=1, stride=self.config.cp_degree)
+                else:
+                    ref_t = _ensure_rank_and_pad_ref_to_target(ref_t, neu_t)
                 # Defensive: dtype should agree with the inferred dtype map
                 if dt != ref_t.dtype:
                     raise ValueError("dtype mismatch between cpu tensors")
@@ -410,6 +405,19 @@ class TensorReplacementRegister:
             shp = self.step_shapes[step][m]
             dt = self.ref_step_dtypes[step][m]
 
+            ''' Guard against difference in batch size defined in config vs tensors captured on neuron run
+                Example: ctx_batch_size=1, batch_size=16, tkg_batch_size=16
+                when run woth 16 prompts as done in logit validation tests
+                router logits in ctx encoding phase will have shp = [16, S, H] although compiler expects [1, S, H]
+            '''
+            if step == 1:
+                bs = self.config.ctx_batch_size or self.config.batch_size
+            else:
+                bs = self.config.tkg_batch_size or self.config.batch_size
+
+            if shp[0] != bs:
+                shp = torch.Size((bs, *shp[1:]))
+
             # Zero TF arg with static shape == compiled shape
             tr_list.append(torch.zeros(shp, dtype=dt))
             # Mask is a simple (1,) Bool flag for this module at this step
@@ -417,23 +425,60 @@ class TensorReplacementRegister:
 
         return (tr_list, mask_list)
 
-    def step_args(self, step: int):
-        """
-        Retrieve the *real* per-step replacement tensors and masks aligned with module_superset.
+    def step_args(self, step: int, divergence_idx=False):
+        tr_list, mask_list = [], []
 
-        Returns:
-          (tr_list, mask_list)
-            tr_list:  [ packed_step[step][m] for m in module_superset ]
-            mask_list:[ masks_step[step][m]  for m in module_superset ]
-        """
-        tr_list: List[torch.Tensor] = []
-        mask_list: List[torch.Tensor] = []
+        if not divergence_idx:
+            # Original behavior: directly return packed tensors for this token-generation step
+            for m in self.module_superset:
+                tr_list.append(self.packed_step[step][m])
+                mask_list.append(self.masks_step[step][m])
+            return tr_list, mask_list
+
+        if 1 not in self.step_shapes:
+            raise ValueError("Missing ctx (step=1) shapes; cannot infer Neuron bucket.")
 
         for m in self.module_superset:
-            tr_list.append(self.packed_step[step][m])
-            mask_list.append(self.masks_step[step][m])
+            neuron_ctx_target = self.tensors_neuron[m][1]
+            # Gather CPU segments from ctx..step (inclusive) for this module
+            ref_step_map = self.tensors_ref.get(m, {})
+            ref_steps = [s for s in sorted(ref_step_map.keys()) if 1 <= s <= step]
+            if not ref_steps:
+                raise ValueError(f"No CPU captures for module '{m}' in steps [1..{step}]")
 
-        return (tr_list, mask_list)
+            batch = neuron_ctx_target.shape[0]
+            hidden = neuron_ctx_target.shape[-1]
+            segments = []
+            for s_idx, s_id in enumerate(ref_steps):
+                seg = ref_step_map[s_id]
+
+                if seg.dim() == 2:
+                    if seg.shape[0] % batch != 0:
+                        raise ValueError(
+                            f"Cannot reshape {tuple(seg.shape)} into (B={batch}, S, H={hidden})"
+                        )
+                    seg = seg.reshape(batch, -1, hidden)
+                else:
+                    raise ValueError(f"Unsupported rank {seg.dim()} for module '{m}'")
+
+                segments.append(seg)
+
+            # Determine sequence dimension for concatenation
+            # For 3D tensors (B, S, H), concatenate along sequence dimension (dim=1)
+            # For 2D tensors (S, H), concatenate along sequence dimension (dim=0)
+            seq_dim = 1 if segments[0].dim() >= 3 else 0
+            try:
+                combined_3d = torch.cat(segments, dim=seq_dim)
+                combined = combined_3d.reshape(batch * combined_3d.shape[1], hidden)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Concatenation failed for module '{m}' along dim {seq_dim}. "
+                    f"Check that non-seq dims match across steps."
+                ) from e
+            combined = _ensure_rank_and_pad_ref_to_target(combined, neuron_ctx_target)
+            tr_list.append(combined)
+            mask_list.append(self.masks_step[step][m])
+        return tr_list, mask_list
 
     # --------------------------------------------------------------------------------
     # Directory scan helpers
@@ -464,6 +509,7 @@ class TensorReplacementRegister:
             m = _FN.match(fn)  # captured_tensors_<phase>_step_<N>_module_<name>.pt
             if not m:
                 continue
+
             step = int(m.group(1))
             raw = m.group(2)
 

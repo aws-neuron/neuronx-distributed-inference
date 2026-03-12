@@ -234,15 +234,20 @@ class LoraCheckpoint:
         if not self.lora_ckpts:
             self.lora_ckpts = self.load_lora_state_dicts(self.ckpt_paths)
 
-        # step 2: update the weight name for base modules because the module name are modified by LoRA
+        # step 2: update the weight and bias name for base modules because the module name are modified by LoRA
         for name, _ in model.named_modules():
             if ".base_layer" in name:
                 name = name.replace(".base_layer", "")
+
                 weight_name = f"{name}.weight"
                 lora_weight_name = f"{name}.base_layer.weight"
-
                 if lora_weight_name not in model_sd:
                     model_sd[lora_weight_name] = model_sd.pop(weight_name)
+
+                bias_name = f"{name}.bias"
+                lora_bias_name = f"{name}.base_layer.bias"
+                if bias_name in model_sd and lora_bias_name not in model_sd:
+                    model_sd[lora_bias_name] = model_sd.pop(bias_name)
 
         # update the scale parameter names for quantized base modules
         model_sd = self._update_scale_for_quantized_model(model_sd)

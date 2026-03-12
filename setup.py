@@ -40,12 +40,13 @@ setup(
     install_requires=[
         "neuronx_distributed",
         "torch_neuronx>=2.5",
-        "transformers==4.56.*",
+        "transformers==4.57.*",
         "huggingface-hub",
         "sentencepiece",
         "torchvision",
         "pillow",
         "blobfile",
+        "hf-xet>=1.1.10,<2.0.0",
     ],
     extras_require={
         "test": ["pytest", "pytest-forked", "pytest-cov", "pytest-xdist", "pytest-rerunfailures==15.1", "accelerate", "diffusers==0.32.0", "openai-whisper==20250625"],

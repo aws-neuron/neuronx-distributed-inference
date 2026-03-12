@@ -10,6 +10,7 @@ import torch
 from neuronx_distributed.quantization.quantization_config import (
     ActivationQuantizationType,
     QuantizedDtype,
+    KVQuantizationConfig,
 )
 from neuronx_distributed.modules.moe.moe_configs import BlockwiseMatmulConfig, RouterConfig
 from neuronx_distributed.utils.utils import hardware
@@ -47,6 +48,8 @@ def to_torch_dtype(dtype_str: str) -> torch.dtype:
         "float32": torch.float32,
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+        "float8_e5m2": torch.float8_e5m2,
     }
     assert dtype_str in dtype_mapping, f"Unsupported dtype: {dtype_str}"
     return dtype_mapping[dtype_str]
@@ -172,6 +175,9 @@ class NeuronConfig:
             self.on_device_sampling_config = OnDeviceSamplingConfig(
                 **self.on_device_sampling_config
             )
+        # Expose argmax kernel flag at top-level for easier configuration with
+        # models like EAGLE
+        self.disable_argmax_kernel = kwargs.pop("disable_argmax_kernel", False)
 
         # async
         self.async_mode = kwargs.pop("async_mode", False)
@@ -194,6 +200,18 @@ class NeuronConfig:
                 self.token_generation_buckets[-1] <= self.max_length
             ), f"Token generation bucket {self.token_generation_buckets[-1]} should be <= {self.max_length}"
 
+        # Batch bucketing for token generation
+        self.token_generation_batches = kwargs.pop("token_generation_batches", None)
+        if self.token_generation_batches is not None:
+            if not isinstance(self.token_generation_batches, list):
+                self.token_generation_batches = [self.token_generation_batches]
+            self.token_generation_batches.sort()
+            max_batch = self.token_generation_batches[-1]
+            assert max_batch <= self.tkg_batch_size, (
+                f"Token generation batch buckets {self.token_generation_batches} "
+                f"should be <= token generation batch size ({self.tkg_batch_size})"
+            )
+
         # Quantization
         self.quantized = kwargs.pop("quantized", False)
         self.quantized_checkpoints_path = kwargs.pop("quantized_checkpoints_path", None)
@@ -213,8 +231,6 @@ class NeuronConfig:
         self.is_intermediate_dim_shuffled = self.is_mxfp4_compute
         # TODO: remove is_full_model_shuffled flag once MXFP4 compute accuracy is validated
         self.is_full_model_shuffled = kwargs.pop("is_full_model_shuffled", False)
-        assert not self.is_full_model_shuffled or self.is_mxfp4_compute, \
-            "is_full_model_shuffled is enabled, but is_mxfp4_compute is not enabled. To enable is_full_model_shuffled, set is_mxfp4_compute=True"
 
         self.modules_to_not_convert = kwargs.pop("modules_to_not_convert", None)
         self.draft_model_modules_to_not_convert = kwargs.pop(
@@ -228,9 +244,13 @@ class NeuronConfig:
         self.spec_batch_size = kwargs.pop("spec_batch_size", self.batch_size)
         self.enable_fused_speculation = kwargs.pop("enable_fused_speculation", False)
         self.enable_eagle_speculation = kwargs.pop("enable_eagle_speculation", False)
+        self.eagle_rolling_buffer_kernel_enabled = kwargs.pop("eagle_rolling_buffer_kernel_enabled", False)
         self.is_eagle3 = kwargs.pop("is_eagle3", False)
         self.is_eagle_draft = kwargs.pop("is_eagle_draft", False)
         self.enable_eagle_draft_input_norm = kwargs.pop("enable_eagle_draft_input_norm", False)
+
+        assert not self.is_full_model_shuffled or (self.is_mxfp4_compute or self.is_eagle_draft), \
+            "is_full_model_shuffled only works with is_mxfp4_compute in target model or an eagle draft model."
 
         if self.enable_eagle_speculation:
             self.enable_fused_speculation = True
@@ -275,6 +295,14 @@ class NeuronConfig:
             self.chunked_prefill_config = ChunkedPrefillConfig(
                 **self.chunked_prefill_config
             )
+
+        # KV Quantization
+        self.kv_quant_config = kwargs.pop("kv_quant_config", None)
+        if type(self.kv_quant_config) is dict:
+            self.kv_quant_config = KVQuantizationConfig(
+                **self.kv_quant_config
+            )
+
         self.is_chunked_prefill = self.chunked_prefill_config is not None
         if self.is_chunked_prefill:
             assert (
@@ -405,6 +433,10 @@ class NeuronConfig:
         self.activation_quantization_type = kwargs.pop("activation_quantization_type", None)
         if self.activation_quantization_type is not None:
             validate_activation_quantization_type(self.activation_quantization_type)
+            # TODO: Add fused qkv support for per tensor static quantization
+            self.fused_qkv = kwargs.pop("fused_qkv", False)
+            if self.activation_quantization_type == "STATIC" and self.fused_qkv:
+                raise IncompatibleConfigError("Static quantization is not supported for fused qkv")
 
         if self.strided_context_parallel_kernel_enabled and not self.cp_degree > 1:
             raise ValueError("CP must also be enabled when strided_context_parallel_kernel_enabled is set.")
@@ -441,6 +473,7 @@ class NeuronConfig:
                 'attn_block_tkg_nki_kernel_cascaded_attention can only be enabled with attn-block-tkg-nki-kernel-enabled'
 
         self.attn_block_tkg_nki_kernel_use_online_softmax = kwargs.pop("attn_block_tkg_nki_kernel_use_online_softmax", True)
+        self.attn_block_tkg_nki_kernel_disable_gpsimd_sb2sb = kwargs.pop("attn_block_tkg_nki_kernel_disable_gpsimd_sb2sb", False)
         self.kv_cache_update_with_kernel = False  # TODO: Set this to be true, dependent on compiler fix tracked through ticket V1970034499
         if self.attention_dp_degree > 1:
             self.kv_cache_batch_size = self.tkg_batch_size // self.attention_dp_degree
@@ -525,10 +558,14 @@ class NeuronConfig:
         self.enable_spill_reload_dge = kwargs.pop("enable_spill_reload_dge", False)
 
         # weights_to_skip_layout_optimization
-        self.weights_to_skip_layout_optimization = []
+        self.weights_to_skip_layout_optimization = kwargs.pop("weights_to_skip_layout_optimization", [])
         # skip WLO for lora weights if dynamic multi-lora serving is enabled
         if self.lora_config and self.lora_config.dynamic_multi_lora:
             self.weights_to_skip_layout_optimization.append(r".*lora.*")
+
+        # Scheduling and allocation order constraints for compiler.
+        # Note that this is an internal experimental feature at the moment.
+        self.dma_order_config = kwargs.pop("dma_order_config", None)
 
         self._verify_quantized_config()
 
@@ -557,12 +594,64 @@ class NeuronConfig:
 
         self.disable_numeric_cc_token = kwargs.pop(
             "disable_numeric_cc_token", False)
+
+        # enable switch collective support
         self.switch_cc = kwargs.pop("switch_cc", False)
+
+        # select ep dispatch cc option
+        self.ep_dispatch_cc_option = kwargs.pop("ep_dispatch_cc_option", "AR_AG")
 
         if kwargs:
             logging.warning(f"NeuronConfig init: Unexpected keyword arguments: {kwargs}")
 
         self.validate_attention_data_parallel(self.attention_dp_degree)
+        self._validate_batch_bucketing_compatibility()
+
+    def _validate_batch_bucketing_compatibility(self):
+        """
+        Validate that batch bucketing is not enabled with incompatible features.
+        Batch bucketing is currently not supported with:
+        - Speculative decoding
+        - Chunked prefill
+        - Prefix caching
+        - Block KV layout
+        """
+        if self.token_generation_batches is None:
+            return
+
+        incompatible_features = []
+
+        if self.speculation_length > 0:
+            incompatible_features.append(f"speculative decoding ({self.speculation_length=})")
+
+        if self.enable_fused_speculation:
+            incompatible_features.append("fused speculation (enable_fused_speculation=True)")
+
+        if self.enable_eagle_speculation:
+            incompatible_features.append("EAGLE speculation (enable_eagle_speculation=True)")
+
+        if self.is_medusa:
+            incompatible_features.append("Medusa decoding (is_medusa=True)")
+
+        if self.enable_token_tree:
+            incompatible_features.append("token tree (enable_token_tree=True)")
+
+        if self.is_chunked_prefill:
+            incompatible_features.append("chunked prefill (is_chunked_prefill=True)")
+
+        if self.is_prefix_caching:
+            incompatible_features.append("prefix caching (is_prefix_caching=True)")
+
+        if self.is_block_kv_layout:
+            incompatible_features.append("block KV layout (is_block_kv_layout=True)")
+
+        if incompatible_features:
+            features_str = ", ".join(incompatible_features)
+            raise ValueError(
+                f"Batch bucketing (token_generation_batches={self.token_generation_batches}) "
+                f"is not currently supported with the following features: {features_str}. "
+                f"Please disable batch bucketing or the incompatible features."
+            )
 
     def _verify_quantized_config(self):
         if not self.quantized:
@@ -592,6 +681,9 @@ class NeuronConfig:
         # TODO: remove this after compiler fix V1970034499 for self.kv_cache_update_with_kernel
         if attention_dp_degree > 1 and self.attn_block_tkg_nki_kernel_cache_update and not self.kv_cache_update_with_kernel:
             raise ValueError("kv_cache_update_with_kernel must be set to enable attn_block_tkg_nki_kernel_cache_update when DP is used")
+
+        if self.ep_dispatch_cc_option == "RS_AG" and self.tp_degree > self.tkg_batch_size:
+            raise ValueError("EP Dispatch option RS_AG not supported when TP degree > batch size")
 
     def _get_lnc(self, kwargs):
         env_lnc = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", -1))
@@ -939,6 +1031,7 @@ class OnDeviceSamplingConfig:
         self.global_topk = kwargs.pop("global_topk", 256)
         self.on_device_sampling_config = kwargs.pop("on_device_sampling_config", True)
         self.top_k_kernel_enabled = kwargs.pop("top_k_kernel_enabled", False)
+        self.sampling_dp_degree = kwargs.pop("sampling_dp_degree", 1)
 
 
 class ChunkedPrefillConfig:
@@ -1043,6 +1136,8 @@ class TensorReplacementConfig:
             raise ValueError("Missing required argument: neuron_dir")
         if 'tf_map' not in kwargs:
             raise ValueError("Missing required argument: tf_map")
+        if 'neuron_config' not in kwargs:
+            raise ValueError("Missing required argument: neuron_config")
 
         self.ref_dir = kwargs.pop("ref_dir", None)
         if not os.path.isdir(self.ref_dir):
@@ -1053,12 +1148,14 @@ class TensorReplacementConfig:
         self.tr_map = kwargs.pop("tf_map", None)
         if type(self.tr_map) is not dict:
             raise FileNotFoundError(f"Tensor replacement map is expected to be a dict but got: {type(self.tr_map)}")
+        self.config = kwargs.pop("neuron_config", None)
         self.module_map = kwargs.pop("module_map", None)
 
         reg = TensorReplacementRegister.get_instance(
             ref_dir=self.ref_dir,
             neuron_dir=self.neuron_dir,
             tr_map=self.tr_map,
+            config=self.config,
             ref_equiv_map=self.module_map,
         )
         RuntimeRegister.module_superset = reg.module_superset
