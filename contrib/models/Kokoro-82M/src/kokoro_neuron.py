@@ -158,8 +158,10 @@ _istftnet_module.SourceModuleHnNSF.forward = _patched_source_forward
 # ================================================================
 
 SAMPLE_RATE = 24000
-HOP_SIZE = 300  # upsample_rates=[10,6] * gen_istft_hop_size=5
-DEFAULT_BUCKETS = [32, 64, 96, 128, 160, 192]
+HOP_SIZE = (
+    600  # decode[3] 2x upsample * generator (upsample_rates=[10,6] * istft_hop=5 = 300)
+)
+DEFAULT_BUCKETS = [64, 128, 192, 512, 768, 1024]
 COMPILER_ARGS = ["--auto-cast", "matmult", "--auto-cast-type", "bf16"]
 
 
@@ -390,8 +392,9 @@ class KokoroNeuron:
         """Compile model parts for specified bucket sizes.
 
         Args:
-            buckets: List of bucket sizes to compile. Default: [32, 64, 96, 128, 160, 192].
-                     Max supported: 192 (SB overflow at >=256).
+            buckets: List of bucket sizes to compile. Default: [64, 128, 192, 512, 768, 1024].
+                     Note: buckets 256-384 and 1344-2624 hit SB overflow on trn2;
+                     zones 32-192, 512-1312, and 2688+ compile successfully.
             compiler_args: Compiler arguments. Default: ['--auto-cast', 'matmult', '--auto-cast-type', 'bf16'].
 
         Returns:
@@ -803,13 +806,24 @@ class KokoroNeuron:
         return audio_out.detach().cpu().numpy()
 
     def _sub_chunk_decode(
-        self, phonemes, voice_name, speed, intermediates, pred_dur, max_bucket
+        self,
+        phonemes,
+        voice_name,
+        speed,
+        intermediates,
+        pred_dur,
+        max_bucket,
+        _depth=0,
     ):
         """Split a single phoneme sequence into sub-chunks that fit in buckets.
 
         When a KPipeline chunk produces more frames than our largest bucket,
         we split along phoneme boundaries using the predicted durations.
         Each sub-chunk gets its own ALBERT + Neuron forward pass.
+
+        If a sub-chunk still exceeds max_bucket after splitting (because
+        ALBERT predicts different durations on the shorter context), we
+        recursively sub-chunk it up to 3 levels deep.
 
         Args:
             phonemes: Full phoneme sequence for this chunk.
@@ -818,32 +832,49 @@ class KokoroNeuron:
             intermediates: CPU forward results for the full chunk.
             pred_dur: Predicted phoneme durations (frames per phoneme).
             max_bucket: Largest available bucket size.
+            _depth: Recursion depth (internal, do not set).
 
         Yields:
             numpy arrays of decoded audio for each sub-chunk.
         """
+        MAX_DEPTH = 3
         # pred_dur includes BOS/EOS tokens: [bos_dur, p1_dur, ..., pN_dur, eos_dur]
         # phonemes is the raw phoneme string (no BOS/EOS)
         # We split the phoneme string at cumulative frame boundaries
 
-        cum_frames = torch.cumsum(pred_dur, dim=0).tolist()
         total_phonemes = len(phonemes)
 
-        # Target: use ~80% of max_bucket to avoid edge effects from padding
-        target_frames = int(max_bucket * 0.8)
+        # Target: use ~60% of max_bucket to leave headroom for ALBERT
+        # re-prediction producing different (often larger) frame counts.
+        target_frames = int(max_bucket * 0.6)
 
-        # Find split points: walk through phonemes, accumulate frames
+        # Find split points: walk through phonemes, accumulate frames.
+        # Prefer splitting at word boundaries (spaces in phoneme string)
+        # to avoid cutting words in half.
         # pred_dur[0] = BOS, pred_dur[1..N] = phonemes, pred_dur[N+1] = EOS
         split_indices = []
         current_frames = pred_dur[0].item()  # BOS frames
         chunk_start = 0
+        last_space = None  # Track last word boundary
 
         for i in range(total_phonemes):
             phoneme_frames = pred_dur[i + 1].item()  # +1 to skip BOS
+            if i > chunk_start and phonemes[i] == " ":
+                last_space = i
             if current_frames + phoneme_frames > target_frames and chunk_start < i:
-                split_indices.append(i)
-                current_frames = phoneme_frames
-                chunk_start = i
+                # Prefer splitting at last word boundary if available
+                if last_space is not None and last_space > chunk_start:
+                    split_idx = last_space + 1  # Split after the space
+                    # Recalculate current_frames from split_idx to i
+                    current_frames = sum(
+                        pred_dur[j + 1].item() for j in range(split_idx, i + 1)
+                    )
+                else:
+                    split_idx = i
+                    current_frames = phoneme_frames
+                split_indices.append(split_idx)
+                chunk_start = split_idx
+                last_space = None
             else:
                 current_frames += phoneme_frames
 
@@ -859,20 +890,27 @@ class KokoroNeuron:
                 continue
 
             try:
-                _, _, sub_intermediates = self._cpu_forward(
+                _, sub_pred_dur, sub_intermediates = self._cpu_forward(
                     sub_phonemes, voice_name, speed
                 )
                 sub_frames = sub_intermediates["total_frames"]
                 if sub_frames <= max_bucket:
                     yield self._neuron_decode(sub_intermediates)
-                else:
-                    # Still too large -- shouldn't happen with 80% target,
-                    # but fall back to CPU audio as safety valve
-                    yield (
-                        sub_intermediates["asr"]
-                        .new_zeros(sub_frames * HOP_SIZE)
-                        .numpy()
+                elif _depth < MAX_DEPTH:
+                    # Recursively sub-chunk with the new ALBERT predictions
+                    yield from self._sub_chunk_decode(
+                        sub_phonemes,
+                        voice_name,
+                        speed,
+                        sub_intermediates,
+                        sub_pred_dur,
+                        max_bucket,
+                        _depth=_depth + 1,
                     )
+                else:
+                    # Exhausted recursion -- skip this chunk rather than
+                    # emit silence (silence is worse than a missing fragment)
+                    continue
             except Exception:
                 continue
 
