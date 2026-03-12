@@ -1,13 +1,23 @@
 import os
 import torch
+import torch_xla
 import pytest
 from unittest.mock import patch, MagicMock
+from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.utils.distributed import (
-    get_init_world_size, get_init_rank, get_tp_group, 
-    get_dp_rank_spmd, get_cp_rank, get_dp_rank, split_along_dim,
-    get_rank_8_by_8, get_kv_head_group_number
+    get_init_world_size,
+    get_init_rank,
+    get_tp_group,
+    get_dp_rank_spmd,
+    get_cp_rank,
+    get_dp_rank,
+    split_along_dim,
+    split_along_dim0_kernel_wrapper,
+    get_rank_8_by_8,
+    get_kv_head_group_number,
 )
+from neuronxcc.nki.language import nc
 
 # Tests for environment variable functions
 @pytest.mark.parametrize(
@@ -128,17 +138,22 @@ def test_get_kv_head_group_number(global_rank, tp_degree, expected_result):
     assert result.dtype == torch.int32
 
 @pytest.mark.parametrize(
-    "global_rank,tp_degree,expected_result", 
+    "global_rank,tp_degree,dp_degree,expected_result", 
     [
-        (torch.tensor(0), 2, torch.tensor(0)),
-        (torch.tensor(1), 2, torch.tensor(0)),
-        (torch.tensor(2), 2, torch.tensor(1)),
-        (torch.tensor(5), 2, torch.tensor(2)),
-        (torch.tensor(6), 4, torch.tensor(1)),
+        (torch.tensor(0), 2, None, torch.tensor(0)),
+        (torch.tensor(1), 2, None, torch.tensor(0)),
+        (torch.tensor(2), 2, None, torch.tensor(1)),
+        (torch.tensor(5), 2, None, torch.tensor(2)),
+        (torch.tensor(6), 4, None, torch.tensor(1)),
+        (torch.tensor(0), 8, 8, torch.tensor(0)),
+        (torch.tensor(13), 8, 8, torch.tensor(0)),
+        (torch.tensor(32), 8, 8, torch.tensor(4)),
+        (torch.tensor(43), 8, 8, torch.tensor(5)),
+        (torch.tensor(63), 8, 8, torch.tensor(6)),
     ]
 )
-def test_get_dp_rank(global_rank, tp_degree, expected_result):
-    result = get_dp_rank(global_rank, tp_degree)
+def test_get_dp_rank(global_rank, tp_degree, dp_degree, expected_result):
+    result = get_dp_rank(global_rank, tp_degree, dp_degree)
     assert result.item() == expected_result.item()
     assert result.dtype == torch.int32
 
@@ -195,6 +210,51 @@ def test_split_along_dim_none_tensor():
     result = split_along_dim(None, 0, 0, 2)
     assert result is None
 
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("on_cpu", [True, False])
+def test_split_along_dim0_kernel(lnc, on_cpu):
+    if get_platform_target() == "trn1" and lnc == 2:
+        pytest.skip("LNC-2 is not supported in trn1")
+
+    def _split_along_dim0_kernel_test_wrap(tensor, rank, num_partitions):
+        """Kernel wrapper for boilerplate to(device) and rank int to tensor code"""
+        device = torch.device('cpu') if on_cpu else torch_xla.device()
+        if tensor.dtype == torch.int64:  # Neuron doesn't like int64
+            tensor = tensor.to(torch.int32)
+
+        result = split_along_dim0_kernel_wrapper(
+            tensor=tensor.to(device),
+            rank=torch.tensor([rank], dtype=torch.int32).to(device),
+            num_partitions=num_partitions,
+            lnc=lnc,
+        )
+        expected = split_along_dim(tensor, 0, rank, num_partitions)
+        assert torch.equal(result, expected)
+
+    # Test 1D tensor.  Split into 3 parts.
+    tensor = torch.arange(6)
+    _split_along_dim0_kernel_test_wrap(tensor, 0, 3)
+    _split_along_dim0_kernel_test_wrap(tensor, 1, 3)
+    _split_along_dim0_kernel_test_wrap(tensor, 2, 3)
+
+    # Test 2D tensor.
+    tensor = torch.arange(24).reshape(6, 4)
+    _split_along_dim0_kernel_test_wrap(tensor, 0, 2)
+    _split_along_dim0_kernel_test_wrap(tensor, 1, 2)
+
+    # Test 3D tensor.
+    tensor = torch.arange(84).reshape(4, 3, 7)
+    _split_along_dim0_kernel_test_wrap(tensor, 0, 2)
+    _split_along_dim0_kernel_test_wrap(tensor, 1, 2)
+
+    # Test with more realistic hidden_state, and a LNC-indivisible H
+    for H in [1024, 4567]:
+        tensor = torch.rand(32, 5, H, dtype=torch.bfloat16)
+        # Test rank 1 & 7, assuming 8 total ranks.
+        _split_along_dim0_kernel_test_wrap(tensor, 1, 8)
+        _split_along_dim0_kernel_test_wrap(tensor, 7, 8)
+
+
 def test_get_rank_8_by_8():
     tp = 8
     cp_8_by_8_mesh = [0, 1, 2, 3, 12, 13, 14, 15, 4, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 28, 29, 30, 31, 20, 21, 22, 23, 24, 25, 26, 27, 32, 33, 34, 35, 44, 45, 46, 47, 36, 37, 38, 39, 40, 41, 42, 43, 48, 49, 50, 51, 60, 61, 62, 63, 52, 53, 54, 55, 56, 57, 58, 59]
@@ -209,7 +269,7 @@ def test_get_rank_8_by_8():
 
 def test_get_rank_8_by_8_with_switch():
     tp = 8
-    pds_mesh = [0, 8, 18, 26, 32, 40, 50, 58, 1, 9, 19, 27, 33, 41, 51, 59, 2, 10, 16, 24, 34, 42, 48, 56, 3, 11, 17, 25, 35, 43, 49, 57, 4, 12, 22, 30, 36, 44, 54, 62, 5, 13, 23, 31, 37, 45, 55, 63, 6, 14, 20, 28, 38, 46, 52, 60, 7, 15, 21, 29, 39, 47, 53, 61]
+    pds_mesh = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19, 16, 17, 22, 23, 20, 21, 26, 27, 24, 25, 30, 31, 28, 29, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 50, 51, 48, 49, 54, 55, 52, 53, 58, 59, 56, 57, 62, 63, 60, 61]
     
     expected_result = sum([[i] * tp for i in range(tp)], [])
     actual_result = []

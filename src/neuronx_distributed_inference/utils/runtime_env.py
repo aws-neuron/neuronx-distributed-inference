@@ -17,6 +17,10 @@ def get_env_vars(neuron_config: NeuronConfig) -> dict[str, str]:
     if neuron_config.scratchpad_page_size:
         env_vars.update({"NEURON_SCRATCHPAD_PAGE_SIZE": f"{neuron_config.scratchpad_page_size}"})
 
+    if neuron_config.is_mxfp4_compute:
+        env_vars["NEURON_RT_ENABLE_OCP"] = "1"
+        env_vars["NEURON_RT_ENABLE_OCP_SATURATION"] = "1"
+
     return env_vars
 
 

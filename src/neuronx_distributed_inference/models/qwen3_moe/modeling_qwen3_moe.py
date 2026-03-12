@@ -103,7 +103,7 @@ def convert_state_dict_to_fused_qkv(qwen_state_dict: Dict[str, Any], cfg: Infere
 def maybe_dequantize_layer(neuron_state_dict, config):
     scale_layers = []
     for layer_key in neuron_state_dict.keys():
-        if "_scale_inv" in layer_key:
+        if layer_key.endswith("_scale_inv"):
             scales = neuron_state_dict[layer_key]
             scale_layers.append(layer_key)
             fp8_layer_name = layer_key.replace("_scale_inv", "")
@@ -376,6 +376,7 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
         self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
         self.moe_mask_padded_tokens = config.neuron_config.moe_mask_padded_tokens
+        self.config = config
 
     def forward(
         self,
@@ -428,7 +429,8 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         residual = hidden_states
         if not self.moe_fused_nki_kernel_enabled:
             hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, padding_mask)[0]
+        is_speculative_decoding = self.config.neuron_config.enable_fused_speculation and (not self.config.neuron_config.is_prefill_stage)
+        hidden_states = self.mlp(hidden_states, padding_mask, is_speculative_decoding=is_speculative_decoding)[0]
         hidden_states = residual + hidden_states
 
         # End module marker

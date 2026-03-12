@@ -20,10 +20,8 @@ from neuronxcc.nki._pre_prod_kernels.util.kernel_helpers import get_program_shar
 def write_kv_cache_at_batch_kernel(K: nt.tensor, V: nt.tensor, K_prior: nt.tensor[nt.mutable], V_prior: nt.tensor[nt.mutable], batch_idx):
     batch_idx = nl.load(batch_idx)
 
-    _, _, s, _ = K.shape
-    _, _, v_s, _ = V.shape
-    _, h, _, d = K_prior.shape
-    _, v_h, _, v_d = V_prior.shape
+    _, h, s, d = K.shape
+    _, v_h, v_s, v_d = V.shape
     _, n_prgs, prg_id = get_program_sharding_info()
 
     assert n_prgs == 2 or n_prgs == 1, "LNC sharding not specified"

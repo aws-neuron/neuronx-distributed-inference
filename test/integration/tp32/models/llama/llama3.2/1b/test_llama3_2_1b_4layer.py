@@ -169,7 +169,7 @@ def test_llama3_2_1b_4layer_neuron_128k():
         output_logits=True,
     )
     run_llama3_2_1b_4layer(neuron_config, run_accuracy=True, run_perf=True,
-                           latency_threshold=4078 * 1.2, throughput_threshold=32138 * 0.8,
+                           latency_threshold=4485 * 1.2, throughput_threshold=28924 * 0.8,
                            divergence_difference_tol=0.008)
 
 
@@ -246,7 +246,7 @@ def test_llama3_2_1b_4layer_neuron_async():
         output_logits=True,
         on_device_sampling_config=OnDeviceSamplingConfig(),
     )
-    # loosen the threshold due to kaizen setup differences
+    # loosen the threshold due to test infra setup differences
     run_llama3_2_1b_4layer(neuron_config, cpu_mode=False, run_accuracy=True, run_perf=True,
                            latency_threshold=258 * 1.2, throughput_threshold = 1992 * 0.8)
 

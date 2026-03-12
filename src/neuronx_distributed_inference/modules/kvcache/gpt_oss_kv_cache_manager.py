@@ -9,11 +9,13 @@ from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402;
     determine_sharding_strategy,
     get_shardable_head_counts,
 )
-from neuronx_distributed_inference.modules.kvcache.utils import dynamic_update_slice, update_cache_const_indices, fill_prefix
+from neuronx_distributed_inference.modules.kvcache.utils import dynamic_update_slice, update_cache_const_indices, fill_prefix, write_kv_cache_at_batch_kernel
 
 from neuronx_distributed_inference.modules.attention.utils import get_kernel_cache_size_bucket, get_kv_head_indices_context_parallel_full_tp_decode, get_kv_head_indices_context_parallel_dp_decode, get_cp8_tp8_rank_ordering
 from neuronx_distributed_inference.modules.attention.attention_process_groups import get_tp_cp_group_mesh
 from neuronx_distributed_inference.utils.distributed import split_along_dim, get_dp_rank
+
+from neuronxcc.nki.language import nc
 
 
 def _slice_kv_cacheline(padding_side: str, seq_len: int, cache: Tensor, transposed: bool):
@@ -89,7 +91,10 @@ class GptOssKVCacheManager(nn.Module):
         self.k_shapes = []
         self.v_shapes = []
 
-        self.dp_cache_bs = (self.batch_size // self.dp_degree) + 1  # +1 for garbage position
+        if self.neuron_config.kv_cache_update_with_kernel:
+            self.dp_cache_bs = (self.batch_size // self.dp_degree)
+        else:
+            self.dp_cache_bs = (self.batch_size // self.dp_degree) + 1  # +1 for garbage position
 
         for layer in range(0, self.num_layers):
             is_swa_layer = layer % 2 == 0
@@ -105,8 +110,9 @@ class GptOssKVCacheManager(nn.Module):
 
             num_kv_heads_per_rank = self._get_num_kv_heads_per_rank(tp_degree)
             hidden_dim_per_head = self._get_hidden_dim_per_head(self.config)
-
             k_shape = v_shape = (batch_size, num_kv_heads_per_rank, max_len, hidden_dim_per_head)
+            if self.k_cache_transposed and not is_swa_layer:
+                k_shape = (batch_size, num_kv_heads_per_rank, hidden_dim_per_head, max_len)
 
             self.k_shapes.append(k_shape)
             self.v_shapes.append(v_shape)
@@ -148,10 +154,11 @@ class GptOssKVCacheManager(nn.Module):
         **kwargs,
     ):
         is_swa_layer = idx % 2 == 0
+        is_k_cache_transposed = self.k_cache_transposed and not is_swa_layer
         dp_degree = self.swa_dp_degree if is_swa_layer else self.dp_degree
         k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer)
 
-        if dp_degree > 1:
+        if dp_degree > 1 and not self.neuron_config.kv_cache_update_with_kernel:
             k_cache = k_cache[: -1]  # remove garbage position
             v_cache = v_cache[: -1]
 
@@ -169,7 +176,7 @@ class GptOssKVCacheManager(nn.Module):
 
         # slice for partial view
         if not skip_slice:
-            k_cache = _slice_kv_cacheline(self.padding_side, seq_len, k_cache, self.k_cache_transposed)
+            k_cache = _slice_kv_cacheline(self.padding_side, seq_len, k_cache, is_k_cache_transposed)
             v_cache = _slice_kv_cacheline(self.padding_side, seq_len, v_cache, False)
 
         return k_cache, v_cache
@@ -262,6 +269,7 @@ class GptOssKVCacheManager(nn.Module):
         **kwargs,
     ):
         is_swa_layer = idx % 2 == 0
+        is_k_cache_transposed = self.k_cache_transposed and not is_swa_layer
         dp_degree = self.swa_dp_degree if is_swa_layer else self.dp_degree
 
         latest_k, latest_v = kv_per_layer[0], kv_per_layer[1]
@@ -273,7 +281,7 @@ class GptOssKVCacheManager(nn.Module):
             cte_rank_ordering = get_cp8_tp8_rank_ordering(self.neuron_config.tp_degree, self.neuron_config.cp_degree, switch_cc=self.neuron_config.switch_cc)
 
         if not is_for_context_encoding and dp_degree > 1:
-            dp_rank = get_dp_rank(self.get_rank(dp_degree, seq_ids.device), self.neuron_config.tp_degree // dp_degree, dp_degree, self.neuron_config.switch_cc)
+            dp_rank = get_dp_rank(self.global_rank.get_rank(), self.neuron_config.tp_degree // dp_degree, dp_degree, switch_cc=self.neuron_config.switch_cc)
             seq_ids = split_along_dim(seq_ids, dim=0, rank=dp_rank, num_partitions=dp_degree)
             position_ids = split_along_dim(position_ids, dim=0, rank=dp_rank, num_partitions=dp_degree)
 
@@ -289,7 +297,7 @@ class GptOssKVCacheManager(nn.Module):
                 # TP + DP update
                 else:
                     decode_ordering = None
-                    if dp_degree == 8 and self.neuron_config.tp_degree // dp_degree == 8:
+                    if (dp_degree == 8 or dp_degree == 16) and self.neuron_config.tp_degree // dp_degree == 8:
                         decode_ordering = sum(get_tp_cp_group_mesh(self.neuron_config.tp_degree, dp_degree, self.neuron_config.switch_cc), [])
 
                     kv_head_indices = get_kv_head_indices_context_parallel_dp_decode(self.num_kv_head, self.neuron_config.tp_degree,
@@ -303,21 +311,26 @@ class GptOssKVCacheManager(nn.Module):
 
             if self.is_continuous_batching:
                 assert seq_ids.dim() == 1 and seq_ids.shape[0] == 1, "only supports single seq_id"
-                if self.neuron_config.k_cache_transposed or dp_degree > 1:
+                if not (is_k_cache_transposed or dp_degree > 1):
+                    k_cache = update_cache_const_indices(k_cache, latest_k, seq_ids)
+                    v_cache = update_cache_const_indices(v_cache, latest_v, seq_ids)
+                elif self.neuron_config.kv_cache_update_with_kernel:
+                    cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids, dp_degree)
+                    # For trn2+ we use the dma_skipping KV update kernel for better performance
+                    grid = (nc(self.neuron_config.logical_nc_config),)
+                    k_cache, v_cache = write_kv_cache_at_batch_kernel[grid](latest_k, latest_v, k_cache, v_cache, cache_idx)
+                else:
                     cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids, dp_degree)
                     indices = [cache_idx] + [torch.zeros(1, device=seq_ids.device) for _ in range(k_cache.dim() - 1)]
                     indices = [t.squeeze().to(torch.int32) for t in indices]
                     k_cache = dynamic_update_slice(k_cache, latest_k, indices)
                     v_cache = dynamic_update_slice(v_cache, latest_v, indices)
-                else:
-                    k_cache = update_cache_const_indices(k_cache, latest_k, seq_ids)
-                    v_cache = update_cache_const_indices(v_cache, latest_v, seq_ids)
             else:
                 k_cache = fill_prefix(k_cache, latest_k)
                 v_cache = fill_prefix(v_cache, latest_v)
         else:
             if self.padding_side == "left":
-                assert not self.k_cache_transposed, 'Transposed K cache not yet implemented for left padding_side'
+                assert not is_k_cache_transposed, 'Transposed K cache not yet implemented for left padding_side'
                 k_cache = k_cache[:, :, 1:, :]
                 v_cache = v_cache[:, :, 1:, :]
                 k_cache = torch.cat([k_cache, latest_k], dim=2)
@@ -330,14 +343,14 @@ class GptOssKVCacheManager(nn.Module):
                     position_ids = torch.where(seq_ids_mask, position_ids, padded_pos_id)
 
                 scatter_index_new_k = self._get_index_to_update_new_position(
-                    scatter_index, position_ids, latest_k, self.k_cache_transposed, idx
+                    scatter_index, position_ids, latest_k, is_k_cache_transposed, idx
                 )
                 scatter_index_new_v = self._get_index_to_update_new_position(
                     scatter_index, position_ids, latest_v, False, idx
                 )
             k_cache = torch.scatter(
                 input=k_cache,
-                dim=(2 if not self.k_cache_transposed else 3),
+                dim=(2 if not is_k_cache_transposed else 3),
                 index=scatter_index_new_k,
                 src=latest_k,
             )
@@ -356,8 +369,12 @@ class GptOssKVCacheManager(nn.Module):
 
     def get_cache_update_index_for_seq_ids(self, seq_ids, dp_degree):
         # handle out-of-bound seq_ids
-        garbage_pos = self.dp_cache_bs - 1
-        true_batch_size = self.dp_cache_bs - 1
+        garbage_offset = 1
+        if self.neuron_config.kv_cache_update_with_kernel:
+            garbage_offset = 0
+
+        garbage_pos = self.dp_cache_bs - garbage_offset
+        true_batch_size = self.dp_cache_bs - garbage_offset
 
         dp_rank = torch.div(
             self.get_rank(dp_degree, seq_ids.device),

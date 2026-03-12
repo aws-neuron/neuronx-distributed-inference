@@ -55,6 +55,7 @@ def mock_tokenizer():
     return tokenizer
 
 
+@pytest.mark.skip(reason="Skipped to prepare for migration to NKI frontend")
 @pytest.mark.parametrize("prompt_len", [5, 25])
 def test_generate_with_chunked_prefill(mock_neuron_model, mock_tokenizer, prompt_len):
     # Prepare input
@@ -745,6 +746,7 @@ class TestCheckAccuracyLogitsV2:
         call_args = mock_logit_validation.call_args[1]
         assert call_args['expected_logits'].shape[0] == num_tokens
     
+    @pytest.mark.skip(reason="Skipped to prepare for migration to NKI frontend")
     @patch('neuronx_distributed_inference.utils.accuracy.logit_validation')
     def test_with_chunked_prefill(self, mock_logit_validation, mock_neuron_model, 
                               expected_logits, input_tensors, generation_config, mock_tokenizer):

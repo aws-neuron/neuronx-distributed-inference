@@ -45,6 +45,14 @@ class RefImpl(nn.Module):
         pixel_values: torch.Tensor,
         image_sizes: torch.Tensor,
     ):
+        if len(pixel_values.shape) == 5:
+            assert pixel_values.shape[0] == 1, "Vision encoder only supports BS=1"
+            pixel_values = pixel_values.squeeze(0)
+
+        if isinstance(image_sizes, torch.Tensor) and len(image_sizes.shape) == 3:
+            assert image_sizes.shape[0] == 1, "Vision encoder only supports BS=1"
+            image_sizes = image_sizes.squeeze(0).to(torch.int32)
+
         patch_embeds = self.patch_conv(pixel_values)
         patch_embeds_list = [
             embed[..., : (size[0] // self.patch_size), : (size[1] // self.patch_size)]
@@ -89,6 +97,7 @@ def convert_to_neuron_state_dict(config, checkpoint_dir):
         (torch.float16, [1, 3, 512, 1024], [[512, 1024]]),
         (torch.float16, [2, 3, 512, 1024], [[512, 512], [512, 1024]]),
         (torch.float16, [32, 3, 512, 512], [[512, 512]] * 32),
+        (torch.float16, [1, 2, 3, 512, 1024], torch.Tensor([[[512, 512], [512, 1024]]]).to(torch.int32)), # vllm addes batch dim, testing BS1, 2 images of the request
     ],
 )
 def test_conv2d(dtype, pixel_values_shape, image_sizes):
@@ -146,3 +155,4 @@ if __name__ == "__main__":
     test_conv2d(torch.float16, [1, 3, 1024, 1024], [[512, 1024]])
     test_conv2d(torch.float16, [4, 3, 512, 1024], [[512, 512], [512, 1024]])
     test_conv2d(torch.float16, [32, 3, 512, 512], [[512, 512]] * 32)
+    test_conv2d(torch.float16, [1, 2, 3, 512, 1024], torch.Tensor([[[512, 512], [512, 1024]]]).to(torch.int32))

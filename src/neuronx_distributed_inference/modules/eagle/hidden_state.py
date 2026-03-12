@@ -1,5 +1,65 @@
 import torch
 
+import neuronxcc.nki.isa as nisa
+import neuronxcc.nki.language as nl
+import neuronxcc.nki as nki
+import neuronxcc.nki.typing as nt
+
+
+@nki.jit(experimental_flags='enable-mutable-parameter')
+def rolling_buffer_set_state(
+    buffer: nt.tensor[nt.mutable],  # float [max_batch_size, buffer_size, hidden_size]
+    hidden_states: nt.tensor,       # float [batch_size, hidden_size]
+    batch_ids: nt.tensor,           # int   [batch_size]
+    position_ids: nt.tensor         # int   [batch_size]
+):
+    """
+    Insert hidden states into a rolling buffer at the batch & token position.
+
+    This kernel is used to ensure that large DMAs are performed for the hidden
+    state update. When this kernel is not used, it is possible to encounter
+    inefficient LNC sharding that uses many small DMAs in order to perform the
+    state write.
+
+    For simplicity, this kernel uses single index DMAs and a single NeuronCore
+    for each scatter.
+
+    Arguments:
+        buffer: The rolling buffer to insert values into.
+        hidden_states: The new hidden states to insert into the rolling buffer.
+        batch_ids: The batch or sequence ids for each hidden state
+        position_ids: The position of each token. This function assumes that position
+            modification has been applied (positions_ids % buffer_length).
+
+    Returns:
+        The rolling buffer modified in-place.
+    """
+    batch_size = batch_ids.shape[0]
+    max_batch_size, buffer_size, hidden_size = buffer.shape
+
+    # Validate that inputs are of expected size
+    assert hidden_states.shape[0] == batch_size
+    assert position_ids.shape[0] == batch_size
+    assert buffer.shape[0] >= batch_size
+    assert buffer.shape[-1] == hidden_states.shape[-1]
+
+    reshaped = buffer.reshape((max_batch_size * buffer_size, hidden_size))
+
+    # Loop over batch to avoid issues with HBM -> HBM Vector DMAs (uCode-135)
+    for i in nl.static_range(batch_size):
+
+        # Compute positional offset into the rolling buffer
+        batch_id = nl.load(batch_ids[i])
+        position_id = nl.load(position_ids[i])
+        base = nisa.tensor_scalar(batch_id, nl.multiply, buffer_size)
+        index = nisa.tensor_tensor(base, position_id, op=nl.add)
+
+        # Scatter into the hidden buffer on one NeuronCore
+        b_i, h_i = nl.mgrid[i:i + 1, :hidden_size]
+        nisa.dma_copy(src=hidden_states[b_i, h_i], dst=reshaped[index, h_i], oob_mode=nisa.oob_mode.skip)
+
+    return buffer
+
 
 class HiddenStateRollingBuffer(torch.nn.Module):
     """
@@ -36,6 +96,7 @@ class HiddenStateRollingBuffer(torch.nn.Module):
         dtype: torch.dtype = torch.float32,
         inplace: bool = False,
         apply_seq_ids_mask: bool = False,
+        use_kernel: bool = False,
     ):
         super().__init__()
         self.max_batch_size = max_batch_size
@@ -47,6 +108,7 @@ class HiddenStateRollingBuffer(torch.nn.Module):
             torch.zeros(self.shape, dtype=dtype), requires_grad=False
         )
         self.apply_seq_ids_mask = apply_seq_ids_mask
+        self.use_kernel = use_kernel
 
     def set_state(
         self,
@@ -63,7 +125,12 @@ class HiddenStateRollingBuffer(torch.nn.Module):
         hidden_state = hidden_state.squeeze(1)
         index = (seq_ids, position_ids % self.buffer_length)
 
-        result = torch.index_put(self.hidden_states, index, hidden_state)
+        # Always use kernel scatter when executing on-device
+        if hidden_state.device.type == 'cpu' or not self.use_kernel:
+            result = torch.index_put(self.hidden_states, index, hidden_state)
+        else:
+            result = rolling_buffer_set_state(self.hidden_states, hidden_state, *index)
+
         if self.inplace:
             self.hidden_states.data = result
         return result

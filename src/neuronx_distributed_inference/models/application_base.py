@@ -535,7 +535,7 @@ class NeuronApplicationBase(torch.nn.Module):
                 ranks,
                 is_input_ranked=submodel.async_mode or submodel.pipeline_execution,
             )
-            submodel.model.register_forward_hook(snapshot_hook)
+            submodel.model.register_forward_pre_hook(snapshot_hook)
             register_nxd_model_hook(submodel.model, "forward_async", snapshot_hook)
             register_nxd_model_hook(submodel.model, "forward_ranked", snapshot_hook)
             logger.info(f"Registered snapshot hooks for {submodel.tag=}")

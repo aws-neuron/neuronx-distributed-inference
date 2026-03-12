@@ -12,7 +12,7 @@ from neuronx_distributed_inference.utils.accuracy import check_accuracy_logits
 from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 from neuronx_distributed_inference.utils.constants import TEST_PROMPT
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
-from torch_neuronx.testing.validation import DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE
+from torch_neuronx.testing.validation import DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, DEFAULT_TOLERANCE_MAP
 
 NEURON_CONFIG_DP16 = NeuronConfig(
     tp_degree=64,
@@ -82,22 +82,48 @@ NEURON_CONFIG_DP8_MULTI_BATCH = NeuronConfig(
     torch_dtype=torch.float32,
 )
 
+NEURON_CONFIG_DP8_MULTI_BATCH_ATTN_KERNELS = NeuronConfig(
+    tp_degree=64,
+    cp_degree=1,
+    attention_dp_degree=8,
+    batch_size=32,
+    ctx_batch_size=1,
+    tkg_batch_size=32,
+    max_context_length=8192,
+    seq_len=8192,
+    sequence_parallel_enabled=True,
+    logical_nc_config=2,
+    attn_kernel_enabled=True,
+    is_continuous_batching=True,
+    fused_qkv=True,
+    torch_dtype=torch.float32,
+    attn_block_tkg_nki_kernel_enabled=True,
+    attn_block_tkg_nki_kernel_cascaded_attention=True,
+    qkv_kernel_enabled=True,
+)
+
+# At high BS theres certain tokens with larger divergence and tolerance errors, most tokens are accurate. 
+# The kernels also do not support fp32 and have precision differences.
+KERNELS_TOL_MAP = DEFAULT_TOLERANCE_MAP.copy()
+KERNELS_TOL_MAP[5] = (1e-5, 0.02)
+
 # TODO: Need to calibrate a non-flakey throughput and latency threshold for the below tests, investigate why variance is so high.
 @pytest.mark.tp64
 @pytest.mark.context_parallel
 @pytest.mark.data_parallel
 @pytest.mark.parametrize(
-    "neuron_config, num_kv_heads, latency_threshold, throughput_threshold, divergence_tolerance",
+    "neuron_config, num_kv_heads, latency_threshold, throughput_threshold, divergence_tolerance, tolerance_map",
     # fmt: off
     [
-        (NEURON_CONFIG_DP4, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE),
-        (NEURON_CONFIG_DP16, 4, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE),
-        pytest.param(NEURON_CONFIG_DP8, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
-        pytest.param(NEURON_CONFIG_DP8_MULTI_BATCH, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
+        (NEURON_CONFIG_DP4, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, DEFAULT_TOLERANCE_MAP),
+        (NEURON_CONFIG_DP16, 4, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, DEFAULT_TOLERANCE_MAP),
+        (NEURON_CONFIG_DP8, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, DEFAULT_TOLERANCE_MAP),
+        (NEURON_CONFIG_DP8_MULTI_BATCH, 8, float("inf"), 0, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, DEFAULT_TOLERANCE_MAP),
+        pytest.param(NEURON_CONFIG_DP8_MULTI_BATCH_ATTN_KERNELS, 8, float("inf"), 0, 0.15, KERNELS_TOL_MAP, marks=pytest.mark.xfail),
     ],
     # fmt: on
 )
-def test_llama_4layer_attention_data_parallel(neuron_config, num_kv_heads, latency_threshold, throughput_threshold, divergence_tolerance):
+def test_llama_4layer_attention_data_parallel(neuron_config, num_kv_heads, latency_threshold, throughput_threshold, divergence_tolerance, tolerance_map):
     config_path = os.path.dirname(os.path.abspath(__file__)) + "/config.json"
 
     model_tempdir = save_checkpoint(config_path, num_kv_heads)
@@ -113,7 +139,7 @@ def test_llama_4layer_attention_data_parallel(neuron_config, num_kv_heads, laten
 
     if config.neuron_config.on_device_sampling_config is None:
         validate_accuracy(model_path, config,
-                          generation_config, divergence_tolerance)
+                          generation_config, divergence_tolerance, tolerance_map)
 
     if throughput_threshold > 0:
         validate_performance(model_path, config, generation_config,
@@ -133,7 +159,7 @@ def save_checkpoint(config_path, num_kv_heads):
     return model_tempdir
 
 
-def validate_accuracy(model_path, config, generation_config, divergence_tolerance):
+def validate_accuracy(model_path, config, generation_config, divergence_tolerance, tolerance_map):
     input_len = 16
     input_ids = torch.rand(
         (config.neuron_config.batch_size, input_len)) * config.vocab_size
@@ -154,6 +180,7 @@ def validate_accuracy(model_path, config, generation_config, divergence_toleranc
         num_tokens_to_check=128 - input_len,
         inputs=inputs,
         divergence_difference_tol=divergence_tolerance,
+        tol_map=tolerance_map,
     )
 
 

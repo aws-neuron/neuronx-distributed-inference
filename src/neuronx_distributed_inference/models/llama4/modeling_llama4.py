@@ -433,7 +433,7 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
         logical_nc_config = self.text_config.neuron_config.logical_nc_config
 
         if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
-            optimization_level = "-O1"
+            optimization_level = "-O2"  # TODO: Change back to -O1 when this is resolved: P329547806
         elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
             optimization_level = "-O2"
         elif self.compile_tag == VISION_ENCODER_MODEL_TAG:

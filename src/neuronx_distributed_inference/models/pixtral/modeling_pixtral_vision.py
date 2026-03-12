@@ -353,6 +353,10 @@ class PixtralVisionModelWrapper(ModelWrapper):
             assert pixel_values.shape[0] == 1, "Vision encoder only supports BS=1"
             pixel_values = pixel_values.squeeze(0)
 
+        if isinstance(image_sizes, torch.Tensor) and len(image_sizes.shape) == 3:
+            assert image_sizes.shape[0] == 1, "Vision encoder only supports BS=1"
+            image_sizes = image_sizes.squeeze(0).to(torch.int32)
+
         # Replace conv2d with unfold + linear and move linear to neuron device
         patch_embeds = self.vision_patch_conv_unfold(pixel_values)  # after-op shape: [1, 768, 32, 32]
 
@@ -581,6 +585,11 @@ class NeuronPixtralForImageEncoding(NeuronApplicationBase):
         hf_model = hf_vision_model(model_path, **kwargs)
 
         return hf_model
+
+    @classmethod
+    def get_config_cls(cls):
+        from neuronx_distributed_inference.models.pixtral.modeling_pixtral import PixtralInferenceConfig
+        return PixtralInferenceConfig
 
 
 def generate_block_attention_mask(patch_embeds_list, tensor):

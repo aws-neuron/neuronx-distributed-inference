@@ -1,6 +1,7 @@
 import json
 import os
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Any, Optional
+from shutil import copytree, ignore_patterns
 
 import torch
 from huggingface_hub import save_torch_state_dict
@@ -196,3 +197,168 @@ def prune_state_dict(state_dict):
 
     pruned_state_dict = {k: v for k, v in state_dict.items() if v is not None}
     return pruned_state_dict
+
+
+def create_n_layer_checkpoint(
+    n: int,
+    src_dir: str,
+    tgt_dir: str,
+    layer_prefix: List[str] = ["layers"],
+    layer_config_keys: List[str] = ["num_hidden_layers"],
+):
+    """
+    Create an n-layer checkpoint given a full checkpoint.
+
+    This function creates a smaller checkpoint by extracting only the first n layers
+    from a full model checkpoint. It copies all non-weight files (config, tokenizer,
+    processor files) and filters the model weights to include only layers with
+    index < n. The config.json is automatically updated to reflect the new layer count.
+
+    Args:
+        n (int): Number of layers to keep in the new checkpoint. Layers with
+            index 0 to n-1 will be retained. Use n=1 to create a minimal
+            single-layer checkpoint for testing.
+        src_dir (str): Path to the source checkpoint directory containing the
+            full model weights, config.json, and tokenizer files.
+        tgt_dir (str): Path to the target directory where the n-layer checkpoint
+            will be saved. Directory will be created if it doesn't exist.
+        layer_prefix (List[str], optional): List of prefix strings used to identify
+            layer weights in the state dict keys. The function searches for these
+            prefixes followed by a layer index (e.g., "layers.0", "blocks.5").
+            Defaults to ["layers"].
+        layer_config_keys (List[str], optional): List of config keys to update with
+            the new layer count. Supports nested config structures.
+            Defaults to ["num_hidden_layers"].
+
+    Returns:
+        Dict[str, Any]: The filtered state dictionary containing only weights for
+            the first n layers and all non-layer weights (embeddings, output layers, etc.).
+
+    Example:
+        Basic usage with default parameters:
+
+        >>> tiny_sd = create_n_layer_checkpoint(
+        ...     n=1,
+        ...     src_dir="path/to/Llama-3-8B",
+        ...     tgt_dir="path/to/Llama-3-8B-tiny"
+        ... )
+
+        For vision-language models with multiple layer types:
+
+        >>> tiny_sd = create_n_layer_checkpoint(
+        ...     n=2,
+        ...     src_dir="path/to/Qwen2-VL-7B",
+        ...     tgt_dir="path/to/Qwen2-VL-7B-tiny",
+        ...     layer_prefix=["layers", "blocks"],
+        ...     layer_config_keys=["num_hidden_layers", "depth"]
+        ... )
+    """
+
+    # copy all non safetensors and non pt files
+    # this will include all model, precessor, and tokenizer config json and .model
+    copytree(src_dir, tgt_dir, ignore=ignore_patterns('*.pt', '.safetensors'), dirs_exist_ok=True)
+
+    # load the full state dict
+    full_sd = load_state_dict(src_dir)
+    print(f"Examining full state dict of keys: {full_sd.keys()}")
+
+    # loop thru the full state dict, only save weight whose layer index < n or have no layer index
+    n_layer_sd = {}
+    for k, v in full_sd.items():
+        layer_idx = find_layer_idx(k, layer_prefix=layer_prefix)
+        if layer_idx < n:
+            n_layer_sd[k] = v
+
+    # save the n layer state dict
+    print(f"Saving n layer state dict of keys: {n_layer_sd.keys()}")
+    save_state_dict_safetensors(n_layer_sd, tgt_dir)
+    print(f"Finished creating {n} layer checkpoint.")
+
+    # update number of layers in config.json
+    config_path = load_config_and_update_layer_num(os.path.join(tgt_dir, "config.json"), n, layer_config_keys)
+    print(f"Finished updating config.json key {layer_config_keys} value to {n}.")
+
+    print("----------------------")
+    print(f"Please inspect {config_path} and manually update more configs incompatible with the number of layers change.")
+    print("----------------------")
+
+    return n_layer_sd
+
+
+def find_layer_idx(
+    key: str,
+    layer_prefix: List[str] = ["layers"]
+):
+    """
+    A helper function to find the layer index of a checkpoint key.
+    Return -1 if layer_prefix is not in the key.
+    """
+
+    delim = key.split(".")
+
+    for i, sub_str in enumerate(delim):
+        if sub_str in layer_prefix:
+            # next sub_str should be layer index
+            try:
+                layer_idx = delim[i + 1]
+                return int(layer_idx)
+            except Exception as e:
+                raise ValueError(f"Unable to fetch layer index from key{key} of prefix {layer_prefix}") from e
+
+    # no sub string from key matches layer_prfix
+    return -1
+
+
+def find_and_update_key(d: Dict[str, Any], target_key: str, new_value: Any) -> bool:
+    """Recursively search and update a key in a nested dictionary."""
+    updated = False
+
+    for key, value in d.items():
+        if key == target_key:
+            d[key] = new_value
+            updated = True
+        elif isinstance(value, dict):
+            if find_and_update_key(value, target_key, new_value):
+                updated = True
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    if find_and_update_key(item, target_key, new_value):
+                        updated = True
+
+    return updated
+
+
+def load_config_and_update_layer_num(
+    config_path: str,
+    num_layers: int,
+    layer_config_keys: Optional[List[str]] = None,
+) -> str:
+    """
+    Load a config.json and update layer-related keys, saving to the same path.
+
+    Args:
+        config_path: Path to the config.json file
+        num_layers: New value for the number of layers
+        layer_config_keys: List of keys to update. Defaults to ["num_hidden_layers"]
+
+    Returns:
+        Updated configuration dictionary
+    """
+
+    if layer_config_keys is None:
+        layer_config_keys = ["num_hidden_layers"]
+
+    # Load config
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+
+    # Update all specified keys
+    for key in layer_config_keys:
+        find_and_update_key(config, key, num_layers)
+
+    # Save to the same path
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
+
+    return str(config_path)

@@ -385,6 +385,10 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         else:
             logger.info("Skipping model warmup")
 
+        enable_snapshot = bool(os.environ.get("NXD_INFERENCE_CAPTURE_SNAPSHOT", False))
+        if enable_snapshot:
+            self._register_snapshot_hooks_from_env()
+
     def load_weights(
         self,
         text_compiled_model_path,
@@ -476,7 +480,7 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
                 ranks,
                 is_input_ranked=submodel.async_mode or submodel.pipeline_execution,
             )
-            submodel.model.register_forward_hook(snapshot_hook)
+            submodel.model.register_forward_pre_hook(snapshot_hook)
             register_nxd_model_hook(submodel.model, "forward_async", snapshot_hook)
             register_nxd_model_hook(submodel.model, "forward_ranked", snapshot_hook)
             logger.info(f"Registered snapshot hooks for {submodel.tag=}")
@@ -535,6 +539,8 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         computed_context_lens: Optional[torch.LongTensor] = None,
         vision_embeddings: Optional[torch.FloatTensor] = None,
         vision_mask: Optional[torch.BoolTensor] = None,
+        deepstack_vision_embeds: Optional[List[torch.FloatTensor]] = None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
         Args:
@@ -572,6 +578,7 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
             block_table=block_table,
             full_context_lens=full_context_lens,
             computed_context_lens=computed_context_lens,
+            rotary_position_ids=rotary_position_ids,
         )
 
         if self.async_mode:
@@ -585,8 +592,10 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
                 adapter_ids=adapter_ids,
                 vision_embeddings=vision_embeddings,
                 vision_mask=vision_mask,
+                deepstack_vision_embeds=deepstack_vision_embeds,
                 medusa_args=medusa_args,
                 llava_args=llava_args,
+                rotary_position_ids=rotary_position_ids,
             )
         else:
             outputs, is_run_on_neuron = self._get_model_outputs(
@@ -599,8 +608,10 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
                 adapter_ids,
                 vision_embeddings,
                 vision_mask,
+                deepstack_vision_embeds,
                 medusa_args,
                 llava_args,
+                rotary_position_ids=rotary_position_ids,
             )
 
         generation_model = self.get_generation_model()
@@ -674,13 +685,17 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         adapter_ids,
         vision_embeddings,
         vision_mask,
+        deepstack_vision_embeds,
         medusa_args,
         llava_args,
         slot_mapping=None,
         block_table=None,
         full_context_lens=None,
         computed_context_lens=None,
+        rotary_position_ids=None,
     ):
+        if rotary_position_ids is None:
+            rotary_position_ids = torch.empty(0)
 
         if self._is_prefill(position_ids):
             outputs = self.context_encoding_model(
@@ -705,9 +720,10 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
                 torch.empty(0),  # inputs_embeds: Optional[torch.FloatTensor] = None,
                 torch.empty(0),  # kv_cache: Optional[torch.Tensor] = None,
                 torch.empty(0),  # active_mask=None,
-                torch.empty(0),  # rotary_position_id=None,
+                rotary_position_ids,
                 vision_embeddings,
                 vision_mask,
+                deepstack_vision_embeds,
             )
 
             self.kv_cache_populated = True
@@ -735,9 +751,10 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
                 torch.empty(0),  # inputs_embeds: Optional[torch.FloatTensor] = None,
                 torch.empty(0),  # kv_cache: Optional[torch.Tensor] = None,
                 torch.empty(0),  # active_mask=None,
-                torch.empty(0),  # rotary_position_id=None,
+                rotary_position_ids,
                 vision_embeddings,
                 vision_mask,
+                deepstack_vision_embeds,
             )
             is_run_on_neuron = self.token_generation_model.is_neuron()
 

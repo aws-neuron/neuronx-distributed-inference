@@ -269,6 +269,10 @@ def scatter_by_index_put(h_image, encoded_patches_proj, positions):
     # Flatten positions
     positions = positions.view(-1)
 
+    # Slice to match positions length
+    num_positions = len(positions)
+    encoded_patches_flat = encoded_patches_flat[:num_positions]
+
     # Use index_put_ to scatter the embeddings
     h_image_new.view(-1, embedding_dim).index_put_(
         (positions,), encoded_patches_flat, accumulate=False

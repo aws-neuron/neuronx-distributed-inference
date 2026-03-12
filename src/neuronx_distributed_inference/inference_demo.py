@@ -13,6 +13,7 @@ import torch
 from neuronx_distributed.quantization.quantization_config import (
     ActivationQuantizationType,
     QuantizationType,
+    KVQuantizationConfig,
 )
 from transformers import AutoTokenizer, GenerationConfig
 
@@ -154,6 +155,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 
     # On device sampling
     run_parser.add_argument("--on-device-sampling", action="store_true")
+    run_parser.add_argument("--sampling-dp-degree", type=int)
 
     # Bucketing
     run_parser.add_argument("--enable-bucketing", action="store_true")
@@ -169,6 +171,24 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         "--quantization-type", type=str, choices=[t.value for t in QuantizationType]
     )
     run_parser.add_argument("--kv-cache-quant", action="store_true")
+
+    def str_to_quantization_type(value):
+        for qt in QuantizationType:
+            if qt.value == value:
+                return qt
+
+        raise ValueError(f"Invalid quantization type: {value}")
+
+    run_parser.add_argument("--k-quant-method", type=str_to_quantization_type,
+                            default=QuantizationType.PER_TENSOR_SYMMETRIC,
+                            help="Quantization method for K cache (choices: per_tensor_symmetric, per_channel_symmetric, per_key_symmetric)")
+    run_parser.add_argument("--v-quant-method", type=str_to_quantization_type,
+                            default=QuantizationType.PER_TENSOR_SYMMETRIC,
+                            help="Quantization method for V cache (choices: per_tensor_symmetric, per_channel_symmetric, per_key_symmetric)")
+    run_parser.add_argument("--kv-quant-dtype", type=to_torch_dtype, default="float8_e4m3fn",
+                            help="Quantization dtype for KV cache")
+    run_parser.add_argument("--kv-direct-cast", action=argparse.BooleanOptionalAction, default=True,
+                            help="Use direct casting for KV quantization (use --no-kv-direct-cast to disable)")
     run_parser.add_argument("--quantization-dtype", type=str)
     run_parser.add_argument(
         "--modules-to-not-convert-file",
@@ -427,6 +447,21 @@ def create_neuron_config(model_cls, args):
         config_kwargs["chunked_prefill_config"] = ChunkedPrefillConfig(
             max_num_seqs=max_num_seqs,
         )
+
+    if args.kv_cache_quant:
+        kv_quant_kwargs = {}
+
+        if hasattr(args, "k_quant_method") and args.k_quant_method:
+            kv_quant_kwargs["k_quant_method"] = args.k_quant_method
+        if hasattr(args, "v_quant_method") and args.v_quant_method:
+            kv_quant_kwargs["v_quant_method"] = args.v_quant_method
+        if hasattr(args, "kv_quant_dtype") and args.kv_quant_dtype:
+            kv_quant_kwargs["quant_dtype"] = args.kv_quant_dtype
+        if hasattr(args, "kv_direct_cast"):
+            kv_quant_kwargs["direct_cast"] = args.kv_direct_cast
+
+        config_kwargs["kv_quant_config"] = KVQuantizationConfig(**kv_quant_kwargs)
+
     if (args.quantized and args.quantization_dtype == "f8e4m3") or args.kv_cache_quant:
         os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
         os.environ["UNSAFE_FP8FNCAST"] = "1"

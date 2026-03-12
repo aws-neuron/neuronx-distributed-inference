@@ -30,7 +30,6 @@ class LearnedSink(BaseParallelLinear):
         self.sink = torch.nn.Parameter(
             torch.zeros(sink_size_per_partition, dtype=torch_dtype), requires_grad=False
         )
-        print(f"learned_sink size = {self.sink.shape}")
         set_tensor_model_parallel_attributes(
             self.sink,
             is_parallel=True,
