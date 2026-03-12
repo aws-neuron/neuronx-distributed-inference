@@ -53,16 +53,21 @@ Note: Gemma3 and DiT backbone share the same 4 NeuronCores and are loaded sequen
 
 ### Per-Step Performance Detail
 
-Warm denoising steps (2-8) at 384×512, 25 frames, with AdaLN deduplication optimization:
+Warm denoising steps (2-8) at 384×512, 25 frames, with both CPU optimizations applied:
 
 | Component | Time | % of Step |
 |-----------|------|-----------|
-| CPU Preprocess | 48.6 ms | 16.5% |
-| Neuron Backbone | 244.6 ms | 82.8% |
+| CPU Preprocess | 39.0 ms | 13.6% |
+| Neuron Backbone | 245.4 ms | 85.7% |
 | Euler Step | 2.1 ms | 0.7% |
-| **Total per step** | **295.3 ms** | 100% |
+| **Total per step** | **286.5 ms** | 100% |
 
-The AdaLN deduplication optimization computes the timestep embedding MLP once per unique sigma value instead of per-token (768 tokens in T2V mode). This reduces CPU preprocessing from 96.5ms to 48.6ms (49.6% reduction), improving overall per-step latency by 10.5%.
+Two CPU preprocessing optimizations are applied:
+
+1. **AdaLN deduplication**: Computes the timestep embedding MLP once per unique sigma value instead of per-token (768 tokens in T2V mode). Reduces AdaLN time from 54ms to 7ms.
+2. **Step-invariant caching**: RoPE embeddings, context projection (caption_projection Linear), and attention masks are constant across denoising steps. Computed once on step 1 and reused for steps 2-8. Saves ~57ms on the first optimization pass (context projection dominates at ~55ms), with combined CPU preprocessing reduced from 96.5ms (baseline) to 39.0ms (60% reduction).
+
+Overall per-step improvement vs unoptimized baseline: 330ms to 286.5ms (13.2% reduction).
 
 ### Two-Stage Pipeline Benchmarks
 
@@ -328,7 +333,7 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 |------|---------|
 | `src/modeling_ltx23.py` | Core backbone: TP sharding, DistributedRMSNorm, SDPA replacement, TransformerArgs construction |
 | `src/modeling_gemma3_encoder.py` | Custom Gemma3 encoder-only model: returns all 49 hidden states stacked, no KV cache |
-| `src/pipeline.py` | NeuronTransformerWrapper: CPU preprocessing, backbone routing, mask handling, AdaLN deduplication |
+| `src/pipeline.py` | NeuronTransformerWrapper: CPU preprocessing, backbone routing, mask handling, AdaLN deduplication, step-invariant caching |
 | `src/compile_transformer.py` | DiT backbone compilation script — full-res 384×512 (torchrun --nproc_per_node=4) |
 | `src/compile_transformer_halfres.py` | DiT backbone compilation script — half-res 192×256 for two-stage mode |
 | `src/compile_gemma3.py` | Gemma3 encoder compilation script (parallel_model_trace) |
