@@ -732,6 +732,12 @@ class Qwen35MoeInferenceConfig(InferenceConfig):
         self.partial_rotary_factor = getattr(self, "partial_rotary_factor", 0.25)
         self.rope_dim = int(self.head_dim * self.partial_rotary_factor)  # 64
 
+        # mRoPE (multimodal RoPE) for VL support
+        # Extract from rope_parameters if present (HF config format)
+        rope_params = getattr(self, "rope_parameters", {}) or {}
+        self.mrope_section = rope_params.get("mrope_section", [11, 11, 10])
+        self.mrope_interleaved = rope_params.get("mrope_interleaved", True)
+
         # Layer types for hybrid dispatch
         if not hasattr(self, "layer_types"):
             self.layer_types = []
@@ -834,6 +840,107 @@ class Qwen35MoeInferenceConfig(InferenceConfig):
 # ============================================================
 
 
+class Qwen35MRoPEEmbedding(nn.Module):
+    """Multimodal Rotary Position Embedding (mRoPE) for Qwen3.5.
+
+    Handles 3D position information (temporal, height, width) for VL models.
+    Position IDs have shape (3, batch_size, seq_len) for T/H/W dimensions.
+    For text-only (2D position_ids), broadcasts to 3D with identical positions.
+
+    Uses interleaved layout: THWTHW... (stride-3 indexing) matching HF reference.
+
+    Based on Qwen3-VL-8B-Thinking contrib model, adapted for partial RoPE:
+    - dim = rope_dim (64), not full head_dim (256)
+    - mrope_section = [11, 11, 10] (total 32 = rope_dim / 2)
+    - Output (cos, sin) shape: (batch_size, seq_len, rope_dim=64)
+    """
+
+    def __init__(self, config: Qwen35MoeInferenceConfig):
+        super().__init__()
+        self.dim = config.rope_dim  # 64 (partial RoPE)
+        self.max_position_embeddings = config.max_position_embeddings
+        self.base = config.rope_theta
+
+        # mRoPE specific configuration
+        self.mrope_section = getattr(config, "mrope_section", [11, 11, 10])
+        self.mrope_interleaved = getattr(config, "mrope_interleaved", True)
+
+        # inv_freq: (rope_dim / 2,) = (32,) -- matches sum(mrope_section)
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def apply_interleaved_mrope(self, freqs, mrope_section):
+        """Apply interleaved mRoPE to 3D rotary embeddings.
+
+        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
+        interleaved [THWTHW...TT], preserving frequency continuity.
+
+        Args:
+            freqs: (3, bs, seq_len, rope_dim // 2) - frequencies for T, H, W
+            mrope_section: (3,) - sections for temporal, height, width
+
+        Returns:
+            freqs_t: (bs, seq_len, rope_dim // 2) - interleaved frequencies
+        """
+        freqs_t = freqs[0].clone()  # Start with temporal frequencies
+        for dim, offset in enumerate((1, 2), start=1):  # H, W
+            length = mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t
+
+    def forward(self, x, position_ids):
+        """Compute mRoPE cos/sin embeddings.
+
+        Args:
+            x: Input tensor (for device/dtype only)
+            position_ids: (3, batch_size, seq_len) or (batch_size, seq_len)
+
+        Returns:
+            cos: (batch_size, seq_len, rope_dim=64)
+            sin: (batch_size, seq_len, rope_dim=64)
+        """
+        # Expand to 3D if needed
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        # (rope_dim/2,) -> (3, batch_size, rope_dim/2, 1)
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
+        )
+
+        # (3, batch_size, seq_len) -> (3, batch_size, 1, seq_len)
+        position_ids_expanded = position_ids[:, :, None, :].float()
+
+        # Compute frequencies per dimension: (3, bs, rope_dim/2, seq_len) -> (3, bs, seq_len, rope_dim/2)
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(2, 3)
+
+            # Apply interleaved mRoPE
+            if self.mrope_interleaved:
+                freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+            else:
+                freqs = freqs[0]
+
+            # Double to rope_dim: (bs, seq_len, rope_dim/2) -> (bs, seq_len, rope_dim)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 class NeuronQwen35Attention(NeuronAttentionBase):
     """Attention with output gate and partial RoPE.
 
@@ -851,7 +958,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
     """
 
     def __init__(self, config: Qwen35MoeInferenceConfig):
-        # Partial RoPE: create RotaryEmbedding with rope_dim (64), not full head_dim (256)
+        # Partial RoPE: create mRoPE embedding with rope_dim (64)
         self.rope_dim = config.rope_dim  # 64 = head_dim * partial_rotary_factor
 
         # Create QK norm modules first (will be passed to base class)
@@ -859,11 +966,8 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         q_ln = get_rmsnorm_cls()(config.head_dim, rms_norm_eps)
         k_ln = get_rmsnorm_cls()(config.head_dim, rms_norm_eps)
 
-        rotary_emb = RotaryEmbedding(
-            self.rope_dim,  # Only 64 dims get rotary embedding
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
+        # Use mRoPE for VL support (handles 3D position_ids for T/H/W)
+        rotary_emb = Qwen35MRoPEEmbedding(config)
         super().__init__(
             config=config,
             hidden_size=config.hidden_size,
@@ -949,6 +1053,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         cos_cache=None,
         sin_cache=None,
         rmsnorm=None,
+        rotary_position_ids=None,
         **kwargs,
     ):
         """Forward with output gate applied BEFORE o_proj.
@@ -958,15 +1063,22 @@ class NeuronQwen35Attention(NeuronAttentionBase):
           gate = sigmoid(gate_proj(pre_attn_hidden))
           attn_output = attn_output * gate
           attn_output = o_proj(attn_output)
+
+        Uses rotary_position_ids (3D mRoPE) if available, else position_ids.
         """
         bsz, q_len, _ = hidden_states.shape
+
+        # Use mRoPE position IDs if available, else standard position IDs
+        rope_pos_ids = (
+            rotary_position_ids if rotary_position_ids is not None else position_ids
+        )
 
         # Compute gate from input hidden states (before QKV projection)
         gate = self.output_gate_proj(hidden_states)  # (B, S, num_heads * head_dim)
 
         # Standard QKV prep (projections, QK norm, RoPE)
         Q, K, V, cos_cache, sin_cache, _residual = self.prep_qkv_tensors(
-            position_ids,
+            rope_pos_ids,
             hidden_states,
             past_key_value,
             adapter_ids=adapter_ids,
@@ -1615,6 +1727,7 @@ class NeuronQwen35MoeModel(NeuronBaseModel):
             active_mask=active_mask,
             inputs_embeds=inputs_embeds,
             adapter_ids=adapter_ids,
+            rotary_position_ids=rotary_position_id,
             update_cache=True,
             is_for_context_encoding=is_for_context_encoding,
             padding_mask=None,
@@ -1931,14 +2044,16 @@ class Qwen35ModelWrapper(ModelWrapper):
         )
 
     def input_generator(self):
-        """Generate inputs including vision_embeddings and vision_mask.
+        """Generate inputs including mrope_position_ids, vision_embeddings, and vision_mask.
 
-        Extends the base input_generator output with vision inputs at
-        positions 22 (vision_embeddings) and 23 (vision_mask) to match
-        NeuronQwen35MoeModel.forward() signature.
-
-        For CTE: vision_embeddings=(BS, seq_len, hidden_size), vision_mask=(BS, seq_len, 1)
-        For TKG: both are empty (0,) tensors (vision only injected during CTE)
+        Extends the base input_generator output:
+        - Positions 7-20: empty tensors (unused NxDI slots)
+        - Position 21: rotary_position_id = mrope_position_ids (3, BS, seq_len) for CTE,
+                        empty (0,) for TKG
+        - Position 22: vision_embeddings (BS, seq_len, hidden_size) for CTE,
+                        empty (0,) for TKG
+        - Position 23: vision_mask (BS, seq_len, 1) for CTE,
+                        empty (0,) for TKG
         """
         base_inputs = super().input_generator()
         extended_inputs = []
@@ -1951,7 +2066,16 @@ class Qwen35ModelWrapper(ModelWrapper):
             is_cte = n_active_tokens > 1
 
             if is_cte:
-                # Context encoding: add properly-shaped vision inputs
+                # Context encoding: properly-shaped inputs
+                # mRoPE position IDs: (3, BS, seq_len) -- T/H/W all sequential for trace
+                mrope_position_ids = (
+                    torch.arange(0, n_active_tokens, dtype=torch.int32)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(3, batch_size, -1)
+                    .contiguous()
+                )
+
                 vision_embeddings = torch.zeros(
                     (batch_size, n_active_tokens, self.config.hidden_size),
                     dtype=self.config.neuron_config.torch_dtype,
@@ -1963,24 +2087,72 @@ class Qwen35ModelWrapper(ModelWrapper):
                     dtype=torch.int32,
                 )
             else:
-                # Token generation: empty tensors (no vision injection)
+                # Token generation: empty tensors
+                mrope_position_ids = torch.zeros((0,), dtype=torch.int32)
                 vision_embeddings = torch.zeros(
                     (0,), dtype=self.config.neuron_config.torch_dtype
                 )
                 vision_mask = torch.zeros((0,), dtype=torch.int32)
 
-            # The base generates 7 args; NxDI pads to 22 with empty tensors.
-            # We need to ensure positions 0-21 are present, then add 22-23.
-            # Pad to 22 positions if needed
+            # Base generates 7 args; pad to 21, then add mrope + vision
             padded = list(bucket_inputs)
-            while len(padded) < 22:
+            while len(padded) < 21:
                 padded.append(torch.zeros((0,), dtype=torch.int32))
+            padded.append(mrope_position_ids)  # position 21: rotary_position_id
             padded.append(vision_embeddings)  # position 22
             padded.append(vision_mask)  # position 23
 
             extended_inputs.append(tuple(padded))
 
         return extended_inputs
+
+    def pad_inputs(self, *args, pad_type="first_fit"):
+        """Override to re-generate mrope_position_ids and vision inputs after bucketing.
+
+        When the base class pads sequences to bucket length, positions 21-23
+        need to be re-generated at the new padded length.
+        """
+        # Let base class pad positions 0-2 and pass through 3+
+        padded_args = super().pad_inputs(*args, pad_type=pad_type)
+
+        # Check if re-generation is needed (CTE only, when we have 24 args)
+        if len(padded_args) >= 24:
+            padded_seq_len = padded_args[0].shape[1]
+            batch_size = padded_args[0].shape[0]
+            is_cte = padded_seq_len > 1
+
+            if is_cte:
+                current_mrope = padded_args[21]
+                # Re-generate mrope_position_ids if shape doesn't match
+                if (
+                    current_mrope.ndim >= 2
+                    and current_mrope.shape[-1] != padded_seq_len
+                ):
+                    mrope_position_ids = (
+                        torch.arange(0, padded_seq_len, dtype=torch.int32)
+                        .unsqueeze(0)
+                        .unsqueeze(0)
+                        .expand(3, batch_size, -1)
+                        .contiguous()
+                    )
+
+                    vision_embeddings = torch.zeros(
+                        (batch_size, padded_seq_len, self.config.hidden_size),
+                        dtype=self.config.neuron_config.torch_dtype,
+                    )
+                    vision_mask = torch.full(
+                        (batch_size, padded_seq_len, 1),
+                        fill_value=padded_seq_len - 1,
+                        dtype=torch.int32,
+                    )
+                    padded_args = (
+                        *padded_args[:21],
+                        mrope_position_ids,
+                        vision_embeddings,
+                        vision_mask,
+                    )
+
+        return padded_args
 
 
 # ============================================================
@@ -2126,25 +2298,37 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
 
         The model is traced with 24 positional args (from Qwen35ModelWrapper.input_generator).
         The base class splats *llava_args after 7 args, which puts vision inputs at positions
-        7-8 instead of 22-23. We override to fill positions 7-21 with torch.empty(0) and
-        place vision inputs at positions 22-23.
+        7-8 instead of 22-23. We override to fill positions 7-20 with torch.empty(0) and
+        place mrope_position_ids at 21 and vision inputs at 22-23.
 
-        For CTE: vision_embeddings must be (BS, seq_len, hidden_size) and vision_mask
-                 must be (BS, seq_len, 1) -- even for text-only (use zeros/fill values).
-        For TKG: both must be torch.zeros((0,)) to match the traced TKG signature.
+        llava_args layout from VL generate():
+            [0] vision_embeddings (BS, seq_len, hidden_size)
+            [1] vision_mask (BS, seq_len, 1)
+            [2] mrope_position_ids (3, batch, seq_len) -- optional
+
+        For CTE: slot 21 = (3, B, S) mRoPE position IDs.
+                 If not in llava_args, generate sequential IDs with T=H=W (text-only).
+        For TKG: slot 21 = torch.zeros((0,)) → set_none_if_empty → None → uses 2D position_ids.
         """
         is_prefill = self._is_prefill(position_ids)
 
-        # Extract vision inputs from llava_args
+        seq_len = input_ids.shape[1]
+        batch_size = input_ids.shape[0]
+
+        # Extract vision inputs and mRoPE position IDs from llava_args.
+        # llava_args layout: [vision_embeddings, vision_mask, mrope_position_ids (optional)]
         if llava_args and len(llava_args) >= 2:
             vision_embeddings = llava_args[0]
             vision_mask = llava_args[1]
+            # mRoPE position IDs: (3, batch, seq_len) if provided
+            if len(llava_args) >= 3:
+                mrope_position_ids = llava_args[2]
+            else:
+                mrope_position_ids = None
         elif is_prefill:
             # Text-only CTE: generate dummy vision inputs matching compiled shape.
             # The compiled CTE expects (BS, seq_len, hidden_size) and (BS, seq_len, 1).
             # Use zeros for embeddings and fill_value=seq_len-1 for mask (safe scatter target).
-            seq_len = input_ids.shape[1]
-            batch_size = input_ids.shape[0]
             vision_embeddings = torch.zeros(
                 (batch_size, seq_len, self.config.hidden_size),
                 dtype=self.config.neuron_config.torch_dtype,
@@ -2154,13 +2338,31 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
                 fill_value=seq_len - 1,
                 dtype=torch.int32,
             )
+            mrope_position_ids = None
         else:
             # TKG: empty tensors (no vision injection during decode)
             vision_embeddings = torch.zeros((0,), dtype=torch.float32)
             vision_mask = torch.zeros((0,), dtype=torch.int32)
+            mrope_position_ids = None
 
-        # Build the 15 empty tensors for positions 7-21
-        empties = [torch.empty(0) for _ in range(15)]
+        # For CTE: mRoPE position IDs at slot 21 must be (3, batch, seq_len).
+        # If not provided (text-only), generate sequential IDs with T=H=W (identical axes).
+        # For TKG: slot 21 = torch.empty(0) → set_none_if_empty → None → fallback to 2D position_ids.
+        if is_prefill:
+            if mrope_position_ids is None:
+                mrope_position_ids = (
+                    torch.arange(0, seq_len, dtype=torch.int32)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(3, batch_size, -1)
+                    .contiguous()
+                )
+        else:
+            mrope_position_ids = torch.zeros((0,), dtype=torch.int32)
+
+        # Build the 14 empty tensors for positions 7-20
+        # Position 21 = mrope_position_ids, 22 = vision_embeddings, 23 = vision_mask
+        empties = [torch.empty(0) for _ in range(14)]
 
         if self._is_prefill(position_ids):
             outputs = self.context_encoding_model(
@@ -2171,7 +2373,8 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
                 sampling_params,  # 4
                 prev_hidden,  # 5
                 adapter_ids,  # 6
-                *empties,  # 7-21
+                *empties,  # 7-20
+                mrope_position_ids,  # 21
                 vision_embeddings,  # 22
                 vision_mask,  # 23
             )
@@ -2186,7 +2389,8 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
                 sampling_params,  # 4
                 prev_hidden,  # 5
                 adapter_ids,  # 6
-                *empties,  # 7-21
+                *empties,  # 7-20
+                mrope_position_ids,  # 21
                 vision_embeddings,  # 22
                 vision_mask,  # 23
             )

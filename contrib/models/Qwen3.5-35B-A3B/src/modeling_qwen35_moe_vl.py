@@ -440,6 +440,13 @@ class NeuronQwen35MoeVLForCausalLM:
             positions_padded[0, :n_vis, 0] = positions[:pad_limit].to(torch.int32)
 
             llava_args = [vis_emb_padded, positions_padded]
+
+            # Append 3D mRoPE position IDs for the text model.
+            # position_ids shape: (3, batch_size, seq_len) from get_rope_index.
+            # Pad to match the compiled CTE sequence length.
+            if position_ids.ndim == 3:
+                mrope_pos = position_ids[:, :, :seq_len].to(torch.int32).contiguous()
+                llava_args.append(mrope_pos)
         else:
             vision_embeddings = None
 
