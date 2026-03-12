@@ -297,35 +297,62 @@ class NeuronQwen35MoeVLForCausalLM:
         vision_cfg = SimpleNamespace(**vl_config.vision_config)
         self.vision_model_wrapper = NeuronQwen35VisionModelWrapper(
             config=vision_cfg,
-            model_cls=NeuronQwen35VisionModel,
+            model_cls=None,  # Standalone mode (no NxDI parallel layers)
             vision_seq_len_buckets=vl_config.vision_seq_len_buckets,
         )
         self._vl_config = vl_config
 
     def compile(self, compiled_model_path):
-        """Compile both text and vision models."""
+        """Compile both text and vision models.
+
+        For the vision encoder, use compile_vision_encoder.py separately
+        (standalone torch_neuronx.trace compilation). Then use load() to
+        load the pre-compiled vision encoder.
+        """
         # Compile text decoder
         text_path = os.path.join(compiled_model_path, "text_model")
         os.makedirs(text_path, exist_ok=True)
         self.text_model.compile(text_path)
 
-        # Compile vision encoder (if present)
+        # Vision encoder is compiled separately via compile_vision_encoder.py
         if self.vision_model_wrapper is not None:
-            vision_path = os.path.join(compiled_model_path, "vision_model")
-            os.makedirs(vision_path, exist_ok=True)
             logger.info(
-                "Vision encoder compilation not yet implemented -- "
-                "vision model will run on CPU for now"
+                "Vision encoder must be compiled separately using "
+                "compile_vision_encoder.py. Use load() to load the "
+                "pre-compiled vision encoder."
             )
 
-    def load(self, compiled_model_path):
-        """Load both compiled models."""
+    def load(self, compiled_model_path, vision_compiled_path=None):
+        """Load both compiled models.
+
+        Args:
+            compiled_model_path: Path to compiled text model (or parent dir)
+            vision_compiled_path: Path to compiled vision encoder .pt file.
+                If None, looks for 'vision_encoder.pt' in compiled_model_path.
+        """
         text_path = os.path.join(compiled_model_path, "text_model")
         if os.path.exists(text_path):
             self.text_model.load(text_path)
         else:
             # Backward compatibility: text model compiled at root
             self.text_model.load(compiled_model_path)
+
+        # Load vision encoder
+        if self.vision_model_wrapper is not None:
+            if vision_compiled_path is None:
+                vision_compiled_path = os.path.join(
+                    compiled_model_path, "vision_encoder.pt"
+                )
+            if os.path.exists(vision_compiled_path):
+                self.vision_model_wrapper.load_compiled(vision_compiled_path)
+                # Also load CPU-side weights (patch_embed, pos_embed)
+                self.vision_model_wrapper.load_vision_weights_from_hf(self.model_path)
+                logger.info("Vision encoder loaded from pre-compiled model")
+            else:
+                logger.warning(
+                    f"No compiled vision encoder found at {vision_compiled_path}. "
+                    "Vision encoding will not be available."
+                )
 
     def generate(
         self,

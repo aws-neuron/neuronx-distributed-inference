@@ -44,19 +44,31 @@ try:
     )
 except ImportError:
     try:
+        # transformers 4.57+ uses Qwen3VL* class names
         from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-            Qwen2VLVisionPatchEmbed as Qwen3_5MoeVisionPatchEmbed,
-            Qwen2VLVisionPatchMerger as Qwen3_5MoeVisionPatchMerger,
-            Qwen2VLVisionRotaryEmbedding as Qwen3_5MoeVisionRotaryEmbedding,
+            Qwen3VLVisionPatchEmbed as Qwen3_5MoeVisionPatchEmbed,
+            Qwen3VLVisionPatchMerger as Qwen3_5MoeVisionPatchMerger,
+            Qwen3VLVisionRotaryEmbedding as Qwen3_5MoeVisionRotaryEmbedding,
         )
     except ImportError:
-        Qwen3_5MoeVisionPatchEmbed = None
-        Qwen3_5MoeVisionPatchMerger = None
-        Qwen3_5MoeVisionRotaryEmbedding = None
+        try:
+            # Older transformers uses Qwen2VL* class names
+            from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+                Qwen2VLVisionPatchEmbed as Qwen3_5MoeVisionPatchEmbed,
+                Qwen2VLVisionPatchMerger as Qwen3_5MoeVisionPatchMerger,
+                Qwen2VLVisionRotaryEmbedding as Qwen3_5MoeVisionRotaryEmbedding,
+            )
+        except ImportError:
+            Qwen3_5MoeVisionPatchEmbed = None
+            Qwen3_5MoeVisionPatchMerger = None
+            Qwen3_5MoeVisionRotaryEmbedding = None
 
 
 def apply_rotary_pos_emb_vision(q, k, cos, sin):
     """Apply rotary position embeddings to vision Q and K tensors.
+
+    Uses rotate_half style (matching HF reference):
+      q_embed = (q * cos) + (rotate_half(q) * sin)
 
     Args:
         q: (seq_len, num_heads, head_dim)
@@ -66,10 +78,14 @@ def apply_rotary_pos_emb_vision(q, k, cos, sin):
     """
     cos = cos.unsqueeze(-2)  # (seq_len, 1, head_dim)
     sin = sin.unsqueeze(-2)
-    x1_q, x2_q = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
-    x1_k, x2_k = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
-    q_embed = torch.cat([x1_q * cos - x2_q * sin, x2_q * cos + x1_q * sin], dim=-1)
-    k_embed = torch.cat([x1_k * cos - x2_k * sin, x2_k * cos + x1_k * sin], dim=-1)
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed.to(q.dtype), k_embed.to(k.dtype)
 
 
@@ -241,11 +257,20 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
     - Rotary position embedding computation
     - Vision attention mask construction (block-diagonal)
     - Sequence length bucketing and padding/unpadding
+
+    Supports two modes:
+    1. NxDI traced model (parallel layers) -- standard NxDI compilation
+    2. Pre-compiled standalone model -- loaded from torch_neuronx.trace() output
     """
 
-    def __init__(self, config, model_cls, **kwargs):
-        super().__init__(config, model_cls, **kwargs)
+    def __init__(self, config, model_cls=None, **kwargs):
+        if model_cls is not None:
+            super().__init__(config, model_cls, **kwargs)
+        else:
+            # Standalone mode: no NxDI model_cls
+            nn.Module.__init__(self)
         self.vision_config = config
+        self._compiled_model = None  # Set by load_compiled()
 
         # These HF modules run on CPU, outside the traced graph
         if Qwen3_5MoeVisionPatchEmbed is not None:
@@ -262,6 +287,47 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
         self.vision_seq_len_buckets = kwargs.get(
             "vision_seq_len_buckets", [1024, 4096, 16384]
         )
+
+    def load_compiled(self, compiled_model_path):
+        """Load a pre-compiled standalone vision encoder.
+
+        Args:
+            compiled_model_path: Path to the compiled .pt file (from torch_neuronx.trace)
+        """
+        import torch_neuronx
+
+        logger.info(f"Loading pre-compiled vision encoder from {compiled_model_path}")
+        self._compiled_model = torch.jit.load(compiled_model_path)
+        logger.info("Vision encoder loaded successfully")
+
+    def load_vision_weights_from_hf(self, model_path):
+        """Load patch_embed and pos_embed weights from HF safetensors.
+
+        Args:
+            model_path: Path to HF model directory
+        """
+        from pathlib import Path
+        from safetensors import safe_open
+
+        st_files = sorted(
+            p
+            for p in Path(model_path).glob("*.safetensors")
+            if p.suffix == ".safetensors"
+        )
+        loaded = 0
+        for sf_path in st_files:
+            with safe_open(str(sf_path), framework="pt") as f:
+                for key in f.keys():
+                    if key == "model.visual.patch_embed.proj.weight":
+                        self.patch_embed.proj.weight.data.copy_(f.get_tensor(key))
+                        loaded += 1
+                    elif key == "model.visual.patch_embed.proj.bias":
+                        self.patch_embed.proj.bias.data.copy_(f.get_tensor(key))
+                        loaded += 1
+                    elif key == "model.visual.pos_embed.weight":
+                        self.pos_embed.weight.data.copy_(f.get_tensor(key))
+                        loaded += 1
+        logger.info(f"Loaded {loaded} CPU-side vision weight tensors from HF")
 
     def _get_vision_bucket(self, seq_len):
         """Find the smallest bucket that fits the sequence length."""
@@ -440,13 +506,12 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
 
         # 5. Bucket and pad for Neuron compilation
         bucket_len = self._get_vision_bucket(seq_len)
+        cos, sin = position_embeddings
         if seq_len < bucket_len:
             pad_len = bucket_len - seq_len
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len))
-            cos, sin = position_embeddings
             cos = F.pad(cos, (0, 0, 0, pad_len))
             sin = F.pad(sin, (0, 0, 0, pad_len))
-            position_embeddings = (cos, sin)
             # Extend mask with -inf for padded positions
             mask = torch.full(
                 (1, 1, bucket_len, bucket_len), float("-inf"), dtype=hidden_states.dtype
@@ -454,8 +519,18 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
             mask[:, :, :seq_len, :seq_len] = attention_mask
             attention_mask = mask
 
-        # 6. Run traced vision model on Neuron
-        vision_output = self.model(hidden_states, attention_mask, position_embeddings)
+        # 6. Run vision model on Neuron
+        if self._compiled_model is not None:
+            # Pre-compiled standalone model: takes (hidden_states, attention_mask, cos, sin)
+            vision_output = self._compiled_model(
+                hidden_states.to(torch.bfloat16),
+                attention_mask.to(torch.bfloat16),
+                cos.to(torch.bfloat16),
+                sin.to(torch.bfloat16),
+            )
+        else:
+            # NxDI traced model: takes (hidden_states, attention_mask, position_embeddings)
+            vision_output = self.model(hidden_states, attention_mask, (cos, sin))
 
         # 7. Unpad: only keep valid merged tokens
         merge_area = self.vision_config.spatial_merge_size**2
