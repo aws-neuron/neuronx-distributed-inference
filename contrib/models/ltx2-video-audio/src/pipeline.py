@@ -26,8 +26,10 @@ import torch.nn as nn
 
 try:
     from .modeling_ltx2 import replace_sdpa_with_bmm
+    from .tiled_vae_decode import load_compiled_vae, tiled_decode
 except ImportError:
     from modeling_ltx2 import replace_sdpa_with_bmm
+    from tiled_vae_decode import load_compiled_vae, tiled_decode
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +270,128 @@ class NeuronTransformerWrapper(nn.Module):
         return video_output, audio_output
 
 
+class NeuronTiledVAEDecoder(nn.Module):
+    """Drop-in replacement for the Diffusers LTX2VideoDecoder3d.
+
+    This is swapped into pipe.vae.decoder so that the stock Diffusers
+    AutoencoderKLLTX2Video.decode() calls our Neuron-tiled decode path
+    transparently.
+
+    The outer VAE calls:
+        self.decoder(hidden_states, temb=None, causal=False)
+
+    For LTX-2: timestep_conditioning=False, so temb is always None.
+    causal=False for non-causal inference.
+
+    This wrapper:
+    1. Loads the compiled TP VAE decoder from disk
+    2. On forward(), calls tiled_decode() to spatially tile the latent
+    3. Returns the full-resolution decoded tensor
+
+    Attributes copied from original decoder:
+        patch_size, patch_size_t — needed by the outer VAE's unpatchify logic
+        (Actually, unpatchify is handled inside our compiled model, but we
+         expose these for compatibility in case the outer VAE checks them.)
+    """
+
+    def __init__(
+        self,
+        compiled_dir,
+        tile_latent_h=4,
+        tile_latent_w=16,
+        overlap_latent_h=1,
+        overlap_latent_w=0,
+        original_decoder=None,
+    ):
+        """
+        Args:
+            compiled_dir: Path to directory with compiled TP model (tp_0.pt, etc.)
+            tile_latent_h: Tile height in latent pixels (default 4)
+            tile_latent_w: Tile width in latent pixels (default 16)
+            overlap_latent_h: Overlap in latent H (default 1)
+            overlap_latent_w: Overlap in latent W (default 0)
+            original_decoder: The original LTX2VideoDecoder3d (for attribute copying)
+        """
+        super().__init__()
+        self.tile_latent_h = tile_latent_h
+        self.tile_latent_w = tile_latent_w
+        self.overlap_latent_h = overlap_latent_h
+        self.overlap_latent_w = overlap_latent_w
+
+        # Load compiled model
+        logger.info("Loading compiled VAE from %s", compiled_dir)
+        t0 = time.time()
+        self.compiled_model = load_compiled_vae(compiled_dir)
+        logger.info("VAE loaded in %.1fs", time.time() - t0)
+
+        # Copy attributes the outer VAE might access
+        if original_decoder is not None:
+            self.patch_size = getattr(original_decoder, "patch_size", 4)
+            self.patch_size_t = getattr(original_decoder, "patch_size_t", 1)
+            self.is_causal = getattr(original_decoder, "is_causal", False)
+        else:
+            self.patch_size = 4
+            self.patch_size_t = 1
+            self.is_causal = False
+
+        self._warmed_up = False
+
+    def warmup(self, num_frames=121):
+        """Run 2 warmup iterations to prime the Neuron model."""
+        if self._warmed_up:
+            return
+        logger.info("Warming up VAE decoder...")
+        latent_t = (num_frames - 1) // 8 + 1
+        dummy = torch.randn(
+            1,
+            128,
+            latent_t,
+            self.tile_latent_h,
+            self.tile_latent_w,
+            dtype=torch.float32,
+        )
+        for _ in range(2):
+            with torch.no_grad():
+                self.compiled_model(dummy)
+        self._warmed_up = True
+        logger.info("VAE warmup done")
+
+    def forward(self, hidden_states, temb=None, causal=None):
+        """Decode latent tensor using Neuron tiled decode.
+
+        Args:
+            hidden_states: [B, C, T, H, W] latent tensor (from VAE encoder/denormalize)
+            temb: Time embedding (always None for LTX-2, timestep_conditioning=False)
+            causal: Causal mode flag (always False for inference)
+
+        Returns:
+            Decoded tensor [B, 3, T_out, H_out, W_out]
+
+        Note: The compiled Neuron model includes unpatchify (48 -> 3 channels),
+        but the outer AutoencoderKLLTX2Video.decode() does NOT call unpatchify
+        separately — it's part of the decoder. So our output is the final RGB.
+        """
+        if not self._warmed_up:
+            num_frames_approx = (hidden_states.shape[2] - 1) * 8 + 1
+            self.warmup(num_frames=num_frames_approx)
+
+        # tiled_decode expects float32 input (Neuron compiles in fp32)
+        latent_fp32 = hidden_states.float()
+
+        output = tiled_decode(
+            latent_fp32,
+            self.compiled_model,
+            tile_latent_h=self.tile_latent_h,
+            tile_latent_w=self.tile_latent_w,
+            overlap_latent_h=self.overlap_latent_h,
+            overlap_latent_w=self.overlap_latent_w,
+            spatial_scale=32,
+            verbose=True,
+        )
+
+        return output
+
+
 class NeuronLTX2Pipeline:
     """Wrapper around the Diffusers LTX2Pipeline that supports Neuron acceleration.
 
@@ -275,6 +399,7 @@ class NeuronLTX2Pipeline:
     1. Loading the stock Diffusers pipeline (text encoder, VAEs, vocoder on CPU)
     2. Holding a reference to the NeuronLTX2BackboneApplication
     3. Swapping the transformer with NeuronTransformerWrapper after loading
+    4. Optionally swapping the VAE decoder with NeuronTiledVAEDecoder
 
     Usage:
         pipe = NeuronLTX2Pipeline.from_pretrained("Lightricks/LTX-2", torch_dtype=torch.bfloat16)
@@ -282,6 +407,7 @@ class NeuronLTX2Pipeline:
         pipe.neuron_backbone.compile(path)
         pipe.neuron_backbone.load(path)
         pipe._swap_transformer_to_neuron()
+        pipe._swap_vae_to_neuron("/home/ubuntu/ltx2_vae_tp4_128x512")
         output = pipe(prompt="...", height=384, width=512, num_frames=25)
     """
 
@@ -295,6 +421,7 @@ class NeuronLTX2Pipeline:
         self.text_seq = text_seq
         self.neuron_backbone = None
         self._original_transformer = None
+        self._original_vae_decoder = None
 
     @classmethod
     def from_pretrained(
@@ -352,12 +479,67 @@ class NeuronLTX2Pipeline:
         self.pipe.transformer = wrapper
         logger.info("Transformer swapped to Neuron backbone")
 
+    def _swap_vae_to_neuron(
+        self,
+        compiled_dir,
+        tile_latent_h=4,
+        tile_latent_w=16,
+        overlap_latent_h=1,
+        overlap_latent_w=0,
+        warmup_frames=None,
+    ):
+        """Replace the pipeline's CPU VAE decoder with Neuron tiled decoder.
+
+        Swaps pipe.vae.decoder with a NeuronTiledVAEDecoder that loads the
+        compiled TP model and uses spatial tiling with overlap blending.
+
+        The outer AutoencoderKLLTX2Video.decode() calls:
+            self.decoder(hidden_states, temb=None, causal=False)
+        Our NeuronTiledVAEDecoder matches this interface.
+
+        Args:
+            compiled_dir: Path to compiled TP VAE model (contains tp_0.pt, etc.)
+            tile_latent_h: Tile height in latent pixels (default 4)
+            tile_latent_w: Tile width in latent pixels (default 16)
+            overlap_latent_h: Overlap in latent H (default 1)
+            overlap_latent_w: Overlap in latent W (default 0)
+            warmup_frames: If set, run warmup immediately with this frame count
+        """
+        original_decoder = self.pipe.vae.decoder
+        self._original_vae_decoder = original_decoder
+
+        neuron_decoder = NeuronTiledVAEDecoder(
+            compiled_dir=compiled_dir,
+            tile_latent_h=tile_latent_h,
+            tile_latent_w=tile_latent_w,
+            overlap_latent_h=overlap_latent_h,
+            overlap_latent_w=overlap_latent_w,
+            original_decoder=original_decoder,
+        )
+
+        # Free the original decoder's heavy layers
+        del original_decoder
+        gc.collect()
+
+        # Hot-swap
+        self.pipe.vae.decoder = neuron_decoder
+        logger.info("VAE decoder swapped to Neuron tiled decoder")
+
+        if warmup_frames is not None:
+            neuron_decoder.warmup(num_frames=warmup_frames)
+
     def __call__(self, *args, **kwargs):
         """Run the full LTX-2 pipeline (text encoding + denoising + VAE decode)."""
         return self.pipe(*args, **kwargs)
 
     def __getattr__(self, name):
         """Proxy attribute access to the underlying Diffusers pipeline."""
-        if name in ("pipe", "text_seq", "neuron_backbone", "_original_transformer"):
+        if name in (
+            "pipe",
+            "text_seq",
+            "neuron_backbone",
+            "_original_transformer",
+            "_original_vae_decoder",
+        ):
             raise AttributeError(name)
         return getattr(self.pipe, name)
