@@ -1195,7 +1195,13 @@ class NeuronQwen35DecoderLayer(nn.Module):
         if not self.moe_fused_nki_kernel_enabled:
             hidden_states = self.post_attention_layernorm(hidden_states)
 
-        moe_output = self.mlp(hidden_states, padding_mask)[0]
+        is_speculative_decoding = (
+            self.config.neuron_config.enable_fused_speculation
+            and not self.config.neuron_config.is_prefill_stage
+        )
+        moe_output = self.mlp(
+            hidden_states, padding_mask, is_speculative_decoding=is_speculative_decoding
+        )[0]
         hidden_states = residual + moe_output
 
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)

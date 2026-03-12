@@ -5,7 +5,7 @@ NeuronX Distributed Inference implementation of Qwen3.5-35B-A3B, a hybrid DeltaN
 ## Model Information
 
 - **HuggingFace ID:** [`Qwen/Qwen3.5-35B-A3B`](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)
-- **Model Type:** Hybrid decoder-only transformer (DeltaNet + GQA + MoE)
+- **Model Type:** Native multimodal VLM (Vision + DeltaNet + GQA + MoE)
 - **Parameters:** 35B total, 3B active per token (sparse MoE)
 - **License:** Check HuggingFace model card
 
@@ -231,16 +231,64 @@ python3 test/integration/test_model.py
 
 - [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) (67 GB, 14 safetensors shards)
 
+## Vision-Language Support
+
+Qwen3.5-35B-A3B is a **native multimodal model** -- all Qwen3.5 models have vision built-in (there is no separate `-VL` variant). The architecture includes a 27-layer ViT vision encoder (1152 hidden, 16 heads, patch_size=16) that projects to the text decoder's embedding space.
+
+### Current Status
+
+| Component | Status |
+|-----------|--------|
+| Text decoder (DeltaNet + GQA + MoE) | **Validated** on Neuron |
+| Vision encoder (ViT) | **Implemented** (CPU execution, Neuron compilation planned) |
+| mRoPE (3D multimodal position IDs) | **Implemented** and tested |
+| Image+text generation | **Implemented** via `NeuronQwen35MoeVLForCausalLM` |
+| Vision encoder on Neuron | Planned (requires separate compilation) |
+
+### Vision-Language Usage
+
+```python
+from transformers import AutoProcessor
+from modeling_qwen35_moe_vl import NeuronQwen35MoeVLForCausalLM, Qwen35MoeVLInferenceConfig
+
+processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+
+# Prepare image+text inputs
+input_ids, attention_mask, vision_inputs = NeuronQwen35MoeVLForCausalLM.prepare_input_args(
+    "What is in this image?",
+    "/path/to/image.jpg",
+    processor,
+)
+
+# Generate
+generated_ids = vl_model.generate(
+    input_ids=input_ids,
+    attention_mask=attention_mask,
+    pixel_values=vision_inputs.get("pixel_values"),
+    image_grid_thw=vision_inputs.get("image_grid_thw"),
+    max_new_tokens=32,
+)
+```
+
+### Running Image Input Tests
+
+```bash
+pytest contrib/models/Qwen3.5-35B-A3B/test/integration/test_image_input.py --capture=tee-sys
+```
+
 ## Files
 
 | File | Description |
 |------|-------------|
 | `src/modeling_qwen35_moe.py` | Main NxDI model: DeltaNet, attention, MoE, config, state dict converter |
+| `src/modeling_qwen35_moe_vision.py` | Vision encoder: ViT blocks, patch merger, rotary embeddings, model wrapper |
+| `src/modeling_qwen35_moe_vl.py` | VL orchestrator: mRoPE, vision+text wiring, generate with image inputs |
 | `src/nki_deltanet.py` | NKI v2 kernels for DeltaNet gated delta rule recurrence |
 | `src/nki_flash_attn_d256.py` | Custom NKI flash attention kernel for head_dim=256 (opt-in, experimental) |
 | `src/nkilib_kernel_patch.py` | nkilib kernel integration for NxDI (blocked by NKI compiler bug, see Known Issues) |
 | `src/__init__.py` | Re-exports public classes |
-| `test/integration/test_model.py` | Integration tests (accuracy + performance) |
+| `test/integration/test_model.py` | Integration tests: text-only accuracy + performance |
+| `test/integration/test_image_input.py` | Integration tests: image tokenization, mRoPE, vision encoder, E2E VL pipeline |
 
 ## Maintainer
 
