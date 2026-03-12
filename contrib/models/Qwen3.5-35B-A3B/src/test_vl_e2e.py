@@ -59,6 +59,7 @@ def create_text_config():
     neuron_config = MoENeuronConfig(
         tp_degree=4,
         max_batch_size=1,
+        seq_len=288,  # max_context_length + max_new_tokens
         max_context_length=256,  # Larger for vision tokens
         max_new_tokens=32,
         on_device_sampling_config=None,
