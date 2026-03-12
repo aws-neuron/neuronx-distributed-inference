@@ -47,56 +47,8 @@ from neuronx_distributed.utils import cpu_mode
 from torch_neuronx.xla_impl.ops import nki_jit
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-try:
-    from .nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
-    from .nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
-except ImportError:
-    from nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
-    from nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
-
-# Custom NKI flash attention kernel for head_dim=256
-# (standard NxDI kernel asserts head_dim <= 128)
-# Opt-in only: set QWEN35_USE_FLASH_ATTN_D256=1 to enable (external kernel, has TTFT regression)
-try:
-    from .nki_flash_attn_d256 import flash_attn_d256 as _flash_attn_d256_raw
-except ImportError:
-    try:
-        from nki_flash_attn_d256 import flash_attn_d256 as _flash_attn_d256_raw
-    except ImportError:
-        _flash_attn_d256_raw = None
-
-if _flash_attn_d256_raw is not None:
-    _flash_attn_d256_kernel = nki_jit()(_flash_attn_d256_raw)
-else:
-    _flash_attn_d256_kernel = None
-
-_USE_FLASH_ATTN_D256 = os.environ.get("QWEN35_USE_FLASH_ATTN_D256", "0") == "1"
-
-# Modified nkilib flash attention kernel for head_dim up to 256.
-# Uses the nki-library kernel (standalone override) with d-tiling, called directly
-# from perform_prefill with tp_out=False (tp_out=True not supported for d>128).
-# Requires: pip install git+https://github.com/jimburtoft/nki-library.git@feature/head-dim-256
-# Set QWEN35_PATCH_FLASH_ATTN=1 to enable (default: disabled)
-_PATCH_FLASH_ATTN = os.environ.get("QWEN35_PATCH_FLASH_ATTN", "0") == "1"
-_nkilib_flash_kernel = None
-if _PATCH_FLASH_ATTN:
-    try:
-        from .nkilib_kernel_patch import get_nkilib_flash_attention_kernel, is_available
-
-        _nkilib_flash_kernel = get_nkilib_flash_attention_kernel()
-    except ImportError:
-        try:
-            from nkilib_kernel_patch import (
-                get_nkilib_flash_attention_kernel,
-                is_available,
-            )
-
-            _nkilib_flash_kernel = get_nkilib_flash_attention_kernel()
-        except ImportError:
-            logging.getLogger(__name__).warning(
-                "QWEN35_PATCH_FLASH_ATTN=1 but nkilib_kernel_patch module not found"
-            )
-_FLASH_ATTN_PATCHED = _nkilib_flash_kernel is not None
+from nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
+from nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -111,7 +63,6 @@ from neuronx_distributed_inference.models.model_wrapper import (
     ModelWrapper,
 )
 from neuronx_distributed_inference.modules.attention.attention_base import (
-    FlashAttentionStrategy,
     NeuronAttentionBase,
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
@@ -146,18 +97,16 @@ class NeuronGatedDeltaNet(nn.Module):
     Gated DeltaNet linear attention for Neuron.
 
     Replaces standard attention for 30 of 40 layers.
-    Uses NKI kernel for context encoding (CTE) and PyTorch recurrent step for
-    token generation (TKG).
+    Uses a chunk-based linear recurrence instead of KV cache.
 
-    State carry-over between CTE and TKG is handled via nn.Parameter buffers
-    and input_output_aliases:
-    - recurrent_state_buffer: (B, num_v_heads, k_dim, v_dim) carries the
-      recurrent state (delta rule memory matrix) across graphs.
-    - conv_state_buffer: (B, conv_dim, kernel_size-1) carries the last 3
-      tokens of QKV concatenation for causal conv1d context.
+    V1 Design (stateless -- compiles but loses state between CTE and TKG):
+    - CTE: chunk forward computes correct output for the prefill sequence.
+    - TKG: recurrent step with ZERO initial state (no carry-over from CTE).
+    - DeltaNet layers return dummy (K, V) tuples so KVCacheManager can process them.
+    - No in-place buffer mutations (XLA trace safe).
 
-    DeltaNet layers return dummy (K, V) tuples so KVCacheManager can process
-    them without crashing. The dummy values are never read back.
+    V2 TODO: Use input_output_aliases or repurpose KV cache slots to carry
+    recurrent state and conv state between CTE and TKG.
 
     HF weight layout:
     - in_proj_qkv.weight: (key_dim*2 + value_dim, hidden_size) = (8192, 2048)
@@ -366,6 +315,134 @@ class NeuronGatedDeltaNet(nn.Module):
 
         return output, final_state
 
+    def _chunk_forward(self, query, key, value, g, beta, output_final_state=False):
+        """Chunk-based forward for context encoding (prefill).
+
+        V5: Uses the chunked formulation from the reference (torch_chunk_gated_delta_rule).
+        Uses chunk_size=64, inter-chunk recurrent state propagation, and iterative
+        correction loop within each chunk.
+
+        NOTE: The iterative correction loop uses variable-width slice assignments
+        which may cause accuracy issues under XLA tracing, but this approach
+        compiles and produces reasonable (not perfect) results.
+
+        Args:
+            query: (B, H, S, k_dim) -- already in float32
+            key:   (B, H, S, k_dim) -- already in float32
+            value: (B, H, S, v_dim) -- already in float32
+            g:     (B, H, S) -- already in float32
+            beta:  (B, H, S) -- already in float32
+            output_final_state: if True, return final recurrent state
+
+        Returns:
+            output: (B, H, S, v_dim)
+            last_recurrent_state: (B, H, k_dim, v_dim) or None
+        """
+        chunk_size = 64
+
+        query = l2norm(query, dim=-1)
+        key = l2norm(key, dim=-1)
+
+        B, H, S, k_dim = query.shape
+        v_dim = value.shape[-1]
+        scale = 1.0 / (k_dim**0.5)
+        query = query * scale
+
+        # Pad to multiple of chunk_size
+        pad_size = (chunk_size - S % chunk_size) % chunk_size
+        if pad_size > 0:
+            query = F.pad(query, (0, 0, 0, pad_size))
+            key = F.pad(key, (0, 0, 0, pad_size))
+            value = F.pad(value, (0, 0, 0, pad_size))
+            beta = F.pad(beta, (0, pad_size))
+            g = F.pad(g, (0, pad_size))
+        total_seq_len = S + pad_size
+
+        v_beta = value * beta.unsqueeze(-1)
+        k_beta = key * beta.unsqueeze(-1)
+
+        # Reshape to chunks: (B, H, num_chunks, chunk_size, dim)
+        num_chunks = total_seq_len // chunk_size
+        query = query.reshape(B, H, num_chunks, chunk_size, k_dim)
+        key = key.reshape(B, H, num_chunks, chunk_size, k_dim)
+        value = value.reshape(B, H, num_chunks, chunk_size, v_dim)
+        k_beta = k_beta.reshape(B, H, num_chunks, chunk_size, k_dim)
+        v_beta = v_beta.reshape(B, H, num_chunks, chunk_size, v_dim)
+        g = g.reshape(B, H, num_chunks, chunk_size)
+
+        mask = torch.triu(
+            torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+            diagonal=0,
+        )
+
+        # Cumulative decay within each chunk
+        g = g.cumsum(dim=-1)
+        decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().tril()
+
+        # Intra-chunk delta rule correction (iterative)
+        attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+        for i in range(1, chunk_size):
+            row = attn[..., i, :i].clone()
+            sub = attn[..., :i, :i].clone()
+            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+
+        # Corrected value within each chunk
+        value = attn @ v_beta  # (B, H, num_chunks, chunk_size, v_dim)
+        # Corrected key * cumdecay within each chunk
+        k_cumdecay = attn @ (
+            k_beta * g.exp().unsqueeze(-1)
+        )  # (B, H, num_chunks, chunk_size, k_dim)
+
+        # Inter-chunk recurrent state propagation
+        last_recurrent_state = torch.zeros(
+            B, H, k_dim, v_dim, dtype=query.dtype, device=query.device
+        )
+        core_attn_out = torch.zeros_like(value)
+        mask2 = torch.triu(
+            torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+            diagonal=1,
+        )
+
+        for i in range(num_chunks):
+            q_i = query[:, :, i]  # (B, H, chunk_size, k_dim)
+            k_i = key[:, :, i]
+            v_i = value[:, :, i]  # corrected value
+
+            attn_i = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(
+                mask2, 0
+            )
+
+            # Inter-chunk: subtract contribution of old state from corrected value
+            v_prime = (
+                k_cumdecay[:, :, i] @ last_recurrent_state
+            )  # (B, H, chunk_size, v_dim)
+            v_new = v_i - v_prime
+
+            # Inter-chunk: query reads from old state
+            attn_inter = (
+                q_i * g[:, :, i, :, None].exp()
+            ) @ last_recurrent_state  # (B, H, chunk_size, v_dim)
+            core_attn_out[:, :, i] = attn_inter + attn_i @ v_new
+
+            # Update recurrent state: decay by last position's cumulative g, then add new info
+            last_recurrent_state = (
+                last_recurrent_state * g[:, :, i, -1, None, None].exp()
+                + (
+                    k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]
+                ).transpose(-1, -2)
+                @ v_new
+            )
+
+        # Reshape back and trim padding
+        core_attn_out = core_attn_out.reshape(B, H, -1, v_dim)
+        core_attn_out = core_attn_out[:, :, :S]
+
+        if not output_final_state:
+            last_recurrent_state = None
+
+        return core_attn_out, last_recurrent_state
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -381,7 +458,7 @@ class NeuronGatedDeltaNet(nn.Module):
         without crashing. The dummy values are zeros and will be written to
         the cache slots allocated for this layer but never read back.
 
-        State carry-over:
+        State carry-over (V37):
         - recurrent_state_buffer: (B, 32, 128, 128) nn.Parameter, aliased via
           input_output_aliases. CTE writes final state; TKG reads it.
         - conv_state_buffer: (B, 8192, 3) nn.Parameter, aliased. CTE writes
@@ -410,9 +487,9 @@ class NeuronGatedDeltaNet(nn.Module):
         # DeltaNet has no attention mask in its recurrence -- padding tokens contaminate
         # the recurrent state. We zero out padding positions before projection.
         #
-        # Save valid_mask_1d for later use to:
+        # CRITICAL (V38b): We also need to save valid_mask_1d for later use to:
         #   1. Zero out g (decay) for padding positions -- otherwise padding tokens
-        #      decay the recurrent state towards zero (exp(-1.3) ~ 0.27 per token)
+        #      decay the recurrent state towards zero (exp(-1.3) ≈ 0.27 per token)
         #   2. Save conv_state from the last 3 VALID positions, not last 3 absolute
         #      positions (which may be padding with right-padding)
         valid_mask_1d = None  # (B, S) float, 1.0 for valid, 0.0 for padding
@@ -432,10 +509,20 @@ class NeuronGatedDeltaNet(nn.Module):
                 hidden_states = hidden_states * valid_mask.unsqueeze(-1)  # (B, S, D)
 
         # Project inputs
-        qkv = self.in_proj_qkv(hidden_states)  # (B, S, 8192)
-        z = self.in_proj_z(hidden_states)  # (B, S, 4096)
-        b = self.in_proj_b(hidden_states)  # (B, S, 32)
-        a = self.in_proj_a(hidden_states)  # (B, S, 32)
+        deltanet_fp32 = os.environ.get("DELTANET_FP32") == "1"
+        if deltanet_fp32:
+            hs_f32 = hidden_states.float()
+            qkv = F.linear(hs_f32, self.in_proj_qkv.weight.float()).to(
+                hidden_states.dtype
+            )
+            z = F.linear(hs_f32, self.in_proj_z.weight.float()).to(hidden_states.dtype)
+            b = F.linear(hs_f32, self.in_proj_b.weight.float()).to(hidden_states.dtype)
+            a = F.linear(hs_f32, self.in_proj_a.weight.float()).to(hidden_states.dtype)
+        else:
+            qkv = self.in_proj_qkv(hidden_states)  # (B, S, 8192)
+            z = self.in_proj_z(hidden_states)  # (B, S, 4096)
+            b = self.in_proj_b(hidden_states)  # (B, S, 32)
+            a = self.in_proj_a(hidden_states)  # (B, S, 32)
 
         # Split QKV
         query = qkv[..., : self.key_dim]  # (B, S, 2048)
@@ -471,12 +558,13 @@ class NeuronGatedDeltaNet(nn.Module):
                 [conv_state[:, :, 1:], mixed], dim=-1
             )  # (B, 8192, 3)
         else:
-            # CTE: Use nn.Conv1d with built-in padding (proven correct).
+            # CTE: Use nn.Conv1d with built-in padding (V36 approach -- proven correct).
             # self.conv1d has padding=kernel_size-1=3, which pads both sides symmetrically.
             # Truncating to [:, :, :seq_len] gives correct causal conv1d output.
+            # This is IDENTICAL to V36 which produced correct "Paris" output.
             mixed_post_conv = F.silu(self.conv1d(mixed)[:, :, :seq_len])
 
-            # Save last 3 VALID tokens' mixed values for conv_state.
+            # CRITICAL (V38b): Save last 3 VALID tokens' mixed values for conv_state.
             # With right-padding, valid tokens are at positions 0..n-1, padding at n..S-1.
             # mixed[:, :, -3:] would capture PADDING positions (all zeros) — WRONG.
             # Instead, find the number of valid tokens and gather the last 3.
@@ -521,7 +609,7 @@ class NeuronGatedDeltaNet(nn.Module):
         beta = b.sigmoid()  # (B, S, num_v_heads)
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        # Zero out g for padding positions.
+        # CRITICAL (V38b): Zero out g for padding positions.
         # g controls the decay factor: exp(g). For padding, g ≈ -1.3 → exp(g) ≈ 0.27.
         # With right-padding, 123 padding tokens after 5 valid tokens would decay state
         # by 0.27^123 ≈ 10^{-70}, effectively zeroing it. Setting g=0 for padding means
@@ -584,7 +672,12 @@ class NeuronGatedDeltaNet(nn.Module):
         output_flat = output.reshape(-1, self.head_v_dim)
         output_flat = self.norm(output_flat) * F.silu(z_flat)
         output = output_flat.reshape(batch_size, seq_len, self.value_dim)
-        output = self.out_proj(output)
+        if deltanet_fp32:
+            output = F.linear(output.float(), self.out_proj.weight.float()).to(
+                hidden_states.dtype
+            )
+        else:
+            output = self.out_proj(output)
 
         # Build dummy KV for KVCacheManager compatibility.
         dummy_k = torch.zeros(
@@ -744,7 +837,7 @@ class Qwen35MoeInferenceConfig(InferenceConfig):
 class NeuronQwen35Attention(NeuronAttentionBase):
     """Attention with output gate and partial RoPE.
 
-    Implements partial RoPE (25% of head_dim), per-head QK norm,
+    V3: Implements partial RoPE (25% of head_dim), per-head QK norm,
     and output gate (sigmoid gate applied BEFORE o_proj, matching reference).
 
     HF weight layout:
@@ -829,129 +922,6 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         K = torch.cat([k_rope, k_pass], dim=-1)
 
         return Q, K, cos_cache, sin_cache
-
-    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
-        """Override to handle head_dim=256 safely.
-
-        The standard NxDI NKI flash attention kernel asserts head_dim <= 128.
-        This override handles three paths (in priority order):
-
-        1. If QWEN35_PATCH_FLASH_ATTN=1 and the nkilib kernel is available:
-           Calls our modified nkilib kernel directly with tp_out=False and
-           tp_q=True, tp_k=True (native GQA). The kernel returns output in
-           (B*H, seqlen, d) format which we reshape to BHSD.
-           Zero layout conversion overhead (no permute needed for inputs).
-
-        2. If QWEN35_USE_FLASH_ATTN_D256=1: Uses a custom external NKI kernel
-           (flash_attn_d256). Functional but ~2.4x slower TTFT due to layout
-           conversion overhead (BHSD -> BHDS permute+contiguous).
-
-        3. Default fallback: Forces the PyTorch softmax path by temporarily
-           disabling attn_kernel for head_dim > 128.
-        """
-        # Path 1: nkilib kernel (d-tiling, tp_out=False)
-        # Calls the modified nkilib attention_cte kernel directly.
-        # Uses tp_q=True, tp_k=True (native GQA path -- same input format as NxDI base class)
-        # Uses tp_out=False because tp_out=True is not supported for d>128.
-        # Output: (B*H, seqlen, d) -> reshape to (B, H, seqlen, d) = BHSD
-        if (
-            _FLASH_ATTN_PATCHED
-            and self.head_dim > 128
-            and q_len >= 512
-            and q_len % 512 == 0
-        ):
-            # Prepare Q: (B, H, S, D) -> (B*H, S, D) with tp_q=True format
-            Q_kernel = Q.reshape(bsz * self.num_heads, q_len, self.head_dim).to(
-                self.torch_dtype
-            )
-            Q_kernel = Q_kernel / math.sqrt(self.head_dim)
-
-            # Prepare K: (B, Hkv, S, D) -> (B*Hkv, S, D) with tp_k=True format
-            K_kernel = K.reshape(
-                bsz * self.num_key_value_heads, q_len, self.head_dim
-            ).to(self.torch_dtype)
-
-            # Prepare V: (B, Hkv, S, D) -> (B*Hkv, S, D)
-            V_kernel = V.reshape(
-                bsz * self.num_key_value_heads, q_len, self.head_dim
-            ).to(self.torch_dtype)
-
-            # Call nkilib kernel without grid (UNSHARDED mode).
-            # The kernel will process all batch elements on a single core.
-            # TODO: Enable grid-based (SHARDED) invocation once the SPMD
-            #       grid propagation issue is resolved.
-            attn_output = _nkilib_flash_kernel(
-                Q_kernel,
-                K_kernel,
-                V_kernel,
-                1.0,  # scale (Q already scaled above)
-                causal_mask=(attention_mask is not None),
-                tp_q=True,
-                tp_k=True,
-                tp_out=False,  # d>128: must use tp_out=False
-            )
-
-            # Output is (B*H, seqlen, d) with tp_out=False
-            # Reshape to BHSD: (B, H, S, D)
-            attn_output = attn_output.reshape(bsz, self.num_heads, q_len, self.head_dim)
-
-            # Return NONE strategy to signal BHSD layout (not BHDS)
-            return attn_output, FlashAttentionStrategy.NONE
-
-        # Path 2: Custom external NKI kernel (opt-in, has TTFT regression)
-        use_custom_kernel = (
-            _USE_FLASH_ATTN_D256
-            and _flash_attn_d256_kernel is not None
-            and self.head_dim == 256
-            and q_len % 512 == 0
-            and q_len >= 512
-        )
-        if use_custom_kernel:
-            # Kernel expects:
-            #   Q: (bs, n_heads, 256, seq_q) -- BHDS
-            #   K: (bs, nk_heads, 256, seq_k) -- BHDS
-            #   V: (bs, nv_heads, seq_v, 256) -- BHSD
-            #   O: (bs, n_heads, seq_q, 256) -- BHSD (pre-allocated output)
-            # Input Q, K, V are all BHSD: (B, H, S, D)
-            Q_kernel = (
-                Q.permute(0, 1, 3, 2).contiguous().to(self.torch_dtype)
-            )  # BHSD -> BHDS
-            K_kernel = (
-                K.permute(0, 1, 3, 2).contiguous().to(self.torch_dtype)
-            )  # BHSD -> BHDS
-            V_kernel = V.to(self.torch_dtype)  # already BHSD
-
-            # Pre-allocate output tensor (nki_jit kernels don't support return)
-            attn_output = torch.zeros(
-                bsz,
-                self.num_heads,
-                q_len,
-                self.head_dim,
-                dtype=self.torch_dtype,
-                device=Q.device,
-            )
-
-            # Launch with grid [bs, nk_heads] -- GQA handled inside kernel
-            _flash_attn_d256_kernel[bsz, self.num_key_value_heads](
-                Q_kernel,
-                K_kernel,
-                V_kernel,
-                attn_output,
-                use_causal_mask=(attention_mask is not None),
-            )
-            # Output is BHSD (B, n_heads, seq_q, 256)
-            # Return NONE strategy to signal BHSD layout to the caller
-            return attn_output, FlashAttentionStrategy.NONE
-
-        # Path 3: Default fallback -- force PyTorch softmax path for head_dim > 128
-        # (standard NxDI NKI kernel asserts head_dim <= 128)
-        if self.head_dim > 128:
-            saved = self.attn_kernel_enabled
-            self.attn_kernel_enabled = False
-            result = super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
-            self.attn_kernel_enabled = saved
-            return result
-        return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
 
     def forward(
         self,
@@ -1160,49 +1130,168 @@ class NeuronQwen35DecoderLayer(nn.Module):
         padding_mask=None,
         **kwargs,
     ):
+        # V30 identity diagnostic: skip all layer computation, return input unchanged
+        if os.environ.get("SKIP_LAYER_COMPUTE") == "1":
+            bsz, seq_len, _ = hidden_states.shape
+            # Create dummy KV cache matching NxDI expected shape:
+            # (B, kv_heads_per_rank, seq_len, head_dim)
+            tp = getattr(self.config.neuron_config, "tp_degree", 1)
+            kv_heads_per_rank = max(self.config.num_key_value_heads // tp, 1)
+            dummy_k = torch.zeros(
+                bsz,
+                kv_heads_per_rank,
+                seq_len,
+                self.config.head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            dummy_v = torch.zeros_like(dummy_k)
+            hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+            hidden_states = ModuleMarkerEndWrapper()(hidden_states)
+            return (hidden_states, (dummy_k, dummy_v), None, None, None, None)
+
+        # V34: Test just input_layernorm + a single projection to isolate where divergence starts
+        if (
+            os.environ.get("DELTANET_PROJ_ONLY") == "1"
+            and self.layer_type == "linear_attention"
+        ):
+            bsz, seq_len, _ = hidden_states.shape
+            tp = getattr(self.config.neuron_config, "tp_degree", 1)
+            kv_heads_per_rank = max(self.config.num_key_value_heads // tp, 1)
+            dummy_k = torch.zeros(
+                bsz,
+                kv_heads_per_rank,
+                seq_len,
+                self.config.head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            dummy_v = torch.zeros_like(dummy_k)
+
+            hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+            # Apply input_layernorm
+            normed = self.input_layernorm(hidden_states)
+            # Do one projection to test matmul
+            proj_out = self.linear_attn.in_proj_qkv(normed)
+            # Return a scaled version so the output is meaningful
+            # Use mean of first 2048 dims as a scalar multiplier for the residual
+            # This avoids having to do the full DeltaNet computation
+            scale = proj_out[..., : self.hidden_size].mean(dim=-1, keepdim=True)
+            hidden_states = (
+                hidden_states + scale * 0.001
+            )  # tiny perturbation from projection
+            hidden_states = ModuleMarkerEndWrapper()(hidden_states)
+            return (hidden_states, (dummy_k, dummy_v), None, None, None, None)
+
         residual = hidden_states
 
         hidden_states = ModuleMarkerStartWrapper()(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
 
+        # V30 diagnostic: SKIP_ATTN_COMPUTE skips attention, keeps MoE
+        skip_attn = os.environ.get("SKIP_ATTN_COMPUTE") == "1"
+
         if self.layer_type == "linear_attention":
-            # DeltaNet path -- returns (output, dummy_kv, new_recurrent, new_conv)
-            attn_out, dummy_kv, new_rec_state, new_conv_state = self.linear_attn(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                **kwargs,
-            )
-            hidden_states = residual + attn_out
-            present_key_value = dummy_kv
-            deltanet_states = (new_rec_state, new_conv_state)
+            if skip_attn:
+                # Skip DeltaNet, just use residual
+                hidden_states = residual
+                bsz, seq_len, _ = hidden_states.shape
+                tp = getattr(self.config.neuron_config, "tp_degree", 1)
+                kv_heads_per_rank = max(self.config.num_key_value_heads // tp, 1)
+                present_key_value = (
+                    torch.zeros(
+                        bsz,
+                        kv_heads_per_rank,
+                        seq_len,
+                        self.config.head_dim,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                    torch.zeros(
+                        bsz,
+                        kv_heads_per_rank,
+                        seq_len,
+                        self.config.head_dim,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                )
+                deltanet_states = None
+            else:
+                # DeltaNet path -- returns (output, dummy_kv, new_recurrent, new_conv)
+                attn_out, dummy_kv, new_rec_state, new_conv_state = self.linear_attn(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    **kwargs,
+                )
+                hidden_states = residual + attn_out
+                present_key_value = dummy_kv
+                deltanet_states = (new_rec_state, new_conv_state)
             cos_cache, sin_cache = None, None
         else:
             deltanet_states = None
-            # Standard attention path (gate is inside self_attn.forward())
-            hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                **kwargs,
+            if skip_attn:
+                hidden_states = residual
+                bsz, seq_len, _ = hidden_states.shape
+                tp = getattr(self.config.neuron_config, "tp_degree", 1)
+                kv_heads_per_rank = max(self.config.num_key_value_heads // tp, 1)
+                present_key_value = (
+                    torch.zeros(
+                        bsz,
+                        kv_heads_per_rank,
+                        seq_len,
+                        self.config.head_dim,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                    torch.zeros(
+                        bsz,
+                        kv_heads_per_rank,
+                        seq_len,
+                        self.config.head_dim,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                )
+                cos_cache, sin_cache = None, None
+            else:
+                # Standard attention path (V3: gate is inside self_attn.forward())
+                hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    **kwargs,
+                )
+                hidden_states = residual + hidden_states
+
+        # V30 diagnostic: SKIP_MOE_COMPUTE skips MoE, keeps attention
+        skip_moe = os.environ.get("SKIP_MOE_COMPUTE") == "1"
+
+        if skip_moe:
+            # Skip MoE entirely, hidden_states stays as-is (attn residual)
+            pass
+        else:
+            # MoE FFN (routed experts + sigmoid-gated shared expert via NxDI MoE)
+            # NxDI's _apply_shared_experts calls self.mlp.shared_experts (our
+            # SigmoidGatedSharedExperts wrapper) which adds sigmoid-gated shared
+            # expert output to routed output BEFORE the all-reduce.
+            residual = hidden_states
+            if not self.moe_fused_nki_kernel_enabled:
+                hidden_states = self.post_attention_layernorm(hidden_states)
+
+            is_speculative_decoding = (
+                self.config.neuron_config.enable_fused_speculation
+                and not self.config.neuron_config.is_prefill_stage
             )
-            hidden_states = residual + hidden_states
-
-        # MoE FFN (routed experts + sigmoid-gated shared expert via NxDI MoE)
-        residual = hidden_states
-        if not self.moe_fused_nki_kernel_enabled:
-            hidden_states = self.post_attention_layernorm(hidden_states)
-
-        is_speculative_decoding = (
-            self.config.neuron_config.enable_fused_speculation
-            and not self.config.neuron_config.is_prefill_stage
-        )
-        moe_output = self.mlp(
-            hidden_states, padding_mask, is_speculative_decoding=is_speculative_decoding
-        )[0]
-        hidden_states = residual + moe_output
+            moe_output = self.mlp(
+                hidden_states,
+                padding_mask,
+                is_speculative_decoding=is_speculative_decoding,
+            )[0]
+            hidden_states = residual + moe_output
 
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)
         outputs = (
@@ -1273,6 +1362,28 @@ class NeuronQwen35MoeModel(NeuronBaseModel):
                 params.append(layer.linear_attn.conv_state_buffer)
         return params
 
+    def encode_vision_to_input(self, inputs_embeds, vision_embeddings, vision_mask):
+        """Scatter vision embeddings into text input embeddings at image token positions.
+
+        Uses index_put_ to replace placeholder token embeddings with vision encoder output.
+
+        Args:
+            inputs_embeds: (batch_size, seq_len, hidden_size) -- text token embeddings
+            vision_embeddings: (batch_size, n_vision_tokens, hidden_size) -- from vision encoder
+            vision_mask: (batch_size, n_vision_tokens, 1) -- int32 position indices
+
+        Returns:
+            inputs_embeds with vision embeddings scattered in at the specified positions
+        """
+        _, max_positions, embedding_dim = inputs_embeds.shape
+        h_new = inputs_embeds.clone()
+        vision_flat = vision_embeddings.view(-1, embedding_dim)
+        positions_flat = vision_mask.view(-1)
+        h_new.view(-1, embedding_dim).index_put_(
+            (positions_flat,), vision_flat, accumulate=False
+        )
+        return h_new
+
     def get_model_output(
         self,
         input_ids=None,
@@ -1310,6 +1421,17 @@ class NeuronQwen35MoeModel(NeuronBaseModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+
+        # Vision embedding injection (scatter vision tokens into text embeddings)
+        if (vision_embeddings is not None) and (vision_mask is not None):
+            if vision_embeddings.dtype != self.config.neuron_config.torch_dtype:
+                vision_embeddings = vision_embeddings.to(
+                    self.config.neuron_config.torch_dtype
+                )
+            if is_for_context_encoding:
+                inputs_embeds = self.encode_vision_to_input(
+                    inputs_embeds, vision_embeddings, vision_mask
+                )
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -1485,6 +1607,8 @@ class NeuronQwen35MoeModel(NeuronBaseModel):
             scatter_index=slot_mapping
             if getattr(self, "is_block_kv_layout", False)
             else scatter_index,
+            vision_embeddings=vision_embeddings,
+            vision_mask=vision_mask,
         )
 
         batch_size = input_ids.shape[0]
@@ -1594,6 +1718,16 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
         if nk in neuron_state_dict:
             old_val = neuron_state_dict[nk]
             neuron_state_dict[nk] = old_val.float() + 1.0
+            if "layers.0." in nk or nk == "norm.weight":
+                print(
+                    f"  [NORM FIX] {nk}: mean {old_val.float().mean():.4f} -> {neuron_state_dict[nk].mean():.4f}"
+                )
+        else:
+            if "layers.0." in nk or nk == "norm.weight":
+                print(f"  [NORM FIX] WARNING: key not found: {nk}")
+                print(
+                    f"    Available keys (sample): {[k for k in neuron_state_dict.keys() if 'norm' in k.lower()][:5]}"
+                )
 
     for l in range(config.num_hidden_layers):
         layer_type = config.layer_types[l]
@@ -1768,7 +1902,11 @@ class Qwen35DecoderModelInstance(DecoderModelInstance):
 
 
 class Qwen35ModelWrapper(ModelWrapper):
-    """Custom ModelWrapper that uses Qwen35DecoderModelInstance."""
+    """Custom ModelWrapper that uses Qwen35DecoderModelInstance.
+
+    Overrides input_generator to add vision_embeddings and vision_mask
+    as traced inputs for VL support.
+    """
 
     def get_model_instance(self):
         return Qwen35DecoderModelInstance(
@@ -1776,6 +1914,58 @@ class Qwen35ModelWrapper(ModelWrapper):
             config=self.config,
             **self.model_init_kwargs,
         )
+
+    def input_generator(self):
+        """Generate inputs including vision_embeddings and vision_mask.
+
+        Extends the base input_generator output with vision inputs at
+        positions 22 (vision_embeddings) and 23 (vision_mask) to match
+        NeuronQwen35MoeModel.forward() signature.
+
+        For CTE: vision_embeddings=(BS, seq_len, hidden_size), vision_mask=(BS, seq_len, 1)
+        For TKG: both are empty (0,) tensors (vision only injected during CTE)
+        """
+        base_inputs = super().input_generator()
+        extended_inputs = []
+
+        for bucket_inputs in base_inputs:
+            input_ids = bucket_inputs[0]
+            batch_size = input_ids.shape[0]
+            n_active_tokens = input_ids.shape[1]
+
+            is_cte = n_active_tokens > 1
+
+            if is_cte:
+                # Context encoding: add properly-shaped vision inputs
+                vision_embeddings = torch.zeros(
+                    (batch_size, n_active_tokens, self.config.hidden_size),
+                    dtype=self.config.neuron_config.torch_dtype,
+                )
+                vision_mask = torch.full(
+                    (batch_size, n_active_tokens, 1),
+                    fill_value=n_active_tokens
+                    - 1,  # Safe fill: scatter to last position
+                    dtype=torch.int32,
+                )
+            else:
+                # Token generation: empty tensors (no vision injection)
+                vision_embeddings = torch.zeros(
+                    (0,), dtype=self.config.neuron_config.torch_dtype
+                )
+                vision_mask = torch.zeros((0,), dtype=torch.int32)
+
+            # The base generates 7 args; NxDI pads to 22 with empty tensors.
+            # We need to ensure positions 0-21 are present, then add 22-23.
+            # Pad to 22 positions if needed
+            padded = list(bucket_inputs)
+            while len(padded) < 22:
+                padded.append(torch.zeros((0,), dtype=torch.int32))
+            padded.append(vision_embeddings)  # position 22
+            padded.append(vision_mask)  # position 23
+
+            extended_inputs.append(tuple(padded))
+
+        return extended_inputs
 
 
 # ============================================================
@@ -1891,6 +2081,84 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
                 new_state = outputs[state_start + i]
                 tkg_param.data = new_state
                 cte_param.data = new_state
+
+    def get_required_kwargs(self):
+        """Return extra kwargs that must be propagated through the HF generation loop.
+
+        This ensures llava_args (vision_embeddings + vision_mask) flows from
+        generate() -> prepare_inputs_for_generation() -> forward() -> _get_model_outputs().
+        """
+        return ["llava_args"]
+
+    def _get_model_outputs(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        prev_hidden,
+        adapter_ids,
+        medusa_args,
+        llava_args,
+        slot_mapping=None,
+        block_table=None,
+        full_context_lens=None,
+        computed_context_lens=None,
+        tf_args=None,
+    ):
+        """Override to pass all 24 positional args explicitly.
+
+        The model is traced with 24 positional args (from Qwen35ModelWrapper.input_generator).
+        The base class splats *llava_args after 7 args, which puts vision inputs at positions
+        7-8 instead of 22-23. We override to fill positions 7-21 with torch.empty(0) and
+        place vision inputs at positions 22-23.
+
+        llava_args: list of [vision_embeddings, vision_mask] for CTE,
+                    or [] / [torch.empty(0), torch.empty(0)] for TKG.
+        """
+        # Extract vision inputs from llava_args
+        if llava_args and len(llava_args) >= 2:
+            vision_embeddings = llava_args[0]
+            vision_mask = llava_args[1]
+        else:
+            vision_embeddings = torch.zeros((0,), dtype=torch.float32)
+            vision_mask = torch.zeros((0,), dtype=torch.int32)
+
+        # Build the 15 empty tensors for positions 7-21
+        empties = [torch.empty(0) for _ in range(15)]
+
+        if self._is_prefill(position_ids):
+            outputs = self.context_encoding_model(
+                input_ids,  # 0
+                attention_mask,  # 1
+                position_ids,  # 2
+                seq_ids,  # 3
+                sampling_params,  # 4
+                prev_hidden,  # 5
+                adapter_ids,  # 6
+                *empties,  # 7-21
+                vision_embeddings,  # 22
+                vision_mask,  # 23
+            )
+            self.kv_cache_populated = True
+            is_run_on_neuron = self.context_encoding_model.is_neuron()
+        else:
+            outputs = self.token_generation_model(
+                input_ids,  # 0
+                attention_mask,  # 1
+                position_ids,  # 2
+                seq_ids,  # 3
+                sampling_params,  # 4
+                prev_hidden,  # 5
+                adapter_ids,  # 6
+                *empties,  # 7-21
+                vision_embeddings,  # 22
+                vision_mask,  # 23
+            )
+            is_run_on_neuron = self.token_generation_model.is_neuron()
+
+        return outputs, is_run_on_neuron
 
     def get_compiler_args(self):
         if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:

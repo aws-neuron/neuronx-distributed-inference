@@ -397,17 +397,55 @@ class NeuronQwen35MoeVLForCausalLM:
             position_ids = torch.arange(seq_len).unsqueeze(0)
             self.rope_deltas = None
 
-        # Step 2: Run vision encoder (if applicable)
-        vision_embeddings = None
+        # Step 2: Run vision encoder and prepare injection args
+        llava_args = []
         if has_vision and self.vision_model_wrapper is not None:
             vision_embeddings = self.vision_model_wrapper(pixel_values, image_grid_thw)
+            # vision_embeddings: (total_merged_tokens, out_hidden_size)
+
+            # Build vision_mask: boolean mask of image token positions
+            image_token_id = self._vl_config.image_token_id
+            vision_bool_mask = input_ids == image_token_id  # (BS, seq_len)
+
+            # Convert bool mask to position indices (1D tensor of int positions)
+            positions = (
+                vision_bool_mask[0].nonzero(as_tuple=False).squeeze(-1)
+            )  # (n_vision_tokens,)
+
+            # Reshape vision_embeddings to (1, n_vision_tokens, hidden_size)
+            n_vis = positions.shape[0]
+            hidden_size = vision_embeddings.shape[-1]
+            vis_emb = vision_embeddings[:n_vis].unsqueeze(0)  # (1, n_vis, hidden)
+
+            # Pad to match input sequence length for compiled graph compatibility
+            seq_len = input_ids.shape[1]
+            pad_limit = seq_len  # Must match the bucket size
+
+            # Pad vision_embeddings to (1, pad_limit, hidden_size)
+            if n_vis < pad_limit:
+                pad_emb = torch.zeros(
+                    (1, pad_limit - n_vis, hidden_size),
+                    dtype=vis_emb.dtype,
+                )
+                vis_emb_padded = torch.cat([vis_emb, pad_emb], dim=1)
+            else:
+                vis_emb_padded = vis_emb[:, :pad_limit]
+
+            # Pad positions to (1, pad_limit, 1) with fill_value=pad_limit-1
+            positions_padded = torch.full(
+                (1, pad_limit, 1),
+                fill_value=pad_limit - 1,
+                dtype=torch.int32,
+            )
+            positions_padded[0, :n_vis, 0] = positions[:pad_limit].to(torch.int32)
+
+            llava_args = [vis_emb_padded, positions_padded]
+        else:
+            vision_embeddings = None
 
         # Step 3: Context encoding (prefill)
         generated_ids = input_ids.clone()
 
-        # For the text decoder, we pass the standard position_ids
-        # The mRoPE position_ids will need to be adapted once the text
-        # decoder supports rotary_position_ids passthrough
         with torch.no_grad():
             output = self.text_model(
                 input_ids=input_ids,
@@ -417,6 +455,7 @@ class NeuronQwen35MoeVLForCausalLM:
                 output_attentions=False,
                 output_hidden_states=False,
                 return_dict=False,
+                llava_args=llava_args,
             )
 
         logits = output[0] if isinstance(output, tuple) else output.logits
