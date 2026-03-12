@@ -923,6 +923,21 @@ class NeuronQwen35Attention(NeuronAttentionBase):
 
         return Q, K, cos_cache, sin_cache
 
+    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
+        """Override to handle head_dim=256 safely.
+
+        The standard NxDI NKI flash attention kernel asserts head_dim <= 128.
+        This override forces the PyTorch softmax path by temporarily disabling
+        attn_kernel for head_dim > 128.
+        """
+        if self.head_dim > 128:
+            saved = self.attn_kernel_enabled
+            self.attn_kernel_enabled = False
+            result = super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+            self.attn_kernel_enabled = saved
+            return result
+        return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
