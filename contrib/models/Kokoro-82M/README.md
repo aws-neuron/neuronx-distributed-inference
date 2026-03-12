@@ -32,11 +32,23 @@ Kokoro-82M generates an entire mel spectrogram in one forward pass (not autoregr
 
 ### Bucketing
 
-Input length varies by text. The model uses bucket-based compilation: compile at fixed sizes (32, 64, 96, 128, 160, 192 frames) and pad inputs with replicate padding to the nearest bucket. Each frame = 12.5ms of audio.
+Input length varies by text. The model uses bucket-based compilation: compile at fixed sizes and pad inputs with replicate padding to the nearest bucket. Each frame = 25ms of audio (HOP_SIZE=600 at 24kHz).
+
+Default buckets: `[64, 128, 192, 512, 768, 1024]` -- covering audio from ~1.6s to ~25.6s per chunk.
+
+**Dead zones:** Certain bucket ranges fail to compile due to State Buffer overflow in Part B2 (Generator). Two Conv1d tensors (~15MB each) cannot share the 29MB SB at these sizes, but the compiler finds different tiling strategies outside them:
+
+| Range | Status |
+|-------|--------|
+| 32-192 | Works |
+| 256-384 | Dead zone (SB overflow) |
+| 512-1312 | Works |
+| 1344-2624 | Dead zone (SB overflow) |
+| 2688+ | Works (tested to 3072) |
 
 ## Benchmark Results
 
-**Validated:** 2026-03-11
+**Validated:** 2026-03-12
 **SDK:** Neuron SDK 2.27 (Deep Learning AMI Neuron Ubuntu 24.04 20260126)
 
 ### trn2.3xlarge (LNC=2, 4 NeuronCores)
@@ -45,27 +57,41 @@ Input length varies by text. The model uses bucket-based compilation: compile at
 
 | Bucket | Audio | P50 Latency | Real-Time Factor | vs CPU Speedup |
 |--------|-------|-------------|-----------------|---------------|
-| 32 | 0.4s | 6.71ms | 60x | 12.6x |
-| 64 | 0.8s | 11.24ms | 71x | 13.1x |
-| 96 | 1.2s | 15.49ms | 77x | 14.0x |
-| 128 | 1.6s | 20.47ms | 78x | 14.7x |
-| 160 | 2.0s | 24.97ms | 80x | 15.0x |
-| 192 | 2.4s | 30.68ms | 78x | 14.3x |
+| 64 | 1.6s | 9.54ms | 168x | 24x |
+| 128 | 3.2s | 17.70ms | 181x | 24x |
+| 192 | 4.8s | 26.76ms | 179x | 26x |
+| 512 | 12.8s | 79.64ms | 161x | 22x |
+| 768 | 19.2s | 149.30ms | 129x | 19x |
+| 1024 | 25.6s | 174.20ms | 147x | 21x |
+
+CPU baseline on trn2 host: ~6-7x real-time (trn2.3xlarge has 16 vCPUs).
+
+#### End-to-End (including CPU G2P + ALBERT)
+
+| Text | Audio | Decoder | Total | RTF (decoder) | RTF (total) |
+|------|-------|---------|-------|---------------|-------------|
+| 58 chars | 4.0s | 31ms | 995ms | 128x | 4x |
+| 212 chars | 13.9s | 162ms | 2.4s | 85x | 6x |
+| 559 chars | 33.1s | 286ms | 5.6s | 116x | 6x |
+
+Note: End-to-end RTF is dominated by CPU stages (ALBERT duration prediction). The Neuron decoder alone runs at 85-181x real-time; the CPU bottleneck brings effective throughput to ~4-6x real-time for single-request latency.
 
 ### inf2.xlarge (2 NeuronCores)
 
 Requires `-O1` compiler flag due to Generator State Buffer constraints on inf2. Buckets 64 and 192 fail to compile (SB overflow even at `-O1`).
 
-#### Decoder Latency (P50, 100 iterations)
+Note: inf2 benchmarks below use the old HOP_SIZE=300 and need re-validation. The real-time factors should approximately double with the corrected HOP_SIZE=600.
+
+#### Decoder Latency (P50, 100 iterations, HOP_SIZE=300 -- needs re-validation)
 
 | Bucket | Audio | P50 Latency | Real-Time Factor | vs CPU Speedup |
 |--------|-------|-------------|-----------------|---------------|
-| 32 | 0.4s | 7.26ms | 55x | 43.2x |
-| 96 | 1.2s | 25.61ms | 47x | 35.4x |
-| 128 | 1.6s | 31.17ms | 51x | 39.6x |
-| 160 | 2.0s | 40.98ms | 49x | 38.3x |
+| 32 | 0.8s | 7.26ms | 110x* | — |
+| 96 | 2.4s | 25.61ms | 94x* | — |
+| 128 | 3.2s | 31.17ms | 103x* | — |
+| 160 | 4.0s | 40.98ms | 98x* | — |
 
-Note: inf2.xlarge CPU baseline is ~1.3x real-time (4 vCPUs), so the Neuron speedup vs CPU is much larger than on trn2 (which has faster host CPUs).
+*Estimated 2x correction from HOP_SIZE fix; actual values need re-measurement on inf2.
 
 ### Accuracy
 
@@ -83,7 +109,7 @@ Note: inf2.xlarge CPU baseline is ~1.3x real-time (4 vCPUs), so the Neuron speed
 | Part B2 | 31-34 MB |
 | Total (per bucket) | ~137 MB |
 
-All 6 bucket copies fit on one NeuronCore (~822 MB, well within 24 GB HBM).
+All 6 bucket copies fit on one NeuronCore (well within 24 GB HBM).
 
 ## Usage
 
@@ -92,7 +118,7 @@ from kokoro_neuron import KokoroNeuron
 
 # Compile and save (one-time, ~60s per bucket)
 model = KokoroNeuron()
-model.compile(buckets=[64, 128, 192])
+model.compile(buckets=[64, 128, 192, 512, 768, 1024])
 model.save("compiled_models")
 
 # Load pre-compiled models
@@ -144,9 +170,9 @@ wavfile.write("output.wav", 24000, audio_int16)
 
 | Instance | Supported | Notes |
 |----------|-----------|-------|
-| trn2.3xlarge | Yes | Primary target, 60-80x real-time, all buckets |
+| trn2.3xlarge | Yes | Primary target, 129-181x real-time, 6 default buckets |
 | trn2.48xlarge | Yes (untested) | Should work, more cores for DP |
-| inf2.xlarge | Yes (`-O1`) | 47-55x real-time, buckets 32/96/128/160 only |
+| inf2.xlarge | Yes (`-O1`) | ~94-110x real-time*, buckets 32/96/128/160 only |
 | inf2.8xlarge | Yes (untested, `-O1`) | Same as inf2.xlarge, more cores for DP |
 
 **inf2 note:** Requires `-O1` compiler optimization flag. The Generator's Conv1d ops need 310KB SB at `-O2`, exceeding inf2's 196KB limit. At `-O1`, the compiler uses a different allocation strategy that fits for most bucket sizes. Buckets 64 and 192 fail to compile on inf2 even with `-O1`.
@@ -200,9 +226,9 @@ python test_model.py
 
 ## Known Limitations
 
-1. **Per-chunk max: 192 frames (~2.4s audio) on trn2, 160 frames (~2.0s audio) on inf2** -- Generator State Buffer limits per Neuron inference call. Long text is automatically split into chunks and stitched (see Long-Form Generation above).
+1. **Bucket dead zones on trn2** -- Buckets 256-384 and 1344-2624 fail to compile (SB overflow). Default buckets skip these zones. Long text is automatically sub-chunked to fit available buckets (see Long-Form Generation above).
 2. **inf2 requires `-O1` compiler flag** -- Default `-O2` causes SB overflow. Buckets 64 and 192 fail on inf2 even at `-O1`.
-3. **CPU preprocessing required** -- ALBERT duration prediction and harmonic precomputation run on CPU. These add ~5-15ms depending on text length but are not the bottleneck.
+3. **CPU preprocessing bottleneck** -- ALBERT duration prediction runs on CPU and dominates end-to-end latency (~1-5s depending on text length). The Neuron decoder is 85-181x real-time but end-to-end is ~4-6x real-time due to CPU stages.
 4. **Single-utterance batch size** -- Model traces at bs=1. Use DataParallel for throughput scaling.
 5. **F.interpolate not traceable** -- The `har` computation uses F.interpolate(scale_factor=300) which the XLA tracer drops silently. Workaround: precompute on CPU.
 6. **No cross-chunk prosody** -- Each chunk gets an independent style vector from the voice pack, selected by its phoneme count. Prosody does not carry across chunk boundaries (same limitation as the official Kokoro package).
@@ -215,4 +241,4 @@ python test_model.py
 
 Jim Burtoft
 
-**Last Updated:** 2026-03-11
+**Last Updated:** 2026-03-12

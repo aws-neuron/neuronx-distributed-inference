@@ -24,7 +24,7 @@ Usage:
     from kokoro_neuron import KokoroNeuron
 
     model = KokoroNeuron()
-    model.compile(buckets=[32, 64, 96, 128, 160, 192])
+    model.compile(buckets=[64, 128, 192, 512, 768, 1024])
     model.save("compiled_models")
 
     model = KokoroNeuron.load("compiled_models")
