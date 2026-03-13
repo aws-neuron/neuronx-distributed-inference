@@ -474,14 +474,14 @@ class NeuronQwen35MoeVLForCausalLM:
                 vis_emb_padded = vis_emb[:, :pad_limit]
 
             # Pad positions to (1, pad_limit, 1) with a SAFE fill value.
-            # CRITICAL: fill_value must NOT be a real token position, otherwise
-            # index_put_ will scatter zero embeddings over a real token's embedding.
-            # Use a large sentinel (2**30) that pad_inputs() will clamp to the
-            # last padded (bucket) position, which is always a padding slot.
-            _SAFE_SCATTER_SENTINEL = 2**30
+            # CRITICAL: fill_value must be a valid index (within [0, pad_limit-1]).
+            # Using pad_limit-1 targets the last position (always a padding slot)
+            # so index_put_ scatters zero embeddings there harmlessly.
+            # NOTE: Do NOT use large sentinel values (e.g., 2**30) as they cause
+            # DGE out-of-bounds crashes in the Neuron runtime.
             positions_padded = torch.full(
                 (1, pad_limit, 1),
-                fill_value=_SAFE_SCATTER_SENTINEL,
+                fill_value=pad_limit - 1,
                 dtype=torch.int32,
             )
             positions_padded[0, :n_vis, 0] = positions[:pad_limit].to(torch.int32)

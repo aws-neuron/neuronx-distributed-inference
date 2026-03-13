@@ -2254,10 +2254,9 @@ class Qwen35ModelWrapper(ModelWrapper):
                     vision_mask,
                 )
 
-                # CRITICAL: Clamp vision_mask entries to valid range.
-                # VL generate uses a sentinel (2**30) for padding entries.
-                # Clamp to padded_seq_len - 1 (a padding position, safe to
-                # scatter zeros to without corrupting real token embeddings).
+                # Safety clamp: ensure all vision_mask entries are within valid range.
+                # This is a no-op when fill_value is already seq_len-1, but protects
+                # against any edge case where values exceed the tensor dimensions.
                 padded_args = list(padded_args)
                 padded_args[23] = padded_args[23].clamp(max=padded_seq_len - 1)
                 padded_args = tuple(padded_args)
@@ -2438,17 +2437,17 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
         elif is_prefill:
             # Text-only CTE: generate dummy vision inputs matching compiled shape.
             # The compiled CTE expects (BS, seq_len, hidden_size) and (BS, seq_len, 1).
-            # Use zeros for embeddings and a SAFE scatter target for mask.
-            # CRITICAL: fill_value must NOT be a real token position -- use sentinel
-            # that pad_inputs() will clamp to the last padded (bucket) position.
-            _SAFE_SCATTER_SENTINEL = 2**30
+            # Use zeros for embeddings and seq_len-1 for mask (safe scatter target).
+            # NOTE: Do NOT use large sentinel values (e.g., 2**30) as fill_value --
+            # they cause DGE out-of-bounds crashes in the Neuron runtime.
+            # Using seq_len-1 targets the last position (always a padding slot).
             vision_embeddings = torch.zeros(
                 (batch_size, seq_len, self.config.hidden_size),
                 dtype=self.config.neuron_config.torch_dtype,
             )
             vision_mask = torch.full(
                 (batch_size, seq_len, 1),
-                fill_value=_SAFE_SCATTER_SENTINEL,
+                fill_value=seq_len - 1,
                 dtype=torch.int32,
             )
             mrope_position_ids = None

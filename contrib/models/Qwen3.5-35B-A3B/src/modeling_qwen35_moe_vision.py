@@ -11,6 +11,7 @@ compiled and loaded via NeuronBaseForImageToText.
 
 import logging
 import math
+import os
 from typing import Optional
 
 import torch
@@ -270,7 +271,8 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
             # Standalone mode: no NxDI model_cls
             nn.Module.__init__(self)
         self.vision_config = config
-        self._compiled_model = None  # Set by load_compiled()
+        self._compiled_model = None  # Set by load_compiled() -- single bucket
+        self._compiled_buckets = None  # Set by load_compiled() -- multi-bucket dict
 
         # These HF modules run on CPU, outside the traced graph
         if Qwen3_5MoeVisionPatchEmbed is not None:
@@ -289,16 +291,70 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
         )
 
     def load_compiled(self, compiled_model_path):
-        """Load a pre-compiled standalone vision encoder.
+        """Load pre-compiled standalone vision encoder(s).
+
+        Supports two modes:
+        1. Single .pt file: Legacy mode, loads one compiled model for one bucket size.
+        2. Directory with multiple .pt files: Multi-bucket mode. Files must be named
+           'vision_encoder_{bucket_size}.pt' (e.g., 'vision_encoder_256.pt').
+           Falls back to single 'vision_encoder.pt' in the directory.
 
         Args:
-            compiled_model_path: Path to the compiled .pt file (from torch_neuronx.trace)
+            compiled_model_path: Path to a .pt file or directory containing bucket .pt files.
         """
-        import torch_neuronx
+        import glob as glob_module
 
         logger.info(f"Loading pre-compiled vision encoder from {compiled_model_path}")
-        self._compiled_model = torch.jit.load(compiled_model_path)
-        logger.info("Vision encoder loaded successfully")
+
+        if os.path.isfile(compiled_model_path):
+            # Single file mode (legacy)
+            self._compiled_model = torch.jit.load(compiled_model_path)
+            self._compiled_buckets = None
+            logger.info("Vision encoder loaded successfully (single bucket)")
+        elif os.path.isdir(compiled_model_path):
+            # Directory mode: look for bucket-specific files
+            bucket_files = sorted(
+                glob_module.glob(
+                    os.path.join(compiled_model_path, "vision_encoder_*.pt")
+                )
+            )
+            if bucket_files:
+                self._compiled_buckets = {}
+                for bf in bucket_files:
+                    # Extract bucket size from filename: vision_encoder_256.pt -> 256
+                    basename = os.path.basename(bf)
+                    try:
+                        bucket_size = int(
+                            basename.replace("vision_encoder_", "").replace(".pt", "")
+                        )
+                        self._compiled_buckets[bucket_size] = torch.jit.load(bf)
+                        logger.info(f"  Loaded vision bucket {bucket_size} from {bf}")
+                    except ValueError:
+                        logger.warning(f"  Skipping unrecognized file: {bf}")
+                self._compiled_model = None
+                # Update vision_seq_len_buckets to match compiled buckets
+                self.vision_seq_len_buckets = sorted(self._compiled_buckets.keys())
+                logger.info(
+                    f"Vision encoder loaded with {len(self._compiled_buckets)} buckets: "
+                    f"{self.vision_seq_len_buckets}"
+                )
+            else:
+                # Fall back to single vision_encoder.pt in directory
+                single_path = os.path.join(compiled_model_path, "vision_encoder.pt")
+                if os.path.exists(single_path):
+                    self._compiled_model = torch.jit.load(single_path)
+                    self._compiled_buckets = None
+                    logger.info(
+                        "Vision encoder loaded successfully (single file in dir)"
+                    )
+                else:
+                    raise FileNotFoundError(
+                        f"No vision encoder files found in {compiled_model_path}"
+                    )
+        else:
+            raise FileNotFoundError(
+                f"Vision encoder path not found: {compiled_model_path}"
+            )
 
     def load_vision_weights_from_hf(self, model_path):
         """Load patch_embed and pos_embed weights from HF safetensors.
@@ -520,8 +576,23 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
             attention_mask = mask
 
         # 6. Run vision model on Neuron
-        if self._compiled_model is not None:
-            # Pre-compiled standalone model: takes (hidden_states, attention_mask, cos, sin)
+        if self._compiled_buckets is not None:
+            # Multi-bucket mode: select the compiled model for this bucket
+            if bucket_len not in self._compiled_buckets:
+                raise RuntimeError(
+                    f"No compiled vision encoder for bucket size {bucket_len}. "
+                    f"Available buckets: {sorted(self._compiled_buckets.keys())}. "
+                    f"Input seq_len={seq_len} requires bucket {bucket_len}."
+                )
+            compiled_model = self._compiled_buckets[bucket_len]
+            vision_output = compiled_model(
+                hidden_states.to(torch.bfloat16),
+                attention_mask.to(torch.bfloat16),
+                cos.to(torch.bfloat16),
+                sin.to(torch.bfloat16),
+            )
+        elif self._compiled_model is not None:
+            # Single compiled model (legacy)
             vision_output = self._compiled_model(
                 hidden_states.to(torch.bfloat16),
                 attention_mask.to(torch.bfloat16),
