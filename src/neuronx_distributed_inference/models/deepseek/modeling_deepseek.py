@@ -71,7 +71,7 @@ class DeepseekV3InferenceConfig(InferenceConfig):
 
     @classmethod
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
-        return MoENeuronConfig
+        return NeuronConfig
 
 
 def get_rmsnorm_cls():
@@ -470,7 +470,7 @@ class NeuronDeepseekV3ForCausalLM(NeuronBaseForCausalLM):
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
-        return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+        return DeepseekV3ForCausalLM.from_pretrained(model_path, **kwargs)
 
     @classmethod
     def get_config_cls(cls):
