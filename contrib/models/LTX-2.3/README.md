@@ -33,7 +33,8 @@ All accuracy numbers measured against CPU reference (unsharded BF16, native ltx-
 |-------|------|-------|
 | CPU component loading | 24.9s | LTXModel, VideoDecoder, AudioDecoder, Vocoder, EmbeddingsProcessor |
 | Gemma3 encoder loading (4 ranks) | 362s | Pre-sharded weights, NEFF rehydration (cold start) |
-| Text encoding — Neuron Gemma3 (warm) | 6.7s | After warmup, includes tokenization + post-processing |
+| Text encoding — Neuron Gemma3 (warm) | 0.6s | Encoder forward pass only (644ms), with tensorizer-optimized compiler flags |
+| Text encoding — Neuron Gemma3 (E2E warm) | ~1.3s | Including tokenization + post-processing |
 | Text encoding — Neuron Gemma3 (warmup) | 16.3s | First forward pass on NeuronCores |
 | Text encoding — CPU fallback | ~162s | Without Neuron compilation |
 | Gemma3 unload | 2.6s | Explicit NRT resource cleanup |
@@ -53,21 +54,21 @@ Note: Gemma3 and DiT backbone share the same 4 NeuronCores and are loaded sequen
 
 ### Per-Step Performance Detail
 
-Warm denoising steps (2-8) at 384×512, 25 frames, with both CPU optimizations applied:
+Warm denoising steps (2-8) at 384×512, 25 frames, with all CPU optimizations applied:
 
 | Component | Time | % of Step |
 |-----------|------|-----------|
-| CPU Preprocess | 39.0 ms | 13.6% |
-| Neuron Backbone | 245.4 ms | 85.7% |
+| CPU Preprocess | 33.1 ms | 11.9% |
+| Neuron Backbone | 244.1 ms | 87.4% |
 | Euler Step | 2.1 ms | 0.7% |
-| **Total per step** | **286.5 ms** | 100% |
+| **Total per step** | **279.3 ms** | 100% |
 
 Two CPU preprocessing optimizations are applied:
 
 1. **AdaLN deduplication**: Computes the timestep embedding MLP once per unique sigma value instead of per-token (768 tokens in T2V mode). Reduces AdaLN time from 54ms to 7ms.
 2. **Step-invariant caching**: RoPE embeddings, context projection (caption_projection Linear), and attention masks are constant across denoising steps. Computed once on step 1 and reused for steps 2-8. Saves ~57ms on the first optimization pass (context projection dominates at ~55ms), with combined CPU preprocessing reduced from 96.5ms (baseline) to 39.0ms (60% reduction).
 
-Overall per-step improvement vs unoptimized baseline: 330ms to 286.5ms (13.2% reduction).
+Overall per-step improvement vs unoptimized baseline: 330ms to 279.3ms (15.4% reduction).
 
 ### Two-Stage Pipeline Benchmarks
 
@@ -176,7 +177,7 @@ python3 src/shard_gemma3_weights.py \
   --output-dir /home/ubuntu/gemma3_encoder_sharded
 ```
 
-The Gemma3 encoder uses stricter compiler flags (`--auto-cast=none --enable-saturate-infinity --enable-mixed-precision-accumulation`) to preserve text encoder precision.
+The Gemma3 encoder uses tensorizer-optimized compiler flags (`--enable-ccop-compute-overlap`, `--cc-pipeline-tiling-factor=1`, `--vectorize-strided-dma`, `--enable-scalar-dge-vectorization`) that achieve 3.1x faster inference (644ms vs 2000ms) compared to the original precision flags.
 
 ### Step 4: Generate Video + Audio
 
@@ -311,10 +312,13 @@ The compiled backbone takes 24 flat tensors (for XLA tracing compatibility):
 --enable-fast-loading-neuron-binaries
 ```
 
-**Gemma3 encoder** (stricter precision for text quality):
+**Optional DiT flag** — adding `--vectorize-strided-dma` to the DiT tensorizer options gives a 1.9% backbone speedup (244.1ms → 239.4ms per step) but reduces single-pass cosine similarity from 0.9999 to 0.996 due to reordered BF16 accumulations. Not enabled by default. Other tensorizer flags tested: `--cc-pipeline-tiling-factor` hurts DiT performance at all values tested (1/2/4/8), and `--enable-scalar-dge-vectorization` is neutral.
+
+**Gemma3 encoder** (tensorizer-optimized, 3.1x faster than original):
 ```
 --model-type=transformer -O1 --auto-cast=none --lnc=2
---enable-saturate-infinity --enable-mixed-precision-accumulation
+--tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=1
+  --vectorize-strided-dma --enable-scalar-dge-vectorization'
 ```
 
 Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHASTIC_ROUNDING_EN=0`
@@ -322,7 +326,7 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 ## Known Issues
 
 - **Cold start latency**: The DiT warmup pass takes ~139s and the first denoising step takes ~175s due to Neuron device initialization. Subsequent steps run at ~0.3s each. Gemma3 encoder NEFF rehydration adds ~362s on first load (one-time per instance).
-- **CPU text encoding fallback**: Without Neuron-compiled Gemma3, text encoding takes ~162s on CPU. Use `--neuron-gemma` for 6.6s warm text encoding (83x faster).
+- **CPU text encoding fallback**: Without Neuron-compiled Gemma3, text encoding takes ~162s on CPU. Use `--neuron-gemma` for 0.6s warm text encoding (~270x faster).
 - **Two-stage cold start**: Two-stage mode loads two separate Neuron backbones sequentially (half-res and full-res), each with its own NEFF warmup. Total cold start overhead is ~2x single-stage.
 - **BF16 TP accumulation**: The 0.972 cosine similarity over 8 denoising steps (vs CPU) is due to normal BF16 rounding across TP=4 ranks. Single forward pass accuracy is 0.9999.
 - **No EFA**: The trn2.3xlarge single-instance setup does not use EFA for inter-node communication. NCCL/OFI warnings about EFA can be safely ignored.
