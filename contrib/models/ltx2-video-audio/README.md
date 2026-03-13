@@ -10,7 +10,7 @@ LTX-2 generates synchronized video + audio from text prompts. The model has thre
 |-----------|-----------|---------|-------|
 | Text encoder (Gemma 3-12B) | 12B | **Neuron TP=4** | Compiled with custom encoder |
 | DiT transformer (48 blocks) | ~6B | **Neuron TP=4** | The denoising bottleneck |
-| Video VAE decoder | ~1B | **Neuron TP=4** | Tiled decode with rectangular 4x16 tiles |
+| Video VAE decoder | ~1B | **Neuron TP=4** | Tiled spatial decode (8×8 or 4×16 tiles) |
 | Audio VAE decoder + vocoder | ~0.1B | CPU | Run once per generation |
 
 Both the text encoder and DiT transformer backbone are compiled for Neuron. They coexist on the same 4 NeuronCores (TP=4) and execute sequentially: text encoding then denoising.
@@ -80,11 +80,16 @@ NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
 # Pre-shard Gemma3 weights for fast loading (~2 minutes)
 python shard_gemma3_weights.py
 
-# Compile VAE decoder for Neuron (~30 minutes on trn2.48xlarge)
-# Default: 4x16 tile (128x512 px), optimal for 1024x1536 output
+# Compile VAE decoder for Neuron
+# For 25-frame videos (default E2E config): use 8x8 tiles (~6 min)
 NEURON_RT_VISIBLE_CORES=0-3 python compile_vae.py \
-  --tp-degree 4 --height 128 --width 512 \
-  --output-dir /home/ubuntu/ltx2_vae_tp4_128x512
+  --tp-degree 4 --height 256 --width 256 --num-frames 25 \
+  --output-dir /home/ubuntu/ltx2_vae_tp4_256x256_f25
+
+# For 121-frame videos: use 4x16 tiles (~15 min, requires trn2.48xlarge)
+# NEURON_RT_VISIBLE_CORES=0-3 python compile_vae.py \
+#   --tp-degree 4 --height 128 --width 512 --num-frames 121 \
+#   --output-dir /home/ubuntu/ltx2_vae_tp4_128x512_f121
 ```
 
 The DiT backbone is compiled automatically on first use by the E2E script.
@@ -94,6 +99,12 @@ The DiT backbone is compiled automatically on first use by the E2E script.
 ```bash
 cd /home/ubuntu/ltx2-neuron/examples
 
+# With Neuron VAE (set compile dir to enable)
+LTX2_VAE_COMPILE_DIR=/home/ubuntu/ltx2_vae_tp4_256x256_f25 \
+NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
+  python neuron_e2e.py
+
+# Without Neuron VAE (falls back to CPU decode)
 NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
   python neuron_e2e.py
 ```
@@ -140,7 +151,7 @@ ltx2-video-audio/
 │   ├── modeling_vae.py               # VAE decoder: TP Conv3d, tiled compilation
 │   ├── modeling_gemma3_encoder.py    # Gemma3 text encoder for Neuron
 │   ├── application.py                # NeuronLTX2Application orchestrator
-│   ├── pipeline.py                   # NeuronTransformerWrapper (CFG batch-split)
+│   ├── pipeline.py                   # NeuronTransformerWrapper + NeuronTiledVAEDecoder
 │   ├── compile_gemma3.py             # Gemma3 encoder compilation script
 │   ├── compile_vae.py                # VAE decoder compilation script
 │   ├── tiled_vae_decode.py           # Tiled VAE decode runtime (standalone + library)
@@ -238,9 +249,59 @@ The LTX-2 VAE decoder (128 input channels, 3D convolutions with 3 upsampler bloc
 
 **Compilation boundary**: `H_latent * W_latent <= 64` elements. Above this, the compiler fails with `NCC_IGCA030` (SRAM allocation failure).
 
-**Optimal tile**: 4x16 latent (128x512 pixels) — maximizes spatial area within the budget.
+#### Pipeline Integration
 
-**Tiled decode performance (1024x1536, 121 frames, trn2.48xlarge)**:
+The Neuron VAE is integrated as a drop-in replacement for `pipe.vae.decoder`. The `NeuronTiledVAEDecoder` class in `pipeline.py` wraps the compiled model and handles tiling transparently — the Diffusers pipeline calls `vae.decode()` as usual without any changes.
+
+To enable in `neuron_e2e.py`, set `LTX2_VAE_COMPILE_DIR` to the compiled model directory. If the directory doesn't exist, the pipeline falls back to CPU VAE decode automatically.
+
+```bash
+# Enable Neuron VAE decode
+LTX2_VAE_COMPILE_DIR=/home/ubuntu/ltx2_vae_tp4_256x256_f25 python neuron_e2e.py
+
+# Configure tile shape (defaults: 8x8 with overlap 2x2)
+LTX2_VAE_TILE_H=8 LTX2_VAE_TILE_W=8 LTX2_VAE_OVERLAP_H=2 LTX2_VAE_OVERLAP_W=2
+
+# For use from Python directly:
+from pipeline import NeuronLTX2Pipeline
+pipe = NeuronLTX2Pipeline.from_pretrained("Lightricks/LTX-2")
+pipe._swap_vae_to_neuron("/path/to/compiled_vae", tile_latent_h=8, tile_latent_w=8)
+```
+
+#### Tile Shape vs Frame Count
+
+**The compiled VAE is fixed to a specific temporal dimension.** The tile shape must be chosen based on the number of video frames:
+
+| Video Frames | Latent T | Recommended Tile | Notes |
+|-------------|----------|-----------------|-------|
+| 25 | 4 | **8×8** (256×256 px) | 4×16 fails at latent_t=4 (SRAM issue) |
+| 121 | 16 | **4×16** (128×512 px) | 12.5% faster per-tile, fewer tiles at high res |
+
+- **Short videos (25 frames)**: Use 8×8 tiles. The 4×16 tile fails to compile at latent_t=4 due to `NCC_IBIR229` state buffer allocation failure. 8×8 compiles in ~6 minutes.
+- **Long videos (121 frames)**: Use 4×16 tiles for best performance. Compiles in ~15 minutes but requires trn2.48xlarge (2TB RAM) — the compiler OOMs on trn2.3xlarge (124GB) for rectangular tiles.
+
+Compile examples:
+```bash
+# Short videos (25 frames, 8x8 tiles)
+NEURON_RT_VISIBLE_CORES=0-3 python compile_vae.py \
+  --tp-degree 4 --height 256 --width 256 --num-frames 25 \
+  --output-dir /home/ubuntu/ltx2_vae_tp4_256x256_f25
+
+# Long videos (121 frames, 4x16 tiles — requires trn2.48xlarge)
+NEURON_RT_VISIBLE_CORES=0-3 python compile_vae.py \
+  --tp-degree 4 --height 128 --width 512 --num-frames 121 \
+  --output-dir /home/ubuntu/ltx2_vae_tp4_128x512_f121
+```
+
+#### Performance
+
+**Short videos (384×512, 25 frames, 8×8 tiles, trn2.48xlarge)**:
+
+| Overlap | Tiles | Neuron | CPU | Speedup |
+|---------|-------|--------|-----|---------|
+| 2×2 | 6 | 2.4s | 3.2s | 1.3x |
+
+**Long videos (1024×1536, 121 frames, trn2.48xlarge)**:
 
 | Tile | Overlap (h×w) | Tiles | Neuron | CPU | Speedup | Cos Sim |
 |------|--------------|-------|--------|-----|---------|---------|
@@ -248,7 +309,7 @@ The LTX-2 VAE decoder (128 input channels, 3D convolutions with 3 upsampler bloc
 | **4×16** | **1×0** | **33** | **42.4s** | **99s** | **2.3x** | **0.892** |
 | 4×16 | 0×0 | 24 | 30.9s | 98s | 3.2x | 0.872 |
 
-Recommended configuration: `--tile-latent-h 4 --tile-latent-w 16 --overlap-h 1 --overlap-w 0`
+The speedup is most significant for long videos at high resolution, where the tile count matters. For short 25-frame videos at 384×512, the VAE decode is already fast (~3s CPU) and the Neuron advantage is modest.
 
 Environment variables:
 ```bash
