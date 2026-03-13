@@ -354,6 +354,12 @@ class NeuronQwen35MoeVLForCausalLM:
                     "Vision encoding will not be available."
                 )
 
+    # Qwen3.5 stop token IDs (loaded from config/tokenizer)
+    _DEFAULT_EOS_TOKEN_IDS = {
+        248044,  # <|endoftext|> -- text config eos_token_id
+        248046,  # <|im_end|> -- tokenizer eos_token / end of assistant turn
+    }
+
     def generate(
         self,
         input_ids,
@@ -362,6 +368,10 @@ class NeuronQwen35MoeVLForCausalLM:
         image_grid_thw=None,
         video_grid_thw=None,
         max_new_tokens=32,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        eos_token_ids=None,
         **kwargs,
     ):
         """Generate text from text and/or vision inputs.
@@ -373,10 +383,24 @@ class NeuronQwen35MoeVLForCausalLM:
             image_grid_thw: (num_images, 3) grid dimensions
             video_grid_thw: (num_videos, 3) grid dimensions
             max_new_tokens: Maximum new tokens to generate
+            temperature: Sampling temperature (0.0 = greedy/argmax)
+            top_p: Nucleus sampling threshold (1.0 = disabled)
+            top_k: Top-k sampling (0 = disabled)
+            eos_token_ids: Set of token IDs to stop generation on
+                (default: {248044, 248046})
 
         Returns:
             generated_ids: (batch_size, seq_len + max_new_tokens) token IDs
         """
+        if eos_token_ids is None:
+            eos_token_ids = self._DEFAULT_EOS_TOKEN_IDS
+
+        # Reset text model state for a fresh generation.
+        # This ensures CTE runs (not TKG) even if a prior generate() was called.
+        # DeltaNet recurrent states don't need explicit zeroing because the CTE
+        # NKI kernel always starts from zero state.
+        self.text_model.reset()
+
         has_vision = pixel_values is not None and pixel_values.numel() > 0
 
         # Step 1: Compute 3D mRoPE position IDs
@@ -399,15 +423,33 @@ class NeuronQwen35MoeVLForCausalLM:
 
         # Step 2: Run vision encoder and prepare injection args
         llava_args = []
+        batch_size = input_ids.shape[0]
         if has_vision and self.vision_model_wrapper is not None:
+            # The vision encoder processes both image and video frames identically
+            # (they share the same ViT architecture). The HF processor outputs a
+            # single pixel_values tensor for images, and video frames are treated
+            # as multiple images with temporal grid > 1.
             vision_embeddings = self.vision_model_wrapper(pixel_values, image_grid_thw)
             # vision_embeddings: (total_merged_tokens, out_hidden_size)
 
-            # Build vision_mask: boolean mask of image token positions
+            # Build vision_mask: boolean mask of ALL vision token positions
+            # (both image_token_id and video_token_id placeholders)
             image_token_id = self._vl_config.image_token_id
-            vision_bool_mask = input_ids == image_token_id  # (BS, seq_len)
+            video_token_id = self._vl_config.video_token_id
+            vision_bool_mask = (input_ids == image_token_id) | (
+                input_ids == video_token_id
+            )  # (BS, seq_len)
 
-            # Convert bool mask to position indices (1D tensor of int positions)
+            # For batch_size=1 (primary path): extract positions from batch element 0.
+            # For batch_size>1: each element may have different image token positions;
+            # we'd need per-element scatter. Currently only batch_size=1 is supported
+            # for VL (the compiled model uses batch_size=1 for CTE).
+            if batch_size > 1:
+                logger.warning(
+                    "VL generation with batch_size > 1 is not fully supported. "
+                    "Using batch element 0 for vision scatter positions."
+                )
+
             positions = (
                 vision_bool_mask[0].nonzero(as_tuple=False).squeeze(-1)
             )  # (n_vision_tokens,)
@@ -489,8 +531,12 @@ class NeuronQwen35MoeVLForCausalLM:
             )
 
         logits = output[0] if isinstance(output, tuple) else output.logits
-        next_token = torch.argmax(logits[:, -1, :], dim=-1)
+        next_token = self._sample_token(logits[:, -1, :], temperature, top_p, top_k)
         generated_ids = torch.cat([generated_ids, next_token.unsqueeze(-1)], dim=-1)
+
+        # Check EOS after first token
+        if next_token.item() in eos_token_ids:
+            return generated_ids
 
         # Step 4: Token generation (TKG) loop
         for _ in range(max_new_tokens - 1):
@@ -508,14 +554,62 @@ class NeuronQwen35MoeVLForCausalLM:
                     return_dict=False,
                 )
             logits = output[0] if isinstance(output, tuple) else output.logits
-            next_token = torch.argmax(logits[:, -1, :], dim=-1)
+            next_token = self._sample_token(logits[:, -1, :], temperature, top_p, top_k)
             generated_ids = torch.cat([generated_ids, next_token.unsqueeze(-1)], dim=-1)
 
             # Stop on EOS
-            if next_token.item() in (151643, 151645):  # Qwen EOS tokens
+            if next_token.item() in eos_token_ids:
                 break
 
         return generated_ids
+
+    @staticmethod
+    def _sample_token(logits, temperature=0.0, top_p=1.0, top_k=0):
+        """Sample a token from logits with optional temperature/top-p/top-k.
+
+        Args:
+            logits: (batch_size, vocab_size) unnormalized logits
+            temperature: Sampling temperature. 0.0 = greedy (argmax).
+            top_p: Nucleus sampling threshold. 1.0 = disabled.
+            top_k: Top-k filtering. 0 = disabled.
+
+        Returns:
+            token_id: (batch_size,) sampled token IDs
+        """
+        if temperature <= 0.0:
+            return torch.argmax(logits, dim=-1)
+
+        # Apply temperature
+        logits = logits / temperature
+
+        # Top-k filtering
+        if top_k > 0:
+            top_k = min(top_k, logits.shape[-1])
+            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits[indices_to_remove] = float("-inf")
+
+        # Top-p (nucleus) filtering
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(
+                torch.softmax(sorted_logits, dim=-1), dim=-1
+            )
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift right so the first token above threshold is kept
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                ..., :-1
+            ].clone()
+            sorted_indices_to_remove[..., 0] = False
+            # Scatter back to original indexing
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                -1, sorted_indices, sorted_indices_to_remove
+            )
+            logits[indices_to_remove] = float("-inf")
+
+        # Sample from the filtered distribution
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     @staticmethod
     def prepare_input_args(text_prompt, image_path, processor, role="user"):
