@@ -21,17 +21,25 @@
 import logging
 from typing import Optional, Tuple, Type
 
+import warnings
 import torch
 import torch.utils.checkpoint
 from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     ColumnParallelLinear,
     RowParallelLinear,
+    ParallelEmbedding,
 )
 from neuronx_distributed.parallel_layers.mappings import gather_from_sequence_parallel_region
 from neuronx_distributed.utils import cpu_mode
 from torch import Tensor, nn
 
-from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
+from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig, MoENeuronConfig
+from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
+from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
+from neuronx_distributed_inference.models.layer_boundary_marker import (
+    ModuleMarkerEndWrapper,
+    ModuleMarkerStartWrapper,
+)
 from neuronx_distributed_inference.models.deepseek.rope_util import (
     DeepseekV3YarnRotaryEmbedding,
     apply_rotary_pos_emb,
@@ -39,17 +47,31 @@ from neuronx_distributed_inference.models.deepseek.rope_util import (
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import manual_softmax
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
+from transformers import AutoModelForCausalLM
 
 logger = logging.getLogger(__name__)
 
+def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "DeepseekV3InferenceConfig") -> dict:
+    # TODO: Implement state dict conversion
+    return state_dict
+
 
 class DeepseekV3InferenceConfig(InferenceConfig):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_local_experts = getattr(self, "n_routed_experts", getattr(self, "num_experts", 0))
+        self.n_shared_experts = getattr(self, "n_shared_experts", 0)
+        self.num_experts_per_tok = getattr(self, "num_experts_per_tok", 0)
+        if getattr(self, "moe_intermediate_size", None) is not None:
+            self.intermediate_size = self.moe_intermediate_size
+
     def add_derived_config(self):
         self.num_cores_per_group = 1
 
     @classmethod
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
-        return NeuronConfig
+        return MoENeuronConfig
 
 
 def get_rmsnorm_cls():
@@ -301,16 +323,183 @@ class DeepseekV3Attention(NeuronAttentionBase):
 
         return attn_output, past_key_value, cos_cache, sin_cache
 
+class NeuronDeepseekV3DecoderLayer(nn.Module):
+    """
+    Just replace the attention with the NXD version, and MLP with the NXD version
+    """
 
-def custom_compiler_args():
+    def __init__(self, config: DeepseekV3InferenceConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = NeuronDeepseekV3Attention(config=config)
+        self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
+
+        self.input_layernorm = get_rmsnorm_cls()(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm = get_rmsnorm_cls()(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+
+        if self.moe_fused_nki_kernel_enabled:
+            self.mlp = initialize_moe_module(
+                config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
+            )
+        else:
+            self.mlp = initialize_moe_module(
+                config=config,
+            )
+
+        self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
+        self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+        self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
+        self.moe_mask_padded_tokens = config.neuron_config.moe_mask_padded_tokens
+        self.config = config
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.FloatTensor`, *optional*):
+                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
+                query_sequence_length, key_sequence_length)` if default attention is used.
+            position_ids (`torch.FloatTensor`, *optional*):
+                position ids of size `(batch_size, sequence_length)`.
+            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+        """
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+
+        residual = hidden_states
+
+        qkv_fused_rmsnorm = None
+        # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
+        # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
+        hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+        if self.input_layernorm:
+            if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
+                qkv_fused_rmsnorm = self.input_layernorm
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            rmsnorm=qkv_fused_rmsnorm,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # MoE
+        residual = hidden_states
+        if not self.moe_fused_nki_kernel_enabled:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+        is_speculative_decoding = self.config.neuron_config.enable_fused_speculation and (not self.config.neuron_config.is_prefill_stage)
+        hidden_states = self.mlp(hidden_states, padding_mask, is_speculative_decoding=is_speculative_decoding)[0]
+        hidden_states = residual + hidden_states
+
+        # End module marker
+        hidden_states = ModuleMarkerEndWrapper()(hidden_states)
+        outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
+
+        return outputs
+
+
+class NeuronDeepseekV3Model(NeuronBaseModel):
     """
-    Over-ride function from base class for better control over compiler flags
+    NeuronDeepseekV3Model extends the DeepseekV3Model to be traceable.
+    The forward function of this class is traced.
     """
-    compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
-    compiler_args += (
-        " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
-    )
-    # add dma optimization flag
-    compiler_args += " --tensorizer-options='--vectorize-strided-dma'"
-    compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
-    return compiler_args
+
+    def setup_attr_for_model(self, config: DeepseekV3InferenceConfig):
+        self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
+        self.tp_degree = config.neuron_config.tp_degree
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.max_batch_size = config.neuron_config.max_batch_size
+        self.buckets = config.neuron_config.buckets
+
+    def init_model(self, config: DeepseekV3InferenceConfig):
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = ParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+            dtype=config.neuron_config.torch_dtype,
+            shard_across_embedding=True,
+        )
+        self.layers = nn.ModuleList(
+            [
+                NeuronDeepseekV3DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = get_rmsnorm_cls()(self.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            gather_output=False if self.on_device_sampling else True,
+            bias=False,
+        )
+
+
+class NeuronDeepseekV3ForCausalLM(NeuronBaseForCausalLM):
+    """
+    This class can be used as DeepseekV3ForCausalLM
+    """
+
+    _model_cls = NeuronDeepseekV3Model
+
+    @staticmethod
+    def load_hf_model(model_path, **kwargs):
+        return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+
+    @classmethod
+    def get_config_cls(cls):
+        return DeepseekV3InferenceConfig
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: DeepseekV3InferenceConfig) -> dict:
+        return convert_deepseek_v3_hf_to_neuron_state_dict(state_dict, config)
+
+    # Wraps NeuronBaseForCausalLM.enable_context_encoding() to add compile_tag.
+    def enable_context_encoding(self):
+        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
+        super().enable_context_encoding()
+
+    # Wraps NeuronBaseForCausalLM.enable_token_generation() to add compile_tag.
+    def enable_token_generation(self):
+        self.compile_tag = TOKEN_GENERATION_MODEL_TAG
+        super().enable_token_generation()
+
+
+    def custom_compiler_args(self):
+        """
+        Over-ride function from base class for better control over compiler flags
+        """
+        compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
+        compiler_args += (
+            " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
+        )
+        # add dma optimization flag
+        compiler_args += " --tensorizer-options='--vectorize-strided-dma'"
+        compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
+        return compiler_args
