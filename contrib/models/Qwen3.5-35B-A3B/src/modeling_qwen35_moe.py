@@ -966,8 +966,14 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         q_ln = get_rmsnorm_cls()(config.head_dim, rms_norm_eps)
         k_ln = get_rmsnorm_cls()(config.head_dim, rms_norm_eps)
 
-        # Use mRoPE for VL support (handles 3D position_ids for T/H/W)
-        rotary_emb = Qwen35MRoPEEmbedding(config)
+        # Partial RoPE: use standard RotaryEmbedding (identical to pre-mRoPE working code).
+        # For VL with 3D mRoPE positions, cos/sin are pre-computed externally in
+        # get_model_output() using Qwen35MRoPEEmbedding and passed as cos_cache/sin_cache.
+        rotary_emb = RotaryEmbedding(
+            self.rope_dim,  # Only 64 dims get rotary embedding
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
         super().__init__(
             config=config,
             hidden_size=config.hidden_size,
@@ -980,6 +986,11 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             q_layernorm=q_ln,
             k_layernorm=k_ln,
         )
+
+        # Separate mRoPE module for VL 3D position_ids (not used as self.rotary_emb).
+        # When rotary_position_ids is 3D (T/H/W), we pre-compute cos/sin with mRoPE
+        # and pass them to prep_qkv_tensors via cos_cache/sin_cache.
+        self.mrope_emb = Qwen35MRoPEEmbedding(config)
 
         # Output gate projection: hidden_size -> num_heads * head_dim (4096)
         # This is populated from the second half of q_proj during state dict conversion.
@@ -1064,14 +1075,19 @@ class NeuronQwen35Attention(NeuronAttentionBase):
           attn_output = attn_output * gate
           attn_output = o_proj(attn_output)
 
-        Uses rotary_position_ids (3D mRoPE) if available, else position_ids.
+        Phase 2 mRoPE: cos_cache/sin_cache are pre-computed from 3D mRoPE
+        position_ids in get_model_output() and passed through the decoder loop.
+        When they arrive non-None, apply_rotary_embedding skips self.rotary_emb()
+        and uses the pre-computed values directly. For TKG (cos/sin=None),
+        self.rotary_emb computes from 2D position_ids as before.
         """
         bsz, q_len, _ = hidden_states.shape
 
-        # Use mRoPE position IDs if available, else standard position IDs
-        rope_pos_ids = (
-            rotary_position_ids if rotary_position_ids is not None else position_ids
-        )
+        # Use standard 2D position_ids for prep_qkv_tensors.
+        # When cos/sin are pre-computed (mRoPE), apply_rotary_embedding skips
+        # self.rotary_emb() and uses them directly. When None (TKG),
+        # self.rotary_emb computes from these 2D position_ids.
+        rope_pos_ids = position_ids
 
         # Compute gate from input hidden states (before QKV projection)
         gate = self.output_gate_proj(hidden_states)  # (B, S, num_heads * head_dim)
@@ -1255,6 +1271,8 @@ class NeuronQwen35DecoderLayer(nn.Module):
         position_ids=None,
         past_key_value=None,
         padding_mask=None,
+        cos_cache=None,
+        sin_cache=None,
         **kwargs,
     ):
         # V30 identity diagnostic: skip all layer computation, return input unchanged
@@ -1356,7 +1374,8 @@ class NeuronQwen35DecoderLayer(nn.Module):
                 hidden_states = residual + attn_out
                 present_key_value = dummy_kv
                 deltanet_states = (new_rec_state, new_conv_state)
-            cos_cache, sin_cache = None, None
+            # Pass through cos/sin cache (pre-computed mRoPE from get_model_output)
+            # instead of resetting to None, so subsequent GQA layers receive them.
         else:
             deltanet_states = None
             if skip_attn:
@@ -1390,6 +1409,8 @@ class NeuronQwen35DecoderLayer(nn.Module):
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_value,
+                    cos_cache=cos_cache,
+                    sin_cache=sin_cache,
                     **kwargs,
                 )
                 hidden_states = residual + hidden_states
@@ -1473,6 +1494,10 @@ class NeuronQwen35MoeModel(NeuronBaseModel):
             gather_output=False if self.on_device_sampling else True,
             bias=False,
         )
+
+        # mRoPE embedding for VL: pre-computes cos/sin from 3D position_ids
+        # in get_model_output() before the decoder layer loop.
+        self.mrope_emb = Qwen35MRoPEEmbedding(config)
 
     @property
     def _deltanet_state_params(self):
@@ -1591,6 +1616,15 @@ class NeuronQwen35MoeModel(NeuronBaseModel):
         deltanet_state_tensors = []  # Collect DeltaNet states
         cos_cache = None
         sin_cache = None
+
+        # Phase 2 mRoPE: Pre-compute cos/sin from 3D position_ids when available.
+        # For CTE with VL content, rotary_position_ids is (3, B, S) with T/H/W positions.
+        # For text-only CTE, it's (3, B, S) with T=H=W=sequential.
+        # For TKG, it's None (set_none_if_empty converted torch.zeros((0,)) to None).
+        # Pre-computing here ensures all layers receive the same mRoPE cos/sin,
+        # and DeltaNet layers pass them through unchanged.
+        if rotary_position_ids is not None and rotary_position_ids.ndim == 3:
+            cos_cache, sin_cache = self.mrope_emb(inputs_embeds, rotary_position_ids)
 
         for idx, decoder_layer in enumerate(self.layers):
             past_key_value = (
@@ -2107,27 +2141,58 @@ class Qwen35ModelWrapper(ModelWrapper):
         return extended_inputs
 
     def pad_inputs(self, *args, pad_type="first_fit"):
-        """Override to re-generate mrope_position_ids and vision inputs after bucketing.
+        """Override to pad mrope_position_ids and vision inputs to bucket size.
 
-        When the base class pads sequences to bucket length, positions 21-23
-        need to be re-generated at the new padded length.
+        CRITICAL FIX: The base class pad_inputs() (model_wrapper.py line 831)
+        has a code path that REGENERATES vision embeddings as all-zeros when
+        it detects 24 args with vision_mask shape != pad_length. This destroys
+        the real vision data BEFORE our override gets to work on it.
+
+        Solution: Save the ORIGINAL vision args (positions 21-23) BEFORE
+        calling super().pad_inputs(), then use those originals for
+        zero-extension padding afterward.
         """
-        # Let base class pad positions 0-2 and pass through 3+
+        # Save original vision args BEFORE the base class destroys them
+        orig_mrope = args[21] if len(args) >= 22 else None
+        orig_vis_emb = args[22] if len(args) >= 23 else None
+        orig_vis_mask = args[23] if len(args) >= 24 else None
+
+        # Let base class pad positions 0-2 (input_ids, attention_mask, position_ids)
+        # NOTE: base class will zero out positions 22-23, but we saved originals above
         padded_args = super().pad_inputs(*args, pad_type=pad_type)
 
-        # Check if re-generation is needed (CTE only, when we have 24 args)
-        if len(padded_args) >= 24:
+        # Check if padding is needed (CTE only, when we have 24 args)
+        if len(padded_args) >= 24 and orig_mrope is not None:
             padded_seq_len = padded_args[0].shape[1]
             batch_size = padded_args[0].shape[0]
             is_cte = padded_seq_len > 1
 
             if is_cte:
-                current_mrope = padded_args[21]
-                # Re-generate mrope_position_ids if shape doesn't match
+                # Use ORIGINALS (not the base-class-zeroed versions)
+                current_mrope = orig_mrope
+                current_vis_emb = orig_vis_emb
+                current_vis_mask = orig_vis_mask
+
+                # Pad mrope_position_ids: (3, BS, orig_len) -> (3, BS, padded_len)
                 if (
-                    current_mrope.ndim >= 2
+                    current_mrope.ndim == 3
                     and current_mrope.shape[-1] != padded_seq_len
                 ):
+                    orig_len = current_mrope.shape[-1]
+                    pad_size = padded_seq_len - orig_len
+                    last_pos = current_mrope[:, :, -1:]  # (3, BS, 1)
+                    pad_offsets = torch.arange(
+                        1, pad_size + 1, dtype=current_mrope.dtype
+                    )
+                    pad_offsets = (
+                        pad_offsets.unsqueeze(0).unsqueeze(0).expand(3, batch_size, -1)
+                    )
+                    mrope_pad = last_pos + pad_offsets
+                    mrope_position_ids = torch.cat([current_mrope, mrope_pad], dim=-1)
+                elif current_mrope.ndim == 3:
+                    mrope_position_ids = current_mrope
+                else:
+                    # Fallback: generate sequential (text-only tracing)
                     mrope_position_ids = (
                         torch.arange(0, padded_seq_len, dtype=torch.int32)
                         .unsqueeze(0)
@@ -2136,21 +2201,66 @@ class Qwen35ModelWrapper(ModelWrapper):
                         .contiguous()
                     )
 
+                # Pad vision_embeddings: (BS, orig_len, H) -> (BS, padded_len, H)
+                # Extend with zeros (padding tokens have no vision content)
+                if (
+                    current_vis_emb is not None
+                    and current_vis_emb.ndim == 3
+                    and current_vis_emb.shape[1] < padded_seq_len
+                ):
+                    pad_emb = torch.zeros(
+                        (
+                            batch_size,
+                            padded_seq_len - current_vis_emb.shape[1],
+                            current_vis_emb.shape[2],
+                        ),
+                        dtype=current_vis_emb.dtype,
+                    )
+                    vision_embeddings = torch.cat([current_vis_emb, pad_emb], dim=1)
+                elif current_vis_emb is not None and current_vis_emb.ndim == 3:
+                    vision_embeddings = current_vis_emb[:, :padded_seq_len]
+                else:
                     vision_embeddings = torch.zeros(
                         (batch_size, padded_seq_len, self.config.hidden_size),
                         dtype=self.config.neuron_config.torch_dtype,
                     )
+
+                # Pad vision_mask: (BS, orig_len, 1) -> (BS, padded_len, 1)
+                # Extend with padded_seq_len-1 (safe scatter target for padding)
+                if (
+                    current_vis_mask is not None
+                    and current_vis_mask.ndim == 3
+                    and current_vis_mask.shape[1] < padded_seq_len
+                ):
+                    pad_mask = torch.full(
+                        (batch_size, padded_seq_len - current_vis_mask.shape[1], 1),
+                        fill_value=padded_seq_len - 1,
+                        dtype=torch.int32,
+                    )
+                    vision_mask = torch.cat([current_vis_mask, pad_mask], dim=1)
+                elif current_vis_mask is not None and current_vis_mask.ndim == 3:
+                    vision_mask = current_vis_mask[:, :padded_seq_len]
+                else:
                     vision_mask = torch.full(
                         (batch_size, padded_seq_len, 1),
                         fill_value=padded_seq_len - 1,
                         dtype=torch.int32,
                     )
-                    padded_args = (
-                        *padded_args[:21],
-                        mrope_position_ids,
-                        vision_embeddings,
-                        vision_mask,
-                    )
+
+                padded_args = (
+                    *padded_args[:21],
+                    mrope_position_ids,
+                    vision_embeddings,
+                    vision_mask,
+                )
+
+                # CRITICAL: Clamp vision_mask entries to valid range.
+                # VL generate uses a sentinel (2**30) for padding entries.
+                # Clamp to padded_seq_len - 1 (a padding position, safe to
+                # scatter zeros to without corrupting real token embeddings).
+                padded_args = list(padded_args)
+                padded_args[23] = padded_args[23].clamp(max=padded_seq_len - 1)
+                padded_args = tuple(padded_args)
 
         return padded_args
 
@@ -2328,14 +2438,17 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
         elif is_prefill:
             # Text-only CTE: generate dummy vision inputs matching compiled shape.
             # The compiled CTE expects (BS, seq_len, hidden_size) and (BS, seq_len, 1).
-            # Use zeros for embeddings and fill_value=seq_len-1 for mask (safe scatter target).
+            # Use zeros for embeddings and a SAFE scatter target for mask.
+            # CRITICAL: fill_value must NOT be a real token position -- use sentinel
+            # that pad_inputs() will clamp to the last padded (bucket) position.
+            _SAFE_SCATTER_SENTINEL = 2**30
             vision_embeddings = torch.zeros(
                 (batch_size, seq_len, self.config.hidden_size),
                 dtype=self.config.neuron_config.torch_dtype,
             )
             vision_mask = torch.full(
                 (batch_size, seq_len, 1),
-                fill_value=seq_len - 1,
+                fill_value=_SAFE_SCATTER_SENTINEL,
                 dtype=torch.int32,
             )
             mrope_position_ids = None

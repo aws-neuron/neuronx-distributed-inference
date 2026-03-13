@@ -431,34 +431,58 @@ class NeuronQwen35MoeVLForCausalLM:
             else:
                 vis_emb_padded = vis_emb[:, :pad_limit]
 
-            # Pad positions to (1, pad_limit, 1) with fill_value=pad_limit-1
+            # Pad positions to (1, pad_limit, 1) with a SAFE fill value.
+            # CRITICAL: fill_value must NOT be a real token position, otherwise
+            # index_put_ will scatter zero embeddings over a real token's embedding.
+            # Use a large sentinel (2**30) that pad_inputs() will clamp to the
+            # last padded (bucket) position, which is always a padding slot.
+            _SAFE_SCATTER_SENTINEL = 2**30
             positions_padded = torch.full(
                 (1, pad_limit, 1),
-                fill_value=pad_limit - 1,
+                fill_value=_SAFE_SCATTER_SENTINEL,
                 dtype=torch.int32,
             )
             positions_padded[0, :n_vis, 0] = positions[:pad_limit].to(torch.int32)
 
             llava_args = [vis_emb_padded, positions_padded]
 
-            # Append 3D mRoPE position IDs for the text model.
-            # position_ids shape: (3, batch_size, seq_len) from get_rope_index.
-            # Pad to match the compiled CTE sequence length.
-            if position_ids.ndim == 3:
-                mrope_pos = position_ids[:, :, :seq_len].to(torch.int32).contiguous()
-                llava_args.append(mrope_pos)
+            # TEMPORARILY DISABLED: mRoPE 3D positions cause degenerate output.
+            # When mRoPE is disabled, _get_model_outputs generates sequential T=H=W
+            # positions (equivalent to standard 2D RoPE). This lets us verify the
+            # vision pipeline works independently of mRoPE.
+            # TODO: Re-enable once mRoPE cos/sin generation is verified correct.
+            # if position_ids.ndim == 3:
+            #     mrope_pos = position_ids[:, :, :seq_len].to(torch.int32).contiguous()
+            #     llava_args.append(mrope_pos)
         else:
             vision_embeddings = None
 
         # Step 3: Context encoding (prefill)
         generated_ids = input_ids.clone()
 
+        # CRITICAL: Always pass an explicit attention_mask for CTE.
+        # The base class _infer_attention_mask() assumes sequential position_ids
+        # (position_ids[i] >= i). When position_ids come from mRoPE temporal
+        # axis (non-sequential, e.g., all vision tokens share position 4),
+        # the inferred mask incorrectly masks out most of the sequence.
+        # Fix: provide a real all-ones mask for the actual token positions.
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        # For slot 2 (position_ids): use SEQUENTIAL positions regardless of mRoPE.
+        # Slot 2 is only used for: (1) logit position selection via torch.max(),
+        # (2) attention mask inference (which we bypass with explicit mask above).
+        # The actual RoPE computation uses slot 21 (rotary_position_ids) from
+        # _get_model_outputs, NOT slot 2. Using sequential slot 2 ensures
+        # correct logit selection and avoids any position_ids-related issues.
+        seq_len = input_ids.shape[1]
+        cte_position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+
         with torch.no_grad():
             output = self.text_model(
                 input_ids=input_ids,
-                position_ids=position_ids[0]
-                if position_ids.ndim == 3
-                else position_ids,
+                attention_mask=attention_mask,
+                position_ids=cte_position_ids,
                 output_attentions=False,
                 output_hidden_states=False,
                 return_dict=False,
