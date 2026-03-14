@@ -9,7 +9,7 @@ Architecture:
   - TP-sharded attention (ColumnParallelLinear/RowParallelLinear)
   - DistributedRMSNorm for QK-norm (all-reduce across TP ranks)
   - SPMDRank-based RoPE slicing (critical fix for TP>1)
-  - BMM-based attention (replaces SDPA for Neuron compatibility)
+  - NKI flash attention for video self-attn (seq >= 512), BMM fallback otherwise
 
 The model takes 22 preprocessed tensor inputs (proj_in, time_embed,
 RoPE, caption_projection, attention masks all computed on CPU) and
@@ -61,22 +61,52 @@ except ImportError:
     NEURON_AVAILABLE = False
 
 
-# ── BMM-based SDPA replacement ──────────────────────────────────────────────
+# ── NKI Flash Attention + BMM-based SDPA replacement ────────────────────────
 _sdpa_replaced = False
 _sdpa_original = None
 
+# Minimum sequence length for NKI flash attention kernel eligibility
+_NKI_FLASH_MIN_SEQ = 512
+
+
+def _try_load_nki_flash():
+    """Try to load the NKI flash attention kernel from the SDK.
+
+    Returns the kernel function or None if unavailable.
+    """
+    try:
+        from neuronx_distributed_inference.experimental.functional.attention.causal_attention_functions import (
+            scaled_dot_product_attention_kernel,
+        )
+
+        return scaled_dot_product_attention_kernel
+    except ImportError:
+        logger.warning("NKI flash attention kernel not available, using BMM fallback")
+        return None
+
 
 def replace_sdpa_with_bmm():
-    """Replace F.scaled_dot_product_attention with BMM-based implementation.
+    """Replace F.scaled_dot_product_attention with NKI flash + BMM hybrid.
 
-    SDPA is not supported on Neuron XLA. This replacement uses explicit
-    BMM + softmax which compiles cleanly. Handles 3D and 4D inputs,
-    optional attention masks, and falls back to original SDPA on CPU.
+    For attention with no mask, Q.seq >= 512, and 4D input on Neuron:
+      Uses the NKI flash attention kernel (tiled, no score matrix materialization).
+      This covers:
+        - Video self-attention (attn1): Q.seq == K.seq == 6144
+        - Audio-to-video cross-modal attention (a2v): Q.seq=6144, K.seq=121
+      The kernel supports Q.seq != K.seq for non-causal attention.
+
+    For attention with masks or Q.seq < 512:
+      Falls back to explicit BMM + softmax.
+
+    Falls back to original SDPA on CPU.
     """
     global _sdpa_replaced, _sdpa_original
     if _sdpa_replaced:
         return _sdpa_original
     _sdpa_original = torch.nn.functional.scaled_dot_product_attention
+
+    # Try to load the NKI flash kernel at module init time
+    _nki_flash_kernel = _try_load_nki_flash()
 
     def neuron_sdpa(
         query,
@@ -99,6 +129,28 @@ def replace_sdpa_with_bmm():
                 is_causal=is_causal,
                 scale=scale,
             )
+
+        # ── NKI Flash Attention path ────────────────────────────────────
+        # Eligible when: 4D input, no mask, Q.seq >= 512
+        # The kernel supports Q.seq != K.seq for non-causal attention.
+        # This covers:
+        #   - Video self-attention (attn1): Q=6144, K=6144 — majority of attn compute
+        #   - Audio-to-video cross-modal (a2v): Q=6144, K=121
+        # Cross-attention with masks (attn2, audio_attn2) uses BMM fallback.
+        # Audio attention with Q.seq < 512 (audio_attn1, v2a) uses BMM fallback.
+        if (
+            _nki_flash_kernel is not None
+            and attn_mask is None
+            and len(query.shape) == 4
+            and query.shape[2] >= _NKI_FLASH_MIN_SEQ
+        ):
+            if scale is None:
+                scale = 1.0 / math.sqrt(query.shape[-1])
+            return _nki_flash_kernel(
+                query, key, value, is_causal=False, scale=float(scale)
+            )
+
+        # ── BMM fallback path ───────────────────────────────────────────
         d = query.shape[-1]
         if scale is None:
             scale = 1.0 / math.sqrt(d)
@@ -200,7 +252,7 @@ class NeuronLTX2TransformerBackbone(nn.Module):
     Key features:
     - SPMDRank for correct per-rank RoPE slicing in TP>1
     - DistributedRMSNorm for QK-norm (all-reduce across ranks)
-    - BMM-based SDPA (replaces torch SDPA for Neuron)
+    - BMM-based SDPA with NKI flash attention for video self-attn (replaces torch SDPA for Neuron)
     """
 
     def __init__(self, config):
