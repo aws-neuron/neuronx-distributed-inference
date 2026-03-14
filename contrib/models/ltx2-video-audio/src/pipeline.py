@@ -96,82 +96,33 @@ class NeuronTransformerWrapper(nn.Module):
         self.cross_attn_rope = cpu_transformer.cross_attn_rope
         self.cross_attn_audio_rope = cpu_transformer.cross_attn_audio_rope
 
-    def forward(
+    def _compute_step_invariant(
         self,
-        hidden_states,
-        audio_hidden_states=None,
-        encoder_hidden_states=None,
-        audio_encoder_hidden_states=None,
-        timestep=None,
-        encoder_attention_mask=None,
-        audio_encoder_attention_mask=None,
-        num_frames=None,
-        height=None,
-        width=None,
-        fps=None,
-        audio_num_frames=None,
-        video_coords=None,
-        audio_coords=None,
-        return_dict=False,
-        **kwargs,
+        encoder_hidden_states,
+        audio_encoder_hidden_states,
+        encoder_attention_mask,
+        audio_encoder_attention_mask,
+        video_coords,
+        audio_coords,
+        batch_size,
+        inner_dim,
+        audio_inner_dim,
+        dtype,
     ):
-        """Preprocess on CPU, run 48 blocks on Neuron, return results."""
-        batch_size = hidden_states.shape[0]
-        dtype = torch.bfloat16
+        """Compute and cache step-invariant preprocessing (caption proj, RoPE, masks).
 
+        These values depend only on the prompt and spatial layout, not the timestep
+        or noisy latents, so they are identical across all denoising steps.
+        Computing them once saves ~0.2-0.4s of CPU time per step.
+        """
         with torch.no_grad():
-            # 1. Project inputs (CPU)
-            hs = self.proj_in(hidden_states)
-            ahs = self.audio_proj_in(audio_hidden_states)
-
-            # 2. Time embeddings (CPU)
-            temb, embedded_ts = self.time_embed(
-                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
-            )
-            temb = temb.view(batch_size, -1, temb.size(-1))
-            embedded_ts = embedded_ts.view(batch_size, -1, embedded_ts.size(-1))
-
-            temb_audio, audio_embedded_ts = self.audio_time_embed(
-                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
-            )
-            temb_audio = temb_audio.view(batch_size, -1, temb_audio.size(-1))
-            audio_embedded_ts = audio_embedded_ts.view(
-                batch_size, -1, audio_embedded_ts.size(-1)
-            )
-
-            # 3. Cross-attention conditioning (CPU)
-            ts_scale = (
-                self.config.cross_attn_timestep_scale_multiplier
-                / self.config.timestep_scale_multiplier
-            )
-
-            video_ca_ss, _ = self.av_cross_attn_video_scale_shift(
-                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
-            )
-            video_ca_gate, _ = self.av_cross_attn_video_a2v_gate(
-                timestep.flatten() * ts_scale, batch_size=batch_size, hidden_dtype=dtype
-            )
-            video_ca_ss = video_ca_ss.view(batch_size, -1, video_ca_ss.shape[-1])
-            video_ca_gate = video_ca_gate.view(batch_size, -1, video_ca_gate.shape[-1])
-
-            audio_ca_ss, _ = self.av_cross_attn_audio_scale_shift(
-                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
-            )
-            audio_ca_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
-                timestep.flatten() * ts_scale, batch_size=batch_size, hidden_dtype=dtype
-            )
-            audio_ca_ss = audio_ca_ss.view(batch_size, -1, audio_ca_ss.shape[-1])
-            audio_ca_v2a_gate = audio_ca_v2a_gate.view(
-                batch_size, -1, audio_ca_v2a_gate.shape[-1]
-            )
-
-            # 4. Caption projection (CPU)
+            # Caption projection (CPU)
             enc_hs = self.caption_projection(encoder_hidden_states)
-            enc_hs = enc_hs.view(batch_size, -1, hs.size(-1))
+            enc_hs = enc_hs.view(batch_size, -1, inner_dim)
             audio_enc_hs = self.audio_caption_projection(audio_encoder_hidden_states)
-            audio_enc_hs = audio_enc_hs.view(batch_size, -1, ahs.size(-1))
+            audio_enc_hs = audio_enc_hs.view(batch_size, -1, audio_inner_dim)
 
-            # 5. RoPE (CPU) — use precomputed coords from the pipeline
+            # RoPE (CPU) — compute from coords
             video_rotary_emb = self.rope(video_coords, device="cpu")
             audio_rotary_emb = self.audio_rope(audio_coords, device="cpu")
             video_cross_rotary_emb = self.cross_attn_rope(
@@ -199,7 +150,7 @@ class NeuronTransformerWrapper(nn.Module):
             audio_cross_rotary_emb[1].to(dtype),
         )
 
-        # 6. Attention masks — convert from binary (B, text_seq) to additive bias
+        # Attention masks — convert from binary (B, text_seq) to additive bias
         with torch.no_grad():
             if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
                 enc_mask = (1 - encoder_attention_mask.to(dtype)) * -10000.0
@@ -220,6 +171,140 @@ class NeuronTransformerWrapper(nn.Module):
                 enc_mask = torch.zeros(batch_size, 1, self.text_seq, dtype=dtype)
             if audio_enc_mask is None:
                 audio_enc_mask = torch.zeros(batch_size, 1, self.text_seq, dtype=dtype)
+
+        return (
+            enc_hs,
+            audio_enc_hs,
+            video_rotary_emb,
+            audio_rotary_emb,
+            video_cross_rotary_emb,
+            audio_cross_rotary_emb,
+            enc_mask,
+            audio_enc_mask,
+        )
+
+    def forward(
+        self,
+        hidden_states,
+        audio_hidden_states=None,
+        encoder_hidden_states=None,
+        audio_encoder_hidden_states=None,
+        timestep=None,
+        encoder_attention_mask=None,
+        audio_encoder_attention_mask=None,
+        num_frames=None,
+        height=None,
+        width=None,
+        fps=None,
+        audio_num_frames=None,
+        video_coords=None,
+        audio_coords=None,
+        return_dict=False,
+        **kwargs,
+    ):
+        """Preprocess on CPU, run 48 blocks on Neuron, return results.
+
+        Step-invariant computations (caption projection, RoPE, attention masks) are
+        cached after the first call and reused for subsequent denoising steps. The
+        cache is invalidated when encoder_hidden_states changes (new prompt).
+        """
+        batch_size = hidden_states.shape[0]
+        dtype = torch.bfloat16
+
+        with torch.no_grad():
+            # 1. Project inputs (CPU) — step-varying (latents change each step)
+            hs = self.proj_in(hidden_states)
+            ahs = self.audio_proj_in(audio_hidden_states)
+
+            # 2. Time embeddings (CPU) — step-varying (timestep changes each step)
+            temb, embedded_ts = self.time_embed(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
+            )
+            temb = temb.view(batch_size, -1, temb.size(-1))
+            embedded_ts = embedded_ts.view(batch_size, -1, embedded_ts.size(-1))
+
+            temb_audio, audio_embedded_ts = self.audio_time_embed(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
+            )
+            temb_audio = temb_audio.view(batch_size, -1, temb_audio.size(-1))
+            audio_embedded_ts = audio_embedded_ts.view(
+                batch_size, -1, audio_embedded_ts.size(-1)
+            )
+
+            # 3. Cross-attention conditioning (CPU) — step-varying (timestep-dependent)
+            ts_scale = (
+                self.config.cross_attn_timestep_scale_multiplier
+                / self.config.timestep_scale_multiplier
+            )
+
+            video_ca_ss, _ = self.av_cross_attn_video_scale_shift(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
+            )
+            video_ca_gate, _ = self.av_cross_attn_video_a2v_gate(
+                timestep.flatten() * ts_scale, batch_size=batch_size, hidden_dtype=dtype
+            )
+            video_ca_ss = video_ca_ss.view(batch_size, -1, video_ca_ss.shape[-1])
+            video_ca_gate = video_ca_gate.view(batch_size, -1, video_ca_gate.shape[-1])
+
+            audio_ca_ss, _ = self.av_cross_attn_audio_scale_shift(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=dtype
+            )
+            audio_ca_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
+                timestep.flatten() * ts_scale, batch_size=batch_size, hidden_dtype=dtype
+            )
+            audio_ca_ss = audio_ca_ss.view(batch_size, -1, audio_ca_ss.shape[-1])
+            audio_ca_v2a_gate = audio_ca_v2a_gate.view(
+                batch_size, -1, audio_ca_v2a_gate.shape[-1]
+            )
+
+        # 4-6. Step-invariant: caption projection, RoPE, attention masks (cached)
+        # Use data_ptr() of encoder_hidden_states as cache key — changes per prompt,
+        # constant across denoising steps within a single generation.
+        cache_key = encoder_hidden_states.data_ptr()
+        if not hasattr(self, "_step_cache") or self._step_cache_key != cache_key:
+            (
+                enc_hs,
+                audio_enc_hs,
+                video_rotary_emb,
+                audio_rotary_emb,
+                video_cross_rotary_emb,
+                audio_cross_rotary_emb,
+                enc_mask,
+                audio_enc_mask,
+            ) = self._compute_step_invariant(
+                encoder_hidden_states,
+                audio_encoder_hidden_states,
+                encoder_attention_mask,
+                audio_encoder_attention_mask,
+                video_coords,
+                audio_coords,
+                batch_size,
+                hs.size(-1),
+                ahs.size(-1),
+                dtype,
+            )
+            self._step_cache = (
+                enc_hs,
+                audio_enc_hs,
+                video_rotary_emb,
+                audio_rotary_emb,
+                video_cross_rotary_emb,
+                audio_cross_rotary_emb,
+                enc_mask,
+                audio_enc_mask,
+            )
+            self._step_cache_key = cache_key
+        else:
+            (
+                enc_hs,
+                audio_enc_hs,
+                video_rotary_emb,
+                audio_rotary_emb,
+                video_cross_rotary_emb,
+                audio_cross_rotary_emb,
+                enc_mask,
+                audio_enc_mask,
+            ) = self._step_cache
 
         # 7. Call compiled Neuron model (22 positional args)
         # The Neuron backbone is compiled for batch_size=2 (CFG mode).
