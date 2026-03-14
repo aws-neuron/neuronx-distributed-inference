@@ -10,10 +10,12 @@ Architecture:
   - DistributedRMSNorm for QK-norm (all-reduce across TP ranks)
   - SPMDRank-based RoPE slicing (critical fix for TP>1)
   - NKI flash attention for video self-attn (seq >= 512), BMM fallback otherwise
+  - Batched CFG (BS=2): unconditional + conditional passes in a single forward call
 
 The model takes 22 preprocessed tensor inputs (proj_in, time_embed,
 RoPE, caption_projection, attention masks all computed on CPU) and
-returns (video_output, audio_output).
+returns (video_output, audio_output). All inputs have batch_size=2
+when CFG is active.
 
 Usage:
   See application.py for the high-level NeuronLTX2Application class.
@@ -601,6 +603,11 @@ class ModelWrapperLTX2Backbone(ModelWrapper if NEURON_AVAILABLE else object):
 
         Returns list of (tuple_of_tensors,) matching the 22-input forward() signature.
 
+        Compiled with batch_size=2 to support CFG (classifier-free guidance) natively.
+        With CFG, the Diffusers pipeline doubles the batch (uncond + cond) and the
+        Neuron backbone processes both in a single forward pass, avoiding the overhead
+        of two sequential BS=1 calls.
+
         Shapes are derived from the actual LTX-2 preprocessing pipeline:
         - time_embed produces (B, 6*inner_dim) for video, (B, 6*audio_inner_dim) for audio
         - cross-attn scale/shift has num_mod_params=4, gate has num_mod_params=1
@@ -620,6 +627,9 @@ class ModelWrapperLTX2Backbone(ModelWrapper if NEURON_AVAILABLE else object):
         audio_num_heads = self.config.audio_num_attention_heads
         audio_head_dim = self.config.audio_attention_head_dim
 
+        # Batch size = 2 for CFG (unconditional + conditional in one pass)
+        bs = 2
+
         # RoPE rotation dim per head:
         # self-attn video: rope.dim=inner_dim → inner_dim / num_heads / 2
         # self-attn audio: audio_rope.dim=audio_inner_dim → audio_inner_dim / audio_num_heads / 2
@@ -632,59 +642,59 @@ class ModelWrapperLTX2Backbone(ModelWrapper if NEURON_AVAILABLE else object):
 
         model_inputs = (
             # Projected hidden states (after proj_in / audio_proj_in on CPU)
-            torch.randn(1, video_seq, inner_dim, dtype=dtype),  # hidden_states
+            torch.randn(bs, video_seq, inner_dim, dtype=dtype),  # hidden_states
             torch.randn(
-                1, audio_seq, audio_inner_dim, dtype=dtype
+                bs, audio_seq, audio_inner_dim, dtype=dtype
             ),  # audio_hidden_states
             # Projected encoder hidden states (after caption_projection on CPU)
-            torch.randn(1, text_seq, inner_dim, dtype=dtype),  # encoder_hidden_states
+            torch.randn(bs, text_seq, inner_dim, dtype=dtype),  # encoder_hidden_states
             torch.randn(
-                1, text_seq, audio_inner_dim, dtype=dtype
+                bs, text_seq, audio_inner_dim, dtype=dtype
             ),  # audio_encoder_hidden_states
             # Time embeddings: LTX2AdaLayerNormSingle with num_mod_params=6
             # time_embed.linear: (embedding_dim) → (6 * embedding_dim)
-            torch.randn(1, 1, 6 * inner_dim, dtype=dtype),  # temb
-            torch.randn(1, 1, 6 * audio_inner_dim, dtype=dtype),  # temb_audio
+            torch.randn(bs, 1, 6 * inner_dim, dtype=dtype),  # temb
+            torch.randn(bs, 1, 6 * audio_inner_dim, dtype=dtype),  # temb_audio
             # Embedded timestep (second return from time_embed, shape=embedding_dim)
-            torch.randn(1, 1, inner_dim, dtype=dtype),  # embedded_timestep
-            torch.randn(1, 1, audio_inner_dim, dtype=dtype),  # audio_embedded_timestep
+            torch.randn(bs, 1, inner_dim, dtype=dtype),  # embedded_timestep
+            torch.randn(bs, 1, audio_inner_dim, dtype=dtype),  # audio_embedded_timestep
             # Cross-attn scale/shift: num_mod_params=4
-            torch.randn(1, 1, 4 * inner_dim, dtype=dtype),  # temb_ca_ss
-            torch.randn(1, 1, 4 * audio_inner_dim, dtype=dtype),  # temb_ca_audio_ss
+            torch.randn(bs, 1, 4 * inner_dim, dtype=dtype),  # temb_ca_ss
+            torch.randn(bs, 1, 4 * audio_inner_dim, dtype=dtype),  # temb_ca_audio_ss
             # Cross-attn gate: num_mod_params=1
-            torch.randn(1, 1, 1 * inner_dim, dtype=dtype),  # temb_ca_gate
-            torch.randn(1, 1, 1 * audio_inner_dim, dtype=dtype),  # temb_ca_audio_gate
+            torch.randn(bs, 1, 1 * inner_dim, dtype=dtype),  # temb_ca_gate
+            torch.randn(bs, 1, 1 * audio_inner_dim, dtype=dtype),  # temb_ca_audio_gate
             # Video RoPE cos/sin: (B, num_heads, video_seq, video_rope_dim)
             torch.randn(
-                1, num_heads, video_seq, video_rope_dim, dtype=dtype
+                bs, num_heads, video_seq, video_rope_dim, dtype=dtype
             ),  # video_rot_cos
             torch.randn(
-                1, num_heads, video_seq, video_rope_dim, dtype=dtype
+                bs, num_heads, video_seq, video_rope_dim, dtype=dtype
             ),  # video_rot_sin
             # Audio RoPE cos/sin: (B, audio_num_heads, audio_seq, audio_rope_dim)
             torch.randn(
-                1, audio_num_heads, audio_seq, audio_rope_dim, dtype=dtype
+                bs, audio_num_heads, audio_seq, audio_rope_dim, dtype=dtype
             ),  # audio_rot_cos
             torch.randn(
-                1, audio_num_heads, audio_seq, audio_rope_dim, dtype=dtype
+                bs, audio_num_heads, audio_seq, audio_rope_dim, dtype=dtype
             ),  # audio_rot_sin
             # Cross-attn RoPE: same seq_len, but rope dim = audio_ca_dim / heads / 2
             # cross_attn_rope has dim=audio_cross_attention_dim, not inner_dim
             torch.randn(
-                1, num_heads, video_seq, ca_video_rope_dim, dtype=dtype
+                bs, num_heads, video_seq, ca_video_rope_dim, dtype=dtype
             ),  # ca_video_rot_cos
             torch.randn(
-                1, num_heads, video_seq, ca_video_rope_dim, dtype=dtype
+                bs, num_heads, video_seq, ca_video_rope_dim, dtype=dtype
             ),  # ca_video_rot_sin
             torch.randn(
-                1, audio_num_heads, audio_seq, ca_audio_rope_dim, dtype=dtype
+                bs, audio_num_heads, audio_seq, ca_audio_rope_dim, dtype=dtype
             ),  # ca_audio_rot_cos
             torch.randn(
-                1, audio_num_heads, audio_seq, ca_audio_rope_dim, dtype=dtype
+                bs, audio_num_heads, audio_seq, ca_audio_rope_dim, dtype=dtype
             ),  # ca_audio_rot_sin
             # Attention masks: additive bias (B, 1, text_seq)
-            torch.zeros(1, 1, text_seq, dtype=dtype),  # encoder_attention_mask
-            torch.zeros(1, 1, text_seq, dtype=dtype),  # audio_encoder_attention_mask
+            torch.zeros(bs, 1, text_seq, dtype=dtype),  # encoder_attention_mask
+            torch.zeros(bs, 1, text_seq, dtype=dtype),  # audio_encoder_attention_mask
         )
 
         return [model_inputs]

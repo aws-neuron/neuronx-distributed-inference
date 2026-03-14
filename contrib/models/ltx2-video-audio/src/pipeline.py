@@ -222,9 +222,9 @@ class NeuronTransformerWrapper(nn.Module):
                 audio_enc_mask = torch.zeros(batch_size, 1, self.text_seq, dtype=dtype)
 
         # 7. Call compiled Neuron model (22 positional args)
-        # The Neuron backbone is compiled for batch_size=1. When CFG is active
-        # (guidance_scale > 1), the pipeline doubles the batch to 2 (uncond + cond).
-        # We handle this by calling the backbone twice and concatenating results.
+        # The Neuron backbone is compiled for batch_size=2 (CFG mode).
+        # When CFG is active (guidance_scale > 1), the pipeline doubles the batch
+        # to 2 (uncond + cond) and the backbone processes both in a single pass.
         backbone_args = (
             hs,
             ahs,
@@ -250,22 +250,7 @@ class NeuronTransformerWrapper(nn.Module):
             audio_enc_mask,
         )
 
-        if batch_size == 1:
-            video_output, audio_output = self.compiled_backbone(*backbone_args)
-        else:
-            # CFG mode: split batch, run twice, concatenate
-            video_parts = []
-            audio_parts = []
-            for i in range(batch_size):
-                single_args = tuple(
-                    a[i : i + 1] if a.shape[0] == batch_size else a
-                    for a in backbone_args
-                )
-                v, a = self.compiled_backbone(*single_args)
-                video_parts.append(v)
-                audio_parts.append(a)
-            video_output = torch.cat(video_parts, dim=0)
-            audio_output = torch.cat(audio_parts, dim=0)
+        video_output, audio_output = self.compiled_backbone(*backbone_args)
 
         return video_output, audio_output
 
