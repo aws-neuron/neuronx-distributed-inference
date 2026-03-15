@@ -18,6 +18,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# CRITICAL: Use finite negative value instead of -inf for Neuron attention masks.
+# The Neuron compiler's bfloat16 handling of -inf produces NaN that bleeds from
+# padding positions into ALL positions through the transformer layers.
+# -65504.0 is large enough for softmax masking but avoids NaN overflow.
+_MASK_NEG_INF = -65504.0
+
 logger = logging.getLogger(__name__)
 
 # -- NxDI imports (available on Neuron instances) --
@@ -524,7 +530,7 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         # Build block-diagonal mask
-        mask = torch.full((seq_len, seq_len), float("-inf"), dtype=dtype)
+        mask = torch.full((seq_len, seq_len), _MASK_NEG_INF, dtype=dtype)
         for i in range(len(cu_seqlens) - 1):
             start = cu_seqlens[i].item()
             end = cu_seqlens[i + 1].item()
@@ -568,9 +574,9 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len))
             cos = F.pad(cos, (0, 0, 0, pad_len))
             sin = F.pad(sin, (0, 0, 0, pad_len))
-            # Extend mask with -inf for padded positions
+            # Extend mask with _MASK_NEG_INF for padded positions (NOT -inf, which causes NaN on Neuron)
             mask = torch.full(
-                (1, 1, bucket_len, bucket_len), float("-inf"), dtype=hidden_states.dtype
+                (1, 1, bucket_len, bucket_len), _MASK_NEG_INF, dtype=hidden_states.dtype
             )
             mask[:, :, :seq_len, :seq_len] = attention_mask
             attention_mask = mask

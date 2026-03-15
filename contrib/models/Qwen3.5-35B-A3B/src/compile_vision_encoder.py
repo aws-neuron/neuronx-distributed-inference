@@ -30,6 +30,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# CRITICAL: Use finite negative value instead of -inf for Neuron attention masks.
+# The Neuron compiler's bfloat16 handling of -inf produces NaN that bleeds from
+# padding positions into ALL positions through the transformer layers.
+# -65504.0 is large enough for softmax masking but avoids NaN overflow.
+_MASK_NEG_INF = -65504.0
+
 
 # ============================================================================
 # Vision Encoder (pure PyTorch, no NxDI deps -- for CPU reference + tracing)
@@ -388,7 +394,7 @@ def preprocess_vision_inputs(pixel_values, image_grid_thw, config, model_path):
     ).cumsum(0, dtype=torch.int32)
     cu = F.pad(cu, (1, 0), value=0)
     seq_len = hidden_states.shape[0]
-    mask = torch.full((seq_len, seq_len), float("-inf"), dtype=torch.float32)
+    mask = torch.full((seq_len, seq_len), _MASK_NEG_INF, dtype=torch.float32)
     for i in range(len(cu) - 1):
         s, e = cu[i].item(), cu[i + 1].item()
         mask[s:e, s:e] = 0.0
@@ -408,13 +414,27 @@ def main():
         "QWEN35_VISION_COMPILED_PATH", "/mnt/models/compiled_vision/"
     )
 
+    # Vision sequence length buckets to compile.
+    # Pre-merge patch counts for various image sizes:
+    #   224x224 -> 256,  448x448 -> 784,  672x672 -> 1764
+    #   896x896 -> 3136, 1120x1120 -> 4900
+    # Bucket sizes must cover these after padding:
+    #   256: covers 224x224
+    #   1024: covers 448x448 (784 patches)
+    #   2048: covers 672x672 (1764 patches)
+    #   4096: covers 896x896 (3136 patches)
+    #   5120: covers 1120x1120 (4900 patches) -- but O(n^2) attention is very slow
+    # Default: [256, 1024, 2048, 4096] covers images up to ~896x896.
+    bucket_sizes_str = os.environ.get("VISION_BUCKET_SIZES", "256,1024,2048,4096")
+    bucket_sizes = [int(x.strip()) for x in bucket_sizes_str.split(",")]
+
     with open(os.path.join(model_path, "config.json")) as f:
         full_config = json.load(f)
     vc = full_config["vision_config"]
     config = SimpleNamespace(**vc)
 
     print("=" * 70)
-    print("Qwen3.5 MoE Vision Encoder -- Neuron Compilation & Test")
+    print("Qwen3.5 MoE Vision Encoder -- Multi-Bucket Neuron Compilation")
     print("=" * 70)
     print(
         f"  depth={config.depth}, hidden={config.hidden_size}, heads={config.num_heads}"
@@ -423,9 +443,10 @@ def main():
         f"  intermediate={config.intermediate_size}, out_hidden={config.out_hidden_size}"
     )
     print(f"  patch={config.patch_size}, spatial_merge={config.spatial_merge_size}")
+    print(f"  Bucket sizes: {bucket_sizes}")
 
     # Step 1: Build model and load weights
-    print("\n[1/5] Building vision encoder and loading weights...")
+    print("\n[1/4] Building vision encoder and loading weights...")
     model = VisionEncoder(config)
     n_params = sum(p.numel() for p in model.parameters())
     print(
@@ -435,30 +456,19 @@ def main():
     model.eval()
     model_bf16 = model.to(torch.bfloat16)
 
-    # Step 2: Create test inputs (224x224 image -> 16x16 patches = 256 patches)
-    print("\n[2/5] Preparing test inputs...")
-    # Simulate a 224x224 image processed by the HF processor
-    # grid_thw: 1 frame, 16 height patches, 16 width patches (after processor resizing)
+    # Step 2: CPU reference with small (256 patch) inputs
+    print("\n[2/4] Running CPU reference (256 patches)...")
     image_grid_thw = torch.tensor([[1, 16, 16]])
-    total_patches = 1 * 16 * 16  # = 256 patches
-    # After spatial merge (2x2): 8*8 = 64 merged tokens -> output shape (64, 2048)
-
-    # Create dummy pixel values (normally from processor)
+    total_patches = 256
     pixel_values = torch.randn(
         total_patches,
         3 * config.temporal_patch_size * config.patch_size * config.patch_size,
     )
-
-    # Preprocess on CPU
     hidden_states, attention_mask, cos, sin = preprocess_vision_inputs(
         pixel_values, image_grid_thw, config, model_path
     )
-    print(f"  hidden_states: {hidden_states.shape} (seq_len={hidden_states.shape[0]})")
-    print(f"  attention_mask: {attention_mask.shape}")
-    print(f"  cos/sin: {cos.shape}")
+    print(f"  hidden_states: {hidden_states.shape}")
 
-    # Step 3: CPU reference
-    print("\n[3/5] Running CPU reference...")
     with torch.no_grad():
         cpu_output = model_bf16(
             hidden_states.to(torch.bfloat16),
@@ -466,101 +476,129 @@ def main():
             cos.to(torch.bfloat16),
             sin.to(torch.bfloat16),
         )
-    print(f"  CPU output shape: {cpu_output.shape}")
-    print(f"  CPU output range: [{cpu_output.min():.4f}, {cpu_output.max():.4f}]")
     expected_merged = total_patches // (config.spatial_merge_size**2)
-    assert cpu_output.shape == (expected_merged, config.out_hidden_size), (
-        f"Expected ({expected_merged}, {config.out_hidden_size}), got {cpu_output.shape}"
+    assert cpu_output.shape == (expected_merged, config.out_hidden_size)
+    print(
+        f"  CPU output: {cpu_output.shape}, range [{cpu_output.min():.4f}, {cpu_output.max():.4f}]"
     )
-    print(f"  Shape verified: ({expected_merged}, {config.out_hidden_size})")
 
-    # Step 4: Compile for Neuron
-    print("\n[4/5] Compiling vision encoder for Neuron...")
+    # Step 3: Compile for each bucket size
+    print("\n[3/4] Compiling vision encoder for each bucket size...")
     import torch_neuronx
 
-    example_inputs = (
-        hidden_states.to(torch.bfloat16),
-        attention_mask.to(torch.bfloat16),
-        cos.to(torch.bfloat16),
-        sin.to(torch.bfloat16),
-    )
-
     os.makedirs(compiled_path, exist_ok=True)
-    compile_start = time.time()
-    try:
-        traced = torch_neuronx.trace(
-            model_bf16,
-            example_inputs,
-            compiler_args=[
-                "--auto-cast",
-                "matmult",
-                "--model-type",
-                "transformer",
-            ],
+    head_dim = config.hidden_size // config.num_heads
+    compiled_models = {}
+
+    for bucket_size in bucket_sizes:
+        print(f"\n  --- Bucket {bucket_size} ---")
+
+        # Create dummy inputs at the bucket size
+        # hidden_states: (bucket_size, hidden_size)
+        # attention_mask: (1, 1, bucket_size, bucket_size) -- all -inf except a real block
+        # cos, sin: (bucket_size, head_dim)
+        hs = torch.randn(bucket_size, config.hidden_size, dtype=torch.bfloat16)
+        # Use a simple mask: first 256 tokens attend to each other, rest are masked
+        mask = torch.full(
+            (1, 1, bucket_size, bucket_size), _MASK_NEG_INF, dtype=torch.bfloat16
         )
-        compile_time = time.time() - compile_start
-        print(f"  Compilation succeeded in {compile_time:.1f}s")
+        real_seq = min(256, bucket_size)
+        mask[:, :, :real_seq, :real_seq] = 0.0
+        c = torch.randn(bucket_size, head_dim, dtype=torch.bfloat16)
+        s = torch.randn(bucket_size, head_dim, dtype=torch.bfloat16)
 
-        # Save
-        save_path = os.path.join(compiled_path, "vision_encoder.pt")
-        torch.jit.save(traced, save_path)
-        print(f"  Saved to {save_path}")
+        example_inputs = (hs, mask, c, s)
+        save_file = os.path.join(compiled_path, f"vision_encoder_{bucket_size}.pt")
 
-    except Exception as e:
-        compile_time = time.time() - compile_start
-        print(f"  Compilation FAILED after {compile_time:.1f}s: {e}")
-        import traceback
+        compile_start = time.time()
+        try:
+            traced = torch_neuronx.trace(
+                model_bf16,
+                example_inputs,
+                compiler_args=[
+                    "--auto-cast",
+                    "matmult",
+                    "--model-type",
+                    "transformer",
+                ],
+            )
+            compile_time = time.time() - compile_start
+            print(f"    Compilation succeeded in {compile_time:.1f}s")
 
-        traceback.print_exc()
-        return
+            torch.jit.save(traced, save_file)
+            print(f"    Saved to {save_file}")
+            compiled_models[bucket_size] = traced
 
-    # Step 5: Neuron inference and comparison
-    print("\n[5/5] Running Neuron inference and comparing...")
-    with torch.no_grad():
-        # Warmup
-        for _ in range(3):
-            neuron_output = traced(*example_inputs)
+        except Exception as e:
+            compile_time = time.time() - compile_start
+            print(f"    Compilation FAILED after {compile_time:.1f}s: {e}")
+            import traceback
 
-        # Timed run
-        times = []
-        for _ in range(10):
-            t0 = time.perf_counter()
-            neuron_output = traced(*example_inputs)
-            t1 = time.perf_counter()
-            times.append((t1 - t0) * 1000)
+            traceback.print_exc()
 
-    avg_latency = sum(times) / len(times)
-    print(f"  Neuron output shape: {neuron_output.shape}")
-    print(f"  Neuron latency: {avg_latency:.2f}ms (avg of 10 runs)")
+    # Step 4: Verify each compiled bucket with real preprocessed inputs
+    print("\n[4/4] Verifying compiled models...")
 
-    # Compare outputs
-    cpu_fp32 = cpu_output.float()
-    neuron_fp32 = neuron_output.float()
+    # Test with the 256-token real inputs against the smallest bucket
+    if 256 in compiled_models:
+        print("\n  Verifying bucket 256 with real 224x224 inputs:")
+        with torch.no_grad():
+            neuron_output = compiled_models[256](
+                hidden_states.to(torch.bfloat16),
+                attention_mask.to(torch.bfloat16),
+                cos.to(torch.bfloat16),
+                sin.to(torch.bfloat16),
+            )
+        cos_sim = F.cosine_similarity(
+            cpu_output.float().flatten().unsqueeze(0),
+            neuron_output.float().flatten().unsqueeze(0),
+        ).item()
+        print(f"    Cosine similarity vs CPU: {cos_sim:.6f}")
+        if cos_sim > 0.99:
+            print(f"    PASS")
+        else:
+            print(f"    WARN: Low cosine similarity")
 
-    cos_sim = F.cosine_similarity(
-        cpu_fp32.flatten().unsqueeze(0), neuron_fp32.flatten().unsqueeze(0)
-    ).item()
-    max_diff = (cpu_fp32 - neuron_fp32).abs().max().item()
-    mean_diff = (cpu_fp32 - neuron_fp32).abs().mean().item()
+    # Test padding to larger bucket with 256 real tokens
+    for bucket_size in sorted(compiled_models.keys()):
+        if bucket_size == 256:
+            continue
+        print(f"\n  Verifying bucket {bucket_size} with padded 256-token inputs:")
 
-    print(f"\n  Cosine similarity: {cos_sim:.6f}")
-    print(f"  Max absolute diff: {max_diff:.6f}")
-    print(f"  Mean absolute diff: {mean_diff:.6f}")
+        # Pad the real 256-token inputs to bucket_size
+        pad_len = bucket_size - 256
+        hs_padded = F.pad(hidden_states.to(torch.bfloat16), (0, 0, 0, pad_len))
+        cos_padded = F.pad(cos.to(torch.bfloat16), (0, 0, 0, pad_len))
+        sin_padded = F.pad(sin.to(torch.bfloat16), (0, 0, 0, pad_len))
+        mask_padded = torch.full(
+            (1, 1, bucket_size, bucket_size), _MASK_NEG_INF, dtype=torch.bfloat16
+        )
+        mask_padded[:, :, :256, :256] = attention_mask.to(torch.bfloat16)
 
-    if cos_sim > 0.99:
-        print(f"\n  PASS: Cosine similarity {cos_sim:.6f} > 0.99")
-    else:
+        with torch.no_grad():
+            neuron_output_padded = compiled_models[bucket_size](
+                hs_padded, mask_padded, cos_padded, sin_padded
+            )
+
+        # Only compare the first 64 merged tokens (256/4 = 64 merged tokens)
+        merged_tokens = 256 // (config.spatial_merge_size**2)
+        cos_sim = F.cosine_similarity(
+            cpu_output.float()[:merged_tokens].flatten().unsqueeze(0),
+            neuron_output_padded.float()[:merged_tokens].flatten().unsqueeze(0),
+        ).item()
         print(
-            f"\n  WARN: Cosine similarity {cos_sim:.6f} < 0.99 -- may need investigation"
+            f"    Cosine similarity (first {merged_tokens} merged tokens) vs CPU: {cos_sim:.6f}"
         )
+        if cos_sim > 0.99:
+            print(f"    PASS")
+        else:
+            print(f"    WARN: Low cosine similarity -- padding may affect results")
 
     print("\n" + "=" * 70)
     print("Summary:")
     print(f"  Vision encoder params: {n_params:,}")
-    print(f"  Compilation time: {compile_time:.1f}s")
-    print(f"  Neuron latency: {avg_latency:.2f}ms")
-    print(f"  Cosine sim (vs CPU): {cos_sim:.6f}")
-    print(f"  Output shape: {neuron_output.shape}")
+    print(f"  Compiled buckets: {sorted(compiled_models.keys())}")
+    print(f"  Output directory: {compiled_path}")
     print("=" * 70)
 
 
