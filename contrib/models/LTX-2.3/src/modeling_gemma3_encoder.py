@@ -575,3 +575,258 @@ def convert_hf_gemma3_to_encoder_state_dict(
         encoder_state_dict[new_key] = value.detach().clone().to(dtype)
 
     return encoder_state_dict
+
+
+# ── NxDI Application Classes ────────────────────────────────────────────────
+# These follow the NeuronApplicationBase pattern from NxDI (see Flux model
+# in src/neuronx_distributed_inference/models/diffusers/flux/ for reference).
+
+try:
+    from neuronx_distributed_inference.models.application_base import (
+        NeuronApplicationBase,
+    )
+    from neuronx_distributed_inference.models.config import (
+        InferenceConfig,
+        NeuronConfig,
+    )
+    from neuronx_distributed_inference.models.model_wrapper import ModelWrapper
+    from neuronx_distributed.trace.model_builder import BaseModelInstance
+
+    _NXDI_AVAILABLE = True
+except ImportError:
+    _NXDI_AVAILABLE = False
+
+
+# Default Gemma3-12B architecture constants
+GEMMA3_12B_CONFIG = dict(
+    vocab_size=262208,
+    hidden_size=3840,
+    num_hidden_layers=48,
+    num_attention_heads=16,
+    num_key_value_heads=8,
+    head_dim=256,
+    intermediate_size=15360,
+    rms_norm_eps=1e-6,
+    rope_theta=1_000_000.0,
+    max_position_embeddings=131072,
+    query_pre_attn_scalar=256,
+    pad_token_id=0,
+)
+
+
+class Gemma3EncoderInferenceConfig(InferenceConfig if _NXDI_AVAILABLE else object):
+    """InferenceConfig for the Gemma3 text encoder."""
+
+    def __init__(self, *args, **kwargs):
+        if _NXDI_AVAILABLE:
+            super().__init__(*args, **kwargs)
+
+    def get_required_attributes(self):
+        return [
+            "vocab_size",
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "intermediate_size",
+        ]
+
+
+class ModelWrapperGemma3Encoder(ModelWrapper if _NXDI_AVAILABLE else object):
+    """ModelWrapper for the Gemma3 text encoder."""
+
+    def __init__(
+        self,
+        config,
+        model_cls,
+        tag="",
+        compiler_args=None,
+        priority_model_idx=None,
+        model_init_kwargs={},
+    ):
+        if _NXDI_AVAILABLE:
+            super().__init__(
+                config,
+                model_cls,
+                tag,
+                compiler_args,
+                priority_model_idx,
+                model_init_kwargs=model_init_kwargs,
+            )
+        self.bucket_config = None
+
+    def input_generator(self):
+        """Generate example inputs for compilation: (input_ids, attention_mask)."""
+        seq_len = self.config.neuron_config.seq_len
+        batch_size = self.config.neuron_config.batch_size
+
+        input_ids = torch.zeros(batch_size, seq_len, dtype=torch.int64)
+        attention_mask = torch.ones(batch_size, seq_len, dtype=torch.int64)
+
+        return [(input_ids, attention_mask)]
+
+    def get_model_instance(self):
+        """Create a factory for the Gemma3TextEncoderModel."""
+        config = self.config
+
+        def _create_model():
+            model = self.model_cls(
+                vocab_size=getattr(
+                    config, "vocab_size", GEMMA3_12B_CONFIG["vocab_size"]
+                ),
+                hidden_size=config.hidden_size,
+                num_hidden_layers=config.num_hidden_layers,
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                intermediate_size=config.intermediate_size,
+                rms_norm_eps=getattr(
+                    config, "rms_norm_eps", GEMMA3_12B_CONFIG["rms_norm_eps"]
+                ),
+                rope_theta=getattr(
+                    config, "rope_theta", GEMMA3_12B_CONFIG["rope_theta"]
+                ),
+                max_position_embeddings=getattr(
+                    config,
+                    "max_position_embeddings",
+                    GEMMA3_12B_CONFIG["max_position_embeddings"],
+                ),
+                query_pre_attn_scalar=getattr(
+                    config,
+                    "query_pre_attn_scalar",
+                    GEMMA3_12B_CONFIG["query_pre_attn_scalar"],
+                ),
+                pad_token_id=getattr(
+                    config, "pad_token_id", GEMMA3_12B_CONFIG["pad_token_id"]
+                ),
+                dtype=config.neuron_config.torch_dtype,
+            )
+            model = model.to(dtype=config.neuron_config.torch_dtype)
+            model.eval()
+            return model
+
+        return BaseModelInstance(module_cls=_create_model, input_output_aliases={})
+
+    def forward(self, *args, **kwargs):
+        if self.model is None:
+            raise RuntimeError("Forward called before load. Run load() first.")
+        return self._forward(*args)
+
+
+class NeuronGemma3EncoderApplication(
+    NeuronApplicationBase if _NXDI_AVAILABLE else object
+):
+    """NxDI Application for the Gemma3-12B text encoder.
+
+    Handles compilation, weight sharding, loading, and inference following
+    the same pattern as NeuronClipApplication / NeuronT5Application in Flux.
+
+    Unlike the Flux text encoders which run simultaneously with other sub-models,
+    the Gemma3 encoder shares NeuronCores with the DiT backbone sequentially
+    on trn2.3xlarge. The compositor (NeuronLTX23Application) manages the
+    load/unload cycling.
+    """
+
+    _model_cls = Gemma3TextEncoderModel
+
+    def __init__(self, *args, **kwargs):
+        if _NXDI_AVAILABLE:
+            super().__init__(*args, **kwargs)
+        self.model_wrapper = self.get_model_wrapper_cls()
+
+        self.model = self.model_wrapper(
+            config=self.config,
+            model_cls=self._model_cls,
+            tag=self._model_cls.__name__,
+            compiler_args=self.get_compiler_args(),
+            priority_model_idx=0,
+        )
+        self.models.append(self.model)
+        self.dtype = self.config.neuron_config.torch_dtype
+
+    @classmethod
+    def get_config_cls(cls):
+        return Gemma3EncoderInferenceConfig
+
+    def get_model_wrapper_cls(self):
+        return ModelWrapperGemma3Encoder
+
+    def forward(self, input_ids, attention_mask):
+        """Forward pass: (input_ids, attention_mask) -> (B, seq_len, hidden_size, 49)."""
+        return self.models[0](input_ids, attention_mask)
+
+    def get_compiler_args(self):
+        """Compiler args for the Gemma3 encoder.
+
+        Uses tensorizer flags that achieve 3.1x speedup (2000ms -> 644ms).
+        """
+        import os as _os
+
+        compiler_args = (
+            "--model-type=transformer -O1 --auto-cast=none --lnc=2 "
+            "--tensorizer-options='--enable-ccop-compute-overlap "
+            "--cc-pipeline-tiling-factor=1 "
+            "--vectorize-strided-dma "
+            "--enable-scalar-dge-vectorization'"
+        )
+
+        _os.environ["NEURON_FUSE_SOFTMAX"] = "1"
+        _os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0"
+        _os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
+
+        return compiler_args
+
+    @staticmethod
+    def update_state_dict_for_tied_weights(state_dict):
+        pass
+
+    def checkpoint_loader_fn(self, mmap: bool = False):
+        """Load Gemma3 weights from HuggingFace checkpoint.
+
+        Supports loading from:
+        - A directory with safetensors shards (google/gemma-3-12b-it-qat-q4_0-unquantized)
+        - A single safetensors file
+        """
+        import os as _os
+        from safetensors.torch import load_file
+
+        # NeuronApplicationBase.normalize_path() adds trailing '/'; strip it
+        # so os.path.isdir/isfile checks work correctly.
+        model_path = self.model_path.rstrip("/")
+        logger.info("Loading Gemma3 encoder weights from %s", model_path)
+
+        if _os.path.isdir(model_path):
+            import glob as _glob
+
+            safetensors_files = sorted(
+                _glob.glob(_os.path.join(model_path, "*.safetensors"))
+            )
+            if safetensors_files:
+                hf_sd = {}
+                for sf in safetensors_files:
+                    hf_sd.update(load_file(sf))
+                logger.info(
+                    "Loaded %d tensors from %d safetensors files",
+                    len(hf_sd),
+                    len(safetensors_files),
+                )
+            else:
+                raise FileNotFoundError(f"No safetensors files in {model_path}")
+        elif _os.path.isfile(model_path) and model_path.endswith(".safetensors"):
+            hf_sd = load_file(model_path)
+            logger.info("Loaded %d tensors from %s", len(hf_sd), model_path)
+        else:
+            raise FileNotFoundError(f"Cannot load weights from {model_path}")
+
+        # Convert HF state dict to encoder format
+        encoder_sd = convert_hf_gemma3_to_encoder_state_dict(
+            hf_sd, dtype=self.config.neuron_config.torch_dtype
+        )
+        logger.info("Converted to encoder format: %d keys", len(encoder_sd))
+        return encoder_sd
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict, config):
+        """State dict is already converted by checkpoint_loader_fn."""
+        return state_dict

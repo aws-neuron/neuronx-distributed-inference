@@ -745,7 +745,9 @@ class NeuronLTX23BackboneApplication(
         HuggingFace model repo with config.json). Weight keys use the
         native ltx-core naming convention.
         """
-        model_path = self.model_path
+        # NeuronApplicationBase.normalize_path() adds trailing '/'; strip it
+        # so os.path.isfile() works for single safetensors files.
+        model_path = self.model_path.rstrip("/")
         logger.info("Loading LTX-2.3 transformer weights from %s", model_path)
 
         if os.path.isdir(model_path):
