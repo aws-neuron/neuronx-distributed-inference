@@ -1182,8 +1182,48 @@ def generate(args):
         from ltx_core.model.transformer.modality import Modality
         from pipeline import NeuronTransformerWrapper
 
-        # --- Stage 1: Half-res generation ---
-        logger.info("\n=== Stage 1: Half-resolution generation ===")
+        v_patchifier = VideoLatentPatchifier(patch_size=1)
+        v_scale = SpatioTemporalScaleFactors.default()
+        s1_total_time = 0.0
+
+        # --- Phase 2 shortcut: Load S1 latent from a previous Phase 1 run ---
+        if args.load_s1_latent:
+            logger.info(
+                "\n=== Phase 2: Loading S1 latent from %s ===", args.load_s1_latent
+            )
+            saved = torch.load(
+                args.load_s1_latent, map_location="cpu", weights_only=True
+            )
+            s1_video_latent = saved["s1_video_latent"]
+            audio_sample = saved["audio_sample"]
+            video_context = saved["video_context"]
+            audio_context = saved["audio_context"]
+            context_mask = saved["context_mask"]
+            s1_total_time = saved.get("s1_total_time", 0.0)
+            logger.info(
+                "  Loaded S1 video latent: %s, audio: %s",
+                s1_video_latent.shape,
+                audio_sample.shape,
+            )
+            logger.info("  S1 denoising time from Phase 1: %.1fs", s1_total_time)
+
+            # Setup audio tools (needed for S2)
+            audio_shape = AudioLatentShape(
+                batch=1, channels=8, frames=args.audio_num_frames, mel_bins=16
+            )
+            a_patchifier = AudioPatchifier(patch_size=16)
+            audio_tools = AudioLatentTools(
+                patchifier=a_patchifier, target_shape=audio_shape
+            )
+            audio_state = audio_tools.create_initial_state(device="cpu", dtype=dtype)
+        else:
+            # --- Normal Phase 1: Run encoder + S1 denoising ---
+            pass  # Fall through to existing S1 code below
+
+        # Skip S1 if loading from Phase 1 save
+        if not args.load_s1_latent:
+            # --- Stage 1: Half-res generation ---
+            logger.info("\n=== Stage 1: Half-resolution generation ===")
 
         # Half-res latent dimensions
         s1_height = args.height // 2
@@ -1232,6 +1272,33 @@ def generate(args):
             s1_video_state.latent.shape, dtype=dtype, generator=gen
         )
         audio_sample = torch.randn(audio_state.latent.shape, dtype=dtype, generator=gen)
+
+        # Image-to-Video conditioning for Stage 1 (half-res)
+        s1_denoise_mask = None
+        s1_clean_latent = None
+        if args.image:
+            logger.info("\n=== Image-to-Video conditioning (Stage 1, half-res) ===")
+            image_latent_5d = encode_image(
+                args.image, args.model_path, s1_height, s1_width, dtype
+            )
+            image_tokens = v_patchifier.patchify(image_latent_5d)
+            frame_0_tokens = s1_latent_h * s1_latent_w
+            logger.info(
+                "  Image patchified: %s (frame 0 = %d tokens)",
+                image_tokens.shape,
+                frame_0_tokens,
+            )
+            video_sample[:, :frame_0_tokens] = image_tokens[:, :frame_0_tokens]
+            video_seq_len = video_sample.shape[1]
+            s1_denoise_mask = torch.ones(1, video_seq_len, 1, dtype=dtype)
+            s1_denoise_mask[:, :frame_0_tokens, :] = 0.0
+            s1_clean_latent = video_sample.clone()
+            logger.info(
+                "  I2V: %d conditioned, %d unconditioned tokens",
+                frame_0_tokens,
+                video_seq_len - frame_0_tokens,
+            )
+            del image_latent_5d, image_tokens
 
         # Load half-res Neuron backbone
         if args.use_app:
@@ -1328,7 +1395,11 @@ def generate(args):
             sigma_next = sigmas[step_idx + 1]
             video_seq_len = s1_video_state.latent.shape[1]
             audio_seq_len = audio_state.latent.shape[1]
-            v_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, video_seq_len)
+            # I2V: per-token timesteps (frame 0 gets 0, rest get sigma)
+            if s1_denoise_mask is not None:
+                v_ts = s1_denoise_mask.squeeze(-1) * sigma
+            else:
+                v_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, video_seq_len)
             a_ts = sigma.unsqueeze(0).unsqueeze(0).expand(1, audio_seq_len)
             video_mod = Modality(
                 latent=video_sample,
@@ -1362,6 +1433,12 @@ def generate(args):
             audio_sample = (audio_sample.float() + audio_velocity.float() * dt).to(
                 dtype
             )
+            # I2V: preserve frame 0 tokens after each Euler step
+            if s1_denoise_mask is not None and s1_clean_latent is not None:
+                video_sample = (
+                    video_sample * s1_denoise_mask
+                    + s1_clean_latent * (1.0 - s1_denoise_mask)
+                ).to(dtype)
             logger.info(
                 "  S1 Step %d/%d: sigma %.4f -> %.4f (%.1fs)",
                 step_idx + 1,
@@ -1388,6 +1465,32 @@ def generate(args):
         # Unpatchify Stage 1 output to spatial format
         s1_video_latent = v_patchifier.unpatchify(video_sample, s1_video_shape)
         logger.info("  Stage 1 video latent: %s", s1_video_latent.shape)
+
+        # Save S1 latent for two-phase TP switching (Phase 1 output)
+        if args.save_s1_latent:
+            save_data = {
+                "s1_video_latent": s1_video_latent,
+                "audio_sample": audio_sample,
+                "video_context": video_context,
+                "audio_context": audio_context,
+                "context_mask": context_mask,
+                "s1_total_time": s1_total_time,
+            }
+            torch.save(save_data, args.save_s1_latent)
+            logger.info(
+                "\n=== Phase 1 complete: S1 latent saved to %s ===",
+                args.save_s1_latent,
+            )
+            logger.info(
+                "  S1 denoising: %.1fs (%.1fs/step)",
+                s1_total_time,
+                s1_total_time / args.num_steps,
+            )
+            logger.info(
+                "  Run Phase 2 with --load-s1-latent %s --s2-tp-degree <N>",
+                args.save_s1_latent,
+            )
+            return
 
         # --- Spatial upsample x2 ---
         logger.info("\n=== Spatial Upsample x2 ===")
@@ -1446,15 +1549,35 @@ def generate(args):
 
         # Load full-res Neuron backbone (same compiled model, same weights)
         if args.use_app:
-            # Application path: reuse the full-res compositor created for encoder
-            logger.info("Loading full-res backbone from %s...", args.app_compiled_dir)
+            # Application path: create or reuse compositor for Stage 2
+            s2_compiled_dir = args.s2_app_compiled_dir
+            if args.s2_tp_degree != args.tp_degree:
+                # Different TP for Stage 2 — need a fresh compositor
+                logger.info(
+                    "Creating Stage 2 compositor (TP=%d, different from S1 TP=%d)...",
+                    args.s2_tp_degree,
+                    args.tp_degree,
+                )
+                s2_app = create_app_compositor(
+                    model_path=args.model_path,
+                    encoder_path=args.gemma_path,
+                    tp_degree=args.s2_tp_degree,
+                    text_seq=args.text_seq,
+                    height=args.height,
+                    width=args.width,
+                    num_frames=args.num_frames,
+                )
+            else:
+                # Same TP — reuse the full-res compositor created for encoder
+                s2_app = app
+            logger.info("Loading full-res backbone from %s...", s2_compiled_dir)
             t0 = time.time()
-            app.load_backbone(args.app_compiled_dir)
+            s2_app.load_backbone(s2_compiled_dir)
             logger.info(
                 "Full-res backbone loaded via Application in %.1fs",
                 time.time() - t0,
             )
-            neuron_backbone = app
+            neuron_backbone = s2_app
             wrapper = NeuronTransformerWrapper(
                 compiled_backbone=neuron_backbone,
                 cpu_ltx_model=cpu["ltx_model"],
@@ -1467,7 +1590,7 @@ def generate(args):
             neuron_backbone = load_neuron_backbone(
                 args.compile_dir,
                 args.model_path,
-                args.tp_degree,
+                args.s2_tp_degree,
                 sharded_dir=args.backbone_sharded_dir,
             )
             wrapper = NeuronTransformerWrapper(
@@ -1585,7 +1708,9 @@ def generate(args):
 
         # Unload full-res backbone before decode
         if args.use_app:
-            app.unload_backbone()
+            s2_app.unload_backbone()
+            if s2_app is not app:
+                del s2_app
         else:
             unload_neuron_model(neuron_backbone, "full-res DiT backbone")
         del neuron_backbone, wrapper
@@ -2128,6 +2253,14 @@ def main():
     )
     parser.add_argument("--tp-degree", type=int, default=TP_DEGREE, help="TP degree")
     parser.add_argument(
+        "--s2-tp-degree",
+        type=int,
+        default=None,
+        help="TP degree for Stage 2 backbone in --two-stage mode (default: same as --tp-degree). "
+        "Use this when Stage 2 (full-res) needs more TP than Stage 1 (half-res), e.g. "
+        "--tp-degree 4 --s2-tp-degree 16 on trn2.48xlarge.",
+    )
+    parser.add_argument(
         "--upscale",
         action="store_true",
         help="Apply spatial x2 + temporal x2 upscaling before VAE decode",
@@ -2186,8 +2319,32 @@ def main():
         help="Base directory with half-res Application-compiled backbone. "
         "Used for Stage 1 of --two-stage --use-app. Must contain backbone/ subdir.",
     )
+    parser.add_argument(
+        "--s2-app-compiled-dir",
+        default=None,
+        help="Base directory with Stage 2 Application-compiled backbone (when using different TP). "
+        "Defaults to --app-compiled-dir. Used only with --two-stage --use-app --s2-tp-degree.",
+    )
+    parser.add_argument(
+        "--save-s1-latent",
+        default=None,
+        help="Path to save Stage 1 output latent + context (for two-phase TP switching). "
+        "When set with --two-stage, runs encoder + S1 denoising then saves and exits.",
+    )
+    parser.add_argument(
+        "--load-s1-latent",
+        default=None,
+        help="Path to load Stage 1 output latent + context (for two-phase TP switching). "
+        "When set with --two-stage, skips encoder + S1 and jumps directly to spatial upsample + S2.",
+    )
 
     args = parser.parse_args()
+
+    # Resolve Stage 2 TP and compiled dir defaults
+    if args.s2_tp_degree is None:
+        args.s2_tp_degree = args.tp_degree
+    if args.s2_app_compiled_dir is None:
+        args.s2_app_compiled_dir = args.app_compiled_dir
 
     if args.use_app:
         if args.gemma_path is None:
