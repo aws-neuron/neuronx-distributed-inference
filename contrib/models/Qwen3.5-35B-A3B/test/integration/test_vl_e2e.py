@@ -13,7 +13,7 @@ Usage:
   export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
   source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
   cd /home/ubuntu/nxdi-qwen35
-  python test_vl_e2e.py 2>&1 | tee test_vl_e2e.log
+  python contrib/models/Qwen3.5-35B-A3B/test/integration/test_vl_e2e.py 2>&1 | tee test_vl_e2e.log
 
 Stages (can skip earlier stages with --skip-compile, --skip-load):
   Stage 1: Compile text decoder (24-arg trace with vision inputs)
@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 import torch
 
@@ -35,16 +36,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # Paths
-MODEL_PATH = "/mnt/models/Qwen3.5-35B-A3B"
-COMPILED_TEXT_PATH = "/mnt/models/compiled_qwen35_vl/"
-COMPILED_VISION_PATH = "/mnt/models/compiled_vision/vision_encoder.pt"
+MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", "/mnt/models/Qwen3.5-35B-A3B")
+COMPILED_TEXT_PATH = os.environ.get(
+    "QWEN35_COMPILED_VL_PATH", "/mnt/models/compiled_qwen35_vl/"
+)
+COMPILED_VISION_PATH = os.environ.get(
+    "QWEN35_COMPILED_VISION_PATH", "/mnt/models/compiled_vision/vision_encoder.pt"
+)
 
 # Add the contrib model src to path
-SRC_PATH = os.path.join(os.path.dirname(__file__), "contrib/models/Qwen3.5-35B-A3B/src")
-if os.path.exists(SRC_PATH):
-    sys.path.insert(0, SRC_PATH)
-else:
-    sys.path.insert(0, "/home/ubuntu/nxdi-qwen35/contrib/models/Qwen3.5-35B-A3B/src")
+SRC_PATH = str(Path(__file__).parent.parent.parent / "src")
+sys.path.insert(0, SRC_PATH)
 
 
 def create_text_config():
