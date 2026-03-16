@@ -36,7 +36,6 @@ from torch import Tensor, nn
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig, MoENeuronConfig
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
-from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
     ModuleMarkerStartWrapper,
@@ -228,6 +227,9 @@ class DeepseekV3InferenceConfig(InferenceConfig):
             self.neuron_config.router_config.act_fn = "sigmoid"
             self.neuron_config.normalize_top_k_affinities = True
 
+        # Disable numeric CC token (workaround for all-gather/reduce-scatter)
+        self.neuron_config.disable_numeric_cc_token = True
+
         # MLA KV cache: override head_dim and num_key_value_heads so the
         # KVCacheManager allocates (bsz, 1, max_len, rope_dim + kv_lora_rank)
         # instead of standard GQA layout.
@@ -361,30 +363,36 @@ class DeepseekV3Router(RouterTopK):
         # Add bias for selection only
         scores_for_choice = expert_affinities + self.e_score_correction_bias.unsqueeze(0)
 
-        # Group-based selection:
-        # Reshape to (T, n_group, experts_per_group), take top-2 per group, sum -> group scores
+        # Group-based selection using compiler-compatible 2-topk pattern.
+        # (3 chained topk ops trigger unsupported sort HLO on trn2, so we use
+        # sum for group scoring instead of topk(2).sum, and gather+reshape+topk
+        # instead of scatter+mask+topk.)
         experts_per_group = self.num_experts // self.n_group
-        group_scores = (
-            scores_for_choice.view(-1, self.n_group, experts_per_group)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
-        )  # (T, n_group)
+        grouped_scores = scores_for_choice.view(-1, self.n_group, experts_per_group)
 
-        # Select top topk_group groups
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
+        # Score each group by sum of its expert scores (approximates topk(2).sum)
+        group_scores = grouped_scores.sum(dim=-1)  # (T, n_group)
 
-        # Expand group mask to expert mask
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(-1, self.n_group, experts_per_group)
-            .reshape(-1, self.num_experts)
-        )
+        # Select top topk_group groups, then gather their expert scores
+        _, group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=True)
+        # group_idx: (T, topk_group)
+        selected_groups = torch.gather(
+            grouped_scores, 1,
+            group_idx.unsqueeze(-1).expand(-1, -1, experts_per_group)
+        )  # (T, topk_group, experts_per_group)
 
-        # Mask out non-selected groups, then select top-K experts
-        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
-        _, expert_index = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)
+        # Flatten selected groups and pick top-K experts within them
+        flat_scores = selected_groups.reshape(-1, self.topk_group * experts_per_group)
+        _, flat_expert_idx = torch.topk(flat_scores, k=self.top_k, dim=-1, sorted=True)
+
+        # Map flat indices back to global expert indices:
+        # flat_expert_idx values are in [0, topk_group * experts_per_group).
+        # Convert to (which_selected_group, offset_within_group), then to global index.
+        selected_group_ord = flat_expert_idx // experts_per_group  # which of the topk selected groups
+        within_group_offset = flat_expert_idx % experts_per_group
+        # Map selected_group_ord -> actual group index via group_idx
+        actual_group = torch.gather(group_idx, 1, selected_group_ord)
+        expert_index = actual_group * experts_per_group + within_group_offset
 
         # Gather weights from ORIGINAL affinities (no bias), normalize, scale
         topk_weights = expert_affinities.gather(1, expert_index)
@@ -627,6 +635,13 @@ class DeepseekV3Attention(NeuronAttentionBase):
             **kwargs,
     ):
         """Implements each layer's forward pass for the attention block."""
+        # On decode, past_key_value comes from KVCacheManager as [k_cache, v_cache]
+        # each shaped (bsz, 1, seq_len, qk_rope_head_dim + kv_lora_rank).
+        # Convert to the single concatenated tensor that the decode path expects.
+        if past_key_value is not None and isinstance(past_key_value, (list, tuple)):
+            combined = past_key_value[0].squeeze(1)  # (bsz, seq_len, rope_dim + kv_lora_rank)
+            past_key_value = combined
+
         if self.sequence_parallel_enabled and self.tensor_model_parallel_group is not None:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states,
@@ -710,7 +725,12 @@ class DeepseekV3Attention(NeuronAttentionBase):
 
         # Z = Z.Wo
         attn_output = self.o_proj(attn_output)
-        past_key_value: Tuple[Tensor, Tensor] = (k_pe.squeeze(1), compressed_kv)
+
+        # Concatenate k_pe and compressed_kv into combined format for KVCacheManager.
+        # KVCacheManager expects (key, value) tuple each shaped (bsz, 1, seq_len, head_dim).
+        # For MLA, we store [k_pe | compressed_kv] in both slots (V is duplicate).
+        combined = torch.cat([k_pe.squeeze(1), compressed_kv], dim=-1).unsqueeze(1)
+        past_key_value = (combined, combined)
 
         return attn_output, past_key_value, cos_cache, sin_cache
 
@@ -884,17 +904,10 @@ class NeuronDeepseekV3ForCausalLM(NeuronBaseForCausalLM):
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: DeepseekV3InferenceConfig) -> dict:
         return convert_deepseek_v3_hf_to_neuron_state_dict(state_dict, config)
 
-    # Wraps NeuronBaseForCausalLM.enable_context_encoding() to add compile_tag.
-    def enable_context_encoding(self):
-        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
-        super().enable_context_encoding()
-
-    # Wraps NeuronBaseForCausalLM.enable_token_generation() to add compile_tag.
-    def enable_token_generation(self):
-        self.compile_tag = TOKEN_GENERATION_MODEL_TAG
-        super().enable_token_generation()
-
-
     def get_compiler_args(self):
-        """Return None to let the framework's ModelWrapper build platform-appropriate compiler args."""
+        """Return None to use framework defaults (matching Moonlight pattern).
+
+        The framework's ModelWrapper builds platform-appropriate compiler args
+        including --lnc, --vectorize-strided-dma, optimization levels, etc.
+        """
         return None

@@ -75,15 +75,20 @@ def test_attn_neuron_e2e(dtype, tp, bsz, max_len):
     inputs = [(X, mask, position_ids, cos, sin),]
     neuron_model = trace_attention(STAGE.PREFILL, inputs, config, tp, dtype, DUMMY_CKPT_PATH)
     neuron_output = neuron_model(*inputs[0])
-    neuron_res, neuron_kv_cache = neuron_output[0], neuron_output[1]
-    neuron_pe_cache, neuron_kv_cache = neuron_kv_cache
+    neuron_res, neuron_kv_tuple = neuron_output[0], neuron_output[1]
+    # KV cache is now (combined, combined) where combined = [k_pe | compressed_kv]
+    # shaped (bsz, 1, seq_len, rope_dim + kv_lora_rank). Extract parts for comparison.
+    combined = neuron_kv_tuple[0].squeeze(1)  # (bsz, seq_len, rope_dim + kv_lora_rank)
+    neuron_pe_cache = combined[..., :rope_dim]
+    neuron_kv_cache = combined[..., rope_dim:]
 
     assert_close(ref_prefill_kv_cache, neuron_kv_cache, rtol=1e-4)
     assert_close(ref_prefill_pe_cache, neuron_pe_cache)
     assert_close(ref_prefill_res, neuron_res, rtol=1e-4)
 
     # ################ test scenario: decode  ################
-    cache_from_prefill = torch.cat((neuron_pe_cache, neuron_kv_cache), dim=-1)
+    # Pass combined tensor (bsz, seq_len, rope_dim + kv_lora_rank) to decode
+    cache_from_prefill = combined
     position_ids = torch.tensor([[SEQ_LEN]])
     attn_mask = torch.tensor([[[[True]*SEQ_LEN]]])
 
@@ -91,8 +96,10 @@ def test_attn_neuron_e2e(dtype, tp, bsz, max_len):
     inputs = [(X_DECODE, attn_mask, position_ids, cache_from_prefill, cos, sin),]
     neuron_model = trace_attention(STAGE.DECODE, inputs, config, tp, dtype, DUMMY_CKPT_PATH)
     neuron_output = neuron_model(*(inputs[0]))
-    neuron_res, neuron_kv_cache = neuron_output[0], neuron_output[1]
-    neuron_pe_cache, neuron_kv_cache = neuron_kv_cache
+    neuron_res, neuron_kv_tuple = neuron_output[0], neuron_output[1]
+    combined_decode = neuron_kv_tuple[0].squeeze(1)
+    neuron_pe_cache = combined_decode[..., :rope_dim]
+    neuron_kv_cache = combined_decode[..., rope_dim:]
 
     assert_close(ref_decode_kv_cache, neuron_kv_cache, rtol=1e-5)
     assert_close(ref_decode_pe_cache, neuron_pe_cache)

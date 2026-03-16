@@ -8,6 +8,9 @@ from neuronx_distributed_inference.models.deepseek.rope_util import (
     apply_rotary_pos_emb,
 )
 
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+    apply_rotary_pos_emb_interleave as hf_apply_rotary_pos_emb_interleave,
+)
 from .test_helper.reference_model import apply_rotary_emb
 
 TEST_YARN_ROPE_CONFIG = {
@@ -109,3 +112,55 @@ class TestDeepseekV3Rope(unittest.TestCase):
 
                 # result
                 torch.testing.assert_close(reference_rope, test_rope)
+
+    def test_matches_hf_interleave_rope(self):
+        """Verify NXDI rotate_fn matches HF apply_rotary_pos_emb_interleave.
+
+        Key layout difference:
+        - HF transposes interleaved [r0,i0,r1,i1,...] -> split [r0,r1,...,i0,i1,...] BEFORE rotation
+        - NXDI rotate_fn operates directly on interleaved layout
+
+        Both produce the SAME rotation (verified by converting NXDI output from
+        interleaved to split layout). This ensures the attention dot products
+        q_pe @ k_pe^T will be identical since both q_pe and k_pe use the same layout.
+        """
+        dim = 64
+        seq_len = 32
+
+        rotary_emb = DeepseekV3YarnRotaryEmbedding(
+            dim=dim,
+            scaling_factor=1.0,
+            base=10000.0,
+            original_max_position_embeddings=4096,
+            max_position_embeddings=4096,
+            mscale=1.0,
+            mscale_all_dim=0,
+            beta_fast=32,
+            beta_slow=1,
+        )
+
+        def interleaved_to_split(x):
+            """Convert [r0,i0,r1,i1,...] -> [r0,r1,...,i0,i1,...] (same as HF transpose)."""
+            b, h, s, d = x.shape
+            return x.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+        for batch in [1, 2]:
+            for num_heads in [1, 4]:
+                q = torch.randn(batch, num_heads, seq_len, dim)
+                position_ids = torch.arange(seq_len).unsqueeze(0)
+
+                # NXDI path: output is in interleaved layout
+                cos_nxdi, sin_nxdi = rotary_emb(q, seq_len)
+                nxdi_out = apply_rotary_pos_emb(q, cos_nxdi, sin_nxdi, position_ids)
+
+                # Convert NXDI output from interleaved -> split for comparison
+                nxdi_out_split = interleaved_to_split(nxdi_out)
+
+                # HF path: output is in split layout
+                cos_half = cos_nxdi[:seq_len, :dim // 2]
+                sin_half = sin_nxdi[:seq_len, :dim // 2]
+                hf_cos = torch.cat([cos_half, cos_half], dim=-1).unsqueeze(0)
+                hf_sin = torch.cat([sin_half, sin_half], dim=-1).unsqueeze(0)
+                hf_out, _ = hf_apply_rotary_pos_emb_interleave(q, q, hf_cos, hf_sin)
+
+                torch.testing.assert_close(nxdi_out_split, hf_out, atol=1e-5, rtol=1e-5)
