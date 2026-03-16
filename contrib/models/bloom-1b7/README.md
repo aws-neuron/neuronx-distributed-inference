@@ -41,3 +41,15 @@ model.compile(output_path)
 
 - **Greedy match**: 76.9% (vs HF bfloat16 reference)
 - **Model**: bloom-1b7, tp=1, seq_len=128, bfloat16
+
+## Performance
+
+Measured on trn1.32xlarge, batch_size=1, seq_len=128, bfloat16. Utilization is per-NeuronCore (TP=1).
+
+| Metric | Value |
+|--------|-------|
+| Throughput | 63.3 tok/s |
+| Context Encoding MBU | 18.6% |
+| Context Encoding MFU | 7.4% |
+| Token Generation MBU | 16.1% |
+| Token Generation MFU | 0.1% |
