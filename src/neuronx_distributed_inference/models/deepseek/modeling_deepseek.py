@@ -48,7 +48,13 @@ from neuronx_distributed_inference.models.deepseek.rope_util import (
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import manual_softmax
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
-from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module, initialize_moe_process_group
+from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
+from neuronx_distributed.modules.moe.model import MoE
+from neuronx_distributed.modules.moe.routing import RouterTopK
+from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig
+from neuronx_distributed.modules.moe.shared_experts import SharedExperts
+from neuronx_distributed.parallel_layers import parallel_state
 from transformers import AutoModelForCausalLM
 from transformers.activations import ACT2FN
 
@@ -325,6 +331,164 @@ class DeepseekV3DenseMLP(nn.Module):
         return (output,)
 
 
+class DeepseekV3Router(RouterTopK):
+    """Router with group-based expert selection for DeepSeek V3.
+
+    DeepSeek V3 uses noaux_tc routing with group-based selection:
+    1. Compute sigmoid(logits) as affinities
+    2. Add e_score_correction_bias for expert SELECTION only
+    3. Group experts (n_group groups), score each group by top-2 sum
+    4. Select top topk_group groups, mask non-selected groups
+    5. Select top-K experts from masked scores
+    6. Gather weights from ORIGINAL affinities (no bias), normalize, scale
+    """
+
+    def __init__(self, n_group=8, topk_group=4, routed_scaling_factor=2.5,
+                 norm_topk_prob=True, **kwargs):
+        super().__init__(**kwargs)
+        self.n_group = n_group
+        self.topk_group = topk_group
+        self.routed_scaling_factor = routed_scaling_factor
+        self.norm_topk_prob = norm_topk_prob
+        self.e_score_correction_bias = nn.Parameter(
+            torch.zeros(kwargs["num_experts"], dtype=kwargs.get("dtype", torch.float32))
+        )
+
+    def forward(self, hidden_states):
+        router_logits = self.get_router_logits(hidden_states)
+        expert_affinities = self.apply_activation_fn(router_logits)
+
+        # Add bias for selection only
+        scores_for_choice = expert_affinities + self.e_score_correction_bias.unsqueeze(0)
+
+        # Group-based selection:
+        # Reshape to (T, n_group, experts_per_group), take top-2 per group, sum -> group scores
+        experts_per_group = self.num_experts // self.n_group
+        group_scores = (
+            scores_for_choice.view(-1, self.n_group, experts_per_group)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )  # (T, n_group)
+
+        # Select top topk_group groups
+        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+
+        # Expand group mask to expert mask
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, self.n_group, experts_per_group)
+            .reshape(-1, self.num_experts)
+        )
+
+        # Mask out non-selected groups, then select top-K experts
+        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+        _, expert_index = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)
+
+        # Gather weights from ORIGINAL affinities (no bias), normalize, scale
+        topk_weights = expert_affinities.gather(1, expert_index)
+        if self.norm_topk_prob and self.top_k > 1:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * self.routed_scaling_factor
+
+        # Write normalized+scaled affinities back to full tensor
+        expert_affinities = torch.zeros_like(expert_affinities)
+        expert_affinities.scatter_(1, expert_index, topk_weights)
+
+        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
+        expert_index = expert_index.detach().to(dtype=torch.long)
+        return router_logits, expert_affinities, expert_index
+
+
+def _build_deepseek_moe(config: "DeepseekV3InferenceConfig"):
+    """Build MoE module with DeepSeek V3's group-based routing."""
+    enabled_hybrid_sharding = config.neuron_config.hybrid_sharding_config is not None
+    (moe_tkg_tensor_model_parallel_group, moe_tkg_expert_model_parallel_group,
+     moe_cte_tensor_model_parallel_group, moe_cte_expert_model_parallel_group) = \
+        initialize_moe_process_group(config, enabled_hybrid_sharding)
+
+    router = DeepseekV3Router(
+        n_group=getattr(config, "n_group", 8),
+        topk_group=getattr(config, "topk_group", 4),
+        routed_scaling_factor=getattr(config, "routed_scaling_factor", 2.5),
+        norm_topk_prob=getattr(config, "norm_topk_prob", True),
+        num_experts=config.num_local_experts,
+        top_k=config.num_experts_per_tok,
+        hidden_size=config.hidden_size,
+        dtype=config.neuron_config.router_config.dtype,
+        act_fn=config.neuron_config.router_config.act_fn,
+        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+        sequence_dimension=1,
+    )
+
+    hidden_size_actual = getattr(config, "original_hidden_size", None)
+    intermediate_size_actual = getattr(config, "original_intermediate_size", None)
+
+    expert_mlps = ExpertMLPsV2(
+        routed_experts_mlp_config=RoutedExpertsMLPOpsConfig(
+            num_experts=config.num_local_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_size_actual=hidden_size_actual,
+            intermediate_size_actual=intermediate_size_actual,
+            is_hidden_dim_shuffled=config.neuron_config.is_hidden_dim_shuffled,
+            is_intermediate_dim_shuffled=config.neuron_config.is_intermediate_dim_shuffled,
+            top_k=config.num_experts_per_tok,
+            hidden_act=config.hidden_act,
+            glu_mlp=config.neuron_config.glu_mlp,
+            glu_type=config.neuron_config.glu_type,
+            hidden_act_scaling_factor=config.neuron_config.hidden_act_scaling_factor,
+            hidden_act_bias=config.neuron_config.hidden_act_bias,
+            use_index_calc_kernel=config.neuron_config.use_index_calc_kernel,
+            gate_clamp_upper_limit=config.neuron_config.gate_clamp_upper_limit,
+            gate_clamp_lower_limit=config.neuron_config.gate_clamp_lower_limit,
+            up_clamp_upper_limit=config.neuron_config.up_clamp_upper_limit,
+            up_clamp_lower_limit=config.neuron_config.up_clamp_lower_limit,
+            early_expert_affinity_modulation=config.neuron_config.early_expert_affinity_modulation,
+            normalize_top_k_affinities=False,  # Router handles normalization+scaling
+            enable_spmd_rank=config.neuron_config.blockwise_matmul_config.parallelize_token_to_block_mapping,
+        ),
+        blockwise_matmul_config=config.neuron_config.blockwise_matmul_config,
+        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+        dtype=config.neuron_config.torch_dtype,
+        is_prefill=config.neuron_config.is_prefill_stage,
+        enabled_hybrid_sharding=enabled_hybrid_sharding,
+        tensor_model_parallel_group=parallel_state.get_tensor_model_parallel_group(),
+        expert_model_parallel_group=parallel_state.get_expert_model_parallel_group(),
+        cte_tensor_model_parallel_group=moe_cte_tensor_model_parallel_group,
+        cte_expert_model_parallel_group=moe_cte_expert_model_parallel_group,
+        tkg_tensor_model_parallel_group=moe_tkg_tensor_model_parallel_group,
+        tkg_expert_model_parallel_group=moe_tkg_expert_model_parallel_group,
+    )
+
+    shared_experts = None
+    if config.n_shared_experts:
+        shared_experts = SharedExperts(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_shared_experts=config.n_shared_experts,
+            hidden_act=config.hidden_act,
+            dtype=config.neuron_config.torch_dtype,
+            reduce_dtype=config.neuron_config.rpl_reduce_dtype,
+            fused_gate_up_projection=config.neuron_config.fused_shared_experts,
+            sequence_parallel_enabled=config.neuron_config.shared_experts_sequence_parallel_enabled,
+            transpose_weights=config.neuron_config.transpose_shared_experts_weights,
+        )
+
+    moe = MoE(
+        router=router,
+        expert_mlps=expert_mlps,
+        shared_experts=shared_experts,
+        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+        return_expert_index=config.neuron_config.return_expert_index,
+        return_router_logits=config.neuron_config.return_router_logits,
+        sequence_dimension=1,
+    )
+    moe.eval()
+    return moe
+
+
 class DeepseekV3Attention(NeuronAttentionBase):
 
     def __init__(self, config: DeepseekV3InferenceConfig, layer_idx: Optional[int] = None, tensor_model_parallel_group=None):
@@ -583,9 +747,7 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
                 config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
             )
         else:
-            self.mlp = initialize_moe_module(
-                config=config,
-            )
+            self.mlp = _build_deepseek_moe(config)
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
