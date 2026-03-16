@@ -720,8 +720,9 @@ class ModelWrapperLTX2Backbone(ModelWrapper if NEURON_AVAILABLE else object):
         audio_num_heads = self.config.audio_num_attention_heads
         audio_head_dim = self.config.audio_attention_head_dim
 
-        # Batch size = 2 for CFG (unconditional + conditional in one pass)
-        bs = 2
+        # Batch size: 2 for CFG (unconditional + conditional in one pass),
+        # 1 for Stage 2 / non-CFG workloads. Configurable via config.batch_size.
+        bs = getattr(self.config, "batch_size", 2)
 
         # RoPE rotation dim per head:
         # self-attn video: rope.dim=inner_dim → inner_dim / num_heads / 2
@@ -848,7 +849,7 @@ class NeuronLTX2BackboneApplication(
 
         Uses --auto-cast matmult (the spelling with two t's) and --lnc 2 for trn2.
         """
-        compiler_args = "--model-type=transformer -O1"
+        compiler_args = "--model-type=transformer -O2"
         compiler_args += " --auto-cast matmult --lnc 2"
         compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap'"
 

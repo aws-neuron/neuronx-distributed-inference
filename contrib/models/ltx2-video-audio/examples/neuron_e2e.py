@@ -68,14 +68,23 @@ VAE_OVERLAP_H = int(os.environ.get("LTX2_VAE_OVERLAP_H", "2"))
 VAE_OVERLAP_W = int(os.environ.get("LTX2_VAE_OVERLAP_W", "2"))
 OUTPUT_DIR = os.environ.get("LTX2_OUTPUT_DIR", "/home/ubuntu/ltx2_output/")
 TP_DEGREE = 4
-HEIGHT, WIDTH, NUM_FRAMES = 384, 512, 25
-NUM_STEPS = 8
+HEIGHT, WIDTH, NUM_FRAMES = 512, 768, 121
+NUM_STEPS = 40
 PROMPT = (
-    "A golden retriever puppy runs across a sunny green meadow, "
-    "its ears flapping in the wind. The camera follows from a low angle. "
-    "Birds chirp in the background."
+    "A close-up shot of a young waitress in a retro 1950s diner, her warm brown eyes "
+    "meeting the camera with a gentle smile. She wears a black polka-dot dress with an "
+    "elegant cream lace collar, her reddish-brown hair styled in an elaborate updo with "
+    "delicate curls framing her freckled face. Soft, warm light from overhead fixtures "
+    "illuminates her features as she stands behind a yellow counter. The camera begins "
+    "slightly to her side, then slowly pushes in toward her face, revealing the subtle "
+    "rosy blush on her cheeks. In the blurred background, the soft teal walls and a "
+    'glowing red "Diner" sign create a nostalgic atmosphere. The ambient sounds of '
+    "clinking dishes, distant conversations, and the gentle hum of a jukebox fill the "
+    'air. She tilts her head slightly and says in a friendly, warm voice: "Welcome to '
+    "Rosie's. What can I get for you today?\" The mood is inviting, timeless, and full "
+    "of classic American diner charm."
 )
-SEED = 42
+SEED = 10
 
 
 # -- Neuron Gemma3 Text Encoder -----------------------------------------------
