@@ -71,6 +71,81 @@ _sdpa_original = None
 _NKI_FLASH_MIN_SEQ = 512
 
 
+def _try_load_nki_cte():
+    """Try to load the nkilib attention_cte kernel and build a 4D wrapper.
+
+    The attention_cte kernel is a pure-NKI flash attention implementation with
+    3-deep software pipelining and LNC2-aware sharding. It operates on 3D
+    tensors (B*H, seq, d) but we wrap it to accept 4D (B, H, S, D) for
+    drop-in compatibility with the ISA kernel interface.
+
+    Integration uses the nki 0.2.0 public API:
+      1. peel_decorations() strips the @nki.jit(mode='auto') decorator
+      2. nki.jit(mode='torchxla') redecorates for PyTorch XLA tensor support
+      3. Integer grid (2,) for LNC=2 sharding (nki 0.2.0 uses int grids)
+
+    Returns a callable matching scaled_dot_product_attention_kernel's 4D interface,
+    or None if nkilib is not available.
+    """
+    try:
+        import nki
+        from nkilib.core.attention.attention_cte import attention_cte
+        from neuronx_distributed_inference.utils.decorator_peeling import (
+            peel_decorations,
+        )
+
+        # Peel @nki.jit(mode='auto') and redecorate with mode='torchxla'
+        # for PyTorch tensor compatibility during torch_neuronx.trace().
+        raw_func = peel_decorations(attention_cte)
+        decorated_cte = nki.jit(
+            raw_func,
+            mode="torchxla",
+            platform_target="trn2",
+        )
+
+        logger.info("nkilib attention_cte kernel loaded (nki 0.2.0 torchxla)")
+
+        def attention_cte_4d(Q, K, V, is_causal=False, scale=None):
+            """4D wrapper for attention_cte: (B, H, S, D) -> (B, H, S, D).
+
+            Reshapes 4D tensors to 3D (B*H, seq, d) with tp_q=True layout,
+            calls the nkilib CTE kernel, and reshapes back.
+            """
+            bsz, num_heads, q_len, head_dim = Q.shape
+            k_len = K.shape[2]
+
+            if scale is None:
+                scale = 1.0 / math.sqrt(head_dim)
+
+            # Reshape to 3D: (B*H, seq, d) — tp_q=True, tp_k=True layout
+            Q_3d = Q.reshape(bsz * num_heads, q_len, head_dim).contiguous()
+            K_3d = K.reshape(bsz * num_heads, k_len, head_dim).contiguous()
+            V_3d = V.reshape(bsz * num_heads, k_len, head_dim).contiguous()
+
+            # Integer grid (2,) for LNC=2 sharding (nki 0.2.0 API)
+            out = decorated_cte[(2,)](
+                q=Q_3d,
+                k=K_3d,
+                v=V_3d,
+                scale=scale,
+                causal_mask=is_causal,
+                tp_q=True,
+                tp_k=True,
+                tp_out=False,
+            )
+
+            return out.reshape(bsz, num_heads, q_len, head_dim)
+
+        return attention_cte_4d
+
+    except ImportError:
+        logger.info("nkilib not available, will try ISA kernel fallback")
+        return None
+    except Exception as e:
+        logger.info(f"nkilib attention_cte load failed: {e}")
+        return None
+
+
 def _try_load_nki_flash():
     """Try to load the NKI flash attention kernel from the SDK.
 
@@ -90,8 +165,13 @@ def _try_load_nki_flash():
 def replace_sdpa_with_bmm():
     """Replace F.scaled_dot_product_attention with NKI flash + BMM hybrid.
 
+    Kernel priority (auto mode):
+      1. NxDI ISA kernel (AttentionMMSoftmaxMMWithoutSwap) — fastest compile
+      2. nkilib attention_cte (pure NKI, 3-deep pipelined, LNC2-aware)
+      3. BMM fallback (explicit batched matmul + softmax)
+
     For attention with no mask, Q.seq >= 512, and 4D input on Neuron:
-      Uses the NKI flash attention kernel (tiled, no score matrix materialization).
+      Uses the best available NKI flash attention kernel.
       This covers:
         - Video self-attention (attn1): Q.seq == K.seq == 6144
         - Audio-to-video cross-modal attention (a2v): Q.seq=6144, K.seq=121
@@ -107,8 +187,21 @@ def replace_sdpa_with_bmm():
         return _sdpa_original
     _sdpa_original = torch.nn.functional.scaled_dot_product_attention
 
-    # Try to load the NKI flash kernel at module init time
-    _nki_flash_kernel = _try_load_nki_flash()
+    # Try ISA kernel first (fastest compile), then nkilib CTE.
+    # Set LTX2_FLASH_KERNEL=isa to force ISA, or LTX2_FLASH_KERNEL=cte to force nkilib CTE.
+    kernel_pref = os.environ.get("LTX2_FLASH_KERNEL", "auto").lower()
+
+    _nki_flash_kernel = None
+    if kernel_pref in ("auto", "isa"):
+        _nki_flash_kernel = _try_load_nki_flash()
+        if _nki_flash_kernel is not None:
+            logger.info("Using NxDI ISA kernel for flash attention")
+    if _nki_flash_kernel is None and kernel_pref in ("auto", "cte"):
+        _nki_flash_kernel = _try_load_nki_cte()
+        if _nki_flash_kernel is not None:
+            logger.info("Using nkilib attention_cte for flash attention")
+    if _nki_flash_kernel is None:
+        logger.warning("No NKI flash kernel available, all attention uses BMM")
 
     def neuron_sdpa(
         query,
