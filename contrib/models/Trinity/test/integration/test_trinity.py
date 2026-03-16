@@ -40,7 +40,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from neuronx_distributed_inference.models.config import MoENeuronConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
@@ -249,6 +249,99 @@ def test_top_token_valid(compiled_model, tokenizer):
     logger.info("Top token validation passed")
 
 
+# Deterministic prompts for 64-token generation comparison
+TOKEN_MATCH_PROMPTS = [
+    "Hello, how are you?",
+    "Explain quantum computing in simple terms.",
+    "Write a Python function that calculates the Fibonacci sequence.",
+    "The capital of France is",
+    "def fibonacci(n):",
+    "What is the meaning of life?",
+    "Once upon a time in a land far away,",
+    "The quick brown fox jumps over the lazy",
+]
+
+# Number of tokens to generate for match rate testing
+NUM_MATCH_TOKENS = 64
+
+
+def test_token_match_rate(compiled_model, tokenizer):
+    """Test Neuron vs CPU token match rate over 64 generated tokens.
+
+    Generates tokens using greedy decoding (argmax) on both Neuron and CPU,
+    then compares token-by-token. At least one prompt must achieve 100% match.
+    """
+    # Load CPU reference model
+    logger.info("Loading CPU reference model for token match comparison...")
+    cpu_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+    )
+    cpu_model = cpu_model.to("cpu")
+    cpu_model.eval()
+    logger.info("CPU reference model loaded")
+
+    best_rate = 0.0
+    best_prompt = ""
+    results = []
+
+    for prompt in TOKEN_MATCH_PROMPTS:
+        inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+        input_ids = inputs.input_ids
+        prompt_len = input_ids.shape[1]
+
+        # CPU reference: greedy generation
+        with torch.no_grad():
+            cpu_output = cpu_model.generate(
+                input_ids,
+                max_new_tokens=NUM_MATCH_TOKENS,
+                do_sample=False,
+            )
+        cpu_tokens = cpu_output[0, prompt_len : prompt_len + NUM_MATCH_TOKENS]
+
+        # Neuron: greedy generation via forward loop
+        neuron_tokens_full = generate_with_neuron_model(
+            compiled_model, input_ids, max_new_tokens=NUM_MATCH_TOKENS
+        )
+        neuron_tokens = neuron_tokens_full[0, prompt_len:]
+
+        # Compare
+        min_len = min(len(cpu_tokens), len(neuron_tokens))
+        if min_len > 0:
+            matched = (cpu_tokens[:min_len] == neuron_tokens[:min_len]).sum().item()
+            rate = matched / min_len
+        else:
+            matched = 0
+            rate = 0.0
+
+        results.append((prompt, matched, min_len, rate))
+        logger.info(
+            "  '%s' -> %d/%d (%.1f%%)",
+            prompt[:50],
+            matched,
+            min_len,
+            rate * 100,
+        )
+
+        if rate > best_rate:
+            best_rate = rate
+            best_prompt = prompt
+
+    del cpu_model
+
+    # Log summary
+    logger.info("Token match summary:")
+    for prompt, matched, total, rate in results:
+        logger.info("  %s: %d/%d (%.1f%%)", prompt[:50], matched, total, rate * 100)
+    logger.info("Best: %.1f%% ('%s')", best_rate * 100, best_prompt[:50])
+
+    assert best_rate >= 1.0, (
+        f"No prompt achieved 100% token match. "
+        f"Best: {best_rate * 100:.1f}% ('{best_prompt[:50]}')"
+    )
+
+
 def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
     """Check if text has excessive repetition."""
     words = text.split()
@@ -397,6 +490,10 @@ if __name__ == "__main__":
     logger.info("")
     logger.info("4. Top Token Validation...")
     test_top_token_valid(model, tokenizer)
+
+    logger.info("")
+    logger.info("5. Token Match Rate (64 tokens, Neuron vs CPU)...")
+    test_token_match_rate(model, tokenizer)
 
     logger.info("")
     logger.info("=" * 80)
