@@ -18,8 +18,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import logging
-from typing import Optional, Tuple, Type
+from typing import List, Optional, Tuple, Type
 
 import warnings
 import torch
@@ -49,29 +50,203 @@ from neuronx_distributed_inference.modules.attention.utils import manual_softmax
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 from transformers import AutoModelForCausalLM
+from transformers.activations import ACT2FN
 
 logger = logging.getLogger(__name__)
 
 def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "DeepseekV3InferenceConfig") -> dict:
-    # TODO: Implement state dict conversion
+    """
+    Convert HuggingFace DeepSeek V3 state dict to Neuron-compatible format.
+
+    Transformations:
+    1. Add rank utility tensors for TP sharding
+    2. Rename router weights: gate.weight -> router.linear_router.weight
+    3. Rename e_score_correction_bias for custom router (Phase 3)
+    4. Fuse gate_proj + up_proj into gate_up_proj for each expert
+    5. Stack down_proj weights across experts
+    6. Skip dense layers (first_k_dense_replace layers)
+    """
+    num_hidden_layers = config.num_hidden_layers
+    num_local_experts = config.num_local_experts
+    tp_degree = getattr(config.neuron_config, "tp_degree", 1)
+    first_k_dense = getattr(config, "first_k_dense_replace", 3)
+
+    # Add rank utilities for TP
+    state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
+
+    for layer_idx in range(num_hidden_layers):
+        # Add rank utility for attention
+        state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
+            0, tp_degree, dtype=torch.int32
+        )
+
+        # Skip dense layers (no MoE conversion needed)
+        if layer_idx < first_k_dense:
+            continue
+
+        # Rename router weights: gate.weight -> router.linear_router.weight
+        router_key = f"layers.{layer_idx}.mlp.gate.weight"
+        if router_key in state_dict:
+            state_dict[f"layers.{layer_idx}.mlp.router.linear_router.weight"] = (
+                state_dict[router_key].detach().clone()
+            )
+            del state_dict[router_key]
+
+        # Rename e_score_correction_bias for the custom router
+        bias_key = f"layers.{layer_idx}.mlp.gate.e_score_correction_bias"
+        if bias_key in state_dict:
+            state_dict[f"layers.{layer_idx}.mlp.router.e_score_correction_bias"] = (
+                state_dict[bias_key].detach().clone()
+            )
+            del state_dict[bias_key]
+
+        # Check if expert weights exist for this layer
+        expert_gate_key = f"layers.{layer_idx}.mlp.experts.0.gate_proj.weight"
+        if expert_gate_key not in state_dict:
+            continue
+
+        intermediate_size, hidden_size = state_dict[expert_gate_key].shape
+        device = state_dict[expert_gate_key].device
+        dtype = state_dict[expert_gate_key].dtype
+
+        # Fuse gate_proj + up_proj into gate_up_proj for all experts
+        gate_up_proj = torch.empty(
+            num_local_experts, hidden_size, 2 * intermediate_size,
+            dtype=dtype, device=device,
+        )
+
+        for e in range(num_local_experts):
+            gate_key = f"layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight"
+            up_key = f"layers.{layer_idx}.mlp.experts.{e}.up_proj.weight"
+
+            if gate_key in state_dict and up_key in state_dict:
+                gate_proj_weights = state_dict[gate_key].T.detach().clone()
+                up_proj_weights = state_dict[up_key].T.detach().clone()
+
+                gate_up_proj_slice = torch.narrow(gate_up_proj, 0, e, 1)
+                torch.narrow(gate_up_proj_slice, 2, 0, intermediate_size).copy_(gate_proj_weights)
+                torch.narrow(gate_up_proj_slice, 2, intermediate_size, intermediate_size).copy_(up_proj_weights)
+
+                del state_dict[gate_key]
+                del state_dict[up_key]
+
+        state_dict[f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
+
+        # Stack down_proj weights across all experts
+        down_proj = torch.empty(
+            num_local_experts, intermediate_size, hidden_size,
+            dtype=dtype, device=device,
+        )
+
+        for e in range(num_local_experts):
+            down_key = f"layers.{layer_idx}.mlp.experts.{e}.down_proj.weight"
+            if down_key in state_dict:
+                down_proj_weights = state_dict[down_key].T.detach().clone()
+                torch.narrow(down_proj, 0, e, 1).copy_(down_proj_weights)
+                del state_dict[down_key]
+
+        state_dict[f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+
+        gc.collect()
+
     return state_dict
 
 
+class DeepseekV3NeuronConfig(MoENeuronConfig):
+    """Neuron hardware configuration for DeepSeek V3 MoE model."""
+    pass
+
+
 class DeepseekV3InferenceConfig(InferenceConfig):
+    """
+    Inference configuration for DeepSeek V3.
+
+    Handles MLA attention parameters, MoE routing config, dense/MoE layer
+    distinction, and KV cache shape overrides for MLA's compressed cache format.
+
+    DeepSeek V3 may use plain RoPE (rope_scaling=None in HF config) or YaRN
+    for context extension. Since the attention class unconditionally reads
+    rope_scaling fields, we inject a no-op YaRN config when rope_scaling is None.
+    """
+
+    _NOOP_YARN_ROPE_SCALING = {
+        "type": "yarn",
+        "factor": 1.0,
+        "mscale": 1.0,
+        "mscale_all_dim": 0,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "original_max_position_embeddings": 4096,
+    }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # Standard HF config attributes expected by model_base.py
+        if not hasattr(self, "output_attentions"):
+            self.output_attentions = False
+        if not hasattr(self, "output_hidden_states"):
+            self.output_hidden_states = False
+        if not hasattr(self, "return_dict"):
+            self.return_dict = True
+
+        # Inject no-op Yarn config if rope_scaling is not set
+        if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
+            self.rope_scaling = self._NOOP_YARN_ROPE_SCALING
+
+        # Map HF config names to NXDI MoE names
         self.num_local_experts = getattr(self, "n_routed_experts", getattr(self, "num_experts", 0))
         self.n_shared_experts = getattr(self, "n_shared_experts", 0)
         self.num_experts_per_tok = getattr(self, "num_experts_per_tok", 0)
+
+        # Store dense layer intermediate size before overriding with MoE size.
+        # HF config uses "intermediate_size" for the dense FFN (18432).
+        if not hasattr(self, "dense_intermediate_size"):
+            self.dense_intermediate_size = getattr(self, "intermediate_size", 0)
+
+        # ExpertMLPsV2 reads config.intermediate_size for MoE expert size
         if getattr(self, "moe_intermediate_size", None) is not None:
             self.intermediate_size = self.moe_intermediate_size
+
+        # Activation function
+        if not hasattr(self, "hidden_act"):
+            self.hidden_act = "silu"
+
+        # Number of dense (non-MoE) layers at the start
+        if not hasattr(self, "first_k_dense_replace"):
+            self.first_k_dense_replace = 3
+
+        # MoE routing config (only when MoENeuronConfig is used)
+        if hasattr(self.neuron_config, "router_config"):
+            self.neuron_config.router_config.dtype = torch.float32
+            self.neuron_config.router_config.act_fn = "sigmoid"
+            self.neuron_config.normalize_top_k_affinities = True
+
+        # MLA KV cache: override head_dim and num_key_value_heads so the
+        # KVCacheManager allocates (bsz, 1, max_len, rope_dim + kv_lora_rank)
+        # instead of standard GQA layout.
+        self.head_dim = self.qk_rope_head_dim + self.kv_lora_rank
+        self.num_key_value_heads = 1
 
     def add_derived_config(self):
         self.num_cores_per_group = 1
 
     @classmethod
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
-        return NeuronConfig
+        return DeepseekV3NeuronConfig
+
+    def get_required_attributes(self) -> List[str]:
+        return [
+            # MLA (Multi-head Latent Attention) parameters
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "v_head_dim",
+            # MoE parameters
+            "n_routed_experts",
+            "num_experts_per_tok",
+            "moe_intermediate_size",
+        ]
 
 
 def get_rmsnorm_cls():
@@ -96,6 +271,58 @@ class DeepseekV3RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+
+def custom_compiler_args():
+    """
+    Compiler flags for DeepSeek V3 on Neuron (standalone function for attention tests).
+    """
+    compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
+    compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
+    compiler_args += " --tensorizer-options='--vectorize-strided-dma'"
+    compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
+    return compiler_args
+
+
+class DeepseekV3DenseMLP(nn.Module):
+    """
+    Dense MLP for DeepSeek V3 layers 0 through first_k_dense_replace-1.
+
+    Uses SiLU-gated architecture: output = down_proj(silu(gate_proj(x)) * up_proj(x))
+    Uses dense_intermediate_size (18432) instead of moe_intermediate_size (2048).
+    """
+
+    def __init__(self, config: DeepseekV3InferenceConfig):
+        super().__init__()
+        dtype = config.neuron_config.torch_dtype
+        self.gate_proj = ColumnParallelLinear(
+            config.hidden_size,
+            config.dense_intermediate_size,
+            bias=False,
+            gather_output=False,
+            dtype=dtype,
+        )
+        self.up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            config.dense_intermediate_size,
+            bias=False,
+            gather_output=False,
+            dtype=dtype,
+        )
+        self.down_proj = RowParallelLinear(
+            config.dense_intermediate_size,
+            config.hidden_size,
+            bias=False,
+            input_is_parallel=True,
+            dtype=dtype,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_states, padding_mask=None, **kwargs):
+        output = self.down_proj(
+            self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        )
+        return (output,)
 
 
 class DeepseekV3Attention(NeuronAttentionBase):
@@ -325,13 +552,19 @@ class DeepseekV3Attention(NeuronAttentionBase):
 
 class NeuronDeepseekV3DecoderLayer(nn.Module):
     """
-    Just replace the attention with the NXD version, and MLP with the NXD version
+    DeepSeek V3 decoder layer with MLA attention and Dense MLP or MoE.
+
+    Layers 0 through first_k_dense_replace-1 use a dense MLP;
+    remaining layers use Mixture-of-Experts (MoE).
     """
 
     def __init__(self, config: DeepseekV3InferenceConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = NeuronDeepseekV3Attention(config=config)
+        self.layer_idx = layer_idx
+        self.is_dense_layer = layer_idx < getattr(config, "first_k_dense_replace", 3)
+
+        self.self_attn = DeepseekV3Attention(config=config, layer_idx=layer_idx)
         self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
 
         self.input_layernorm = get_rmsnorm_cls()(
@@ -343,7 +576,9 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
         )
 
-        if self.moe_fused_nki_kernel_enabled:
+        if self.is_dense_layer:
+            self.mlp = DeepseekV3DenseMLP(config)
+        elif self.moe_fused_nki_kernel_enabled:
             self.mlp = initialize_moe_module(
                 config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
             )
@@ -405,12 +640,16 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # MoE
+        # MLP (Dense for first_k_dense_replace layers, MoE for rest)
         residual = hidden_states
-        if not self.moe_fused_nki_kernel_enabled:
+        if self.is_dense_layer:
             hidden_states = self.post_attention_layernorm(hidden_states)
-        is_speculative_decoding = self.config.neuron_config.enable_fused_speculation and (not self.config.neuron_config.is_prefill_stage)
-        hidden_states = self.mlp(hidden_states, padding_mask, is_speculative_decoding=is_speculative_decoding)[0]
+            hidden_states = self.mlp(hidden_states, padding_mask)[0]
+        else:
+            if not self.moe_fused_nki_kernel_enabled:
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            is_speculative_decoding = self.config.neuron_config.enable_fused_speculation and (not self.config.neuron_config.is_prefill_stage)
+            hidden_states = self.mlp(hidden_states, padding_mask, is_speculative_decoding=is_speculative_decoding)[0]
         hidden_states = residual + hidden_states
 
         # End module marker
@@ -436,7 +675,7 @@ class NeuronDeepseekV3Model(NeuronBaseModel):
         self.buckets = config.neuron_config.buckets
 
     def init_model(self, config: DeepseekV3InferenceConfig):
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = ParallelEmbedding(
@@ -470,7 +709,10 @@ class NeuronDeepseekV3ForCausalLM(NeuronBaseForCausalLM):
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
-        return DeepseekV3ForCausalLM.from_pretrained(model_path, **kwargs)
+        kwargs.setdefault("torch_dtype", torch.bfloat16)
+        return AutoModelForCausalLM.from_pretrained(
+            model_path, trust_remote_code=True, **kwargs
+        )
 
     @classmethod
     def get_config_cls(cls):
@@ -491,15 +733,6 @@ class NeuronDeepseekV3ForCausalLM(NeuronBaseForCausalLM):
         super().enable_token_generation()
 
 
-    def custom_compiler_args(self):
-        """
-        Over-ride function from base class for better control over compiler flags
-        """
-        compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer -O1"
-        compiler_args += (
-            " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
-        )
-        # add dma optimization flag
-        compiler_args += " --tensorizer-options='--vectorize-strided-dma'"
-        compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
-        return compiler_args
+    def get_compiler_args(self):
+        """Return None to let the framework's ModelWrapper build platform-appropriate compiler args."""
+        return None
