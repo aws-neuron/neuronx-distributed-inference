@@ -111,6 +111,7 @@ APP_ENCODER_SEQ_LEN = 512  # Gemma3 encoder seq_len for Application-compiled NEF
 APP_BACKBONE_AUDIO_SEQ = (
     26  # Audio latent frames (AudioLatentShape frames=26, mel_bins=16, patch=16)
 )
+APP_HALFRES_COMPILED_DIR = "/mnt/models/compiled/e2e_v2_halfres"
 GEMMA3_MODEL_PATH = "/mnt/models/gemma-3-12b"
 
 
@@ -1233,20 +1234,52 @@ def generate(args):
         audio_sample = torch.randn(audio_state.latent.shape, dtype=dtype, generator=gen)
 
         # Load half-res Neuron backbone
-        logger.info("Loading half-res backbone from %s...", args.halfres_compiled_dir)
-        neuron_backbone = load_neuron_backbone(
-            args.halfres_compiled_dir,
-            args.model_path,
-            args.tp_degree,
-            sharded_dir=args.halfres_sharded_dir
-            if os.path.isdir(args.halfres_sharded_dir)
-            else args.backbone_sharded_dir,
-        )
-        wrapper = NeuronTransformerWrapper(
-            compiled_backbone=neuron_backbone,
-            cpu_ltx_model=cpu["ltx_model"],
-            text_seq=args.text_seq,
-        )
+        if args.use_app:
+            # Application path: create half-res compositor and load backbone
+            s1_app = create_app_compositor(
+                model_path=args.model_path,
+                encoder_path=args.gemma_path,
+                tp_degree=args.tp_degree,
+                text_seq=args.text_seq,
+                height=s1_height,
+                width=s1_width,
+                num_frames=args.num_frames,
+            )
+            logger.info(
+                "Loading half-res backbone from %s...",
+                args.app_halfres_compiled_dir,
+            )
+            t0 = time.time()
+            s1_app.load_backbone(args.app_halfres_compiled_dir)
+            logger.info(
+                "Half-res backbone loaded via Application in %.1fs",
+                time.time() - t0,
+            )
+            neuron_backbone = s1_app
+            wrapper = NeuronTransformerWrapper(
+                compiled_backbone=neuron_backbone,
+                cpu_ltx_model=cpu["ltx_model"],
+                text_seq=args.text_seq,
+                mask_4d=True,
+                compiled_text_seq=APP_BACKBONE_TEXT_SEQ,
+            )
+        else:
+            logger.info(
+                "Loading half-res backbone from %s...", args.halfres_compiled_dir
+            )
+            neuron_backbone = load_neuron_backbone(
+                args.halfres_compiled_dir,
+                args.model_path,
+                args.tp_degree,
+                sharded_dir=args.halfres_sharded_dir
+                if os.path.isdir(args.halfres_sharded_dir)
+                else args.backbone_sharded_dir,
+            )
+            wrapper = NeuronTransformerWrapper(
+                compiled_backbone=neuron_backbone,
+                cpu_ltx_model=cpu["ltx_model"],
+                text_seq=args.text_seq,
+            )
 
         # Warmup half-res backbone
         logger.info("Warming up half-res DiT backbone...")
@@ -1345,7 +1378,11 @@ def generate(args):
         )
 
         # Unload half-res backbone
-        unload_neuron_model(neuron_backbone, "half-res DiT backbone")
+        if args.use_app:
+            s1_app.unload_backbone()
+            del s1_app
+        else:
+            unload_neuron_model(neuron_backbone, "half-res DiT backbone")
         del neuron_backbone, wrapper
 
         # Unpatchify Stage 1 output to spatial format
@@ -1408,18 +1445,36 @@ def generate(args):
         del s2_noise, s2_upscaled_tokens, s2_video_latent
 
         # Load full-res Neuron backbone (same compiled model, same weights)
-        logger.info("Loading full-res backbone from %s...", args.compile_dir)
-        neuron_backbone = load_neuron_backbone(
-            args.compile_dir,
-            args.model_path,
-            args.tp_degree,
-            sharded_dir=args.backbone_sharded_dir,
-        )
-        wrapper = NeuronTransformerWrapper(
-            compiled_backbone=neuron_backbone,
-            cpu_ltx_model=cpu["ltx_model"],
-            text_seq=args.text_seq,
-        )
+        if args.use_app:
+            # Application path: reuse the full-res compositor created for encoder
+            logger.info("Loading full-res backbone from %s...", args.app_compiled_dir)
+            t0 = time.time()
+            app.load_backbone(args.app_compiled_dir)
+            logger.info(
+                "Full-res backbone loaded via Application in %.1fs",
+                time.time() - t0,
+            )
+            neuron_backbone = app
+            wrapper = NeuronTransformerWrapper(
+                compiled_backbone=neuron_backbone,
+                cpu_ltx_model=cpu["ltx_model"],
+                text_seq=args.text_seq,
+                mask_4d=True,
+                compiled_text_seq=APP_BACKBONE_TEXT_SEQ,
+            )
+        else:
+            logger.info("Loading full-res backbone from %s...", args.compile_dir)
+            neuron_backbone = load_neuron_backbone(
+                args.compile_dir,
+                args.model_path,
+                args.tp_degree,
+                sharded_dir=args.backbone_sharded_dir,
+            )
+            wrapper = NeuronTransformerWrapper(
+                compiled_backbone=neuron_backbone,
+                cpu_ltx_model=cpu["ltx_model"],
+                text_seq=args.text_seq,
+            )
 
         # Warmup full-res backbone
         logger.info("Warming up full-res DiT backbone...")
@@ -1529,7 +1584,10 @@ def generate(args):
         video_shape = s2_video_shape  # for the decode path below
 
         # Unload full-res backbone before decode
-        unload_neuron_model(neuron_backbone, "full-res DiT backbone")
+        if args.use_app:
+            app.unload_backbone()
+        else:
+            unload_neuron_model(neuron_backbone, "full-res DiT backbone")
         del neuron_backbone, wrapper
 
         # Skip to decode section (jump past single-stage code)
@@ -2121,6 +2179,12 @@ def main():
         default=APP_COMPILED_DIR,
         help="Base directory with Application-compiled artifacts. "
         "Must contain backbone/ and text_encoder/ subdirs (from NeuronLTX23Application.compile()).",
+    )
+    parser.add_argument(
+        "--app-halfres-compiled-dir",
+        default=APP_HALFRES_COMPILED_DIR,
+        help="Base directory with half-res Application-compiled backbone. "
+        "Used for Stage 1 of --two-stage --use-app. Must contain backbone/ subdir.",
     )
 
     args = parser.parse_args()
