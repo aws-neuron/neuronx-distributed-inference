@@ -90,6 +90,30 @@ Overall per-step improvement vs unoptimized baseline: 330ms to 279.3ms (15.4% re
 
 Two-stage mode generates at half resolution (192×256) with 8 denoising steps, spatially upscales x2, then refines at full resolution (384×512) with 3 additional steps. The same backbone weights are used for both stages — only the compiled shapes differ.
 
+### trn2.48xlarge Full Benchmark (Two-Phase Pipeline)
+
+**Validated:** 2026-03-16
+**Instance:** trn2.48xlarge (TP=4/16, LNC=2, 32 logical NeuronCores)
+**SDK:** Neuron SDK 2.27, PyTorch 2.9, Deep Learning AMI Neuron (Ubuntu 24.04) 20260126
+**Resolution:** 512×768 → 1024×1536, 121 frames, Image-to-Video
+
+Two-phase execution is required because the NRT communicator cannot change TP degree mid-process:
+- **Phase 1** (TP=4): Gemma3 text encoding + S1 denoising (8 steps at 512×768)
+- **Phase 2** (TP=16): Spatial upsample → S2 denoising (3 steps at 1024×1536) → Neuron VAE decode
+
+| Component | Time | Notes |
+|-----------|------|-------|
+| **S1 denoising (8 steps, 512×768)** | **14.4s** | **1.8s/step, TP=4** |
+| **S2 denoising (3 steps, 1024×1536)** | **21.7s** | **7.2s/step, TP=16** |
+| **Combined denoising** | **36.0s** | S1 + S2 |
+| **VAE decode (Neuron, tiled)** | **23.5s** | 33 tiles @ 610ms/tile (TP=4), 3.4s first-tile warmup |
+| VAE decode (CPU, reference) | 78.7s | 3.3x slower than Neuron |
+| Audio decode (CPU) | 2.2s | Stereo WAV |
+| Spatial upsample (CPU) | 1.8s | 498M params |
+| Compilation (total) | ~33 min | Encoder 68s + S1 133s + S2 338s + VAE 570s |
+
+**VAE Decoder**: The LTX-2.3 video decoder is compiled at TP=4 with 4×16 latent tiles (128×512 pixels). After Phase 2 unloads the TP=16 S2 backbone, the TP=4 VAE loads onto the freed NeuronCores (4.6s load time). Tiled decode uses overlap blending (overlap_h=1 latent) for seamless spatial reconstruction at arbitrary resolutions.
+
 ### Component Distribution
 
 | Component | Location | Notes |
@@ -252,9 +276,10 @@ Output: PNG frames, MP4 video (if ffmpeg available), WAV audio.
 
 ## Compatibility Matrix
 
-| Instance/Version | SDK 2.28 |
-|------------------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | VALIDATED |
+| Instance/Version | SDK 2.27 | SDK 2.28 |
+|------------------|----------|----------|
+| trn2.3xlarge (TP=4, LNC=2) | — | VALIDATED |
+| trn2.48xlarge (TP=4/16, LNC=2) | VALIDATED | — |
 
 ## Example Checkpoints
 
@@ -330,7 +355,7 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 - **Two-stage cold start**: Two-stage mode loads two separate Neuron backbones sequentially (half-res and full-res), each with its own NEFF warmup. Total cold start overhead is ~2x single-stage.
 - **BF16 TP accumulation**: The 0.972 cosine similarity over 8 denoising steps (vs CPU) is due to normal BF16 rounding across TP=4 ranks. Single forward pass accuracy is 0.9999.
 - **No EFA**: The trn2.3xlarge single-instance setup does not use EFA for inter-node communication. NCCL/OFI warnings about EFA can be safely ignored.
-- **CPU video decode bottleneck**: At 384×512 (25 frames), the CPU video decoder takes ~4.7s — over half of warm E2E time. At this resolution, CPU decode is faster than a Neuron tiled approach (estimated ~8.4s for 6 tiles at 1.4s each). For higher resolutions (512×768+, 121 frames), a TP=4 tiled VAE decoder on Neuron achieves 3.1x speedup over CPU on trn2.3xlarge (21.8s vs 68.3s, benchmarked on LTX-2 which shares the same 128-channel VAE architecture). The tiled approach compiles the decoder at 8×8 latent (256×256 pixels) — the maximum tile size before hitting the NCC_EBVF030 instruction limit — and decodes via overlapping spatial tiles with linear blending. Key implementation detail: `ColumnRowParallelConv3d` must all-gather input channels along dim=1 (not the last dim) before column-parallel convolution; the naive diagonal-only sharding produces cosine=0.26 vs CPU. See the `light-benchmark` project for the validated TP compilation and tiling code.
+- **CPU video decode bottleneck**: At 384×512 (25 frames), the CPU video decoder takes ~4.7s — over half of warm E2E time. At higher resolutions (1024×1536, 121 frames), CPU decode takes 78.7s. The TP=4 tiled Neuron VAE decoder reduces this to 23.5s (3.3x speedup). Use `--vae-compiled-dir` in `run_phase2.py` to enable Neuron decode. The tiled approach compiles the decoder at 4×16 latent (128×512 pixels) — H×W ≤ 64 is the SRAM limit — and decodes via overlapping spatial tiles with linear blending.
 
 ## Source Files
 
@@ -346,3 +371,9 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 | `src/shard_backbone_weights.py` | Pre-shard DiT backbone weights to per-rank files for fast loading |
 | `src/load_with_weights.py` | DiT backbone weight sharding and injection utilities |
 | `src/generate_ltx23.py` | E2E generation pipeline (text encoding, single/two-stage denoising, VAE decode, upscaling, image-to-video) |
+| `src/run_phase2.py` | Phase 2 standalone script: spatial upsample + S2 denoising + Neuron/CPU VAE decode |
+| `src/modeling_vae_23.py` | TP-sharded LTX-2.3 VAE decoder (~560 lines), ColumnRowParallelConv3d, CausalConv3d |
+| `src/compile_vae_23.py` | VAE decoder compilation script (TP=4, 4×16 tile, 121 frames) |
+| `src/tiled_vae_decode_23.py` | Tiled decode with overlap blending for arbitrary resolutions |
+| `src/compile_benchmark.py` | Full benchmark compilation script (encoder + S1 + S2 backbone) |
+| `src/application.py` | NeuronLTX23Application compositor for NxDI Application path |

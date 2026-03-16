@@ -4,21 +4,24 @@ Phase 2 of the two-stage LTX-2.3 benchmark on trn2.48xlarge.
 Loads Stage 1 latent saved by Phase 1, then runs:
   - Spatial upsample x2 (CPU)
   - Stage 2 denoising at full resolution (Neuron, TP=16)
-  - VAE decode + save frames + MP4
+  - VAE decode (Neuron tiled or CPU fallback) + save frames + MP4
 
 Usage:
     # Phase 1 (TP=4, separate process):
     python generate_ltx23.py --two-stage --use-app --save-s1-latent /mnt/models/s1_latent.pt ...
 
-    # Phase 2 (TP=16, this script):
+    # Phase 2 (TP=16, this script) with Neuron VAE:
     python run_phase2.py \
         --model-path /mnt/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
         --s1-latent /mnt/models/s1_latent.pt \
         --s2-compiled-dir /mnt/models/compiled/benchmark/s2_tp16 \
         --spatial-upscaler-path /mnt/models/LTX-2.3/ltx-2.3-spatial-upscaler-x2-1.0.safetensors \
+        --vae-compiled-dir /mnt/models/compiled/vae_tp4_4x16 \
         --height 1024 --width 1536 --num-frames 121 \
         --tp-degree 16 \
         --output-dir /mnt/models/output/benchmark
+
+    # Without --vae-compiled-dir, falls back to CPU decode.
 """
 
 import argparse
@@ -173,6 +176,11 @@ def main():
     )
     parser.add_argument(
         "--gemma-path", default=None, help="Gemma3 path (for Application init)"
+    )
+    parser.add_argument(
+        "--vae-compiled-dir",
+        default=None,
+        help="Compiled Neuron VAE directory (if omitted, falls back to CPU decode)",
     )
     parser.add_argument("--height", type=int, required=True, help="Full-res height")
     parser.add_argument("--width", type=int, required=True, help="Full-res width")
@@ -411,17 +419,80 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    logger.info("  Decoding video...")
-    t0 = time.time()
-    from ltx_core.model.video_vae.video_vae import decode_video
+    if args.vae_compiled_dir:
+        # --- Neuron tiled VAE decode ---
+        logger.info("  Using Neuron VAE from %s", args.vae_compiled_dir)
+        from tiled_vae_decode_23 import (
+            preprocess_latent,
+            get_scaled_timestep,
+            load_compiled_vae,
+            tiled_decode,
+        )
 
-    video_chunks = []
-    with torch.no_grad():
-        for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
-            video_chunks.append(chunk)
-    video_frames = torch.cat(video_chunks, dim=0)
-    decode_time = time.time() - t0
-    logger.info("  Video decoded: %s in %.1fs", video_frames.shape, decode_time)
+        # Preprocess on CPU (noise injection + denormalization)
+        t0 = time.time()
+        preprocessed = preprocess_latent(
+            video_latent_spatial, cpu["video_decoder"], seed=42
+        )
+        scaled_ts = get_scaled_timestep(cpu["video_decoder"], batch_size=1)
+        # The compiled VAE NEF always expects 2 inputs (latent + scaled_timestep),
+        # even when timestep_conditioning=False in config (the value was constant-
+        # folded during tracing). Provide a default if get_scaled_timestep returns None.
+        if scaled_ts is None:
+            scaled_ts = torch.tensor([0.05 * 1000.0], dtype=torch.float32)
+            logger.info(
+                "  Using default scaled_timestep=50.0 (constant-folded in compiled model)"
+            )
+        logger.info(
+            "  Preprocessing: %.1fs (scaled_ts=%s)",
+            time.time() - t0,
+            scaled_ts,
+        )
+
+        # Unload S2 backbone models from Neuron before loading VAE
+        # (they were already unloaded above, but ensure NRT is clear)
+
+        # Load compiled VAE
+        t0 = time.time()
+        compiled_vae = load_compiled_vae(args.vae_compiled_dir)
+        logger.info("  Compiled VAE loaded in %.1fs", time.time() - t0)
+
+        # Tiled decode
+        t0 = time.time()
+        video_output = tiled_decode(
+            preprocessed,
+            compiled_vae,
+            scaled_timestep=scaled_ts,
+            tile_latent_h=4,
+            tile_latent_w=16,
+            overlap_latent_h=1,
+            overlap_latent_w=0,
+            verbose=True,
+        )
+        decode_time = time.time() - t0
+        logger.info("  Neuron VAE decode: %.1fs", decode_time)
+
+        # Convert to uint8 frames: [1, 3, T_out, H, W] -> [T_out, H, W, 3]
+        video_output = video_output.clamp(0, 1)
+        video_frames = (video_output[0].permute(1, 2, 3, 0) * 255).to(torch.uint8)
+        logger.info("  Video frames: %s", video_frames.shape)
+
+        del compiled_vae, preprocessed
+        gc.collect()
+    else:
+        # --- CPU fallback decode ---
+        logger.info("  Using CPU VAE decode (no --vae-compiled-dir provided)")
+        logger.info("  Decoding video...")
+        t0 = time.time()
+        from ltx_core.model.video_vae.video_vae import decode_video
+
+        video_chunks = []
+        with torch.no_grad():
+            for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
+                video_chunks.append(chunk)
+        video_frames = torch.cat(video_chunks, dim=0)
+        decode_time = time.time() - t0
+        logger.info("  Video decoded: %s in %.1fs", video_frames.shape, decode_time)
 
     from PIL import Image
 
@@ -485,6 +556,7 @@ def main():
         )
 
     total_time = time.time() - total_t0
+    vae_mode = "Neuron" if args.vae_compiled_dir else "CPU"
     logger.info("\n" + "=" * 60)
     logger.info("BENCHMARK RESULTS")
     logger.info("=" * 60)
@@ -494,7 +566,7 @@ def main():
         s2_total_time,
         s2_total_time / s2_num_steps,
     )
-    logger.info("  VAE decode:                  %.1fs", decode_time)
+    logger.info("  VAE decode (%s):          %.1fs", vae_mode, decode_time)
     logger.info("  Total Phase 2 wall time:     %.1fs", total_time)
     logger.info("  Output: %s", args.output_dir)
     logger.info("=" * 60)
