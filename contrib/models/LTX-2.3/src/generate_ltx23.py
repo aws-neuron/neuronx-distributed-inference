@@ -15,6 +15,12 @@ Outputs: video frames (PNG), MP4 video, WAV audio.
 Usage:
   source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
 
+  # Recommended: Application path (fastest, ~21% E2E speedup):
+  python3 generate_ltx23.py --use-app \
+    --gemma-path /mnt/models/gemma-3-12b \
+    --app-compiled-dir /mnt/models/compiled/e2e \
+    --prompt "A dog plays in a meadow"
+
   # Text-to-Video with random embeddings (no Gemma required):
   python3 generate_ltx23.py --no-text-encoder
 
@@ -97,6 +103,15 @@ STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 # Default half-res compilation paths (for two-stage mode)
 HALFRES_COMPILE_DIR = "/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_halfres"
 HALFRES_SHARDED_DIR = "/home/ubuntu/backbone_sharded_halfres"
+
+# Default backbone text_seq for Application-compiled NEFFs
+APP_BACKBONE_TEXT_SEQ = 256  # DiT backbone text_seq for Application-compiled NEFF
+APP_COMPILED_DIR = "/mnt/models/compiled/e2e_v2"
+APP_ENCODER_SEQ_LEN = 512  # Gemma3 encoder seq_len for Application-compiled NEFF
+APP_BACKBONE_AUDIO_SEQ = (
+    26  # Audio latent frames (AudioLatentShape frames=26, mel_bins=16, patch=16)
+)
+GEMMA3_MODEL_PATH = "/mnt/models/gemma-3-12b"
 
 
 def encode_image(image_path, model_path, height, width, dtype=torch.bfloat16):
@@ -784,6 +799,208 @@ def spatial_upscale_latent(video_latent_5d, video_decoder, spatial_upsampler):
     return latent
 
 
+def create_app_compositor(
+    model_path,
+    encoder_path,
+    tp_degree=4,
+    text_seq=256,
+    height=384,
+    width=512,
+    num_frames=25,
+    audio_seq=APP_BACKBONE_AUDIO_SEQ,
+):
+    """Create NeuronLTX23Application compositor with proper configs.
+
+    Returns:
+        NeuronLTX23Application instance ready for compile/load.
+    """
+    from neuronx_distributed_inference.models.config import NeuronConfig
+    from modeling_ltx23 import LTX23BackboneInferenceConfig
+    from modeling_gemma3_encoder import (
+        Gemma3EncoderInferenceConfig,
+        GEMMA3_12B_CONFIG,
+    )
+    from application import NeuronLTX23Application
+
+    config = load_config(model_path)
+    tc = config["transformer"]
+
+    num_heads = tc["num_attention_heads"]
+    head_dim = tc["attention_head_dim"]
+    inner_dim = num_heads * head_dim
+    audio_num_heads = tc["audio_num_attention_heads"]
+    audio_head_dim = tc["audio_attention_head_dim"]
+    audio_inner_dim = audio_num_heads * audio_head_dim
+    audio_ca_dim = tc.get("audio_cross_attention_dim", 2048)
+
+    latent_h = height // 32
+    latent_w = width // 32
+    latent_f = (num_frames - 1) // 8 + 1
+    video_seq = latent_f * latent_h * latent_w
+
+    dtype = torch.bfloat16
+
+    # Backbone InferenceConfig
+    backbone_neuron_config = NeuronConfig(
+        tp_degree=tp_degree,
+        world_size=tp_degree,
+        batch_size=1,
+        seq_len=video_seq,
+        torch_dtype=dtype,
+        logical_nc_config=2,
+        save_sharded_checkpoint=True,
+    )
+    backbone_config = LTX23BackboneInferenceConfig(
+        neuron_config=backbone_neuron_config,
+        num_layers=tc["num_layers"],
+        num_attention_heads=num_heads,
+        attention_head_dim=head_dim,
+        inner_dim=inner_dim,
+        audio_num_attention_heads=audio_num_heads,
+        audio_attention_head_dim=audio_head_dim,
+        audio_inner_dim=audio_inner_dim,
+        audio_cross_attention_dim=audio_ca_dim,
+        video_seq=video_seq,
+        audio_seq=audio_seq,
+        text_seq=APP_BACKBONE_TEXT_SEQ,  # Must match Application-compiled backbone
+        height=latent_h,
+        width=latent_w,
+        num_frames=latent_f,
+        ltx_config_dict=config,
+    )
+
+    # Gemma3 Encoder InferenceConfig
+    encoder_neuron_config = NeuronConfig(
+        tp_degree=tp_degree,
+        world_size=tp_degree,
+        batch_size=1,
+        seq_len=APP_ENCODER_SEQ_LEN,  # Must match Application-compiled encoder
+        torch_dtype=dtype,
+        logical_nc_config=2,
+        save_sharded_checkpoint=True,
+    )
+    encoder_config = Gemma3EncoderInferenceConfig(
+        neuron_config=encoder_neuron_config,
+        vocab_size=GEMMA3_12B_CONFIG["vocab_size"],
+        hidden_size=GEMMA3_12B_CONFIG["hidden_size"],
+        num_hidden_layers=GEMMA3_12B_CONFIG["num_hidden_layers"],
+        num_attention_heads=GEMMA3_12B_CONFIG["num_attention_heads"],
+        num_key_value_heads=GEMMA3_12B_CONFIG["num_key_value_heads"],
+        head_dim=GEMMA3_12B_CONFIG["head_dim"],
+        intermediate_size=GEMMA3_12B_CONFIG["intermediate_size"],
+        rms_norm_eps=GEMMA3_12B_CONFIG["rms_norm_eps"],
+        rope_theta=GEMMA3_12B_CONFIG["rope_theta"],
+        max_position_embeddings=GEMMA3_12B_CONFIG["max_position_embeddings"],
+        query_pre_attn_scalar=GEMMA3_12B_CONFIG["query_pre_attn_scalar"],
+        pad_token_id=GEMMA3_12B_CONFIG["pad_token_id"],
+    )
+
+    app = NeuronLTX23Application(
+        backbone_config=backbone_config,
+        encoder_config=encoder_config,
+        model_path=model_path,
+        encoder_path=encoder_path,
+    )
+    logger.info(
+        "NeuronLTX23Application created (video_seq=%d, text_seq=%d)",
+        video_seq,
+        text_seq,
+    )
+    return app
+
+
+def encode_text_with_app(
+    app, compiled_dir, tokenizer_path, prompt, text_seq, embeddings_processor
+):
+    """Encode text using the Application-loaded Gemma3 encoder.
+
+    Handles: load encoder → tokenize → forward → process → unload.
+
+    Args:
+        app: NeuronLTX23Application compositor
+        compiled_dir: Base compiled directory with text_encoder/ subdir
+        tokenizer_path: Path to Gemma3 tokenizer (HuggingFace dir)
+        prompt: Text prompt to encode
+        text_seq: Text sequence length for the backbone (256)
+        embeddings_processor: CPU EmbeddingsProcessor for post-processing
+
+    Returns:
+        (video_context, audio_context, context_mask) tensors
+    """
+    from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
+
+    # Load encoder to NeuronCores
+    logger.info("Loading Gemma3 encoder via Application...")
+    t0 = time.time()
+    app.load_text_encoder(compiled_dir)
+    logger.info("Gemma3 encoder loaded in %.1fs", time.time() - t0)
+
+    # Use the Application-compiled encoder seq_len (512), not the standalone one (1024)
+    compiled_seq_len = APP_ENCODER_SEQ_LEN
+
+    # Warmup
+    logger.info("  Warmup forward pass...")
+    t0 = time.time()
+    warmup_ids = torch.zeros(1, compiled_seq_len, dtype=torch.int64)
+    warmup_mask = torch.ones(1, compiled_seq_len, dtype=torch.int64)
+    with torch.no_grad():
+        _ = app.encode_text(warmup_ids, warmup_mask)
+    logger.info("  Warmup done in %.1fs", time.time() - t0)
+
+    # Tokenize
+    tokenizer = LTXVGemmaTokenizer(
+        tokenizer_path=tokenizer_path,
+        max_length=text_seq,
+    )
+    token_pairs = tokenizer.tokenize_with_weights(prompt)["gemma"]
+    input_ids = torch.tensor([[t[0] for t in token_pairs]], dtype=torch.int64)
+    attention_mask = torch.tensor([[w[1] for w in token_pairs]], dtype=torch.int64)
+    actual_len = input_ids.shape[1]
+
+    # compiled_seq_len already set to APP_ENCODER_SEQ_LEN above
+    if actual_len < compiled_seq_len:
+        pad_len = compiled_seq_len - actual_len
+        input_ids = torch.cat(
+            [torch.zeros(1, pad_len, dtype=torch.int64), input_ids], dim=1
+        )
+        attention_mask = torch.cat(
+            [torch.zeros(1, pad_len, dtype=torch.int64), attention_mask], dim=1
+        )
+    elif actual_len > compiled_seq_len:
+        input_ids = input_ids[:, :compiled_seq_len]
+        attention_mask = attention_mask[:, :compiled_seq_len]
+
+    logger.info(
+        "  Tokenized: %d tokens -> padded to %d", actual_len, input_ids.shape[1]
+    )
+
+    # Forward
+    t0 = time.time()
+    with torch.no_grad():
+        stacked = app.encode_text(input_ids, attention_mask)
+    logger.info("  Application Gemma3 forward: %.3fs", time.time() - t0)
+
+    # Trim padding
+    if actual_len < compiled_seq_len:
+        pad_len = compiled_seq_len - actual_len
+        stacked = stacked[:, pad_len:, :, :]
+        attention_mask = attention_mask[:, pad_len:]
+
+    # Convert stacked tensor to tuple of per-layer tensors
+    hidden_states = tuple(stacked[:, :, :, i] for i in range(stacked.shape[-1]))
+
+    result = embeddings_processor.process_hidden_states(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+    )
+
+    # Unload encoder to free NeuronCores for backbone
+    app.unload_text_encoder()
+    logger.info("  Gemma3 encoder unloaded")
+
+    return result.video_encoding, result.audio_encoding, result.attention_mask
+
+
 def generate(args):
     """Main generation pipeline."""
     config = load_config(args.model_path)
@@ -806,7 +1023,34 @@ def generate(args):
 
     # Get context embeddings
     dtype = torch.bfloat16
-    if args.no_text_encoder:
+    app = None  # NeuronLTX23Application compositor (only used with --use-app)
+    if args.use_app:
+        logger.info("\n=== Using Application path (recommended) ===")
+        app = create_app_compositor(
+            model_path=args.model_path,
+            encoder_path=args.gemma_path,
+            tp_degree=args.tp_degree,
+            text_seq=args.text_seq,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+        )
+        t0 = time.time()
+        video_context, audio_context, context_mask = encode_text_with_app(
+            app=app,
+            compiled_dir=args.app_compiled_dir,
+            tokenizer_path=args.gemma_path,
+            prompt=args.prompt,
+            text_seq=args.text_seq,
+            embeddings_processor=cpu["embeddings_processor"],
+        )
+        logger.info("Text encoded via Application in %.1fs", time.time() - t0)
+        logger.info(
+            "  video_context: %s, audio_context: %s",
+            video_context.shape,
+            audio_context.shape,
+        )
+    elif args.no_text_encoder:
         logger.info("\n=== Using random embeddings (no text encoder) ===")
         torch.manual_seed(args.seed)
         video_context = torch.randn(1, args.text_seq, 4096, dtype=dtype)
@@ -1389,22 +1633,33 @@ def generate(args):
     # =========================================================================
 
     # Load Neuron backbone — AFTER text encoding to avoid NeuronCore contention
-    # When using --neuron-gemma, Gemma3 was already unloaded above
+    # When using --neuron-gemma or --use-app, Gemma3 was already unloaded above
     logger.info("\n=== Loading Neuron backbone ===")
-    neuron_backbone = load_neuron_backbone(
-        args.compile_dir,
-        args.model_path,
-        args.tp_degree,
-        sharded_dir=args.backbone_sharded_dir,
-    )
+    if args.use_app:
+        # Application path: load backbone via compositor
+        t0 = time.time()
+        app.load_backbone(args.app_compiled_dir)
+        logger.info("Backbone loaded via Application in %.1fs", time.time() - t0)
+        neuron_backbone = app  # app is callable with the same 24-tensor interface
+    else:
+        neuron_backbone = load_neuron_backbone(
+            args.compile_dir,
+            args.model_path,
+            args.tp_degree,
+            sharded_dir=args.backbone_sharded_dir,
+        )
 
     # Build pipeline wrapper
     from pipeline import NeuronTransformerWrapper
 
+    # Application-compiled NEFFs use text_seq=256 (matching standalone); no padding needed
+    compiled_text_seq = APP_BACKBONE_TEXT_SEQ if args.use_app else None
     wrapper = NeuronTransformerWrapper(
         compiled_backbone=neuron_backbone,
         cpu_ltx_model=cpu["ltx_model"],
         text_seq=args.text_seq,
+        mask_4d=args.use_app,
+        compiled_text_seq=compiled_text_seq,
     )
 
     # Setup latent tools (needed for warmup and denoising)
@@ -1854,13 +2109,29 @@ def main():
         help="Directory with pre-sharded backbone weights for half-res model "
         "(same weights, different compiled shape)",
     )
+    parser.add_argument(
+        "--use-app",
+        action="store_true",
+        help="Use NeuronApplicationBase path for both Gemma3 encoder and DiT backbone. "
+        "Faster than --neuron-gemma due to ModelBuilder weight layout optimization. "
+        "Requires --app-compiled-dir with backbone/ and text_encoder/ subdirs.",
+    )
+    parser.add_argument(
+        "--app-compiled-dir",
+        default=APP_COMPILED_DIR,
+        help="Base directory with Application-compiled artifacts. "
+        "Must contain backbone/ and text_encoder/ subdirs (from NeuronLTX23Application.compile()).",
+    )
 
     args = parser.parse_args()
 
-    if not args.no_text_encoder and not args.neuron_gemma and args.gemma_path is None:
+    if args.use_app:
+        if args.gemma_path is None:
+            args.gemma_path = GEMMA3_MODEL_PATH
+    elif not args.no_text_encoder and not args.neuron_gemma and args.gemma_path is None:
         parser.error(
-            "Either --no-text-encoder or --gemma-path must be specified. "
-            "Use --neuron-gemma for Neuron-compiled Gemma3 (fastest)."
+            "Either --no-text-encoder, --neuron-gemma, --use-app, or --gemma-path must be specified. "
+            "Use --use-app for Application-compiled models (fastest, recommended)."
         )
 
     generate(args)

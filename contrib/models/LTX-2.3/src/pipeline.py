@@ -48,18 +48,33 @@ class NeuronTransformerWrapper(nn.Module):
       Saves ~57ms/step (RoPE ~1.6ms + context projection ~55ms).
     """
 
-    def __init__(self, compiled_backbone, cpu_ltx_model, text_seq=256):
+    def __init__(
+        self,
+        compiled_backbone,
+        cpu_ltx_model,
+        text_seq=256,
+        mask_4d=False,
+        compiled_text_seq=None,
+    ):
         """
         Args:
             compiled_backbone: Compiled Neuron model (TensorParallelNeuronModel
                 or callable that takes 24 positional tensor args)
             cpu_ltx_model: The full unsharded LTXModel on CPU (for preprocessors)
-            text_seq: Maximum text sequence length (must match compile-time)
+            text_seq: Maximum text sequence length for preprocessing
+            mask_4d: If True, keep attention masks as 4D (B,1,1,seq) for
+                Application-compiled NEFFs. Standalone-compiled NEFFs expect
+                2D (B,seq) masks.
+            compiled_text_seq: Text sequence length the NEFF was compiled with.
+                If different from text_seq, context tensors are padded to match.
+                Defaults to text_seq if None.
         """
         super().__init__()
         self.compiled_backbone = compiled_backbone
         self.text_seq = text_seq
+        self.compiled_text_seq = compiled_text_seq or text_seq
         self.dtype = torch.bfloat16
+        self.mask_4d = mask_4d
 
         # Keep CPU preprocessors from the native model
         self.video_args_preprocessor = cpu_ltx_model.video_args_preprocessor
@@ -301,11 +316,17 @@ class NeuronTransformerWrapper(nn.Module):
         already_additive = False
 
         if v_mask is not None and v_mask.ndim == 4:
-            # Preprocessor converted int64 → 4D additive. Squeeze to 2D.
-            v_mask = v_mask.squeeze(1).squeeze(1)  # (B,1,1,seq) -> (B,seq)
-            already_additive = True
+            if self.mask_4d:
+                # Application-compiled NEFFs expect 4D masks (B,1,1,seq).
+                # Keep as-is; already in additive format from preprocessor.
+                already_additive = True
+            else:
+                # Standalone-compiled NEFFs expect 2D masks (B,seq).
+                v_mask = v_mask.squeeze(1).squeeze(1)  # (B,1,1,seq) -> (B,seq)
+                already_additive = True
         if a_mask is not None and a_mask.ndim == 4:
-            a_mask = a_mask.squeeze(1).squeeze(1)
+            if not self.mask_4d:
+                a_mask = a_mask.squeeze(1).squeeze(1)
 
         # Convert to bf16
         if v_mask is not None:
@@ -314,19 +335,24 @@ class NeuronTransformerWrapper(nn.Module):
             a_mask = a_mask.to(dtype)
 
         # Only convert if the mask is still binary (bf16 input case)
-        if v_mask is not None and v_mask.ndim == 2 and not already_additive:
-            # Mask is bf16 binary {0, 1}: convert to additive format
-            finfo = torch.finfo(dtype)
-            v_mask = torch.where(
-                v_mask > 0.5,
-                torch.zeros_like(v_mask),
-                torch.full_like(v_mask, finfo.min),
-            )
-            a_mask = torch.where(
-                a_mask > 0.5,
-                torch.zeros_like(a_mask),
-                torch.full_like(a_mask, finfo.min),
-            )
+        if v_mask is not None and not already_additive:
+            if v_mask.ndim == 2:
+                # Mask is bf16 binary {0, 1}: convert to additive format
+                finfo = torch.finfo(dtype)
+                v_mask = torch.where(
+                    v_mask > 0.5,
+                    torch.zeros_like(v_mask),
+                    torch.full_like(v_mask, finfo.min),
+                )
+                a_mask = torch.where(
+                    a_mask > 0.5,
+                    torch.zeros_like(a_mask),
+                    torch.full_like(a_mask, finfo.min),
+                )
+                if self.mask_4d:
+                    # Expand to 4D for Application path
+                    v_mask = v_mask.unsqueeze(1).unsqueeze(1)  # (B,seq) -> (B,1,1,seq)
+                    a_mask = a_mask.unsqueeze(1).unsqueeze(1)
 
         inputs = (
             va.x.to(dtype),
@@ -354,7 +380,55 @@ class NeuronTransformerWrapper(nn.Module):
             va.prompt_timestep.to(dtype),
             aa.prompt_timestep.to(dtype),
         )
+
+        # Pad context/mask tensors if compiled_text_seq > actual text_seq
+        if self.compiled_text_seq != self.text_seq:
+            inputs = self._pad_context_tensors(inputs)
+
         return inputs, va, aa
+
+    def _pad_context_tensors(self, inputs):
+        """Pad context and mask tensors to match compiled_text_seq.
+
+        The NEFF was compiled with compiled_text_seq context tokens, but the
+        actual text encoder output may have fewer tokens. Pad with zeros
+        (context) and -inf (masks) so the extra positions are ignored.
+
+        Tensor indices in the 24-input tuple:
+            [2]  encoder_hidden_states    (B, text_seq, inner_dim)
+            [3]  audio_encoder_hidden_states (B, text_seq, audio_inner_dim)
+            [20] encoder_attention_mask   (B, text_seq) or (B,1,1,text_seq)
+            [21] audio_encoder_attention_mask (same shape)
+        """
+        actual_seq = inputs[2].shape[1]
+        target_seq = self.compiled_text_seq
+        if actual_seq >= target_seq:
+            return inputs
+
+        pad_len = target_seq - actual_seq
+        dtype = self.dtype
+        inputs = list(inputs)
+
+        # Pad context with zeros
+        for idx in (2, 3):
+            ctx = inputs[idx]
+            pad = torch.zeros(ctx.shape[0], pad_len, ctx.shape[2], dtype=dtype)
+            inputs[idx] = torch.cat([ctx, pad], dim=1)
+
+        # Pad masks with -inf (masked out)
+        finfo = torch.finfo(dtype)
+        for idx in (20, 21):
+            mask = inputs[idx]
+            if mask.ndim == 4:
+                # (B, 1, 1, seq) -> pad last dim
+                pad = torch.full((mask.shape[0], 1, 1, pad_len), finfo.min, dtype=dtype)
+                inputs[idx] = torch.cat([mask, pad], dim=-1)
+            elif mask.ndim == 2:
+                # (B, seq) -> pad last dim
+                pad = torch.full((mask.shape[0], pad_len), finfo.min, dtype=dtype)
+                inputs[idx] = torch.cat([mask, pad], dim=-1)
+
+        return tuple(inputs)
 
     def forward(self, video_modality, audio_modality):
         """Preprocess on CPU, run backbone on Neuron, return (video_out, audio_out).
@@ -409,6 +483,8 @@ class NeuronLTX23Pipeline:
         audio_vae=None,
         vocoder=None,
         text_seq=256,
+        mask_4d=False,
+        compiled_text_seq=None,
     ):
         """
         Args:
@@ -421,12 +497,16 @@ class NeuronLTX23Pipeline:
             audio_vae: Audio VAE decoder
             vocoder: Audio vocoder
             text_seq: Maximum text sequence length
+            mask_4d: If True, keep attention masks as 4D for Application-compiled NEFFs
+            compiled_text_seq: Text seq len the NEFF was compiled with (defaults to text_seq)
         """
         self.ltx_model = ltx_model
         self.wrapper = NeuronTransformerWrapper(
             compiled_backbone=neuron_backbone,
             cpu_ltx_model=ltx_model,
             text_seq=text_seq,
+            mask_4d=mask_4d,
+            compiled_text_seq=compiled_text_seq,
         )
         self.text_encoder = text_encoder
         self.embeddings_processor = embeddings_processor
