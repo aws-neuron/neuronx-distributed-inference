@@ -79,6 +79,18 @@ inputs = tokenizer("Wikipedia The theory of relativity", return_tensors="pt")
 | Trn1             | PASS (99.84% TF) | Not tested |
 | Inf2             | Not tested | Not tested |
 
+## Performance
+
+Profiled on trn1.32xlarge (single NeuronCore utilization):
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| Throughput | - | 59.3 tok/s |
+| MBU (Memory) | 16.7% | 15.0% |
+| MFU (Compute) | 7.6% | 0.1% |
+
+*Batch size 1, sequence length 128, BF16 precision, TP=1*
+
 ## Testing
 
 Run integration tests:
