@@ -162,6 +162,30 @@ def _try_load_nki_flash():
         return None
 
 
+# ── NKI Cross-Attention Kernel (masked, for attn2/audio_attn2) ──────────────
+def _try_load_nki_cross_attn():
+    """Load the NKI cross-attention kernel from nki_cross_attention_kernel.py.
+
+    The kernel is in a separate file so that nki.language and nki.isa are
+    module-level imports visible to the NKI AST tracer (which inspects
+    the kernel function's __globals__). Defining the kernel inline as a
+    closure causes 'nl.ndarray not found' during compilation.
+
+    Returns the @nki.jit kernel callable or None if NKI is unavailable.
+    """
+    try:
+        from nki_cross_attention_kernel import cross_attn_kernel
+
+        logger.info("NKI cross-attention kernel loaded (ISA-only, mode=torchxla)")
+        return cross_attn_kernel
+    except ImportError:
+        logger.info("NKI not available for cross-attention kernel")
+        return None
+    except Exception as e:
+        logger.info(f"NKI cross-attention kernel load failed: {e}")
+        return None
+
+
 def replace_sdpa_with_bmm():
     """Replace F.scaled_dot_product_attention with NKI flash + BMM hybrid.
 
@@ -202,6 +226,19 @@ def replace_sdpa_with_bmm():
             logger.info("Using nkilib attention_cte for flash attention")
     if _nki_flash_kernel is None:
         logger.warning("No NKI flash kernel available, all attention uses BMM")
+
+    # Try to load NKI cross-attention kernel for masked attention (attn2).
+    # Set LTX2_CROSS_ATTN_KERNEL=off to disable.
+    _nki_cross_attn = None
+    cross_attn_pref = os.environ.get("LTX2_CROSS_ATTN_KERNEL", "auto").lower()
+    if cross_attn_pref != "off":
+        _nki_cross_attn = _try_load_nki_cross_attn()
+        if _nki_cross_attn is not None:
+            logger.info("Using NKI cross-attention kernel for masked attention")
+        else:
+            logger.info(
+                "NKI cross-attention kernel not available, masked attn uses BMM"
+            )
 
     def neuron_sdpa(
         query,
@@ -244,6 +281,48 @@ def replace_sdpa_with_bmm():
             return _nki_flash_kernel(
                 query, key, value, is_causal=False, scale=float(scale)
             )
+
+        # ── NKI Cross-Attention path (masked, K_seq=1024) ──────────────
+        # Eligible when: 4D input, has mask, K_seq=1024, d=128, Q_seq >= 512
+        # This covers: attn2 (text cross-attention), audio_attn2
+        if (
+            _nki_cross_attn is not None
+            and attn_mask is not None
+            and len(query.shape) == 4
+            and query.shape[-1] == 128
+            and key.shape[2] == 1024
+            and query.shape[2] >= _NKI_FLASH_MIN_SEQ
+            and query.shape[2] % 128 == 0
+        ):
+            b, h, sq, d_head = query.shape
+            k_seq = key.shape[2]
+            if scale is None:
+                scale = 1.0 / math.sqrt(d_head)
+            # Pre-scale Q, reshape to 3D
+            Q_3d = (query * scale).reshape(b * h, sq, d_head).contiguous()
+            K_3d = key.reshape(b * h, k_seq, d_head).contiguous()
+            V_3d = value.reshape(b * h, k_seq, d_head).contiguous()
+            # Reshape mask to [B*H, 1, K_seq]
+            if attn_mask.ndim == 4:
+                mask_3d = attn_mask.reshape(
+                    b * h, attn_mask.shape[-2], attn_mask.shape[-1]
+                )
+            else:
+                mask_3d = attn_mask
+            mask_3d = mask_3d.float().contiguous()
+            out_3d = torch.zeros(
+                b * h, sq, d_head, dtype=Q_3d.dtype, device=Q_3d.device
+            )
+            _nki_cross_attn(Q_3d, K_3d, V_3d, mask_3d, out_3d)
+            # Force XLA to keep mask_3d in the compiled graph. Without this,
+            # XLA's dead code elimination drops the mask tensor because the
+            # NKI custom op is opaque to XLA's data flow analysis.
+            # Adding a tiny mask-derived value (~0 in bf16) creates a
+            # traceable dependency without affecting numerical output.
+            # mask values are {0, -10000}: /1e20 → {0, -1e-16} → 0 in bf16.
+            mask_dep = (mask_3d[:, :1, :1] / 1e20).to(out_3d.dtype)
+            out_3d = out_3d + mask_dep
+            return out_3d.reshape(b, h, sq, d_head)
 
         # ── BMM fallback path ───────────────────────────────────────────
         d = query.shape[-1]
@@ -691,6 +770,22 @@ class ModelWrapperLTX2Backbone(ModelWrapper if NEURON_AVAILABLE else object):
             )
         self.bucket_config = None
 
+    @staticmethod
+    def _make_attention_mask(bs, text_seq, dtype, valid_tokens=84):
+        """Create a realistic additive attention mask for compilation.
+
+        Returns (bs, 1, text_seq) with additive bias format:
+          - First `valid_tokens` positions: 0.0 (attend)
+          - Remaining positions: -10000.0 (mask out padding)
+
+        Using all-zeros causes XLA to constant-fold the mask, dropping it
+        from the compiled graph. This results in the NKI cross-attention
+        kernel (and even the BMM fallback) receiving no mask data at runtime.
+        """
+        mask = torch.full((bs, 1, text_seq), -10000.0, dtype=dtype)
+        mask[:, :, :valid_tokens] = 0.0
+        return mask
+
     def input_generator(self):
         """Generate example inputs for Neuron compilation.
 
@@ -787,8 +882,14 @@ class ModelWrapperLTX2Backbone(ModelWrapper if NEURON_AVAILABLE else object):
                 bs, audio_num_heads, audio_seq, ca_audio_rope_dim, dtype=dtype
             ),  # ca_audio_rot_sin
             # Attention masks: additive bias (B, 1, text_seq)
-            torch.zeros(bs, 1, text_seq, dtype=dtype),  # encoder_attention_mask
-            torch.zeros(bs, 1, text_seq, dtype=dtype),  # audio_encoder_attention_mask
+            # CRITICAL: Must use realistic non-zero mask values, NOT all-zeros.
+            # All-zeros causes XLA to constant-fold the mask tensor, dropping it
+            # from the compiled graph. Real masks have ~84 valid (0.0) and ~940
+            # padding (-10000.0) positions in additive bias format.
+            self._make_attention_mask(bs, text_seq, dtype),  # encoder_attention_mask
+            self._make_attention_mask(
+                bs, text_seq, dtype
+            ),  # audio_encoder_attention_mask
         )
 
         return [model_inputs]
@@ -848,10 +949,19 @@ class NeuronLTX2BackboneApplication(
         """Compiler args for the LTX-2 transformer.
 
         Uses --auto-cast matmult (the spelling with two t's) and --lnc 2 for trn2.
+
+        Extra flags can be appended via LTX2_EXTRA_COMPILER_FLAGS env var for A/B testing.
+        Example: LTX2_EXTRA_COMPILER_FLAGS="--enable-saturate-infinity --internal-hoist-allgather"
         """
         compiler_args = "--model-type=transformer -O2"
         compiler_args += " --auto-cast matmult --lnc 2"
         compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap'"
+
+        # Allow extra compiler flags for A/B testing
+        extra = os.environ.get("LTX2_EXTRA_COMPILER_FLAGS", "")
+        if extra:
+            compiler_args += " " + extra
+            logger.info(f"Extra compiler flags: {extra}")
 
         os.environ["LOCAL_WORLD_SIZE"] = str(self.config.neuron_config.world_size)
         os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
