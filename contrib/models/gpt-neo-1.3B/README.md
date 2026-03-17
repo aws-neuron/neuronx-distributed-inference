@@ -74,6 +74,18 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 | Trn1             | PASS | Not tested |
 | Inf2             | Not tested | Not tested |
 
+## Performance
+
+Profiled on trn1.32xlarge (single NeuronCore utilization):
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| Throughput | - | 81.9 tok/s |
+| MBU (Memory) | 18.1% | 15.2% |
+| MFU (Compute) | 9.4% | 0.1% |
+
+*Batch size 1, sequence length 128, BF16 precision, TP=1*
+
 ## Testing
 
 Run integration tests:
