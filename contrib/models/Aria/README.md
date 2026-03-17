@@ -23,26 +23,36 @@ pattern as built-in Mixtral and Qwen3-MoE models.
 
 ## Validation Results
 
-**Validated:** 2026-03-16
+**Validated:** 2026-03-17
 
 | Metric | Value |
 |--------|-------|
-| Inference test | PASSED (3/3 prompts coherent) |
+| Teacher-forced match | **98.12%** (PASSED) |
+| Greedy match | 72.81% |
 | Throughput (TKG) | 4.2 tokens/sec |
 | Config | tp=8, batch=1, seq_len=512, bf16 |
 | Instance | trn1.32xlarge |
+| HF golden reference | `AriaForConditionalGeneration` (text-only input) |
 
-### Inference-Only Test Output
+### Token Match Details (10 prompts, 32 tokens each)
 
-| Prompt | Generated |
-|--------|-----------|
-| "The capital of France is" | " Paris. The capital of Germany is Berlin..." |
-| "In machine learning, neural networks" | " are a set of algorithms, modeled after the human brain..." |
-| "def fibonacci(n):" | " if n == 0: return 0 elif..." |
+| Prompt | Greedy | Teacher-Forced |
+|--------|--------|----------------|
+| "The theory of general relativity..." | 90.6% | 96.9% |
+| "The French Revolution began in..." | 100.0% | 100.0% |
+| "To solve a quadratic equation..." | 100.0% | 100.0% |
+| "Once upon a time in a distant galaxy..." | 12.5% | 96.9% |
+| "def fibonacci(n):..." | 100.0% | 100.0% |
+| "The Amazon River flows through..." | 96.9% | 93.8% |
+| "The concept of free will..." | 28.1% | 96.9% |
+| "To make a cup of coffee, first..." | 0.0% | 96.9% |
+| "List three benefits of regular exercise..." | 100.0% | 100.0% |
+| "If all roses are flowers..." | 100.0% | 100.0% |
 
-Note: Full HF golden comparison skipped because the reference HF model
-(`AriaForConditionalGeneration`) is multimodal with 64 MoE experts,
-making CPU-based token generation prohibitively slow.
+Note: HF golden uses full `AriaForConditionalGeneration` with text-only input
+(no pixel_values). `AriaTextForCausalLM` cannot be loaded directly due to
+weight prefix mismatch (`language_model.*` in checkpoint). Greedy divergence
+is expected for MoE models in bf16 due to cascading expert routing differences.
 
 ## Compatibility Matrix
 
@@ -55,4 +65,4 @@ making CPU-based token generation prohibitively slow.
 
 Neuroboros Team - Annapurna Labs
 
-**Last Updated:** 2026-03-16
+**Last Updated:** 2026-03-17
