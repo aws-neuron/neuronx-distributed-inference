@@ -81,6 +81,18 @@ inputs = tokenizer("a photo of", return_tensors="pt")
 | Trn1             | Working | Not tested |
 | Inf2             | Not tested | Not tested |
 
+## Performance
+
+Profiled on trn1.32xlarge (single NeuronCore utilization):
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| Throughput | - | 714.4 tok/s |
+| MBU (Memory) | 11.7% | 12.4% |
+| MFU (Compute) | 4.3% | 0.1% |
+
+*Batch size 1, sequence length 128, BF16 precision, TP=1*
+
 ## Testing
 
 Run integration tests:
