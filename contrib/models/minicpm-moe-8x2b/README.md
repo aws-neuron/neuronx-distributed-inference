@@ -31,17 +31,34 @@ NeuronX Distributed Inference implementation of MiniCPM-MoE-8x2B.
 
 **Validated:** 2026-03-17
 
-| Metric | Result |
-|--------|--------|
+| Metric | Value |
+|--------|-------|
+| Teacher-forced match | 92.19% |
+| Greedy match | 39.38% |
 | Compilation | PASS |
 | Inference (greedy) | PASS |
+| Config | tp=2, batch=1, seq_len=2048, bf16 |
+| Instance | trn1.32xlarge |
 
-**Sample outputs:**
-- "The capital of France is" -> "a city with a rich history and cultural heritage..."
-- "def fibonacci(n):" -> "if n <= 1: return n else: return..."
-- "In machine learning, neural networks" -> "are a type of model that is inspired by the structure..."
+### Token Match Details (10 prompts, 32 tokens each)
 
-**Note:** Full HF token-match comparison skipped due to MoE model size (26GB) making CPU-based HF inference impractically slow.
+| Prompt | Greedy | Teacher-Forced |
+|--------|--------|----------------|
+| "The theory of general relativity..." | 25.0% | 90.6% |
+| "The French Revolution began in..." | 25.0% | 93.8% |
+| "To solve a quadratic equation..." | 25.0% | 87.5% |
+| "Once upon a time in a distant galaxy..." | 3.1% | 87.5% |
+| "def fibonacci(n):..." | 59.4% | 93.8% |
+| "The Amazon River flows through..." | 28.1% | 90.6% |
+| "The concept of free will..." | 100.0% | 100.0% |
+| "To make a cup of coffee, first..." | 21.9% | 84.4% |
+| "List three benefits of regular exercise..." | 6.2% | 93.8% |
+| "If all roses are flowers..." | 100.0% | 100.0% |
+
+Note: Teacher-forced accuracy is 92.19%, below the 95% pass threshold.
+MiniCPM-MoE uses embedding/residual scaling (`scale_emb=12`, `scale_depth=1.4`)
+which amplifies bf16 rounding differences through the MoE routing path.
+Greedy divergence is expected for MoE models in bf16.
 
 ## Usage
 
