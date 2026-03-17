@@ -49,6 +49,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 from nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
 from nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
+from nki_flash_attn_d256 import flash_attn_d256 as _flash_attn_d256_kernel
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -64,6 +65,7 @@ from neuronx_distributed_inference.models.model_wrapper import (
 )
 from neuronx_distributed_inference.modules.attention.attention_base import (
     NeuronAttentionBase,
+    FlashAttentionStrategy,
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
@@ -1039,13 +1041,42 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         return Q, K, cos_cache, sin_cache
 
     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
-        """Override to handle head_dim=256 safely.
+        """Override to handle head_dim=256 with custom NKI flash attention kernel.
 
         The standard NxDI NKI flash attention kernel asserts head_dim <= 128.
-        This override forces the PyTorch softmax path by temporarily disabling
-        attn_kernel for head_dim > 128.
+        We use our own flash_attn_d256 kernel which tiles the QK contraction
+        into 2x128 chunks, giving ~2-3x TTFT improvement over the softmax fallback.
+
+        Shape contract:
+          Input Q:  (B, H, S, D=256) -- BHSD
+          Input K:  (B, Hkv, S, D=256) -- BHSD
+          Input V:  (B, Hkv, S, D=256) -- BHSD
+          Kernel q: (B, H, D, S) -- BHDS (transposed)
+          Kernel k: (B, Hkv, D, S) -- BHDS (transposed)
+          Kernel v: (B, Hkv, S, D) -- BHSD (unchanged)
+          Output:   (B, H, S, D) -- BHSD (same as NONE path)
+
+        The kernel requires seq_len divisible by 512 (B_F tile size).
+        For smaller seq_lens, fall back to softmax path.
         """
+        if self.head_dim > 128 and q_len >= 512 and q_len % 512 == 0:
+            # Reshape for our d=256 kernel: BHSD -> BHDS for Q and K
+            q_kernel = Q.permute(0, 1, 3, 2).contiguous().to(self.torch_dtype)
+            k_kernel = K.permute(0, 1, 3, 2).contiguous().to(self.torch_dtype)
+            v_kernel = V.contiguous().to(self.torch_dtype)
+
+            n_kv_heads = K.shape[1]
+            grid_size = bsz * n_kv_heads
+
+            # Kernel returns (B, H, S, D) -- BHSD, same as NONE path
+            attn_output = _flash_attn_d256_kernel[grid_size](
+                q_kernel, k_kernel, v_kernel, use_causal_mask=True
+            )
+
+            return attn_output, FlashAttentionStrategy.NONE
+
         if self.head_dim > 128:
+            # Fallback for seq_lens not divisible by 512
             saved = self.attn_kernel_enabled
             self.attn_kernel_enabled = False
             result = super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
