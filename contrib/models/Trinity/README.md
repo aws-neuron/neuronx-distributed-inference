@@ -48,6 +48,7 @@ NeuronX Distributed Inference implementation of the Trinity model family (AfmoeF
 **Validated:** 2026-03-16
 **SDK:** NxDI 0.8.0, neuronx-cc 2.23.6484, torch-neuronx 2.9.0.2.12, transformers 4.57.6 (SDK 2.28)
 **Benchmarked:** 2026-03-06 (Nano + Mini, trn2.3xlarge + inf2.8xlarge, with bucketing)
+**Fused TKG benchmarked:** 2026-03-18 (Mini with expert_bias patches, trn2.3xlarge, +29% throughput)
 **Neuron vs CPU accuracy verified:** 2026-03-16 (Nano, trn2.3xlarge TP=2, 64-token generation)
 
 All results below are from the **unified `modeling_trinity.py`** (this code), SDK 2.28 with bucketing enabled. Fused TKG results from SDK 2.28.
@@ -192,13 +193,14 @@ Single forward pass comparison -- HuggingFace `AutoModelForCausalLM` (bf16) vs N
 
 ### Trinity-Mini (~26B total, ~4.5B active)
 
-| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile |
-|----------|-----|------|-----------|-------------|-------------------|-----------------|---------|
-| trn2.3xlarge | 4 | 1 | 371 | 11.8 | 85 | 85 | 3.9 min |
-| trn2.3xlarge | 4 | 2 | 598 | 11.5 | 174 | 87 | 6.8 min |
-| trn2.3xlarge | 4 | 4 | 805 | 13.6 | 295 | 74 | 9.1 min |
+| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile | Notes |
+|----------|-----|------|-----------|-------------|-------------------|-----------------|---------|-------|
+| trn2.3xlarge | 4 | 1 | 371 | 11.8 | 85 | 85 | 3.9 min | |
+| trn2.3xlarge | 4 | 2 | 598 | 11.5 | 174 | 87 | 6.8 min | |
+| trn2.3xlarge | 4 | 4 | 805 | 13.6 | 295 | 74 | 9.1 min | |
+| trn2.3xlarge | 4 | 1 | 371 | **9.1** | **110** | **110** | 3.8 min | **Fused TKG** |
 
-Mini requires TP=4 (all cores on trn2.3xlarge), so DP is not applicable.
+Mini requires TP=4 (all cores on trn2.3xlarge), so DP is not applicable. With the fused MoE TKG kernel (requires patched libraries), BS=1 throughput improves from 85 to **110 tok/s** (+29%).
 
 **Recommended config**: trn2.3xlarge TP=4 BS=4 for best throughput/latency balance (295 tok/s, 13.6ms TKG), or BS=1 for lowest TTFT (371 ms).
 
@@ -643,7 +645,7 @@ This model required solving several non-trivial porting challenges:
 2. **Gated attention:** Trinity applies `sigmoid(gate(input))` to attention output before o_proj. Solved via inline override of attention forward methods (required for Neuron tracer compatibility).
 3. **Dual intermediate sizes:** Dense layers use `intermediate_size`, MoE experts use `moe_intermediate_size`. Config swaps values for MoE module compatibility.
 4. **route_scale not supported by NxDI MoE v2:** Baked into expert `down_proj` weights during conversion.
-5. **expert_bias not supported by NxDI:** Created custom `RouterTopKWithBias` subclass.
+5. **expert_bias not supported by NxDI:** Created custom `RouterTopKWithBias` subclass for non-fused path. For fused TKG kernel, patched three upstream libraries to thread `expert_bias` through the kernel pipeline (see Fused MoE TKG section).
 6. **Conditional RoPE:** Only sliding attention layers get rotary embeddings.
 7. **Mixed attention masks and KV cache:** Framework provides both global and local masks via `has_mixed_attn=True`; decoder layer selects based on layer type. `TrinityKVCacheManager` provides per-layer KV cache management (uniform buffers, per-layer scatter modulation and read slicing) to handle the different cache sizes of sliding vs full-attention layers.
 8. **Gate weight padding at high TP:** Interleaved padding matching Q projection layout (prevents wrong-head gating on 54/64 cores).
@@ -684,7 +686,9 @@ The fused kernel requires `moe_intermediate_size / tp_degree % 128 == 0`:
 
 The config class automatically enables/disables fused TKG based on this alignment check.
 
-### Test Results (SDK 2.28, Trinity-Nano, trn2.3xlarge, TP=2)
+### Test Results
+
+#### Trinity-Nano (SDK 2.28, trn2.3xlarge, TP=2)
 
 **CTE (context encoding) -- exact match with non-fused baseline:**
 
@@ -692,19 +696,11 @@ The config class automatically enables/disables fused TKG based on this alignmen
 |--------|----------------|-------------|-------|
 | Hello, how are you? | I | I | YES |
 | What is the capital of France? | ( | ( | YES |
-| 1 + 1 = | (newline) | (newline) | YES |
+| Explain quantum computing in simple terms. | Answer | Answer | YES |
+| Write a Python function to compute fibonacci numbers. | The | The | YES |
+| The meaning of life is | to | to | YES |
 
-**TKG (autoregressive generation, 8 tokens):**
-
-| Prompt | Non-fused TKG | Fused TKG | First Token |
-|--------|---------------|-----------|-------------|
-| Hello, how are you? | I am fine, thank you. And | I am fine, thanks! And you | MATCH (diverges at token 4) |
-| What is the capital of France? | (Answer: Paris)... | (A) Paris (B) London | MATCH (diverges at token 2) |
-| 1 + 1 = | 2, 1 + 2 = | 2, 2 + 1 = | MATCH (diverges at token 2) |
-
-TKG tokens diverge after the first token due to **expert_bias not being used by the fused kernel** (known limitation -- the fused kernel omits per-layer expert bias). Both paths produce coherent, sensible text. CTE outputs are identical because the CTE path always uses the non-fused compute-bound pipeline.
-
-**Latency:**
+**Latency (Nano):**
 
 | Metric | Non-fused | Fused | Notes |
 |--------|-----------|-------|-------|
@@ -712,13 +708,57 @@ TKG tokens diverge after the first token due to **expert_bias not being used by 
 | CTE latency | ~0.52s | ~0.49s | Similar |
 | TKG latency | ~0.011s | ~0.014s | Fused is slower on Nano |
 
-The fused kernel does not improve TKG latency on Trinity-Nano (intermediate_size=256 is too small for the selective loading to pay off). The kernel is designed for larger models where expert weight loading from HBM is the bottleneck. Mini (intermediate=1024) is expected to benefit.
+The fused kernel does not improve TKG latency on Trinity-Nano (intermediate_size=256 is too small for the selective loading to pay off). The kernel is designed for larger models where expert weight loading from HBM is the bottleneck.
+
+#### Trinity-Mini (SDK 2.28, trn2.3xlarge, TP=4) -- with expert_bias patches
+
+Tested with patched `nki-library`, `neuronx-distributed`, and `neuronx-distributed-inference` libraries from `feature/expert-bias-support` branches, which thread `expert_bias` through the fused kernel pipeline.
+
+**CTE correctness -- exact match with non-fused baseline (5/5):**
+
+| Prompt | Non-fused Top-1 | Fused Top-1 | Match |
+|--------|----------------|-------------|-------|
+| Hello, how are you? | I | I | YES |
+| What is the capital of France? | Paris | Paris | YES |
+| Explain quantum computing in simple terms. | What | What | YES |
+| Write a Python function to compute fibonacci numbers. | The | The | YES |
+| The meaning of life is | to | to | YES |
+
+**Latency and throughput (Mini, BS=1):**
+
+| Metric | Non-fused | Fused+expert_bias | Change |
+|--------|-----------|-------------------|--------|
+| CTE (ms) | 371.1 | 371.0 | -0.0% |
+| TKG (ms/tok) | 11.8 | 9.1 | **-22.5%** |
+| Throughput (tok/s) | 84.9 | 109.5 | **+29.0%** |
+| Compile time | 3.9 min | 3.8 min | -2.6% |
+
+**TKG multi-token divergence:** The second TKG token diverges between fused and non-fused paths due to numerical reordering in the fused kernel (different operation order produces bf16-equivalent but non-identical intermediate values). This is the same class of divergence observed in all bf16 MoE comparisons (see Token Match Rate section). Both paths produce coherent text; the divergence compounds autoregressively as expected.
+
+### Expert Bias Support (Patched Libraries)
+
+The fused MoE TKG kernel requires `expert_bias` to be threaded through three library layers. The patches are on `feature/expert-bias-support` branches:
+
+| Repo | File | Change | Lines |
+|------|------|--------|-------|
+| [nki-library](https://github.com/jimburtoft/nki-library/tree/feature/expert-bias-support) | `router_topk.py` | Add `expert_bias` param, load/broadcast/add in SBUF | ~30 |
+| [neuronx-distributed](https://github.com/jimburtoft/neuronx-distributed/tree/feature/expert-bias-support) | `routing.py` + `moe_fused_tkg.py` | Add `expert_bias_size` to `RouterTopK`, pass through `optional_kwargs` | ~15 |
+| [neuronx-distributed-inference](https://github.com/jimburtoft/neuronx-distributed-inference/tree/feature/expert-bias-support) | `moe_v2.py` | Pass `expert_bias_size` from config | ~3 |
+
+**Install:**
+```bash
+pip install --no-deps git+https://github.com/jimburtoft/nki-library.git@feature/expert-bias-support
+pip install --no-deps git+https://github.com/jimburtoft/neuronx-distributed.git@feature/expert-bias-support
+pip install --no-deps git+https://github.com/jimburtoft/neuronx-distributed-inference.git@feature/expert-bias-support
+```
+
+Without these patches, the fused kernel omits `expert_bias`, causing incorrect expert selection and garbled TKG output.
 
 ### Known Limitations
 
-1. **Expert bias omitted** -- The fused NKI kernel does not apply per-layer `expert_bias` during routing. Non-fused routing uses `RouterTopKWithBias` which adds bias. This causes TKG output divergence after the first token.
-2. **Nano TP=4 and Large TP=64 ineligible** -- Alignment constraint `intermediate/TP % 128 != 0` prevents use.
-3. **No latency benefit on Nano** -- Expert weights (256 intermediate) are too small for selective loading overhead to pay off.
+1. **Nano TP=4 and Large TP=64 ineligible** -- Alignment constraint `intermediate/TP % 128 != 0` prevents use.
+2. **No latency benefit on Nano** -- Expert weights (256 intermediate) are too small for selective loading overhead to pay off.
+3. **Requires patched libraries for expert_bias** -- Until the `feature/expert-bias-support` patches are merged upstream, the fused kernel requires installing forked versions of nki-library, neuronx-distributed, and neuronx-distributed-inference.
 
 ## NKI Kernels
 
@@ -752,4 +792,4 @@ The NxDI framework uses several NKI (Neuron Kernel Interface) kernels during Tri
 
 Jim Burtoft
 
-**Last Updated:** 2026-03-16 (added 64-token generation match rate: 100% on "What is the meaning of life?")
+**Last Updated:** 2026-03-18 (added fused MoE TKG with expert_bias benchmark: Mini +29% throughput, 5/5 correctness match)

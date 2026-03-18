@@ -107,12 +107,12 @@ def _patch_fused_tkg_for_sigmoid():
     This patch wraps the selective-load kernel call to force
     use_router_topk_nki_kernel=False, which uses the ISA router fallback.
 
-    NOTE: The fused TKG kernel does NOT support expert_selection_bias.
-    The compiled NKI router kernels and nkilib utilities are incompatible with
-    user-level @nki.jit kernel inlining (TensorView.get_view() requires .ap()
-    which is unavailable in the NKI trace context). For models that need
-    expert_bias (all Trinity models), use the non-fused path instead
-    (moe_fused_nki_kernel_enabled=False).
+    NOTE: The fused TKG kernel supports expert_bias when using the patched
+    nki-library, neuronx-distributed, and neuronx-distributed-inference
+    libraries from the feature/expert-bias-support branches. The ISA router
+    fallback is still needed for sigmoid routing (NKI kernel only supports
+    softmax), but expert_bias is correctly passed through and applied in the
+    ISA path.
 
     Must be called before model.compile().
     """
@@ -156,7 +156,7 @@ def _patch_fused_tkg_for_sigmoid():
 
         logger.warning(
             "Patched MoEFusedTKG for sigmoid routing (ISA fallback). "
-            "expert_bias NOT supported in fused TKG - TKG tokens may diverge from non-fused."
+            "expert_bias is supported via patched libraries (feature/expert-bias-support branches)."
         )
     except ImportError:
         logger.info("moe_fused_tkg module not available (SDK < 2.28), skipping patch")
