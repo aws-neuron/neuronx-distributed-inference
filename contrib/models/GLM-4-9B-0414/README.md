@@ -75,6 +75,18 @@ model.compile(compiled_model_path)
 model.load(compiled_model_path)
 ```
 
+## Performance
+
+Profiled on trn1.32xlarge (single NeuronCore utilization):
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| Throughput | - | 12.3 tok/s |
+| MBU (Memory) | 4.4% | 9.1% |
+| MFU (Compute) | 2.3% | 0.0% |
+
+*Batch size 1, sequence length 128, BF16 precision, TP=2*
+
 ## Maintainer
 
 Neuroboros Team - Annapurna Labs
