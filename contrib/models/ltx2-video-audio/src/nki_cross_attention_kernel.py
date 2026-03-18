@@ -5,7 +5,7 @@ NKI Cross-Attention Kernel for LTX-2 attn2 (text cross-attention)
 Custom NKI kernel for cross-attention with a 1D additive mask over K positions.
 
 K_seq = 1024, d = 128, Q_seq = 6144 (or 24576 for Stage 2).
-Mask: [batch_heads, 1, 1024] additive bias {0, -10000}.
+Mask: [batch_heads, 1024] additive bias {0, -10000} (2D, flat).
 
 Uses ONLY nisa.* (ISA-level) APIs for mode='torchxla' compatibility.
 All loads/stores via nisa.dma_copy, transposes via nisa.nc_transpose,
@@ -27,18 +27,23 @@ _XATTN_D = 128  # head_dim
 
 
 @nki.jit(mode="torchxla")
-def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
+def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref):
     """NKI masked cross-attention: softmax(Q@K^T + mask) @ V.
 
     q_ref: [batch_heads, q_seq, 128] pre-scaled
     k_ref: [batch_heads, 1024, 128]
     v_ref: [batch_heads, 1024, 128]
-    mask_ref: [batch_heads, 1, 1024] additive bias
-    out_ref: [batch_heads, q_seq, 128]
+    mask_ref: [batch_heads, 1024] additive bias (2D, flat)
+    Returns: [batch_heads, q_seq, 128] output in HBM
     """
     batch_heads = q_ref.shape[0]
     q_seq = q_ref.shape[1]
     n_q_grps = q_seq // _XATTN_Q_GRP
+
+    # Allocate output in HBM (returned to XLA)
+    out_ref = nl.ndarray(
+        (batch_heads, q_seq, _XATTN_D), dtype=q_ref.dtype, buffer=nl.hbm
+    )
 
     # Ones column for mask broadcasting via outer product
     ones_col = nl.ndarray((1, _XATTN_Q_GRP), dtype=nl.float32, buffer=nl.sbuf)
@@ -46,99 +51,177 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
 
     for bh in nl.affine_range(batch_heads):
         # ── Load & transpose K: 8 × [128,128] -> [d_par, 128] ──────
-        kc0_raw = nl.ndarray(
+        # CoreV3+ requires nc_transpose input/output dtypes to match.
+        # Load bf16, upcast to f32, then transpose f32→f32.
+        _kc0_bf = nl.ndarray(
             (_XATTN_K_CHUNK, _XATTN_D), dtype=k_ref.dtype, buffer=nl.sbuf
         )
-        nisa.dma_copy(dst=kc0_raw, src=k_ref[bh, 0:128, :])
+        nisa.dma_copy(dst=_kc0_bf, src=k_ref[bh, 0:128, :])
+        kc0_f32 = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.tensor_scalar(kc0_f32, _kc0_bf, nl.multiply, 1.0)
         kc0_p = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(kc0_p, kc0_raw)
+        nisa.nc_transpose(kc0_p, kc0_f32)
         kc0 = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(kc0, kc0_p)
 
-        kc1_raw = nl.ndarray(
+        _kc1_bf = nl.ndarray(
             (_XATTN_K_CHUNK, _XATTN_D), dtype=k_ref.dtype, buffer=nl.sbuf
         )
-        nisa.dma_copy(dst=kc1_raw, src=k_ref[bh, 128:256, :])
+        nisa.dma_copy(dst=_kc1_bf, src=k_ref[bh, 128:256, :])
+        kc1_f32 = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.tensor_scalar(kc1_f32, _kc1_bf, nl.multiply, 1.0)
         kc1_p = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(kc1_p, kc1_raw)
+        nisa.nc_transpose(kc1_p, kc1_f32)
         kc1 = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(kc1, kc1_p)
 
-        kc2_raw = nl.ndarray(
+        _kc2_bf = nl.ndarray(
             (_XATTN_K_CHUNK, _XATTN_D), dtype=k_ref.dtype, buffer=nl.sbuf
         )
-        nisa.dma_copy(dst=kc2_raw, src=k_ref[bh, 256:384, :])
+        nisa.dma_copy(dst=_kc2_bf, src=k_ref[bh, 256:384, :])
+        kc2_f32 = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.tensor_scalar(kc2_f32, _kc2_bf, nl.multiply, 1.0)
         kc2_p = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(kc2_p, kc2_raw)
+        nisa.nc_transpose(kc2_p, kc2_f32)
         kc2 = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(kc2, kc2_p)
 
-        kc3_raw = nl.ndarray(
+        _kc3_bf = nl.ndarray(
             (_XATTN_K_CHUNK, _XATTN_D), dtype=k_ref.dtype, buffer=nl.sbuf
         )
-        nisa.dma_copy(dst=kc3_raw, src=k_ref[bh, 384:512, :])
+        nisa.dma_copy(dst=_kc3_bf, src=k_ref[bh, 384:512, :])
+        kc3_f32 = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.tensor_scalar(kc3_f32, _kc3_bf, nl.multiply, 1.0)
         kc3_p = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(kc3_p, kc3_raw)
+        nisa.nc_transpose(kc3_p, kc3_f32)
         kc3 = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(kc3, kc3_p)
 
-        kc4_raw = nl.ndarray(
+        _kc4_bf = nl.ndarray(
             (_XATTN_K_CHUNK, _XATTN_D), dtype=k_ref.dtype, buffer=nl.sbuf
         )
-        nisa.dma_copy(dst=kc4_raw, src=k_ref[bh, 512:640, :])
+        nisa.dma_copy(dst=_kc4_bf, src=k_ref[bh, 512:640, :])
+        kc4_f32 = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.tensor_scalar(kc4_f32, _kc4_bf, nl.multiply, 1.0)
         kc4_p = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(kc4_p, kc4_raw)
+        nisa.nc_transpose(kc4_p, kc4_f32)
         kc4 = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(kc4, kc4_p)
 
-        kc5_raw = nl.ndarray(
+        _kc5_bf = nl.ndarray(
             (_XATTN_K_CHUNK, _XATTN_D), dtype=k_ref.dtype, buffer=nl.sbuf
         )
-        nisa.dma_copy(dst=kc5_raw, src=k_ref[bh, 640:768, :])
+        nisa.dma_copy(dst=_kc5_bf, src=k_ref[bh, 640:768, :])
+        kc5_f32 = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.tensor_scalar(kc5_f32, _kc5_bf, nl.multiply, 1.0)
         kc5_p = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(kc5_p, kc5_raw)
+        nisa.nc_transpose(kc5_p, kc5_f32)
         kc5 = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(kc5, kc5_p)
 
-        kc6_raw = nl.ndarray(
+        _kc6_bf = nl.ndarray(
             (_XATTN_K_CHUNK, _XATTN_D), dtype=k_ref.dtype, buffer=nl.sbuf
         )
-        nisa.dma_copy(dst=kc6_raw, src=k_ref[bh, 768:896, :])
+        nisa.dma_copy(dst=_kc6_bf, src=k_ref[bh, 768:896, :])
+        kc6_f32 = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.tensor_scalar(kc6_f32, _kc6_bf, nl.multiply, 1.0)
         kc6_p = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(kc6_p, kc6_raw)
+        nisa.nc_transpose(kc6_p, kc6_f32)
         kc6 = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(kc6, kc6_p)
 
-        kc7_raw = nl.ndarray(
+        _kc7_bf = nl.ndarray(
             (_XATTN_K_CHUNK, _XATTN_D), dtype=k_ref.dtype, buffer=nl.sbuf
         )
-        nisa.dma_copy(dst=kc7_raw, src=k_ref[bh, 896:1024, :])
+        nisa.dma_copy(dst=_kc7_bf, src=k_ref[bh, 896:1024, :])
+        kc7_f32 = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.tensor_scalar(kc7_f32, _kc7_bf, nl.multiply, 1.0)
         kc7_p = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(kc7_p, kc7_raw)
+        nisa.nc_transpose(kc7_p, kc7_f32)
         kc7 = nl.ndarray((_XATTN_D, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(kc7, kc7_p)
 
-        # ── Load V: 8 × [128_par, 128_free] ────────────────────────
-        vt0 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=vt0, src=v_ref[bh, 0:128, :])
-        vt1 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=vt1, src=v_ref[bh, 128:256, :])
-        vt2 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=vt2, src=v_ref[bh, 256:384, :])
-        vt3 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=vt3, src=v_ref[bh, 384:512, :])
-        vt4 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=vt4, src=v_ref[bh, 512:640, :])
-        vt5 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=vt5, src=v_ref[bh, 640:768, :])
-        vt6 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=vt6, src=v_ref[bh, 768:896, :])
-        vt7 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=vt7, src=v_ref[bh, 896:1024, :])
+        # ── Load V: 8 × [128_par, 128_free] in float32 ──────────
+        # V must be float32 because nc_matmul requires both operands
+        # to be float32 when one is float32 (exp tiles are float32).
+        # Load bf16 from HBM, then upcast via tensor_scalar multiply by 1.0.
+        _vt0_bf = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(dst=_vt0_bf, src=v_ref[bh, 0:128, :])
+        vt0 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(vt0, _vt0_bf, nl.multiply, 1.0)
 
-        # ── Broadcast masks: [1,128] -> [128,128] via outer product ─
+        _vt1_bf = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(dst=_vt1_bf, src=v_ref[bh, 128:256, :])
+        vt1 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(vt1, _vt1_bf, nl.multiply, 1.0)
+
+        _vt2_bf = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(dst=_vt2_bf, src=v_ref[bh, 256:384, :])
+        vt2 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(vt2, _vt2_bf, nl.multiply, 1.0)
+
+        _vt3_bf = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(dst=_vt3_bf, src=v_ref[bh, 384:512, :])
+        vt3 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(vt3, _vt3_bf, nl.multiply, 1.0)
+
+        _vt4_bf = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(dst=_vt4_bf, src=v_ref[bh, 512:640, :])
+        vt4 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(vt4, _vt4_bf, nl.multiply, 1.0)
+
+        _vt5_bf = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(dst=_vt5_bf, src=v_ref[bh, 640:768, :])
+        vt5 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(vt5, _vt5_bf, nl.multiply, 1.0)
+
+        _vt6_bf = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(dst=_vt6_bf, src=v_ref[bh, 768:896, :])
+        vt6 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(vt6, _vt6_bf, nl.multiply, 1.0)
+
+        _vt7_bf = nl.ndarray(
+            (_XATTN_K_CHUNK, _XATTN_D), dtype=v_ref.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(dst=_vt7_bf, src=v_ref[bh, 896:1024, :])
+        vt7 = nl.ndarray((_XATTN_K_CHUNK, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(vt7, _vt7_bf, nl.multiply, 1.0)
+
+        # ── Load mask chunks from 2D [batch_heads, 1024] and broadcast ─
+        # mask_ref is [batch_heads, 1024]. Indexing mask_ref[bh, 0:128]
+        # gives a [1, 128] SBUF tile from a 2D DRAM source.
         m0_raw = nl.ndarray((1, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=m0_raw, src=mask_ref[bh, 0:1, 0:128])
+        nisa.dma_copy(dst=m0_raw, src=mask_ref[bh, 0:128])
         m0_p = nl.ndarray(
             (_XATTN_Q_GRP, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum
         )
@@ -149,7 +232,7 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
         nisa.tensor_copy(m0, m0_p)
 
         m1_raw = nl.ndarray((1, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=m1_raw, src=mask_ref[bh, 0:1, 128:256])
+        nisa.dma_copy(dst=m1_raw, src=mask_ref[bh, 128:256])
         m1_p = nl.ndarray(
             (_XATTN_Q_GRP, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum
         )
@@ -160,7 +243,7 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
         nisa.tensor_copy(m1, m1_p)
 
         m2_raw = nl.ndarray((1, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=m2_raw, src=mask_ref[bh, 0:1, 256:384])
+        nisa.dma_copy(dst=m2_raw, src=mask_ref[bh, 256:384])
         m2_p = nl.ndarray(
             (_XATTN_Q_GRP, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum
         )
@@ -171,7 +254,7 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
         nisa.tensor_copy(m2, m2_p)
 
         m3_raw = nl.ndarray((1, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=m3_raw, src=mask_ref[bh, 0:1, 384:512])
+        nisa.dma_copy(dst=m3_raw, src=mask_ref[bh, 384:512])
         m3_p = nl.ndarray(
             (_XATTN_Q_GRP, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum
         )
@@ -182,7 +265,7 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
         nisa.tensor_copy(m3, m3_p)
 
         m4_raw = nl.ndarray((1, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=m4_raw, src=mask_ref[bh, 0:1, 512:640])
+        nisa.dma_copy(dst=m4_raw, src=mask_ref[bh, 512:640])
         m4_p = nl.ndarray(
             (_XATTN_Q_GRP, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum
         )
@@ -193,7 +276,7 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
         nisa.tensor_copy(m4, m4_p)
 
         m5_raw = nl.ndarray((1, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=m5_raw, src=mask_ref[bh, 0:1, 640:768])
+        nisa.dma_copy(dst=m5_raw, src=mask_ref[bh, 640:768])
         m5_p = nl.ndarray(
             (_XATTN_Q_GRP, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum
         )
@@ -204,7 +287,7 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
         nisa.tensor_copy(m5, m5_p)
 
         m6_raw = nl.ndarray((1, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=m6_raw, src=mask_ref[bh, 0:1, 768:896])
+        nisa.dma_copy(dst=m6_raw, src=mask_ref[bh, 768:896])
         m6_p = nl.ndarray(
             (_XATTN_Q_GRP, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum
         )
@@ -215,7 +298,7 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
         nisa.tensor_copy(m6, m6_p)
 
         m7_raw = nl.ndarray((1, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=m7_raw, src=mask_ref[bh, 0:1, 896:1024])
+        nisa.dma_copy(dst=m7_raw, src=mask_ref[bh, 896:1024])
         m7_p = nl.ndarray(
             (_XATTN_Q_GRP, _XATTN_K_CHUNK), dtype=nl.float32, buffer=nl.psum
         )
@@ -229,15 +312,19 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
         for qg in nl.sequential_range(n_q_grps):
             q_start = qg * _XATTN_Q_GRP
 
-            # Load Q chunk and transpose
-            q_raw = nl.ndarray(
+            # Load Q chunk, upcast to f32, then transpose
+            _q_bf = nl.ndarray(
                 (_XATTN_Q_GRP, _XATTN_D), dtype=q_ref.dtype, buffer=nl.sbuf
             )
-            nisa.dma_copy(dst=q_raw, src=q_ref[bh, q_start : q_start + _XATTN_Q_GRP, :])
+            nisa.dma_copy(dst=_q_bf, src=q_ref[bh, q_start : q_start + _XATTN_Q_GRP, :])
+            q_f32 = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(q_f32, _q_bf, nl.multiply, 1.0)
             q_t_p = nl.ndarray(
                 (_XATTN_D, _XATTN_Q_GRP), dtype=nl.float32, buffer=nl.psum
             )
-            nisa.nc_transpose(q_t_p, q_raw)
+            nisa.nc_transpose(q_t_p, q_f32)
             q_t = nl.ndarray((_XATTN_D, _XATTN_Q_GRP), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(q_t, q_t_p)
 
@@ -514,38 +601,90 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref, out_ref):
             nisa.tensor_copy(e7_t, e7_t_p)
 
             # P@V matmuls and accumulation
-            o_p = nl.ndarray((_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(o_p, e0_t, vt0)
+            # CRITICAL: Each nc_matmul MUST use a fresh PSUM allocation.
+            # On NeuronCore, nc_matmul accumulates to PSUM by default.
+            # Reusing the same PSUM buffer causes previous results to bleed
+            # into subsequent matmuls (e.g., chunk0 result persists in chunk1).
+            o_p0 = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(o_p0, e0_t, vt0)
             out_acc = nl.ndarray(
                 (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
             )
-            nisa.tensor_copy(out_acc, o_p)
+            nisa.tensor_copy(out_acc, o_p0)
             tmp = nl.ndarray((_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.nc_matmul(o_p, e1_t, vt1)
-            nisa.tensor_copy(tmp, o_p)
+
+            o_p1 = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(o_p1, e1_t, vt1)
+            nisa.tensor_copy(tmp, o_p1)
             nisa.tensor_tensor(out_acc, out_acc, tmp, op=nl.add)
-            nisa.nc_matmul(o_p, e2_t, vt2)
-            nisa.tensor_copy(tmp, o_p)
+
+            o_p2 = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(o_p2, e2_t, vt2)
+            nisa.tensor_copy(tmp, o_p2)
             nisa.tensor_tensor(out_acc, out_acc, tmp, op=nl.add)
-            nisa.nc_matmul(o_p, e3_t, vt3)
-            nisa.tensor_copy(tmp, o_p)
+
+            o_p3 = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(o_p3, e3_t, vt3)
+            nisa.tensor_copy(tmp, o_p3)
             nisa.tensor_tensor(out_acc, out_acc, tmp, op=nl.add)
-            nisa.nc_matmul(o_p, e4_t, vt4)
-            nisa.tensor_copy(tmp, o_p)
+
+            o_p4 = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(o_p4, e4_t, vt4)
+            nisa.tensor_copy(tmp, o_p4)
             nisa.tensor_tensor(out_acc, out_acc, tmp, op=nl.add)
-            nisa.nc_matmul(o_p, e5_t, vt5)
-            nisa.tensor_copy(tmp, o_p)
+
+            o_p5 = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(o_p5, e5_t, vt5)
+            nisa.tensor_copy(tmp, o_p5)
             nisa.tensor_tensor(out_acc, out_acc, tmp, op=nl.add)
-            nisa.nc_matmul(o_p, e6_t, vt6)
-            nisa.tensor_copy(tmp, o_p)
+
+            o_p6 = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(o_p6, e6_t, vt6)
+            nisa.tensor_copy(tmp, o_p6)
             nisa.tensor_tensor(out_acc, out_acc, tmp, op=nl.add)
-            nisa.nc_matmul(o_p, e7_t, vt7)
-            nisa.tensor_copy(tmp, o_p)
+
+            o_p7 = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(o_p7, e7_t, vt7)
+            nisa.tensor_copy(tmp, o_p7)
             nisa.tensor_tensor(out_acc, out_acc, tmp, op=nl.add)
 
             # Phase 4: Normalize and write
-            nisa.tensor_tensor(out_acc, out_acc, sum_recip, op=nl.multiply)
+            # CoreV3 tensor_tensor requires exact shape match (no broadcasting).
+            # Broadcast sum_recip [128,1] → [128,128] via outer product.
+            sr_t_p = nl.ndarray((1, _XATTN_Q_GRP), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(sr_t_p, sum_recip)
+            sr_t = nl.ndarray((1, _XATTN_Q_GRP), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(sr_t, sr_t_p)
+            # nc_matmul(dst, stationary=sr_t[1,128], moving=ones_col[1,128])
+            # = sr_t.T @ ones_col = [128,1] @ [1,128] = [128,128]
+            sr_bc_p = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(sr_bc_p, sr_t, ones_col)
+            sum_recip_bc = nl.ndarray(
+                (_XATTN_Q_GRP, _XATTN_D), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.tensor_copy(sum_recip_bc, sr_bc_p)
+            nisa.tensor_tensor(out_acc, out_acc, sum_recip_bc, op=nl.multiply)
             nisa.dma_copy(
                 dst=out_ref[bh, q_start : q_start + _XATTN_Q_GRP, :],
                 src=out_acc,
             )
+
+    return out_ref

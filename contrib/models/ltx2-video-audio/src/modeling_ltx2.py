@@ -302,7 +302,7 @@ def replace_sdpa_with_bmm():
             Q_3d = (query * scale).reshape(b * h, sq, d_head).contiguous()
             K_3d = key.reshape(b * h, k_seq, d_head).contiguous()
             V_3d = value.reshape(b * h, k_seq, d_head).contiguous()
-            # Reshape mask to [B*H, 1, K_seq]
+            # Reshape mask to [B*H, K_seq] (2D flat for NKI kernel)
             if attn_mask.ndim == 4:
                 mask_3d = attn_mask.reshape(
                     b * h, attn_mask.shape[-2], attn_mask.shape[-1]
@@ -310,18 +310,20 @@ def replace_sdpa_with_bmm():
             else:
                 mask_3d = attn_mask
             mask_3d = mask_3d.float().contiguous()
-            out_3d = torch.zeros(
-                b * h, sq, d_head, dtype=Q_3d.dtype, device=Q_3d.device
-            )
-            _nki_cross_attn(Q_3d, K_3d, V_3d, mask_3d, out_3d)
-            # Force XLA to keep mask_3d in the compiled graph. Without this,
-            # XLA's dead code elimination drops the mask tensor because the
-            # NKI custom op is opaque to XLA's data flow analysis.
-            # Adding a tiny mask-derived value (~0 in bf16) creates a
-            # traceable dependency without affecting numerical output.
-            # mask values are {0, -10000}: /1e20 → {0, -1e-16} → 0 in bf16.
-            mask_dep = (mask_3d[:, :1, :1] / 1e20).to(out_3d.dtype)
-            out_3d = out_3d + mask_dep
+            # NKI kernel expects mask as [B*H, 1024] (2D flat)
+            # Original mask is [B*H, 1, K_seq=1024] -> squeeze to [B*H, 1024]
+            mask_2d = mask_3d.reshape(b * h, k_seq).contiguous()
+            out_3d = _nki_cross_attn(Q_3d, K_3d, V_3d, mask_2d)
+            # Force XLA to keep ALL input tensors in the compiled graph.
+            # XLA's dead code elimination can drop operands of opaque NKI
+            # custom ops because it can't see the data flow inside them.
+            # We create tiny dependencies on each input by extracting a
+            # scalar value that rounds to 0 in bf16, preventing DCE while
+            # not affecting numerical output.
+            mask_dep = (mask_2d[:, :1].unsqueeze(-1) / 1e20).to(out_3d.dtype)
+            k_dep = (K_3d[:, :1, :1] / 1e20).to(out_3d.dtype)
+            v_dep = (V_3d[:, :1, :1] / 1e20).to(out_3d.dtype)
+            out_3d = out_3d + mask_dep + k_dep + v_dep
             return out_3d.reshape(b, h, sq, d_head)
 
         # ── BMM fallback path ───────────────────────────────────────────
