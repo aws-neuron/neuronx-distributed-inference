@@ -61,6 +61,18 @@ is expected for MoE models in bf16 due to cascading expert routing differences.
 | Trn1             | Working | Not tested |
 | Inf2             | Not tested | Not tested |
 
+## Performance
+
+Profiled on trn1.32xlarge (single NeuronCore utilization):
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| Throughput | - | 4.2 tok/s |
+| MBU (Memory) | 1.4% | 2.8% |
+| MFU (Compute) | 0.9% | 0.0% |
+
+*Batch size 1, sequence length 512, BF16 precision, TP=8*
+
 ## Maintainer
 
 Neuroboros Team - Annapurna Labs
