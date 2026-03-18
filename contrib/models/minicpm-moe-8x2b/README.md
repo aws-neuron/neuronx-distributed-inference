@@ -79,6 +79,18 @@ model.compile(compiled_model_path)
 model.load(compiled_model_path)
 ```
 
+## Performance
+
+Profiled on trn1.32xlarge:
+
+| Metric | Value |
+|--------|-------|
+| Throughput (TKG) | 2.5 tok/s |
+
+*Batch size 1, sequence length 2048, BF16 precision, TP=2*
+
+Note: MBU/MFU NEFF capture timed out for this MoE model due to its size. Throughput measured via end-to-end token generation.
+
 ## Maintainer
 
 Neuroboros Team - Annapurna Labs
