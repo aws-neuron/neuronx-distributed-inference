@@ -162,6 +162,85 @@ def _try_load_nki_flash():
         return None
 
 
+# ── NKI Cross-Attention via attention_cte_bias (production-quality flash attention with additive bias) ──
+def _try_load_attention_cte_bias():
+    """Load the forked attention_cte kernel with additive bias support.
+
+    This kernel is a production-quality flash attention kernel (from nkilib)
+    modified to accept an additive bias parameter for cross-attention.
+    It supports 3-deep software pipelining, dma_transpose, and modular
+    buffer allocation — all the optimizations that make CTE 10.4% faster
+    than BMM for self-attention.
+
+    The bias is a 1D per-K-position additive mask [batch, seqlen_k] that gets
+    broadcast across Q positions via nc_matmul outer product in PSUM.
+
+    Returns a callable (Q_4d, K_4d, V_4d, bias_2d, scale) -> O_4d, or None.
+    """
+    try:
+        import nki
+        from attention_cte_bias import attention_cte
+        from neuronx_distributed_inference.utils.decorator_peeling import (
+            peel_decorations,
+        )
+
+        raw_func = peel_decorations(attention_cte)
+        decorated_cte_bias = nki.jit(
+            raw_func,
+            mode="torchxla",
+            platform_target="trn2",
+        )
+
+        logger.info("attention_cte_bias kernel loaded (nki 0.2.0 torchxla)")
+
+        def attention_cte_bias_4d(Q, K, V, attn_bias, scale=None):
+            """4D wrapper: (B, H, S, D) + bias [B*H, K_seq] -> (B, H, S, D).
+
+            Reshapes inputs to 3D (B*H, seq, d) with tp_q=True layout,
+            passes additive bias to the CTE kernel, reshapes output back.
+
+            The CTE kernel applies: scores = scale * (QK^T + bias)
+            To get the standard: scores = scale * QK^T + bias
+            we pre-divide the bias by scale so: scale * (QK^T + bias/scale) = scale * QK^T + bias
+            """
+            bsz, num_heads, q_len, head_dim = Q.shape
+            k_len = K.shape[2]
+
+            if scale is None:
+                scale = 1.0 / math.sqrt(head_dim)
+
+            Q_3d = Q.reshape(bsz * num_heads, q_len, head_dim).contiguous()
+            K_3d = K.reshape(bsz * num_heads, k_len, head_dim).contiguous()
+            V_3d = V.reshape(bsz * num_heads, k_len, head_dim).contiguous()
+
+            # Pre-divide bias by scale to compensate for the kernel's scale multiplication.
+            # This ensures: scale * (QK^T + bias/scale) = scale * QK^T + bias
+            bias_2d = (attn_bias.float() / scale).contiguous()
+
+            out = decorated_cte_bias[(2,)](
+                q=Q_3d,
+                k=K_3d,
+                v=V_3d,
+                scale=scale,
+                causal_mask=False,
+                tp_q=True,
+                tp_k=True,
+                tp_out=False,
+                bias=bias_2d,
+            )
+
+            return out.reshape(bsz, num_heads, q_len, head_dim)
+
+        return attention_cte_bias_4d
+
+    except ImportError as e:
+        logger.info(f"attention_cte_bias not available: {e}")
+        return None
+    except Exception as e:
+        logger.info(f"attention_cte_bias load failed: {e}")
+        return None
+
+
 # ── NKI Cross-Attention Kernel (masked, for attn2/audio_attn2) ──────────────
 def _try_load_nki_cross_attn():
     """Load the NKI cross-attention kernel from nki_cross_attention_kernel.py.
@@ -190,21 +269,24 @@ def replace_sdpa_with_bmm():
     """Replace F.scaled_dot_product_attention with NKI flash + BMM hybrid.
 
     Kernel priority (auto mode):
+
+    For attention WITHOUT mask (self-attn, a2v), Q.seq >= 512:
       1. NxDI ISA kernel (AttentionMMSoftmaxMMWithoutSwap) — fastest compile
       2. nkilib attention_cte (pure NKI, 3-deep pipelined, LNC2-aware)
+
+    For attention WITH mask (cross-attn: attn2, audio_attn2), Q.seq >= 512:
+      1. attention_cte_bias (forked CTE with additive bias via nc_matmul)
+      2. Hand-written NKI cross-attention kernel (ISA-only, correct but slower)
       3. BMM fallback (explicit batched matmul + softmax)
 
-    For attention with no mask, Q.seq >= 512, and 4D input on Neuron:
-      Uses the best available NKI flash attention kernel.
-      This covers:
-        - Video self-attention (attn1): Q.seq == K.seq == 6144
-        - Audio-to-video cross-modal attention (a2v): Q.seq=6144, K.seq=121
-      The kernel supports Q.seq != K.seq for non-causal attention.
-
-    For attention with masks or Q.seq < 512:
-      Falls back to explicit BMM + softmax.
+    For Q.seq < 512 (audio_attn1, v2a, etc.):
+      BMM fallback always.
 
     Falls back to original SDPA on CPU.
+
+    Env vars:
+      LTX2_FLASH_KERNEL=auto|isa|cte — controls no-mask attention kernel
+      LTX2_CROSS_ATTN_KERNEL=auto|cte|nki|off — controls masked attention kernel
     """
     global _sdpa_replaced, _sdpa_original
     if _sdpa_replaced:
@@ -227,18 +309,25 @@ def replace_sdpa_with_bmm():
     if _nki_flash_kernel is None:
         logger.warning("No NKI flash kernel available, all attention uses BMM")
 
-    # Try to load NKI cross-attention kernel for masked attention (attn2).
-    # Set LTX2_CROSS_ATTN_KERNEL=off to disable.
+    # Try to load cross-attention kernel for masked attention (attn2).
+    # Priority: attention_cte_bias (production flash attn with bias) > hand-written NKI > BMM.
+    # Set LTX2_CROSS_ATTN_KERNEL=off to disable, =nki to force hand-written, =cte to force CTE bias.
+    _cte_bias_kernel = None
     _nki_cross_attn = None
     cross_attn_pref = os.environ.get("LTX2_CROSS_ATTN_KERNEL", "auto").lower()
     if cross_attn_pref != "off":
-        _nki_cross_attn = _try_load_nki_cross_attn()
-        if _nki_cross_attn is not None:
-            logger.info("Using NKI cross-attention kernel for masked attention")
-        else:
-            logger.info(
-                "NKI cross-attention kernel not available, masked attn uses BMM"
-            )
+        if cross_attn_pref in ("auto", "cte"):
+            _cte_bias_kernel = _try_load_attention_cte_bias()
+            if _cte_bias_kernel is not None:
+                logger.info(
+                    "Using attention_cte_bias for cross-attention (production flash attn with additive bias)"
+                )
+        if _cte_bias_kernel is None and cross_attn_pref in ("auto", "nki"):
+            _nki_cross_attn = _try_load_nki_cross_attn()
+            if _nki_cross_attn is not None:
+                logger.info("Using NKI hand-written cross-attention kernel")
+        if _cte_bias_kernel is None and _nki_cross_attn is None:
+            logger.info("No NKI cross-attention kernel available, masked attn uses BMM")
 
     def neuron_sdpa(
         query,
@@ -268,7 +357,7 @@ def replace_sdpa_with_bmm():
         # This covers:
         #   - Video self-attention (attn1): Q=6144, K=6144 — majority of attn compute
         #   - Audio-to-video cross-modal (a2v): Q=6144, K=121
-        # Cross-attention with masks (attn2, audio_attn2) uses BMM fallback.
+        # Masked cross-attention (attn2, audio_attn2) handled by CTE bias or BMM.
         # Audio attention with Q.seq < 512 (audio_attn1, v2a) uses BMM fallback.
         if (
             _nki_flash_kernel is not None
@@ -281,6 +370,34 @@ def replace_sdpa_with_bmm():
             return _nki_flash_kernel(
                 query, key, value, is_causal=False, scale=float(scale)
             )
+
+        # ── CTE Bias Cross-Attention path (production flash attn + additive bias) ──
+        # Eligible when: 4D input, has mask, Q_seq >= 512
+        # This uses the forked attention_cte kernel with additive bias support.
+        # Covers: attn2 (text cross-attention), audio_attn2
+        if (
+            _cte_bias_kernel is not None
+            and attn_mask is not None
+            and len(query.shape) == 4
+            and query.shape[2] >= _NKI_FLASH_MIN_SEQ
+        ):
+            b, h, sq, d_head = query.shape
+            k_seq = key.shape[2]
+            if scale is None:
+                scale = 1.0 / math.sqrt(d_head)
+            # Reshape mask to [B*H, K_seq] for the CTE bias kernel.
+            # Input mask shapes: [B, 1, 1, K_seq] or [B, H, Q, K] or [B*H, 1, K_seq]
+            if attn_mask.ndim == 4:
+                # [B, 1, 1, K_seq] -> broadcast to [B, H, 1, K_seq] -> [B*H, K_seq]
+                bias_2d = attn_mask.expand(b, h, 1, k_seq).reshape(b * h, k_seq)
+            elif attn_mask.ndim == 3:
+                # [B*H, 1, K_seq] -> [B*H, K_seq]
+                bias_2d = attn_mask.reshape(b * h, k_seq)
+            else:
+                # [B*H, K_seq] already flat
+                bias_2d = attn_mask
+            bias_2d = bias_2d.float().contiguous()
+            return _cte_bias_kernel(query, key, value, bias_2d, scale=float(scale))
 
         # ── NKI Cross-Attention path (masked, K_seq=1024) ──────────────
         # Eligible when: 4D input, has mask, K_seq=1024, d=128, Q_seq >= 512
