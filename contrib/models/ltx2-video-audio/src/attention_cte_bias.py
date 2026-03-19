@@ -162,7 +162,7 @@ _SWA_ALLOCATION_STRATEGY_THRESHOLD = 128  # for SWA, threshold above which alloc
 
 
 @nki.jit
-def attention_cte(
+def attention_cte_with_bias(
     q: nl.ndarray,
     k: nl.ndarray,
     v: nl.ndarray,

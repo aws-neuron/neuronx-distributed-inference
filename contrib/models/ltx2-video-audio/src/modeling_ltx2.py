@@ -179,12 +179,12 @@ def _try_load_attention_cte_bias():
     """
     try:
         import nki
-        from attention_cte_bias import attention_cte
+        from attention_cte_bias import attention_cte_with_bias
         from neuronx_distributed_inference.utils.decorator_peeling import (
             peel_decorations,
         )
 
-        raw_func = peel_decorations(attention_cte)
+        raw_func = peel_decorations(attention_cte_with_bias)
         decorated_cte_bias = nki.jit(
             raw_func,
             mode="torchxla",
