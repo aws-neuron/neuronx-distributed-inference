@@ -60,6 +60,19 @@ Both CLIP vision encoder and text decoder are compiled as separate NEFFs on Neur
 | Token Matching (TF) | PASS | **95.13% avg** (5 random images, 20 tokens each) |
 | Token Matching (Greedy) | INFO | 46.41% avg (2/5 images 100%, cascading divergence on others) |
 
+#### COCO Image Captioning Demo
+
+Captions generated from real COCO val2017 photos (greedy decoding, max 30 tokens):
+
+| Image | HF Golden | Neuron |
+|-------|-----------|--------|
+| Two cats on a couch | two cats laying on a pink blanket | two cats laying on a couch |
+| Person skateboarding | a woman bending over | a woman bending over |
+| Bus on street | a skateboarder doing a trick | skateboarder doing a trick |
+| Kitchen / food | kitchen with a breakfast bar | kitchen with a breakfast bar |
+| Solid red (synthetic) | the red light of the light | the red light of the car |
+| Checkerboard (synthetic) | black and white checkered pattern | checkered pattern in the middle |
+
 ## Usage (Vision+Text)
 
 ```python
