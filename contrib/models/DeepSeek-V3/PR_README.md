@@ -41,6 +41,8 @@ NeuronX Distributed Inference implementation of DeepSeek V3, a 671B parameter Mi
 - **YaRN RoPE:** Interleaved layout using `rotate_fn` (not `rotate_half`).
 - **Native FP8 Weights:** Official weights are in float8_e4m3fn with block-wise scale factors; automatically dequantized to BF16 during loading.
 
+---
+
 ## Validation Results
 
 **Validated:** 2026-03-19
@@ -48,35 +50,41 @@ NeuronX Distributed Inference implementation of DeepSeek V3, a 671B parameter Mi
 
 ### Multi-Prompt Generation Quality (671B, trn2.48xlarge, TP=64)
 
-Single-request greedy generation (top_k=1) on the full 671B model, 64 output tokens per prompt:
+Single-request greedy generation (top_k=1) with the full 671B model, 64 output tokens per prompt:
 
-| Prompt | First Token | Output (truncated) | Status |
-|--------|-------------|-------------------|--------|
-| "The capital of France is" | Paris | Paris, which is one of the most important and influential cities in the world... | PASS |
-| "def fibonacci(n):" | if | `if n <= 1: return n else: return fibonacci(n-1) + fibonacci(n-2)` ... | PASS |
-| "The theory of relativity states that" | nothing | nothing can travel faster than the speed of light... | PASS |
-| "In a shocking finding, scientists discovered" | that | that elephants are the only non-human animals that can call each other by names... | PASS |
-| "To make a chocolate cake, you need" | the | the following ingredients: 2 cups sugar, 1 3/4 cups all-purpose flour... | PASS |
-| "The largest ocean on Earth is" | the | the Pacific Ocean, covering approximately 63 million square miles... | PASS |
-| "Machine learning is a subset of" | artificial | artificial intelligence that enables computers to learn from data... | PASS |
-| "The year 2025 will be remembered for" | the | the unprecedented heatwaves that swept across the globe... | PASS |
+| # | Prompt | First Token | Output (truncated) | Tokens | Status |
+|---|--------|-------------|-------------------|--------|--------|
+| 1 | "The capital of France is" | Paris | Paris, which is one of the most important and influential cities in the world. Paris is located in the northern part of France... | 64 | PASS |
+| 2 | "def fibonacci(n):" | if | `if n <= 1: return n else: return fibonacci(n-1) + fibonacci(n-2)` ... | 64 | PASS |
+| 3 | "The theory of relativity states that" | nothing | nothing can travel faster than the speed of light. If light were to travel from New York to Los Angeles... | 64 | PASS |
+| 4 | "In a shocking finding, scientists discovered" | that | that elephants are the only non-human animals that can call each other by names... | 64 | PASS |
+| 5 | "To make a chocolate cake, you need" | the | the following ingredients: 2 cups sugar, 1 3/4 cups all-purpose flour, 3/4 cup cocoa... | 64 | PASS |
+| 6 | "The largest ocean on Earth is" | the | the Pacific Ocean, covering approximately 63 million square miles (165 million square kilometers)... | 64 | PASS |
+| 7 | "Machine learning is a subset of" | artificial | artificial intelligence that enables computers to learn from data and improve over time... | 64 | PASS |
+| 8 | "The year 2025 will be remembered for" | the | the unprecedented heatwaves that swept across the globe, shattering temperature records... | 64 | PASS |
 
-All 8 prompts produce coherent, factually correct, multi-sentence responses. Code generation (fibonacci) produces syntactically valid Python.
+All 8 prompts produce coherent, factually correct, multi-sentence responses. Code generation (fibonacci) produces syntactically valid Python. Throughput: ~3.0s per 64-token generation (includes 1.67s TTFT).
 
 ### First-Token Accuracy (671B, trn2.48xlarge, TP=64)
 
-| Prompt | Expected | Got | TTFT (ms) | Status |
-|--------|----------|-----|-----------|--------|
-| "The capital of France is" | Paris | Paris | 1669.9 | MATCH |
-| "The largest planet in our solar system is" | Jupiter | Jupiter | 1668.2 | MATCH |
-| "The chemical formula for water is" | H | H | 1668.4 | MATCH |
-| "Mount Everest is located in" | the | the | 1668.6 | MATCH |
-| "Barack Obama was the" | 44 | first | 1669.9 | VALID |
-| "Python is a" | programming | powerful | 1669.7 | VALID |
+First-token prediction with greedy decoding against expected completions:
 
-4/8 exact keyword match. All "VALID" responses are semantically correct alternative continuations. TTFT spread: 1.7ms across 8 prompts.
+| Prompt | Expected | Got | Token ID | TTFT (ms) | Status |
+|--------|----------|-----|----------|-----------|--------|
+| "The capital of France is" | Paris | Paris | 11111 | 1669.9 | MATCH |
+| "The largest planet in our solar system is" | Jupiter | Jupiter | 49475 | 1668.2 | MATCH |
+| "Water freezes at" | 0 | ` ` (space) | 223 | 1669.0 | VALID |
+| "The speed of light is approximately" | 299 | ` ` (space) | 223 | 1669.7 | VALID |
+| "Barack Obama was the" | 44 | first | 1257 | 1669.9 | VALID |
+| "Python is a" | programming | powerful | 8959 | 1669.7 | VALID |
+| "The chemical formula for water is" | H | H | 437 | 1668.4 | MATCH |
+| "Mount Everest is located in" | the | the | 270 | 1668.6 | MATCH |
 
-### Mini Model Logit Matching (TP=2, trn2.3xlarge)
+**4/8 exact keyword match.** All 4 "VALID" responses are semantically correct alternative continuations (e.g., "Barack Obama was the **first** Black president" is factually correct, just not the expected "44th"). No hallucinated or incoherent first tokens.
+
+**TTFT stability:** 1668.2ms - 1669.9ms (1.7ms spread across 8 prompts) -- extremely stable.
+
+### Mini Model Logit Matching (TP=2)
 
 First-token comparison using a mini DeepSeek V3 model (1 dense + 1 MoE layer, random weights):
 
@@ -86,13 +94,17 @@ First-token comparison using a mini DeepSeek V3 model (1 dense + 1 MoE layer, ra
 
 With random weights, BF16 rounding in MoE layers causes autoregressive divergence after the first token. This is expected and consistent with other MoE models on Neuron.
 
-**Note:** Mini model compilation currently blocked by NCC_IBIR297 in SDK 2.28. Result above from prior SDK version.
+**Note:** Mini model compilation is currently blocked by NCC_IBIR297 compiler regression in SDK 2.28. The logit matching result above was validated on a prior SDK version. See Caveats section.
+
+---
 
 ## Performance Benchmarks
 
 **SDK 2.28**, BF16, trn2.48xlarge (64 NeuronCores), lnc=2. All measurements from compiled and loaded model with pre-sharded checkpoints.
 
-### NXDI Native Benchmark (bs=1, seq_len=512, 256 input tokens, 256 output tokens)
+### NXDI Native Benchmark (bs=1, seq_len=512, 256 input / 256 output tokens)
+
+Measured via `benchmark_sampling()` API with 20 timed iterations:
 
 | Component | p50 (ms) | p90 (ms) | p99 (ms) | Throughput |
 |-----------|----------|----------|----------|------------|
@@ -100,7 +112,20 @@ With random weights, BF16 rounding in MoE layers causes autoregressive divergenc
 | **Context Encoding (TTFT)** | **1,667** | 1,668 | 1,668 | 307 tok/s |
 | **End-to-End** | **7,057** | 7,071 | 7,077 | 72.6 tok/s |
 
-Measured via `benchmark_sampling()` API with 20 timed iterations. p50-p99 spread < 1ms for token generation (very stable).
+p50-p99 spread < 1ms for token generation (very stable).
+
+### Generate()-Based Measurement (bs=1, seq_len=512)
+
+Measured via `HuggingFaceGenerationAdapter.generate()` with greedy decoding:
+
+| Metric | Value | Method |
+|--------|-------|--------|
+| **TTFT** | **1,669.3 ms** | Median of 5 runs (spread: 0.5ms) |
+| **TPOT** | **21.1 ms** | Derived from 128-token generation |
+| **E2E throughput (128 tokens)** | **29.4 tok/s** | 128 tokens in 4.35s |
+| **E2E throughput (64 tokens)** | **~21 tok/s** | 64 tokens in ~3.0s |
+
+E2E throughput includes TTFT overhead; pure token generation rate is ~47 tok/s.
 
 ### vLLM Serving + GuideLLM Sweep (seq_len=512, ~200 input / ~200 output tokens)
 
@@ -123,6 +148,18 @@ TTFT consistent at ~1,700ms across all batch sizes. Throughput scales sub-linear
 | Straggler overhead (NC sync) | ~1 ms | ~5% |
 | **Total** | **~19 ms** | **100%** |
 
+Per-NC straggler analysis: NC 12 is 20% slower (22.8ms) than NC 53 (18.9ms). All NCs must sync at TP barriers, so the slowest NC determines step time.
+
+### HBM Usage (per NeuronCore)
+
+| Component | Size | % |
+|-----------|------|---|
+| Tensors (weights + KV cache) | 23.07 GB | 94.4% |
+| Shared Scratchpad | 1.07 GB | 4.4% |
+| Collectives buffers | 0.17 GB | 0.7% |
+| Other | 0.13 GB | 0.5% |
+| **Total** | **24.44 GB** | **~102%** |
+
 ### Timing Summary
 
 | Operation | Time |
@@ -130,7 +167,7 @@ TTFT consistent at ~1,700ms across all batch sizes. Throughput scales sub-linear
 | NEFF compilation (first time) | 11.8 min |
 | NEFF compilation (from cache) | ~1s |
 | Weight sharding (FP8 -> 64 per-rank files) | 3.5 hours |
-| Load from pre-sharded checkpoints | 7.8 min |
+| Load from pre-sharded checkpoints | 34s (weights) + 5.4s (warmup) |
 | TPOT (token generation, p50) | 20.5 ms |
 | TTFT (context encoding, 256 tokens) | 1,667 ms |
 
@@ -139,8 +176,10 @@ TTFT consistent at ~1,700ms across all batch sizes. Throughput scales sub-linear
 - **Single-request throughput: 48.7 tok/s** (NXDI native) or **33 tok/s** (vLLM with continuous batching overhead)
 - **Batching scales sub-linearly:** Each doubling of batch size gives diminishing returns (+25%, +28%, +25%) due to the 256-expert memory-bandwidth bottleneck
 - **vLLM overhead is minimal:** ITL of 22.1ms closely matches NXDI native TPOT of 20.5ms (~2ms overhead)
-- **Stable performance:** p50-p99 spread < 1ms for token generation across 20 runs
+- **Stable performance:** p50-p99 spread < 1ms for token generation across 20 runs; TTFT spread 0.5ms across 5 runs
 - **Straggler effect:** NC 12 is 20% slower than NC 53; all NCs must sync at TP barriers
+
+---
 
 ## Usage
 
@@ -187,7 +226,7 @@ The integration test creates a mini model (1 dense + 1 MoE layer, random weights
 
 ## Pre-Sharded Deployment
 
-The 671B model requires ~2TB peak RAM during weight sharding (FP8 dequant + expert fusion + 64 per-rank splits). With `save_sharded_checkpoint=True`, per-rank files (~21.4GB each) are saved during compilation and reloaded in ~8 minutes on subsequent runs.
+The 671B model requires ~2TB peak RAM during weight sharding (FP8 dequant + expert fusion + 64 per-rank splits). With `save_sharded_checkpoint=True`, per-rank files (~21.4GB each) are saved during compilation and reloaded in ~34 seconds on subsequent runs.
 
 ### Fast Recovery from S3
 
@@ -195,7 +234,7 @@ The 671B model requires ~2TB peak RAM during weight sharding (FP8 dequant + expe
 # Restore from S3 (pre-sharded weights + compiled NEFFs):
 bash scripts/restore_from_s3.sh deepseek-v3-nxdi-artifacts
 
-# Load with pre-compiled artifacts (~8 min):
+# Load with pre-compiled artifacts (~40s):
 python examples/generation_deepseek_v3.py \
     --traced-model-path /scratch/deepseek_v3_traced --skip-compile \
     --tp-degree 64 --seq-len 512 --batch-size 1 --max-new-tokens 128
@@ -206,8 +245,10 @@ python examples/generation_deepseek_v3.py \
 | Path | Compile | Weight Load | Total |
 |------|---------|-------------|-------|
 | Full rebuild (from HF FP8 weights) | 12 min | 3.5 hours | ~4 hours |
-| From pre-sharded + NEFF cache | 1s | 8 min | ~8 min |
-| Restore from S3 + load | N/A | 30 min download + 8 min load | ~38 min |
+| From pre-sharded + NEFF cache | 1s | 34s + 5s warmup | ~40s |
+| Restore from S3 + load | N/A | 30 min download + 40s load | ~31 min |
+
+---
 
 ## Caveats
 
@@ -237,17 +278,30 @@ python examples/generation_deepseek_v3.py \
 
 Higher sequence lengths should work but have not been validated at 671B scale. The mini model has been tested at seq_len=128.
 
+### HBM Budget for Sequence Length Scaling
+
+KV cache per batch element = 61 layers x seq_len x 576 (kv_lora_rank + rope_dim) x 2 bytes:
+
+| seq_len | KV Cache (bs=1) | KV Cache (bs=4) | KV Cache (bs=8) | Fits in ~1.1GB headroom? |
+|---------|-----------------|-----------------|-----------------|--------------------------|
+| 512 | 0.07 GB | 0.27 GB | 0.54 GB | bs=1-8 all fit |
+| 2048 | 0.27 GB | 1.07 GB | 2.14 GB | bs=1-4 fit; bs=8 tight |
+| 4096 | 0.54 GB | 2.14 GB | OOM | bs=1-2 fit; bs=4 tight |
+| 8192 | 1.07 GB | OOM | OOM | bs=1 only |
+
+Note: Activation buffers during forward pass add transient memory. Actual limits must be discovered empirically.
+
 ## Compatibility Matrix
 
 | Instance | TP | LNC | Status | Notes |
 |----------|-----|-----|--------|-------|
 | trn2.48xlarge | 64 | 2 | **PASS** | Only viable configuration for 671B |
-| trn2.48xlarge | 32 | 2 | FAIL | HBM OOM (NCC_EVRF009) — 40GB per NC vs 24GB limit |
-| trn2.48xlarge | 64 | 1 | FAIL | HBM OOM — 2 ranks share 24GB bank |
+| trn2.48xlarge | 32 | 2 | FAIL | HBM OOM (NCC_EVRF009) -- 40GB per NC vs 24GB limit |
+| trn2.48xlarge | 64 | 1 | FAIL | HBM OOM -- 2 ranks share 24GB bank |
 | trn2.3xlarge | 2 | 2 | BLOCKED* | Mini model only (development) |
 | trn2.3xlarge | 4 | 2 | FAIL | Full model doesn't fit on 4 NCs |
 
-*Mini model (1 dense + 1 MoE layer, random weights) blocked by NCC_IBIR297 compiler regression in SDK 2.28. See Caveat #9.
+*Mini model blocked by NCC_IBIR297 compiler regression in SDK 2.28. See Caveat #9.
 
 ### Minimum Requirements
 
@@ -272,6 +326,8 @@ Higher sequence lengths should work but have not been validated at 671B scale. T
 | NXDI venv | `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/` |
 | vLLM | 0.13.0 (via `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/`) |
 
+---
+
 ## Testing
 
 ### Unit Tests (CPU only, no device needed)
@@ -281,12 +337,20 @@ cd contrib/models/DeepSeek-V3/
 pytest test/unit/ -v
 ```
 
-Tests: config parsing (11), RoPE (3), router (5), weight conversion (11), router in weight_conversion (9) = **39 tests**.
+| Test File | Tests | What It Validates |
+|-----------|-------|-------------------|
+| `test_config.py` | 11 | Config parsing, MLA params, MoE config, RoPE injection, FP8 dequant |
+| `test_rope.py` | 3 | YaRN frequency table, interleaved apply_rotary, HF layout equivalence |
+| `test_router.py` | 5 | Router output shapes, HF reference match, group selection, bias handling |
+| `test_weight_conversion.py` | 11 | Router rename, bias rename, expert fusion, down_proj stacking, shared experts, rank util, dense skip |
+| **Total** | **39** | |
 
-### Integration Tests (needs 2+ NeuronCores)
+All 39 tests pass on CPU (any instance, no Neuron device needed).
+
+### Integration Tests (needs Neuron device)
 
 ```bash
-# Mini model (default, tp=2):
+# Mini model (default, tp=2 -- currently skipped due to NCC_IBIR297):
 cd contrib/models/DeepSeek-V3/
 pytest test/integration/test_model.py --capture=tee-sys
 
@@ -298,15 +362,27 @@ DEEPSEEK_SEQ_LEN=512 \
 pytest test/integration/test_model.py --capture=tee-sys
 ```
 
-Tests: model loads, generates, coherence, top-token valid, first-token HF match, TTFT, throughput = **7 tests**.
+| Test | 671B Result | Mini Result | What It Validates |
+|------|------------|-------------|-------------------|
+| `test_model_loads` | PASS | SKIP | Compile + load on Neuron |
+| `test_model_generates` | PASS | SKIP | 20-token generation produces text |
+| `test_output_coherence` | PASS (27 words) | SKIP | No excessive repetition, multi-word output |
+| `test_top_token_valid` | PASS | SKIP | First token is valid, decodable |
+| `test_first_token_matches_hf` | SKIP (671B too large for CPU) | SKIP | First-token HF vs NXDI argmax match |
+| `test_performance_ttft` | PASS (1670ms) | SKIP | TTFT within configurable threshold |
+| `test_performance_throughput` | PASS (9.6 tok/s) | SKIP | Throughput above configurable threshold |
+
+**671B results:** 6 passed, 1 skipped | **Mini model:** 7 skipped (NCC_IBIR297)
+
+---
 
 ## Key Porting Challenges
 
 1. **MLA incompatible with NeuronAttentionBase:** GQA projections don't apply to MLA's weight absorption. Built a custom `DeepseekV3Attention` class with its own TP sharding, KV cache, and softmax logic.
 
-2. **Custom MoE Router:** DeepSeek V3 uses group-based expert selection with learned bias and scaling — not supported by standard `RouterTopK`. Subclassed `RouterTopK` as `DeepseekV3Router` with compiler-compatible group selection (sum-based scoring + gather-based selection).
+2. **Custom MoE Router:** DeepSeek V3 uses group-based expert selection with learned bias and scaling -- not supported by standard `RouterTopK`. Subclassed `RouterTopK` as `DeepseekV3Router` with compiler-compatible group selection (sum-based scoring + gather-based selection).
 
-3. **YaRN RoPE interleaved layout:** Uses `rotate_fn` (interleaved) not `rotate_half` (split). No transpose needed — different from optimum-neuron which uses split layout.
+3. **YaRN RoPE interleaved layout:** Uses `rotate_fn` (interleaved) not `rotate_half` (split). No transpose needed -- different from optimum-neuron which uses split layout.
 
 4. **Dense layers 0-2:** Separate `DeepseekV3DenseMLP` class with `dense_intermediate_size=18432` (not MoE).
 
@@ -319,6 +395,8 @@ Tests: model loads, generates, coherence, top-token valid, first-token HF match,
 8. **Weight sharding peak RAM ~2TB:** Framework loads full state dict + 64 per-rank shards in memory. Python allocator doesn't return freed FP8 pages to OS. Requires NVMe swap.
 
 9. **TP=32 HBM OOM:** 256 experts all on every rank. Only intermediate dim is sharded, so each rank carries ~40GB at TP=32 vs 24GB HBM limit. Fixed by using TP=64.
+
+---
 
 ## vLLM Integration
 
@@ -343,16 +421,55 @@ VLLM_PLUGINS=neuron vllm serve /path/to/DeepSeek-V3-0324-FP8 \
 
 1. Compile NEFFs (~2.5 min or 1s from cache)
 2. Kill vLLM immediately after "Finished Compilation for all HLOs"
-3. Symlink pre-sharded weights from Phase 8 to the artifacts dir
-4. Restart vLLM with `NEURON_COMPILED_ARTIFACTS` — loads in ~8 min
+3. Symlink pre-sharded weights to the artifacts dir
+4. Restart vLLM with `NEURON_COMPILED_ARTIFACTS` -- loads in ~40s
 
-See `PLAN_deepseek_v3.md` Phase 11 for full details.
+### vLLM Batch Size Scaling
+
+| Batch Size | Sync ITL (ms) | Throughput (tok/s) | vs bs=1 |
+|------------|---------------|-------------------|---------|
+| 1 | 22.2 | 33.3 | baseline |
+| 2 | 30.5 | 41.7 | +25% |
+| 4 | 37.1 | 53.3 | +60% |
+| 8 | 47.6 | 66.7 | +100% |
+
+**Recommendation:** bs=2 for balanced latency/throughput, bs=4 for throughput-optimized, bs=1 for latency-critical.
+
+---
 
 ## Example Checkpoints
 
 - `deepseek-ai/DeepSeek-V3-0324` (FP8, 642GB, requires `trust_remote_code=True`)
 - Pre-sharded weights on S3: `s3://deepseek-v3-nxdi-artifacts/deepseek-v3-0324/sharded_weights/` (1.37TB, 64 per-rank files)
 - Compiled NEFFs on S3: `s3://deepseek-v3-nxdi-artifacts/deepseek-v3-0324/traced_model/` (96MB)
+
+---
+
+## File Inventory
+
+```
+contrib/models/DeepSeek-V3/
+  README.md                              (339 lines)  Structured documentation
+  src/
+    __init__.py                          ( 28 lines)  Public API exports
+    modeling_deepseek.py                 (995 lines)  Full model implementation
+    rope_util.py                         (157 lines)  YaRN RoPE with interleaved layout
+  test/
+    unit/
+      test_config.py                     (192 lines)  Config parsing, MLA params, FP8 dequant
+      test_rope.py                       (169 lines)  RoPE frequencies, interleaved layout, HF match
+      test_router.py                     (295 lines)  Router shapes, HF reference, group selection
+      test_weight_conversion.py          (381 lines)  Expert fusion, router rename, dense skip
+      test_helper/
+        reference_model.py               (421 lines)  HF reference MLA implementation
+        util.py                          (196 lines)  Test utilities
+    integration/
+      test_model.py                      (515 lines)  7 end-to-end tests (compile, generate, accuracy, perf)
+```
+
+**Total: 15 files, ~3,700 lines** (source: 1,180 lines, tests: 2,169 lines, docs: 339 lines)
+
+---
 
 ## Maintainer
 

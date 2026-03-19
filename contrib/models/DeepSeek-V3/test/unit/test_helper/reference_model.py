@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Reference source: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 # Minor adjustments to run in cpu, bfloat16 and simpler configs.
 # This serves as mini deep seek demo. Its self-contained MLA can be used as golden for unit testing.

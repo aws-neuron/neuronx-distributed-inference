@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for DeepseekV3Router (group-based expert selection).
 
 Tests the custom router against a pure-PyTorch reference implementation
