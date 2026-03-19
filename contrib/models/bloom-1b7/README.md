@@ -44,12 +44,12 @@ model.compile(output_path)
 
 ## Performance
 
-Measured on trn1.32xlarge, batch_size=1, seq_len=128, bfloat16. Utilization is per-NeuronCore (TP=1).
+Profiled on trn1.32xlarge (single NeuronCore utilization):
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 63.3 tok/s |
-| Context Encoding MBU | 18.6% |
-| Context Encoding MFU | 7.4% |
-| Token Generation MBU | 16.1% |
-| Token Generation MFU | 0.1% |
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| Throughput | - | 63.3 tok/s |
+| MBU (Memory) | 18.6% | 16.1% |
+| MFU (Compute) | 7.4% | 0.1% |
+
+*Batch size 1, sequence length 128, BF16 precision, TP=1*
