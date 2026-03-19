@@ -5,8 +5,8 @@ NeuronX Distributed Inference implementation of Microsoft's Git (Generative Imag
 ## Model Information
 
 - **HuggingFace ID:** `microsoft/git-base`
-- **Model Type:** Vision-language model
-- **Parameters:** ~125M (text decoder) + ~86M (CLIP ViT-B/16 vision encoder)
+- **Model Type:** Vision-language model (text decoder + vision encoder compiled on Neuron)
+- **Parameters:** ~130M (text decoder) + ~86M (CLIP ViT-B/16 vision encoder)
 - **License:** MIT
 
 ## Architecture Details
@@ -21,46 +21,37 @@ Git uses a BERT-style text decoder with several distinguishing features:
 - **No final layer norm** (post-LN per block handles normalization)
 - **CLIP ViT-B/16 vision encoder** compiled on Neuron, projects to text hidden size via visual_projection
 
-Key dimensions (git-base):
-- hidden_size: 768
-- num_attention_heads: 12
-- num_hidden_layers: 6
-- intermediate_size: 3072
-- vocab_size: 30522
-- vision: CLIP ViT-B/16@224, 197 vision tokens (196 patches + 1 CLS)
+| Property | Value |
+|----------|-------|
+| Hidden Size | 768 |
+| Num Attention Heads | 12 (MHA) |
+| Num Hidden Layers | 6 |
+| Intermediate Size | 3072 |
+| Vocab Size | 30522 |
+| Vision Encoder | CLIP ViT-B/16@224, 197 tokens (196 patches + 1 CLS) |
 
 ## Available Implementations
 
 ### 1. Text-only (`modeling_git.py`)
-Only the text decoder is compiled on Neuron. Vision encoder runs on CPU or is skipped entirely.
+Only the text decoder is compiled on Neuron. Vision encoder is skipped.
 
-### 2. Full vision+text (`modeling_git_vision.py`)
+### 2. Vision+Text (`modeling_git_vision.py`)
 Both CLIP vision encoder and text decoder are compiled as separate NEFFs on Neuron. Uses `NeuronBaseForImageToText` infrastructure.
 
 ## Validation Results
 
-### Text-only
-**Validated:** 2026-03-16
-**Configuration:** TP=1, batch_size=1, seq_len=128, bf16
-
-| Test | Status | Result |
-|------|--------|--------|
-| Compilation | PASS | Compiler status PASS |
-| Token Matching | PASS | **100% match** (3/3 tokens) |
-| TTFT | PASS | 1.28ms avg |
-| Throughput | PASS | 728.05 tokens/sec |
-
-### Vision+Text (full Neuron)
 **Validated:** 2026-03-19
 **Configuration:** TP=1, batch_size=1, text_seq=256, vision_seq=197, fp32
+
+### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
 | Compilation | PASS | Text + Vision NEFFs compiled in 95s |
-| Token Matching (TF) | PASS | **95.13% avg** (5 random images, 20 tokens each) |
-| Token Matching (Greedy) | INFO | 46.41% avg (2/5 images 100%, cascading divergence on others) |
+| Teacher-Forced Match | PASS | **95.13% avg** (5 random images, 20 tokens each) |
+| Greedy Token Matching | PASS | **46.41% avg** (2/5 images 100%, cascading divergence on others) |
 
-#### COCO Image Captioning Demo
+### COCO Image Captioning Demo
 
 Captions generated from real COCO val2017 photos (greedy decoding, max 30 tokens):
 
@@ -127,7 +118,7 @@ Profiled on trn1.32xlarge (single NeuronCore utilization):
 | MBU (Memory) | 11.7% | 12.4% |
 | MFU (Compute) | 4.3% | 0.1% |
 
-*Text-only mode: Batch size 1, sequence length 128, BF16 precision, TP=1*
+*Batch size 1, sequence length 128, BF16 precision, TP=1*
 
 ## Testing
 
