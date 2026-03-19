@@ -59,11 +59,77 @@ from transformers.activations import ACT2FN
 
 logger = logging.getLogger(__name__)
 
+
+def _dequantize_fp8_state_dict(state_dict: dict, block_size: int = 128) -> dict:
+    """
+    Dequantize FP8 block-wise weights to BF16 in-place.
+
+    DeepSeek V3's native FP8 format stores weights as float8_e4m3fn with
+    per-block scale factors in corresponding weight_scale_inv tensors.
+    Block size is typically 128x128 (from config.quantization_config.weight_block_size).
+    """
+    scale_inv_keys = [k for k in state_dict if k.endswith(".weight_scale_inv")]
+    if not scale_inv_keys:
+        return state_dict
+
+    total = len(scale_inv_keys)
+    logger.info("Dequantizing %d FP8 weights to BF16 (block_size=%d)...", total, block_size)
+
+    for idx, scale_key in enumerate(scale_inv_keys):
+        if idx % 1000 == 0 and idx > 0:
+            logger.info("  Dequantized %d/%d weights...", idx, total)
+            gc.collect()
+        weight_key = scale_key.replace(".weight_scale_inv", ".weight")
+        if weight_key not in state_dict:
+            continue
+
+        weight = state_dict[weight_key]
+        scale_inv = state_dict[scale_key]
+
+        if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # Already in a standard dtype, just remove the scale key
+            del state_dict[scale_key]
+            continue
+
+        M, N = weight.shape
+        num_blocks_m = (M + block_size - 1) // block_size
+        num_blocks_n = (N + block_size - 1) // block_size
+
+        # Pad weight to block-aligned shape if needed
+        pad_m = num_blocks_m * block_size - M
+        pad_n = num_blocks_n * block_size - N
+        if pad_m or pad_n:
+            weight_f32 = torch.zeros(num_blocks_m * block_size, num_blocks_n * block_size, dtype=torch.float32)
+            weight_f32[:M, :N] = weight.to(torch.float32)
+        else:
+            weight_f32 = weight.to(torch.float32)
+
+        # Reshape to blocks and multiply by scale factors
+        # weight_f32: (num_blocks_m, block_size, num_blocks_n, block_size)
+        # scale_inv:  (num_blocks_m, num_blocks_n)
+        weight_f32 = weight_f32.view(num_blocks_m, block_size, num_blocks_n, block_size)
+        weight_f32 = weight_f32 * scale_inv[:num_blocks_m, :num_blocks_n].unsqueeze(1).unsqueeze(3)
+        weight_f32 = weight_f32.view(num_blocks_m * block_size, num_blocks_n * block_size)
+
+        state_dict[weight_key] = weight_f32[:M, :N].to(torch.bfloat16)
+        del state_dict[scale_key]
+
+    # Remove any remaining scale_inv keys that didn't have matching weights
+    for key in list(state_dict.keys()):
+        if key.endswith(".weight_scale_inv"):
+            del state_dict[key]
+
+    gc.collect()
+    logger.info("FP8 dequantization complete.")
+    return state_dict
+
+
 def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "DeepseekV3InferenceConfig") -> dict:
     """
     Convert HuggingFace DeepSeek V3 state dict to Neuron-compatible format.
 
     Transformations:
+    0. Dequantize FP8 weights to BF16 (if present)
     1. Add rank utility tensors for TP sharding
     2. Rename router weights: gate.weight -> router.linear_router.weight
     3. Rename e_score_correction_bias for custom router (Phase 3)
@@ -71,6 +137,19 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
     5. Stack down_proj weights across experts
     6. Skip dense layers (first_k_dense_replace layers)
     """
+    # Dequantize FP8 weights if present (DeepSeek V3 native FP8 format)
+    quant_config = getattr(config, "quantization_config", None)
+    if quant_config is None:
+        # Check the underlying HF config for quantization_config
+        load_config = getattr(config, "_load_config", None)
+        if load_config:
+            quant_config = getattr(load_config, "quantization_config", None)
+    block_size = 128
+    if quant_config and isinstance(quant_config, dict):
+        wbs = quant_config.get("weight_block_size", [128, 128])
+        block_size = wbs[0] if isinstance(wbs, (list, tuple)) else wbs
+    _dequantize_fp8_state_dict(state_dict, block_size=block_size)
+
     num_hidden_layers = config.num_hidden_layers
     num_local_experts = config.num_local_experts
     tp_degree = getattr(config.neuron_config, "tp_degree", 1)

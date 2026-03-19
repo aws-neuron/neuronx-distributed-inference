@@ -79,14 +79,32 @@ else
     echo "  -> Updated $CONSTANTS"
 fi
 
-# ── 3. Ensure __init__.py files exist for test imports ───────────────
+# ── 3. Register model in inference_demo.py ────────────────────────────
+echo ""
+DEMO="$NXDI_ROOT/inference_demo.py"
+if [[ -f "$DEMO" ]]; then
+    if grep -q "NeuronDeepseekV3ForCausalLM" "$DEMO"; then
+        echo "DeepSeek V3 already registered in inference_demo.py"
+    else
+        echo "Registering DeepSeek V3 in inference_demo.py..."
+        # Add import after the last model import line
+        sed -i '/from neuronx_distributed_inference.models.qwen3_moe/a from neuronx_distributed_inference.models.deepseek.modeling_deepseek import NeuronDeepseekV3ForCausalLM' "$DEMO"
+        # Add to MODEL_TYPES dict before closing brace
+        sed -i '/^MODEL_TYPES = {/,/^}/ s/^}/    "deepseek_v3": {"causal-lm": NeuronDeepseekV3ForCausalLM},\n}/' "$DEMO"
+        echo "  -> Updated $DEMO"
+    fi
+else
+    echo "  inference_demo.py not found at $DEMO (skipping)"
+fi
+
+# ── 4. Ensure __init__.py files exist for test imports ───────────────
 echo ""
 echo "Setting up test structure..."
 for d in test test/unit test/unit/models test/unit/models/deepseek; do
     touch "$SCRIPT_DIR/$d/__init__.py" 2>/dev/null || true
 done
 
-# ── 4. Verify imports ────────────────────────────────────────────────
+# ── 5. Verify imports ────────────────────────────────────────────────
 echo ""
 echo "Verifying imports..."
 source "$VENV/bin/activate"
@@ -104,7 +122,7 @@ from neuronx_distributed_inference.models.deepseek.modeling_deepseek import (
 print('  DeepSeek V3 imports OK')
 "
 
-# ── 5. Print next steps ──────────────────────────────────────────────
+# ── 6. Print next steps ──────────────────────────────────────────────
 echo ""
 echo "============================================================"
 echo " Installation complete!"
