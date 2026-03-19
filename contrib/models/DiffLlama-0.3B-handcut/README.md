@@ -88,16 +88,15 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 
 ## Performance
 
-Measured on trn1.32xlarge, batch_size=1, seq_len=128, bfloat16. Utilization is per-NeuronCore (TP=1).
+Profiled on trn1.32xlarge (single NeuronCore utilization):
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 56.6 tok/s |
-| Context Encoding MBU | 13.2% |
-| Context Encoding MFU | 5.3% |
-| Token Generation MBU | 19.3% |
-| Token Generation MFU | 0.1% |
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| Throughput | - | 56.6 tok/s |
+| MBU (Memory) | 13.2% | 19.3% |
+| MFU (Compute) | 5.3% | 0.1% |
 
+*Batch size 1, sequence length 128, BF16 precision, TP=1*
 ## Compatibility Matrix
 
 | Instance/Version | 2.20+ | 2.19 and earlier |
