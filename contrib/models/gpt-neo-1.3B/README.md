@@ -26,11 +26,11 @@ NeuronX Distributed Inference implementation of GPT-Neo-1.3B.
 | Test | Status | Result |
 |------|--------|--------|
 | Compilation | PASS | Compiler status PASS |
-| Token Matching (greedy) | PASS | **52.97% match** (640 tokens, 10 prompts) |
-| Token Matching (teacher-forced) | PASS | **98.59% match** |
+| Greedy Token Matching | PASS | **100% match on 10/10 prompts** (1185 tokens) |
+| Teacher-Forced Match | PASS | **100% average** |
 | Throughput | PASS | **81.5 tokens/sec** |
 
-**Status:** PASS - Teacher-forced accuracy confirms correct weight loading and computation.
+**Status:** EXCELLENT - Perfect greedy and teacher-forced match across all prompts.
 
 ## Usage
 
