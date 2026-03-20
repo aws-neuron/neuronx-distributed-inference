@@ -175,4 +175,3 @@ Output: 33 PNG frames at 480×640 in the output directory.
 | `modeling_qwen2vl_encoder.py` | Qwen2.5-VL text encoder (NxDI, TP) |
 | `neuron_full_backbone.py` | TP transformer block implementation |
 | `PERFORMANCE.md` | Detailed benchmarks and TP scaling analysis |
-| `USAGE.md` | Step-by-step setup and usage guide |
