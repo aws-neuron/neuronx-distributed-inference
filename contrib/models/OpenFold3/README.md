@@ -1,6 +1,6 @@
 # Contrib Model: OpenFold3
 
-Biomolecular structure prediction (AlphaFold3 reproduction, ~330M params) on AWS Trainium 2 using vanilla `torch_neuronx.trace()` compilation with weight replacement for multi-layer stacks. Supports sequence lengths up to N=2048 via progressive decomposition of PairFormer sub-operations, enabling protein structure prediction at scales where GPU (A100-40GB) runs out of memory.
+Biomolecular structure prediction (AlphaFold3 reproduction, ~330M params) on AWS Trainium 2 using vanilla `torch_neuronx.trace()` compilation with weight replacement for multi-layer stacks. Supports sequence lengths up to N=2048 via progressive decomposition of PairFormer sub-operations, with N-range-aware strategy selection that merges segments at smaller N for reduced overhead. Enables protein structure prediction at scales where GPU (A100-40GB) runs out of memory.
 
 ## Model Information
 
@@ -189,7 +189,7 @@ batch_out, output = pipeline.run_inference(
 )
 ```
 
-For N > 1024, the pipeline automatically uses chunked TriAttn MHA (chunk_size=64) to fit attention score tensors within 24GB HBM per core.
+For N > 1024, the pipeline automatically uses chunked TriAttn MHA (chunk_size=128) to fit attention score tensors within 24GB HBM per core.
 
 ### Using Individual Blocks
 
@@ -277,16 +277,33 @@ The test suite includes 10 tests (all PASS, 557s total on trn2.3xlarge):
 
 **Monolithic (N <= 256):** Each of the 5 model components is traced as a single unit via `torch_neuronx.trace()`. The 48-layer PairFormer stack uses one NEFF with 47 weight swaps.
 
-**Decomposed (N > 256):** The PairFormerBlock is split into individually traced sub-operations:
+**Decomposed (N > 256):** The PairFormerBlock is split into individually traced sub-operations. The decomposition strategy is auto-selected based on N to minimize call overhead:
+
+| N Range | TriMul Strategy | TriAttn/APB Strategy | Calls/Layer |
+|---------|----------------|---------------------|-------------|
+| 257-384 | Full TriMul (1 call each) | Merged (1 call each) | **7** |
+| 385-512 | Proj + merged BMM+Output (2 calls each) | Merged (1 call each) | **9** |
+| 513-1024 | 3-segment (3 calls each) | 2-segment (2 calls each) | **14** |
+| >1024 | 3-segment (3 calls each) | 2-seg + chunked MHA (chunk=128) | **14+C** |
+
+C = 2 * ceil(N / 128) extra calls for chunked TriAttn MHA.
+
+**Merged segment speedups** (validated on SDK 2.28):
+- Full TriMul at N=384: 1.57x faster than 3-segment (182ms vs 285ms)
+- Merged TriAttn at N=384-512: 1.68-1.79x faster than 2-segment
+- Merged AttnPairBias at N=384-512: 1.17-1.31x faster than 2-segment
+- chunk_size=128 at N=2048: 8% faster than chunk_size=64 (half the calls)
+
+Sub-op maximum compilation sizes:
 
 | Sub-Op | Segments | Technique | Compiles To |
 |--------|----------|-----------|-------------|
-| TriMulOut | 3 (Projection, BMM, Output) | Finer decomposition | N=2048+ |
-| TriMulIn | 3 (Projection, BMM, Output) | Finer decomposition | N=2048+ |
-| TriAttnStart | 2 (Bias, MHA) | Finer decomposition | N=1024 |
-| TriAttnStart | 2 (Bias, MHA chunked) | + Chunked MHA (chunk_size=64) | N=2048+ |
-| TriAttnEnd | 2 (Bias, MHA) | Same as TriAttnStart | N=2048+ |
-| AttnPairBias | 2 (Bias, MHA) | Finer decomposition | N=2048+ |
+| TriMulOut | 1 (full) or 3 (decomposed) | Full at N<=384, 3-seg at N>384 | N=2048+ |
+| TriMulIn | 1 (full) or 3 (decomposed) | Same as TriMulOut | N=2048+ |
+| TriAttnStart | 1 (merged) or 2 (decomposed) | Merged at N<=512, 2-seg at N>512 | N=1024 (full MHA) |
+| TriAttnStart | 2 (Bias, MHA chunked) | + Chunked MHA (chunk_size=128) | N=2048+ |
+| TriAttnEnd | Same as TriAttnStart | Same strategies | N=2048+ |
+| AttnPairBias | 1 (merged) or 2 (decomposed) | Merged at N<=512, 2-seg at N>512 | N=2048+ |
 | PairTransition | 1 (monolithic) | No decomposition needed | N=2048+ |
 | SingleTransition | 1 (monolithic) | No decomposition needed | N=2048+ |
 
@@ -301,6 +318,8 @@ Each sub-op is compiled once, then weights are replaced for all 48 layers.
 | Finer TriMul (3 segments each) | 512 | Split TriMul projection from matmul |
 | Finer TriAttn/APB (2 segments each) | 1024 | Split bias computation from MHA |
 | Chunked TriAttn MHA | **2048** | Chunk MHA rows to fit in HBM |
+| Merged segments (SDK 2.28) | 384-512 | Full TriMul + merged TriAttn/APB at small N |
+| Optimized chunk size | 2048 | chunk_size=128 (8% faster, half the calls vs 64) |
 
 ### Compiled Components (Monolithic Pipeline)
 
@@ -369,6 +388,6 @@ All patches are applied automatically by `patch_openfold3_source()` or the `Open
 
 | File | Description |
 |------|-------------|
-| `src/modeling_openfold3.py` | Main module: monolithic wrappers, decomposed sub-op wrappers, DecomposedPairFormerCompiler, OpenFold3NeuronPipeline |
+| `src/modeling_openfold3.py` | Main module: monolithic wrappers, decomposed sub-op wrappers, merged wrappers, N-range-aware DecomposedPairFormerCompiler, OpenFold3NeuronPipeline |
 | `src/__init__.py` | Package exports |
 | `test/integration/test_model.py` | 10 accuracy tests: 6 monolithic + 4 decomposed, all using neuron_allclose |

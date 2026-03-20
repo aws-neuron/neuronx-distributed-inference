@@ -6,7 +6,8 @@ torch_neuronx.trace() compilation with weight replacement.
 
 Two PairFormer compilation strategies:
   - Monolithic (N <= 256): Single PairFormerBlock trace per layer
-  - Decomposed (N > 256, up to 2048): Sub-op traces with optional chunked MHA
+  - Decomposed (N > 256, up to 2048): N-range-aware sub-op traces with
+    merged segments at small N and chunked MHA at large N
 """
 
 from .modeling_openfold3 import (
@@ -19,11 +20,15 @@ from .modeling_openfold3 import (
     TriMulProjectionWrapper,
     TriMulBmmWrapper,
     TriMulOutputWrapper,
+    TriMulFullWrapper,
+    TriMulBmmOutputWrapper,
     TriAttnBiasWrapper,
     TriAttnMHAWrapper,
     TriAttnMHAChunkedWrapper,
+    TriAttnFullWrapper,
     AttnPairBiasBiasWrapper,
     AttnPairBiasMHAWrapper,
+    AttnPairBiasFullWrapper,
     PairTransitionWrapper,
     SingleTransitionWrapper,
     create_dummy_batch,
@@ -34,4 +39,7 @@ from .modeling_openfold3 import (
     C_TOKEN,
     CHUNKED_ATTN_THRESHOLD,
     CHUNKED_ATTN_CHUNK_SIZE,
+    MERGED_TRIMUL_MAX_N,
+    MERGED_TRIMUL_BMM_OUTPUT_MAX_N,
+    MERGED_ATTN_MAX_N,
 )
