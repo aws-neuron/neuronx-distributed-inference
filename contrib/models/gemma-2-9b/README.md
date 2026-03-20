@@ -66,6 +66,18 @@ model.compile(compiled_model_path)
 model.load(compiled_model_path)
 ```
 
+## Performance
+
+Profiled on trn1.32xlarge (single NeuronCore utilization):
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| Throughput | - | 47.1 tok/s |
+| MBU (Memory) | 1.3% | 2.3% |
+| MFU (Compute) | 0.6% | 0.0% |
+
+*Batch size 1, sequence length 128, BF16 precision, TP=8*
+
 ## Compatibility Matrix
 
 | Instance/Version | 2.20+ | 2.19 and earlier |
