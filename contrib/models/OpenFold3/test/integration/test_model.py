@@ -475,3 +475,257 @@ class TestDiffCondForward:
 
         assert result_s, "DiffCond S output failed neuron_allclose"
         assert result_z, "DiffCond Z output failed neuron_allclose"
+
+
+# ============================================================================
+# Tests: Decomposed PairFormer (N > 256)
+# ============================================================================
+
+# Use N=384 for decomposed tests -- large enough to require decomposition,
+# small enough to compile in reasonable time for testing.
+DECOMP_N_TOKEN = 384
+
+# Tolerances for decomposed path -- slightly relaxed due to additional
+# decomposition boundaries that introduce rounding at segment edges
+ATOL_DECOMP = 0.1
+RTOL_DECOMP = 0.05
+
+
+class TestDecomposedTriMul:
+    """Test decomposed TriMul (3 segments) against CPU reference."""
+
+    def test_trimul_out_decomposition(self, openfold3_model):
+        """Compile TriMulOut as 3 segments and validate against CPU monolithic."""
+        from modeling_openfold3 import (
+            TriMulProjectionWrapper,
+            TriMulBmmWrapper,
+            TriMulOutputWrapper,
+        )
+
+        N = DECOMP_N_TOKEN
+        tri_mul_out = openfold3_model.pairformer_stack.blocks[0].pair_stack.tri_mul_out
+        trace_kwargs = dict(
+            compiler_args=["--target", "trn2"],
+            inline_weights_to_neff=False,
+        )
+
+        z_in = torch.randn(1, N, N, TEST_C_Z)
+
+        # CPU reference (monolithic)
+        with torch.no_grad():
+            cpu_ref = tri_mul_out(
+                z_in.clone(),
+                mask=None,
+                inplace_safe=False,
+                use_cueq_triangle_kernels=False,
+                _add_with_inplace=False,
+            )
+
+        # Compile 3 segments
+        proj_w = TriMulProjectionWrapper(tri_mul_out)
+        proj_w.eval()
+        traced_proj = torch_neuronx.trace(proj_w, (z_in,), **trace_kwargs)
+        a, b, zn = traced_proj(z_in)
+
+        bmm_w = TriMulBmmWrapper()
+        bmm_w.eval()
+        traced_bmm = torch_neuronx.trace(
+            bmm_w, (torch.randn_like(a), torch.randn_like(b)), **trace_kwargs
+        )
+        p = traced_bmm(a, b)
+
+        out_w = TriMulOutputWrapper(tri_mul_out)
+        out_w.eval()
+        traced_out = torch_neuronx.trace(
+            out_w, (torch.randn_like(p), torch.randn_like(zn)), **trace_kwargs
+        )
+
+        with torch.no_grad():
+            neuron_result = traced_out(p, zn)
+
+        result = torch_neuronx.testing.neuron_allclose(
+            cpu_ref, neuron_result, rtol=RTOL_DECOMP, atol=ATOL_DECOMP
+        )
+        cos = F.cosine_similarity(
+            cpu_ref.flatten().unsqueeze(0), neuron_result.flatten().unsqueeze(0)
+        ).item()
+        print(
+            f"\n  TriMulOut decomposed N={N}: neuron_allclose={result}, cos={cos:.6f}"
+        )
+
+        assert result, f"TriMulOut decomposed at N={N} failed neuron_allclose"
+
+    def test_trimul_in_decomposition(self, openfold3_model):
+        """Compile TriMulIn as 3 segments and validate against CPU monolithic."""
+        from modeling_openfold3 import (
+            TriMulProjectionWrapper,
+            TriMulBmmWrapper,
+            TriMulOutputWrapper,
+        )
+
+        N = DECOMP_N_TOKEN
+        tri_mul_in = openfold3_model.pairformer_stack.blocks[0].pair_stack.tri_mul_in
+        trace_kwargs = dict(
+            compiler_args=["--target", "trn2"],
+            inline_weights_to_neff=False,
+        )
+
+        z_in = torch.randn(1, N, N, TEST_C_Z)
+
+        # CPU reference
+        with torch.no_grad():
+            cpu_ref = tri_mul_in(
+                z_in.clone(),
+                mask=None,
+                inplace_safe=False,
+                use_cueq_triangle_kernels=False,
+                _add_with_inplace=False,
+            )
+
+        # Compile 3 segments
+        proj_w = TriMulProjectionWrapper(tri_mul_in)
+        proj_w.eval()
+        traced_proj = torch_neuronx.trace(proj_w, (z_in,), **trace_kwargs)
+        a, b, zn = traced_proj(z_in)
+
+        bmm_w = TriMulBmmWrapper()
+        bmm_w.eval()
+        traced_bmm = torch_neuronx.trace(
+            bmm_w, (torch.randn_like(a), torch.randn_like(b)), **trace_kwargs
+        )
+        p = traced_bmm(a, b)
+
+        out_w = TriMulOutputWrapper(tri_mul_in)
+        out_w.eval()
+        traced_out = torch_neuronx.trace(
+            out_w, (torch.randn_like(p), torch.randn_like(zn)), **trace_kwargs
+        )
+
+        with torch.no_grad():
+            neuron_result = traced_out(p, zn)
+
+        result = torch_neuronx.testing.neuron_allclose(
+            cpu_ref, neuron_result, rtol=RTOL_DECOMP, atol=ATOL_DECOMP
+        )
+        cos = F.cosine_similarity(
+            cpu_ref.flatten().unsqueeze(0), neuron_result.flatten().unsqueeze(0)
+        ).item()
+        print(f"\n  TriMulIn decomposed N={N}: neuron_allclose={result}, cos={cos:.6f}")
+
+        assert result, f"TriMulIn decomposed at N={N} failed neuron_allclose"
+
+
+class TestDecomposedTriAttn:
+    """Test decomposed TriAttn (2 segments: Bias + MHA) against CPU reference."""
+
+    def test_triattn_start_decomposition(self, openfold3_model):
+        """Compile TriAttnStart as 2 segments and validate."""
+        from modeling_openfold3 import TriAttnBiasWrapper, TriAttnMHAWrapper
+
+        N = DECOMP_N_TOKEN
+        tri_att_start = openfold3_model.pairformer_stack.blocks[
+            0
+        ].pair_stack.tri_att_start
+        trace_kwargs = dict(
+            compiler_args=["--target", "trn2"],
+            inline_weights_to_neff=False,
+        )
+
+        z_in = torch.randn(1, N, N, TEST_C_Z)
+
+        # CPU reference
+        with torch.no_grad():
+            cpu_ref = tri_att_start(
+                z_in.clone(),
+                mask=None,
+                use_deepspeed_evo_attention=False,
+                use_cueq_triangle_kernels=False,
+                use_lma=False,
+                inplace_safe=False,
+            )
+
+        # Compile 2 segments
+        bias_w = TriAttnBiasWrapper(tri_att_start)
+        bias_w.eval()
+        traced_bias = torch_neuronx.trace(bias_w, (z_in,), **trace_kwargs)
+        xn, tb = traced_bias(z_in)
+
+        mha_w = TriAttnMHAWrapper(tri_att_start)
+        mha_w.eval()
+        traced_mha = torch_neuronx.trace(
+            mha_w, (torch.randn_like(xn), torch.randn_like(tb)), **trace_kwargs
+        )
+
+        with torch.no_grad():
+            neuron_result = traced_mha(xn, tb)
+
+        result = torch_neuronx.testing.neuron_allclose(
+            cpu_ref, neuron_result, rtol=RTOL_DECOMP, atol=ATOL_DECOMP
+        )
+        cos = F.cosine_similarity(
+            cpu_ref.flatten().unsqueeze(0), neuron_result.flatten().unsqueeze(0)
+        ).item()
+        print(
+            f"\n  TriAttnStart decomposed N={N}: neuron_allclose={result}, cos={cos:.6f}"
+        )
+
+        assert result, f"TriAttnStart decomposed at N={N} failed neuron_allclose"
+
+
+class TestDecomposedFullLayer:
+    """Test full decomposed PairFormer layer using DecomposedPairFormerCompiler."""
+
+    def test_full_decomposed_layer(self, openfold3_model):
+        """Compile and run one full layer at N=384 using decomposed sub-ops."""
+        from modeling_openfold3 import DecomposedPairFormerCompiler
+
+        N = DECOMP_N_TOKEN
+        block0 = openfold3_model.pairformer_stack.blocks[0]
+
+        z_in = torch.randn(1, N, N, TEST_C_Z)
+        s_in = torch.randn(1, N, TEST_C_S)
+
+        # CPU reference: run the full block
+        with torch.no_grad():
+            s_ref, z_ref = block0(
+                s=s_in.clone(),
+                z=z_in.clone(),
+                single_mask=torch.ones(1, N),
+                pair_mask=torch.ones(1, N, N),
+                use_deepspeed_evo_attention=False,
+                use_lma=False,
+                inplace_safe=False,
+            )
+
+        # Compile decomposed
+        compiler = DecomposedPairFormerCompiler(
+            model=openfold3_model,
+            n_token=N,
+        )
+        compile_times = compiler.compile_all()
+        total_compile = sum(compile_times.values())
+        print(f"\n  Decomposed layer compile time: {total_compile:.1f}s")
+
+        # Run one layer
+        with torch.no_grad():
+            z_neu, s_neu = compiler.run_layer(z_in.clone(), s_in.clone(), layer_idx=0)
+
+        # Validate
+        result_s = torch_neuronx.testing.neuron_allclose(
+            s_ref, s_neu, rtol=RTOL_DECOMP, atol=ATOL_DECOMP
+        )
+        result_z = torch_neuronx.testing.neuron_allclose(
+            z_ref, z_neu, rtol=RTOL_DECOMP, atol=ATOL_DECOMP
+        )
+
+        cos_s = F.cosine_similarity(
+            s_ref.flatten().unsqueeze(0), s_neu.flatten().unsqueeze(0)
+        ).item()
+        cos_z = F.cosine_similarity(
+            z_ref.flatten().unsqueeze(0), z_neu.flatten().unsqueeze(0)
+        ).item()
+        print(f"  S neuron_allclose: {result_s}, cos_sim: {cos_s:.6f}")
+        print(f"  Z neuron_allclose: {result_z}, cos_sim: {cos_z:.6f}")
+
+        assert result_s, f"Decomposed full layer S at N={N} failed neuron_allclose"
+        assert result_z, f"Decomposed full layer Z at N={N} failed neuron_allclose"

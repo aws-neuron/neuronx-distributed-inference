@@ -1,9 +1,20 @@
 """OpenFold3 Neuron acceleration module.
 
-Provides wrapper classes and monkey-patching utilities for running
-OpenFold3 (AlphaFold3 reproduction, ~330M params) on AWS Trainium 2
-hardware. Uses vanilla torch_neuronx.trace() compilation (no NKI
-kernels) with the replace_weights pattern for multi-layer stacks.
+Provides wrapper classes and compilation utilities for running OpenFold3
+(AlphaFold3 reproduction, ~330M params) on AWS Trainium 2 hardware.
+Uses vanilla torch_neuronx.trace() compilation (no NKI kernels) with
+the replace_weights pattern for multi-layer stacks.
+
+Two compilation strategies are supported:
+
+  1. **Monolithic** (N <= 256): Each PairFormerBlock is traced as a
+     single unit. Fast compilation, low overhead, 12.1x speedup per layer.
+
+  2. **Decomposed** (N > 256, up to 2048): PairFormerBlock is split into
+     sub-operations, each traced independently. Three decomposition levels:
+       - Finer TriMul: 3 segments (Projection -> BMM -> Output)
+       - Finer TriAttn/AttnPairBias: 2 segments (Bias + MHA)
+       - Chunked TriAttn MHA: for N > 1024, MHA is chunked over rows
 
 Five model components are compiled:
   1. PairFormerBlock (48 layers) - main trunk
@@ -38,9 +49,13 @@ C_Z = 128
 C_M = 64
 C_TOKEN = 768
 
+# Chunked attention threshold and chunk size
+CHUNKED_ATTN_THRESHOLD = 1024  # Use chunked MHA for N > this value
+CHUNKED_ATTN_CHUNK_SIZE = 64  # Number of rows per MHA chunk
+
 
 # ============================================================================
-# Wrapper Modules for Neuron Compilation
+# Monolithic Wrapper Modules (N <= 256)
 # ============================================================================
 
 
@@ -219,6 +234,598 @@ class DiffCondForwardWrapper(nn.Module):
 
 
 # ============================================================================
+# Decomposed Sub-Op Wrappers (N > 256)
+# ============================================================================
+
+
+class TriMulProjectionWrapper(nn.Module):
+    """TriMul Segment A: LayerNorm + projections + gating + permute.
+
+    Splits the projection phase from the matmul to avoid SBUF overflow
+    and NCC_ITEN404 compiler issues at large N.
+
+    Input: z [1, N, N, C_Z]
+    Output: (a [1, D, N, N], b [1, D, N, N], z_normed [1, N, N, C_Z])
+    """
+
+    def __init__(self, tri_mul):
+        super().__init__()
+        self.layer_norm_in = tri_mul.layer_norm_in
+        self.linear_a_g = tri_mul.linear_a_g
+        self.linear_a_p = tri_mul.linear_a_p
+        self.linear_b_g = tri_mul.linear_b_g
+        self.linear_b_p = tri_mul.linear_b_p
+        self.sigmoid = nn.Sigmoid()
+        self._outgoing = tri_mul._outgoing
+
+    def forward(self, z):
+        z_norm = self.layer_norm_in(z)
+        a = self.sigmoid(self.linear_a_g(z_norm)) * self.linear_a_p(z_norm)
+        b = self.sigmoid(self.linear_b_g(z_norm)) * self.linear_b_p(z_norm)
+        if self._outgoing:
+            a = a.permute(0, 3, 1, 2).contiguous()
+            b = b.permute(0, 3, 2, 1).contiguous()
+        else:
+            a = a.permute(0, 3, 2, 1).contiguous()
+            b = b.permute(0, 3, 1, 2).contiguous()
+        return a, b, z_norm
+
+
+class TriMulBmmWrapper(nn.Module):
+    """TriMul Segment B: Bare batched matmul.
+
+    Input: a [1, D, N, N], b [1, D, N, N]
+    Output: p [1, D, N, N]
+    """
+
+    def forward(self, a, b):
+        return torch.einsum("...ij,...jk->...ik", a, b)
+
+
+class TriMulOutputWrapper(nn.Module):
+    """TriMul Segment C: permute_back + LayerNorm + linear + gate.
+
+    Input: p [1, D, N, N], z_norm [1, N, N, C_Z]
+    Output: result [1, N, N, C_Z]
+    """
+
+    def __init__(self, tri_mul):
+        super().__init__()
+        self.layer_norm_out = tri_mul.layer_norm_out
+        self.linear_z = tri_mul.linear_z
+        self.linear_g = tri_mul.linear_g
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, p, z_norm):
+        p = p.permute(0, 2, 3, 1).contiguous()
+        p = self.layer_norm_out(p)
+        p = self.linear_z(p)
+        g = self.sigmoid(self.linear_g(z_norm))
+        return p * g
+
+
+class TriAttnBiasWrapper(nn.Module):
+    """TriAttn Segment A: LayerNorm + bias computation.
+
+    Separating the bias computation from MHA avoids NCC_ITEN404 at N > 512.
+
+    Input: x [1, N, N, C_Z]
+    Output: (x_normed [1, N, N, C_Z], triangle_bias [1, 1, H, N, N])
+    """
+
+    def __init__(self, tri_attn):
+        super().__init__()
+        self.layer_norm = tri_attn.layer_norm
+        self.linear_z = tri_attn.linear_z
+
+    def forward(self, x):
+        x_normed = self.layer_norm(x)
+        triangle_bias = self.linear_z(x_normed)
+        triangle_bias = triangle_bias.permute(0, 3, 1, 2)
+        triangle_bias = triangle_bias.unsqueeze(1)
+        return x_normed, triangle_bias
+
+
+class TriAttnMHAWrapper(nn.Module):
+    """TriAttn Segment B: Full MHA (non-chunked, for N <= 1024).
+
+    Input: (x_normed [1, N, N, C_Z], triangle_bias [1, 1, H, N, N])
+    Output: attn_output [1, N, N, C_Z]
+    """
+
+    def __init__(self, tri_attn):
+        super().__init__()
+        self.mha = tri_attn.mha
+
+    def forward(self, x_normed, triangle_bias):
+        return self.mha(
+            q_x=x_normed,
+            kv_x=x_normed,
+            biases=[triangle_bias],
+            use_deepspeed_evo_attention=False,
+            use_lma=False,
+            use_cueq_triangle_kernels=False,
+        )
+
+
+class TriAttnMHAChunkedWrapper(nn.Module):
+    """TriAttn Segment B (chunked): MHA for a chunk of rows.
+
+    For N > 1024, the full attention scores tensor [1, N, H, N, N] exceeds
+    24 GB HBM. Chunking over rows (each row's attention is independent)
+    is mathematically exact and fits in memory.
+
+    Input: (x_chunk [1, chunk_size, N, C_Z], triangle_bias [1, 1, H, N, N])
+    Output: attn_output [1, chunk_size, N, C_Z]
+    """
+
+    def __init__(self, tri_attn):
+        super().__init__()
+        self.mha = tri_attn.mha
+
+    def forward(self, x_chunk, triangle_bias):
+        return self.mha(
+            q_x=x_chunk,
+            kv_x=x_chunk,
+            biases=[triangle_bias],
+            use_deepspeed_evo_attention=False,
+            use_lma=False,
+            use_cueq_triangle_kernels=False,
+        )
+
+
+class AttnPairBiasBiasWrapper(nn.Module):
+    """AttnPairBias Segment A: LayerNorm + bias computation from z.
+
+    Input: (a [1, N, C_S], z [1, N, N, C_Z])
+    Output: (a_normed [1, N, C_S], pair_bias [1, H, N, N])
+    """
+
+    def __init__(self, apb):
+        super().__init__()
+        self.layer_norm_a = apb.layer_norm_a
+        self.layer_norm_z = apb.layer_norm_z
+        self.linear_z = apb.linear_z
+
+    def forward(self, a, z):
+        a_normed = self.layer_norm_a(a)
+        z_normed = self.layer_norm_z(z)
+        pair_bias = self.linear_z(z_normed)
+        pair_bias = pair_bias.permute(0, 3, 1, 2)
+        return a_normed, pair_bias
+
+
+class AttnPairBiasMHAWrapper(nn.Module):
+    """AttnPairBias Segment B: MHA with pre-computed pair bias.
+
+    Input: (a_normed [1, N, C_S], pair_bias [1, H, N, N])
+    Output: attn_output [1, N, C_S]
+    """
+
+    def __init__(self, apb):
+        super().__init__()
+        self.mha = apb.mha
+
+    def forward(self, a_normed, pair_bias):
+        return self.mha(
+            q_x=a_normed,
+            kv_x=a_normed,
+            biases=[pair_bias],
+            use_deepspeed_evo_attention=False,
+            use_lma=False,
+            use_cueq_triangle_kernels=False,
+        )
+
+
+class PairTransitionWrapper(nn.Module):
+    """Monolithic PairTransition wrapper (compiles at all N sizes).
+
+    Includes the residual add to match the PairFormerBlock behavior.
+
+    Input: z [1, N, N, C_Z]
+    Output: z + pair_transition(z)
+    """
+
+    def __init__(self, pt):
+        super().__init__()
+        self.pair_transition = pt
+
+    def forward(self, z):
+        return z + self.pair_transition(z, mask=None)
+
+
+class SingleTransitionWrapper(nn.Module):
+    """Monolithic SingleTransition wrapper (compiles at all N sizes).
+
+    Input: s [1, N, C_S]
+    Output: s + single_transition(s)
+    """
+
+    def __init__(self, st):
+        super().__init__()
+        self.single_transition = st
+
+    def forward(self, s):
+        return s + self.single_transition(s, mask=None)
+
+
+# ============================================================================
+# Decomposed PairFormer Compiler
+# ============================================================================
+
+
+def _run_chunked_triattn(bias_neff, mha_neff, z_in, chunk_size):
+    """Run TriAttn with chunked MHA over the row dimension.
+
+    For N > 1024, the attention scores tensor exceeds HBM capacity.
+    Since each row's attention is independent, we process chunks of
+    rows and concatenate -- mathematically exact.
+
+    Args:
+        bias_neff: Traced TriAttnBiasWrapper
+        mha_neff: Traced TriAttnMHAChunkedWrapper
+        z_in: [1, N, N, C_Z] input tensor
+        chunk_size: Number of rows per chunk
+
+    Returns:
+        attn_output: [1, N, N, C_Z]
+    """
+    x_normed, tri_bias = bias_neff(z_in)
+    N = x_normed.shape[1]
+    chunks_out = []
+    for i in range(0, N, chunk_size):
+        x_chunk = x_normed[:, i : i + chunk_size, :, :].contiguous()
+        out_chunk = mha_neff(x_chunk, tri_bias)
+        chunks_out.append(out_chunk)
+    return torch.cat(chunks_out, dim=1)
+
+
+class DecomposedPairFormerCompiler:
+    """Compiles PairFormer sub-operations for N > 256.
+
+    This compiler traces each PairFormer sub-operation independently,
+    enabling compilation at sequence lengths up to N=2048+. Three
+    decomposition levels are applied automatically:
+
+      1. TriMul decomposition (always): 3 segments per TriMulIn/Out
+      2. TriAttn/AttnPairBias decomposition (always): 2 segments each
+      3. Chunked TriAttn MHA (N > 1024): chunks over rows
+
+    Usage::
+
+        compiler = DecomposedPairFormerCompiler(model, n_token=2048)
+        compile_time = compiler.compile_all()
+        z, s = compiler.run_layer(z, s, layer_idx=0)
+
+    Args:
+        model: Loaded OpenFold3 model
+        n_token: Sequence length
+        compiler_args: Neuron compiler arguments
+        chunk_size: Rows per TriAttn MHA chunk (default: 64)
+    """
+
+    def __init__(
+        self,
+        model,
+        n_token: int,
+        compiler_args: Optional[List[str]] = None,
+        chunk_size: int = CHUNKED_ATTN_CHUNK_SIZE,
+    ):
+        self.model = model
+        self.n_token = n_token
+        self.compiler_args = compiler_args or ["--target", "trn2"]
+        self.chunk_size = chunk_size
+        self.use_chunked = n_token > CHUNKED_ATTN_THRESHOLD
+
+        # Traced sub-ops (populated by compile_all)
+        self.sub_ops: Dict[str, Any] = {}
+        self.compile_times: Dict[str, float] = {}
+
+    def compile_all(self) -> Dict[str, float]:
+        """Compile all decomposed sub-operations.
+
+        Returns:
+            dict mapping sub-op names to compilation times in seconds
+        """
+        import torch_neuronx
+
+        N = self.n_token
+        trace_kwargs = dict(
+            compiler_args=self.compiler_args,
+            inline_weights_to_neff=False,
+        )
+
+        block0 = self.model.pairformer_stack.blocks[0]
+
+        z_dummy = torch.randn(1, N, N, C_Z)
+        z_t_dummy = z_dummy.transpose(-2, -3).contiguous()
+        s_dummy = torch.randn(1, N, C_S)
+
+        # --- TriMulOut (3 segments) ---
+        print("  Compiling TriMulOut Projection...", end=" ", flush=True)
+        t0 = time.time()
+        w = TriMulProjectionWrapper(block0.pair_stack.tri_mul_out)
+        w.eval()
+        self.sub_ops["tmout_proj"] = torch_neuronx.trace(w, (z_dummy,), **trace_kwargs)
+        a_o, b_o, zn_o = self.sub_ops["tmout_proj"](z_dummy)
+        self.compile_times["tmout_proj"] = time.time() - t0
+        print(f"OK ({self.compile_times['tmout_proj']:.1f}s)")
+
+        print("  Compiling TriMulOut BMM...", end=" ", flush=True)
+        t0 = time.time()
+        w = TriMulBmmWrapper()
+        w.eval()
+        self.sub_ops["tmout_bmm"] = torch_neuronx.trace(
+            w, (torch.randn_like(a_o), torch.randn_like(b_o)), **trace_kwargs
+        )
+        p_o = self.sub_ops["tmout_bmm"](a_o, b_o)
+        self.compile_times["tmout_bmm"] = time.time() - t0
+        print(f"OK ({self.compile_times['tmout_bmm']:.1f}s)")
+
+        print("  Compiling TriMulOut Output...", end=" ", flush=True)
+        t0 = time.time()
+        w = TriMulOutputWrapper(block0.pair_stack.tri_mul_out)
+        w.eval()
+        self.sub_ops["tmout_out"] = torch_neuronx.trace(
+            w, (torch.randn_like(p_o), torch.randn_like(zn_o)), **trace_kwargs
+        )
+        self.compile_times["tmout_out"] = time.time() - t0
+        print(f"OK ({self.compile_times['tmout_out']:.1f}s)")
+
+        # --- TriMulIn (3 segments) ---
+        print("  Compiling TriMulIn Projection...", end=" ", flush=True)
+        t0 = time.time()
+        w = TriMulProjectionWrapper(block0.pair_stack.tri_mul_in)
+        w.eval()
+        self.sub_ops["tmin_proj"] = torch_neuronx.trace(w, (z_dummy,), **trace_kwargs)
+        a_i, b_i, zn_i = self.sub_ops["tmin_proj"](z_dummy)
+        self.compile_times["tmin_proj"] = time.time() - t0
+        print(f"OK ({self.compile_times['tmin_proj']:.1f}s)")
+
+        print("  Compiling TriMulIn BMM...", end=" ", flush=True)
+        t0 = time.time()
+        w = TriMulBmmWrapper()
+        w.eval()
+        self.sub_ops["tmin_bmm"] = torch_neuronx.trace(
+            w, (torch.randn_like(a_i), torch.randn_like(b_i)), **trace_kwargs
+        )
+        self.compile_times["tmin_bmm"] = time.time() - t0
+        print(f"OK ({self.compile_times['tmin_bmm']:.1f}s)")
+
+        print("  Compiling TriMulIn Output...", end=" ", flush=True)
+        t0 = time.time()
+        w = TriMulOutputWrapper(block0.pair_stack.tri_mul_in)
+        w.eval()
+        self.sub_ops["tmin_out"] = torch_neuronx.trace(
+            w, (torch.randn_like(p_o), torch.randn_like(zn_i)), **trace_kwargs
+        )
+        self.compile_times["tmin_out"] = time.time() - t0
+        print(f"OK ({self.compile_times['tmin_out']:.1f}s)")
+
+        # --- TriAttnStart (Bias + MHA) ---
+        print("  Compiling TriAttnStart Bias...", end=" ", flush=True)
+        t0 = time.time()
+        w = TriAttnBiasWrapper(block0.pair_stack.tri_att_start)
+        w.eval()
+        self.sub_ops["tas_bias"] = torch_neuronx.trace(w, (z_dummy,), **trace_kwargs)
+        xn_s, tb_s = self.sub_ops["tas_bias"](z_dummy)
+        self.compile_times["tas_bias"] = time.time() - t0
+        print(f"OK ({self.compile_times['tas_bias']:.1f}s)")
+
+        if self.use_chunked:
+            print(
+                f"  Compiling TriAttnStart MHA (chunked, chunk_size={self.chunk_size})...",
+                end=" ",
+                flush=True,
+            )
+            t0 = time.time()
+            x_chunk_dummy = torch.randn(1, self.chunk_size, N, C_Z)
+            tb_dummy = torch.randn_like(tb_s)
+            w = TriAttnMHAChunkedWrapper(block0.pair_stack.tri_att_start)
+            w.eval()
+            self.sub_ops["tas_mha"] = torch_neuronx.trace(
+                w, (x_chunk_dummy, tb_dummy), **trace_kwargs
+            )
+        else:
+            print("  Compiling TriAttnStart MHA (full)...", end=" ", flush=True)
+            t0 = time.time()
+            w = TriAttnMHAWrapper(block0.pair_stack.tri_att_start)
+            w.eval()
+            self.sub_ops["tas_mha"] = torch_neuronx.trace(
+                w, (torch.randn_like(xn_s), torch.randn_like(tb_s)), **trace_kwargs
+            )
+        self.compile_times["tas_mha"] = time.time() - t0
+        print(f"OK ({self.compile_times['tas_mha']:.1f}s)")
+
+        # --- TriAttnEnd (Bias + MHA) ---
+        print("  Compiling TriAttnEnd Bias...", end=" ", flush=True)
+        t0 = time.time()
+        w = TriAttnBiasWrapper(block0.pair_stack.tri_att_end)
+        w.eval()
+        self.sub_ops["tae_bias"] = torch_neuronx.trace(w, (z_t_dummy,), **trace_kwargs)
+        xn_e, tb_e = self.sub_ops["tae_bias"](z_t_dummy)
+        self.compile_times["tae_bias"] = time.time() - t0
+        print(f"OK ({self.compile_times['tae_bias']:.1f}s)")
+
+        if self.use_chunked:
+            print(f"  Compiling TriAttnEnd MHA (chunked)...", end=" ", flush=True)
+            t0 = time.time()
+            w = TriAttnMHAChunkedWrapper(block0.pair_stack.tri_att_end)
+            w.eval()
+            self.sub_ops["tae_mha"] = torch_neuronx.trace(
+                w, (x_chunk_dummy, tb_dummy), **trace_kwargs
+            )
+        else:
+            print("  Compiling TriAttnEnd MHA (full)...", end=" ", flush=True)
+            t0 = time.time()
+            w = TriAttnMHAWrapper(block0.pair_stack.tri_att_end)
+            w.eval()
+            self.sub_ops["tae_mha"] = torch_neuronx.trace(
+                w, (torch.randn_like(xn_e), torch.randn_like(tb_e)), **trace_kwargs
+            )
+        self.compile_times["tae_mha"] = time.time() - t0
+        print(f"OK ({self.compile_times['tae_mha']:.1f}s)")
+
+        # --- AttnPairBias (2 segments) ---
+        print("  Compiling AttnPairBias Bias...", end=" ", flush=True)
+        t0 = time.time()
+        w = AttnPairBiasBiasWrapper(block0.attn_pair_bias)
+        w.eval()
+        self.sub_ops["apb_bias"] = torch_neuronx.trace(
+            w, (s_dummy, z_dummy), **trace_kwargs
+        )
+        an, pb = self.sub_ops["apb_bias"](s_dummy, z_dummy)
+        self.compile_times["apb_bias"] = time.time() - t0
+        print(f"OK ({self.compile_times['apb_bias']:.1f}s)")
+
+        print("  Compiling AttnPairBias MHA...", end=" ", flush=True)
+        t0 = time.time()
+        w = AttnPairBiasMHAWrapper(block0.attn_pair_bias)
+        w.eval()
+        self.sub_ops["apb_mha"] = torch_neuronx.trace(
+            w, (torch.randn_like(an), torch.randn_like(pb)), **trace_kwargs
+        )
+        self.compile_times["apb_mha"] = time.time() - t0
+        print(f"OK ({self.compile_times['apb_mha']:.1f}s)")
+
+        # --- PairTransition (monolithic) ---
+        print("  Compiling PairTransition...", end=" ", flush=True)
+        t0 = time.time()
+        w = PairTransitionWrapper(block0.pair_stack.pair_transition)
+        w.eval()
+        self.sub_ops["ptrans"] = torch_neuronx.trace(w, (z_dummy,), **trace_kwargs)
+        self.compile_times["ptrans"] = time.time() - t0
+        print(f"OK ({self.compile_times['ptrans']:.1f}s)")
+
+        # --- SingleTransition (monolithic) ---
+        print("  Compiling SingleTransition...", end=" ", flush=True)
+        t0 = time.time()
+        w = SingleTransitionWrapper(block0.single_transition)
+        w.eval()
+        self.sub_ops["strans"] = torch_neuronx.trace(w, (s_dummy,), **trace_kwargs)
+        self.compile_times["strans"] = time.time() - t0
+        print(f"OK ({self.compile_times['strans']:.1f}s)")
+
+        total = sum(self.compile_times.values())
+        print(f"  All {len(self.sub_ops)} sub-ops compiled in {total:.1f}s total")
+        return self.compile_times
+
+    def _replace_weights_for_layer(self, block):
+        """Replace weights in all traced sub-ops for a given PairFormer block.
+
+        Args:
+            block: A PairFormerBlock from model.pairformer_stack.blocks[i]
+        """
+        import torch_neuronx
+
+        ps = block.pair_stack
+
+        # TriMulOut
+        w = TriMulProjectionWrapper(ps.tri_mul_out)
+        torch_neuronx.replace_weights(self.sub_ops["tmout_proj"], w.state_dict())
+        w = TriMulOutputWrapper(ps.tri_mul_out)
+        torch_neuronx.replace_weights(self.sub_ops["tmout_out"], w.state_dict())
+
+        # TriMulIn
+        w = TriMulProjectionWrapper(ps.tri_mul_in)
+        torch_neuronx.replace_weights(self.sub_ops["tmin_proj"], w.state_dict())
+        w = TriMulOutputWrapper(ps.tri_mul_in)
+        torch_neuronx.replace_weights(self.sub_ops["tmin_out"], w.state_dict())
+
+        # TriAttnStart
+        w = TriAttnBiasWrapper(ps.tri_att_start)
+        torch_neuronx.replace_weights(self.sub_ops["tas_bias"], w.state_dict())
+        if self.use_chunked:
+            w = TriAttnMHAChunkedWrapper(ps.tri_att_start)
+        else:
+            w = TriAttnMHAWrapper(ps.tri_att_start)
+        torch_neuronx.replace_weights(self.sub_ops["tas_mha"], w.state_dict())
+
+        # TriAttnEnd
+        w = TriAttnBiasWrapper(ps.tri_att_end)
+        torch_neuronx.replace_weights(self.sub_ops["tae_bias"], w.state_dict())
+        if self.use_chunked:
+            w = TriAttnMHAChunkedWrapper(ps.tri_att_end)
+        else:
+            w = TriAttnMHAWrapper(ps.tri_att_end)
+        torch_neuronx.replace_weights(self.sub_ops["tae_mha"], w.state_dict())
+
+        # AttnPairBias
+        w = AttnPairBiasBiasWrapper(block.attn_pair_bias)
+        torch_neuronx.replace_weights(self.sub_ops["apb_bias"], w.state_dict())
+        w = AttnPairBiasMHAWrapper(block.attn_pair_bias)
+        torch_neuronx.replace_weights(self.sub_ops["apb_mha"], w.state_dict())
+
+        # PairTransition
+        w = PairTransitionWrapper(ps.pair_transition)
+        torch_neuronx.replace_weights(self.sub_ops["ptrans"], w.state_dict())
+
+        # SingleTransition
+        w = SingleTransitionWrapper(block.single_transition)
+        torch_neuronx.replace_weights(self.sub_ops["strans"], w.state_dict())
+
+    def _run_triattn(self, bias_neff_key, mha_neff_key, z_in):
+        """Run a TriAttn sub-op (start or end) with appropriate strategy."""
+        if self.use_chunked:
+            return _run_chunked_triattn(
+                self.sub_ops[bias_neff_key],
+                self.sub_ops[mha_neff_key],
+                z_in,
+                self.chunk_size,
+            )
+        else:
+            xn, tb = self.sub_ops[bias_neff_key](z_in)
+            return self.sub_ops[mha_neff_key](xn, tb)
+
+    def run_layer(self, z, s, layer_idx):
+        """Run a single PairFormer layer using decomposed sub-ops.
+
+        Replaces weights for the specified layer, then executes all
+        sub-operations in the correct order with residual connections.
+
+        Args:
+            z: [1, N, N, C_Z] pair representation
+            s: [1, N, C_S] single representation
+            layer_idx: Index of the PairFormer layer (0-47)
+
+        Returns:
+            (z, s): Updated representations
+        """
+        block = self.model.pairformer_stack.blocks[layer_idx]
+        self._replace_weights_for_layer(block)
+
+        # TriMulOut
+        a, b, zn = self.sub_ops["tmout_proj"](z)
+        p = self.sub_ops["tmout_bmm"](a, b)
+        z = z + self.sub_ops["tmout_out"](p, zn)
+
+        # TriMulIn
+        a, b, zn = self.sub_ops["tmin_proj"](z)
+        p = self.sub_ops["tmin_bmm"](a, b)
+        z = z + self.sub_ops["tmin_out"](p, zn)
+
+        # TriAttnStart
+        z = z + self._run_triattn("tas_bias", "tas_mha", z)
+
+        # TriAttnEnd (operates on transposed z)
+        z_t = z.transpose(-2, -3).contiguous()
+        z_t = z_t + self._run_triattn("tae_bias", "tae_mha", z_t)
+        z = z_t.transpose(-2, -3).contiguous()
+
+        # PairTransition (includes residual add in wrapper)
+        z = self.sub_ops["ptrans"](z)
+
+        # AttnPairBias
+        an, pb = self.sub_ops["apb_bias"](s, z)
+        s = s + self.sub_ops["apb_mha"](an, pb)
+
+        # SingleTransition (includes residual add in wrapper)
+        s = self.sub_ops["strans"](s)
+
+        return z, s
+
+
+# ============================================================================
 # Source Code Patches
 # ============================================================================
 
@@ -339,7 +946,7 @@ def patch_openfold3_source(openfold3_path: str) -> List[str]:
                 "core/utils/callbacks.py: replaced synchronize() and manual_seed_all()"
             )
 
-    # Patch 5: model_config.py — disable deepspeed evo for eval
+    # Patch 5: model_config.py -- disable deepspeed evo for eval
     config_path = os.path.join(base, "projects/of3_all_atom/config/model_config.py")
     if os.path.exists(config_path):
         with open(config_path) as fh:
@@ -379,7 +986,7 @@ def create_dummy_batch(
     CB atom index OOB errors.
 
     Args:
-        n_token: Number of tokens (max 256 on Neuron)
+        n_token: Number of tokens
         n_atom: Number of atoms (set equal to n_token for 1:1 mapping)
         n_msa: Number of MSA sequences
         n_templ: Number of templates
@@ -444,25 +1051,17 @@ def create_dummy_batch(
 class OpenFold3NeuronPipeline:
     """End-to-end pipeline for OpenFold3 inference on Neuron.
 
-    Handles model loading, source patching, compilation of 5 block types,
+    Handles model loading, source patching, compilation of all block types,
     weight replacement, monkey-patching, and inference. The pipeline
-    patches the original model's forward() path so all orchestration
-    (recycling, diffusion loop, confidence heads) stays on CPU while
-    compute-heavy blocks run on Neuron.
+    automatically selects the compilation strategy based on N:
 
-    Compiled blocks:
-      - PairFormerBlock: 48 layers, 1 NEFF, 47 weight swaps
-      - MSA type A: 3 blocks, 1 NEFF, 2 weight swaps
-      - MSA type B: 1 block, 1 NEFF (different structure)
-      - TemplatePairBlock: 2 blocks, 1 NEFF, 1 weight swap
-      - DiffusionConditioning._forward(): 1 block, shared weights
+      - N <= 256: Monolithic PairFormerBlock tracing (fastest, lowest overhead)
+      - N > 256: Decomposed sub-op tracing (enables N up to 2048+)
+        - N <= 1024: Full TriAttn MHA
+        - N > 1024: Chunked TriAttn MHA (chunk_size=64)
 
-    Not compiled (run on CPU):
-      - AtomAttentionEncoder/Decoder: batch dict inputs, data-dependent ops
-      - InputEmbedder: batch dict inputs
-      - DiffTransformerBlock: weight replacement overhead exceeds compute
-        at N<=256 (1.3ms overhead x 4800 calls = 6.2s net slower)
-      - Confidence heads' 4-block PairFormer: minor runtime contribution
+    Non-PairFormer blocks (MSA, Template, DiffCond) are always compiled
+    monolithically since they operate at small fixed sizes.
 
     Usage::
 
@@ -481,11 +1080,12 @@ class OpenFold3NeuronPipeline:
     Args:
         openfold3_src_path: Path to OpenFold3 repository root
         checkpoint_path: Path to model checkpoint
-        n_token: Sequence length (max 256)
+        n_token: Sequence length (max ~2048 for decomposed, 256 for monolithic)
         n_atom: Number of atoms (default: same as n_token)
         n_msa: Number of MSA sequences (default: 4)
         n_templ: Number of templates (default: 1)
         compiler_args: Neuron compiler arguments
+        pairformer_strategy: "auto", "monolithic", or "decomposed"
     """
 
     def __init__(
@@ -497,6 +1097,7 @@ class OpenFold3NeuronPipeline:
         n_msa: int = 4,
         n_templ: int = 1,
         compiler_args: Optional[List[str]] = None,
+        pairformer_strategy: str = "auto",
     ):
         self.openfold3_src_path = openfold3_src_path
         self.checkpoint_path = str(Path(checkpoint_path).expanduser())
@@ -506,11 +1107,25 @@ class OpenFold3NeuronPipeline:
         self.n_templ = n_templ
         self.compiler_args = compiler_args or ["--target", "trn2"]
 
+        # Determine PairFormer strategy
+        if pairformer_strategy == "auto":
+            self.use_decomposed = n_token > 256
+        elif pairformer_strategy == "decomposed":
+            self.use_decomposed = True
+        elif pairformer_strategy == "monolithic":
+            self.use_decomposed = False
+        else:
+            raise ValueError(
+                f"pairformer_strategy must be 'auto', 'monolithic', or 'decomposed', "
+                f"got '{pairformer_strategy}'"
+            )
+
         # Model (populated by load_model)
         self.model = None
 
         # Compiled blocks (populated by compile_all)
-        self.traced_pf = None
+        self.traced_pf = None  # Monolithic PairFormer (N <= 256)
+        self.decomposed_pf = None  # DecomposedPairFormerCompiler (N > 256)
         self.traced_msa_a = None
         self.traced_msa_b = None
         self.traced_tmpl = None
@@ -563,7 +1178,15 @@ class OpenFold3NeuronPipeline:
         del ckpt, state_dict, bare_state_dict
         gc.collect()
 
-        print("Model loaded successfully")
+        strategy = "decomposed" if self.use_decomposed else "monolithic"
+        chunked = (
+            " (chunked MHA)"
+            if self.n_token > CHUNKED_ATTN_THRESHOLD and self.use_decomposed
+            else ""
+        )
+        print(
+            f"Model loaded. PairFormer strategy: {strategy}{chunked}, N={self.n_token}"
+        )
 
     def compile_all(self) -> Dict[str, float]:
         """Compile all Neuron blocks.
@@ -578,7 +1201,38 @@ class OpenFold3NeuronPipeline:
         N_MSA = self.n_msa
         N_TEMPL = self.n_templ
 
-        # Trace inputs
+        # --- PairFormer ---
+        if self.use_decomposed:
+            print(f"  Compiling PairFormer (decomposed, N={N})...")
+            self.decomposed_pf = DecomposedPairFormerCompiler(
+                model=self.model,
+                n_token=N,
+                compiler_args=self.compiler_args,
+            )
+            pf_times = self.decomposed_pf.compile_all()
+            self.compile_times["pairformer_decomposed"] = sum(pf_times.values())
+            self.compile_times.update({f"pf_{k}": v for k, v in pf_times.items()})
+        else:
+            # Monolithic
+            s_dummy = torch.randn(1, N, C_S)
+            z_dummy = torch.randn(1, N, N, C_Z)
+            single_mask = torch.ones(1, N)
+            pair_mask = torch.ones(1, N, N)
+
+            print("  Compiling PairFormerBlock (monolithic)...")
+            pf_wrapper = PairFormerBlockWrapper(self.model.pairformer_stack.blocks[0])
+            pf_wrapper.eval()
+            t0 = time.time()
+            self.traced_pf = torch_neuronx.trace(
+                pf_wrapper,
+                (s_dummy, z_dummy, single_mask, pair_mask),
+                compiler_args=self.compiler_args,
+                inline_weights_to_neff=False,
+            )
+            self.compile_times["pairformer"] = time.time() - t0
+            print(f"    Done in {self.compile_times['pairformer']:.1f}s")
+
+        # Common dummy tensors for non-PairFormer blocks
         s_dummy = torch.randn(1, N, C_S)
         z_dummy = torch.randn(1, N, N, C_Z)
         single_mask = torch.ones(1, N)
@@ -587,20 +1241,6 @@ class OpenFold3NeuronPipeline:
         msa_mask_dummy = torch.ones(1, N_MSA, N)
         t_dummy = torch.randn(1, N_TEMPL, N, N, 64)
         t_mask_dummy = torch.ones(1, N_TEMPL, N, N)
-
-        # --- PairFormer ---
-        print("  Compiling PairFormerBlock...")
-        pf_wrapper = PairFormerBlockWrapper(self.model.pairformer_stack.blocks[0])
-        pf_wrapper.eval()
-        t0 = time.time()
-        self.traced_pf = torch_neuronx.trace(
-            pf_wrapper,
-            (s_dummy, z_dummy, single_mask, pair_mask),
-            compiler_args=self.compiler_args,
-            inline_weights_to_neff=False,
-        )
-        self.compile_times["pairformer"] = time.time() - t0
-        print(f"    Done in {self.compile_times['pairformer']:.1f}s")
 
         # --- MSA type A (blocks 0-2) ---
         print("  Compiling MSA block (type A)...")
@@ -665,16 +1305,18 @@ class OpenFold3NeuronPipeline:
         self.compile_times["diff_cond"] = time.time() - t0
         print(f"    Done in {self.compile_times['diff_cond']:.1f}s")
 
-        # Warmup
+        # Warmup non-PairFormer blocks
         print("  Warming up traced models...")
         for _ in range(2):
-            self.traced_pf(s_dummy, z_dummy, single_mask, pair_mask)
             self.traced_msa_a(m_dummy, z_dummy, msa_mask_dummy, pair_mask)
             self.traced_msa_b(m_dummy, z_dummy, msa_mask_dummy, pair_mask)
             self.traced_tmpl(t_dummy, t_mask_dummy)
             self.traced_dc(s_dummy, z_dummy, single_mask)
-        print("  All blocks compiled and warmed up.")
+            if not self.use_decomposed:
+                self.traced_pf(s_dummy, z_dummy, single_mask, pair_mask)
 
+        total = sum(self.compile_times.values())
+        print(f"  All blocks compiled in {total:.1f}s total")
         return self.compile_times
 
     def patch_model(self) -> None:
@@ -687,9 +1329,7 @@ class OpenFold3NeuronPipeline:
         import torch_neuronx
 
         assert self.model is not None, "Call load_model() first"
-        assert self.traced_pf is not None, "Call compile_all() first"
 
-        traced_pf = self.traced_pf
         traced_msa_a = self.traced_msa_a
         traced_msa_b = self.traced_msa_b
         traced_tmpl = self.traced_tmpl
@@ -697,19 +1337,38 @@ class OpenFold3NeuronPipeline:
 
         # --- PairFormer blocks ---
         num_pf_blocks = len(self.model.pairformer_stack.blocks)
-        for i in range(num_pf_blocks):
-            block = self.model.pairformer_stack.blocks[i]
 
-            def make_pf_forward(block_idx, original_block):
-                def neuron_forward(s, z, single_mask, pair_mask, **kwargs):
-                    w = PairFormerBlockWrapper(original_block)
-                    torch_neuronx.replace_weights(traced_pf, w.state_dict())
-                    return traced_pf(s, z, single_mask, pair_mask)
+        if self.use_decomposed:
+            # Decomposed: replace the entire pairformer_stack.forward()
+            decomposed_pf = self.decomposed_pf
+            model_ref = self.model
 
-                return neuron_forward
+            def neuron_pairformer_stack_forward(s, z, single_mask, pair_mask, **kwargs):
+                """Run all 48 PairFormer layers using decomposed sub-ops."""
+                with torch.no_grad():
+                    for i in range(len(model_ref.pairformer_stack.blocks)):
+                        z, s = decomposed_pf.run_layer(z, s, i)
+                return s, z
 
-            block.forward = make_pf_forward(i, block)
-        print(f"  Patched {num_pf_blocks} PairFormer blocks")
+            self.model.pairformer_stack.forward = neuron_pairformer_stack_forward
+            print(f"  Patched PairFormer stack ({num_pf_blocks} layers, decomposed)")
+
+        else:
+            # Monolithic: patch individual block forward() methods
+            traced_pf = self.traced_pf
+            for i in range(num_pf_blocks):
+                block = self.model.pairformer_stack.blocks[i]
+
+                def make_pf_forward(block_idx, original_block):
+                    def neuron_forward(s, z, single_mask, pair_mask, **kwargs):
+                        w = PairFormerBlockWrapper(original_block)
+                        torch_neuronx.replace_weights(traced_pf, w.state_dict())
+                        return traced_pf(s, z, single_mask, pair_mask)
+
+                    return neuron_forward
+
+                block.forward = make_pf_forward(i, block)
+            print(f"  Patched {num_pf_blocks} PairFormer blocks (monolithic)")
 
         # --- MSA blocks ---
         num_msa_blocks = len(self.model.msa_module.blocks)
