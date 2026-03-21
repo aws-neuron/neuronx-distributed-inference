@@ -147,12 +147,10 @@ class Gemma2InferenceConfig(InferenceConfig):
         if "tie_word_embeddings" not in config_dict:
             config_dict["tie_word_embeddings"] = True
 
-        # Override softcapping: disable attn, keep final
-        config_dict["attn_logit_softcapping"] = None
-        config_dict["sliding_window"] = None
+        # Note: sliding_window and attn_logit_softcapping are force-overridden
+        # in add_derived_config() regardless of what's in config.json
 
         if neuron_config is None:
-            from neuronx_distributed_inference.models.config import NeuronConfig
             neuron_config = NeuronConfig()
 
         config = cls(neuron_config=neuron_config, **config_dict)

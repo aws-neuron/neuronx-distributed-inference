@@ -9,7 +9,7 @@ import pytest
 import torch
 import json
 from pathlib import Path
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoTokenizer
 
 from neuronx_distributed_inference.models.config import NeuronConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
@@ -59,22 +59,11 @@ def create_model_for_inference(compiled_path: str, model_path: str):
 
     neuron_config = NeuronConfig(**neuron_config_kwargs)
 
-    try:
-        model_config = Gemma2InferenceConfig.from_pretrained(
-            model_path, neuron_config=neuron_config,
-        )
-    except (TypeError, AttributeError):
-        model_config = Gemma2InferenceConfig(
-            neuron_config, load_config=load_pretrained_config(model_path),
-        )
+    model_config = Gemma2InferenceConfig.from_pretrained(
+        model_path, neuron_config=neuron_config,
+    )
 
-    try:
-        if hasattr(NeuronGemma2ForCausalLM, 'from_pretrained'):
-            model = NeuronGemma2ForCausalLM.from_pretrained(compiled_path, config=model_config)
-        else:
-            raise AttributeError("No from_pretrained method")
-    except (TypeError, AttributeError, Exception):
-        model = NeuronGemma2ForCausalLM(model_path, model_config)
+    model = NeuronGemma2ForCausalLM(model_path, model_config)
 
     return model, neuron_config
 
@@ -98,11 +87,10 @@ def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
     return generated_ids
 
 
-@pytest.fixture(scope="module")
-def compiled_model():
-    compiled_path = Path(COMPILED_MODEL_PATH)
-    if not (compiled_path / "model.pt").exists():
-        print(f"Compiling model to {COMPILED_MODEL_PATH}...")
+def compile_if_needed(model_path: str, compiled_path: str):
+    """Compile the model if compiled artifacts don't exist."""
+    if not (Path(compiled_path) / "model.pt").exists():
+        print(f"Compiling model to {compiled_path}...")
         neuron_config = NeuronConfig(
             tp_degree=2,
             batch_size=1,
@@ -112,11 +100,15 @@ def compiled_model():
         )
         config = Gemma2InferenceConfig(
             neuron_config,
-            load_config=load_pretrained_config(MODEL_PATH),
+            load_config=load_pretrained_config(model_path),
         )
-        model = NeuronGemma2ForCausalLM(MODEL_PATH, config)
-        model.compile(COMPILED_MODEL_PATH)
+        model = NeuronGemma2ForCausalLM(model_path, config)
+        model.compile(compiled_path)
 
+
+@pytest.fixture(scope="module")
+def compiled_model():
+    compile_if_needed(MODEL_PATH, COMPILED_MODEL_PATH)
     model, neuron_config = create_model_for_inference(COMPILED_MODEL_PATH, MODEL_PATH)
     model.load(COMPILED_MODEL_PATH)
     return model
@@ -157,23 +149,7 @@ if __name__ == "__main__":
     print("Gemma-2-9b Integration Tests")
     print("=" * 80)
 
-    compiled_path = Path(COMPILED_MODEL_PATH)
-    if not (compiled_path / "model.pt").exists():
-        print(f"\nCompiling model to {COMPILED_MODEL_PATH}...")
-        neuron_config = NeuronConfig(
-            tp_degree=2,
-            batch_size=1,
-            seq_len=128,
-            max_context_length=128,
-            torch_dtype=torch.bfloat16,
-        )
-        config = Gemma2InferenceConfig(
-            neuron_config,
-            load_config=load_pretrained_config(MODEL_PATH),
-        )
-        model = NeuronGemma2ForCausalLM(MODEL_PATH, config)
-        model.compile(COMPILED_MODEL_PATH)
-        print("Compilation complete")
+    compile_if_needed(MODEL_PATH, COMPILED_MODEL_PATH)
 
     print(f"\nLoading compiled model from {COMPILED_MODEL_PATH}...")
     model, neuron_config = create_model_for_inference(COMPILED_MODEL_PATH, MODEL_PATH)
