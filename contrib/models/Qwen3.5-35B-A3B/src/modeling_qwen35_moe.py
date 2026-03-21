@@ -185,21 +185,24 @@ class NeuronGatedDeltaNet(nn.Module):
         # input_output_aliases, allowing the XLA runtime to alias the output
         # tensors back to the same HBM buffers across CTE and TKG graphs.
         #
-        # Recurrent state: (B, num_v_heads, k_dim, v_dim) = (1, 32, 128, 128)
+        # Recurrent state: (B, num_v_heads, k_dim, v_dim) = (B, 32, 128, 128)
         # The NKI kernel outputs per-head (128, 128) in float32; we store as bf16
         # on HBM and cast at load/store time.
         #
         # Conv state: last (kernel_size - 1) = 3 tokens of the mixed tensor
         # (QKV concat before conv1d). Shape: (B, conv_dim, kernel_size - 1)
-        # = (1, 8192, 3). Stores the last 3 tokens' mixed values so TKG can
+        # = (B, 8192, 3). Stores the last 3 tokens' mixed values so TKG can
         # compute conv1d correctly for the next token.
         #
-        # Note: batch_size is determined at config time. We default to 1.
+        # Note: Use max_batch_size for buffer allocation so CTE and TKG models
+        # have identically-shaped state dict entries (required for loading).
+        # In forward(), we slice to the actual batch_size.
         # Both buffers are stored in the model's compute dtype (bf16).
-        batch_size = getattr(config.neuron_config, "max_batch_size", 1)
+        alloc_batch_size = getattr(config.neuron_config, "max_batch_size", 1)
+        self._phase_batch_size = getattr(config.neuron_config, "batch_size", 1)
         self.recurrent_state_buffer = nn.Parameter(
             torch.zeros(
-                batch_size,
+                alloc_batch_size,
                 self.num_v_heads,
                 self.head_k_dim,
                 self.head_v_dim,
@@ -209,7 +212,7 @@ class NeuronGatedDeltaNet(nn.Module):
         )
         self.conv_state_buffer = nn.Parameter(
             torch.zeros(
-                batch_size,
+                alloc_batch_size,
                 self.conv_dim,
                 self.conv_kernel_size - 1,  # 3
                 dtype=config.neuron_config.torch_dtype,
@@ -540,7 +543,8 @@ class NeuronGatedDeltaNet(nn.Module):
             # conv_state_buffer holds the last 3 tokens of pre-silu mixed from CTE/prev TKG.
             # We need 4 consecutive values for conv1d kernel_size=4.
             # Build window: [conv_state[:, :, 0:3], new_token] = (B, 8192, 4)
-            conv_state = self.conv_state_buffer  # (B, 8192, 3)
+            # Slice to actual batch_size (buffer may be alloc_batch_size > batch_size)
+            conv_state = self.conv_state_buffer[:batch_size]  # (B, 8192, 3)
             conv_input = torch.cat([conv_state, mixed], dim=-1)  # (B, 8192, 4)
 
             # Apply depthwise conv1d manually (kernel_size=4, groups=conv_dim):
@@ -559,6 +563,22 @@ class NeuronGatedDeltaNet(nn.Module):
             new_conv_state = torch.cat(
                 [conv_state[:, :, 1:], mixed], dim=-1
             )  # (B, 8192, 3)
+            # Pad to alloc_batch_size and touch full buffer for alias
+            alloc_bs = self.conv_state_buffer.shape[0]
+            if batch_size < alloc_bs:
+                pad_size = alloc_bs - batch_size
+                new_conv_state = torch.cat(
+                    [
+                        new_conv_state,
+                        self.conv_state_buffer[batch_size:]
+                        * 0,  # touch remaining buffer entries
+                    ],
+                    dim=0,
+                )
+            else:
+                new_conv_state = (
+                    new_conv_state + self.conv_state_buffer * 0
+                )  # touch for alias
         else:
             # CTE: Use nn.Conv1d with built-in padding (V36 approach -- proven correct).
             # self.conv1d has padding=kernel_size-1=3, which pads both sides symmetrically.
@@ -593,6 +613,23 @@ class NeuronGatedDeltaNet(nn.Module):
             # padding), but the alias requires the parameter to be part of the
             # traced graph. Adding * 0 ensures the old buffer is read but has
             # no numeric effect on new_conv_state.
+            # Pad new_conv_state to alloc_batch_size for alias compatibility.
+            alloc_bs = self.conv_state_buffer.shape[0]
+            if batch_size < alloc_bs:
+                pad_size = alloc_bs - batch_size
+                new_conv_state = torch.cat(
+                    [
+                        new_conv_state,
+                        torch.zeros(
+                            pad_size,
+                            self.conv_dim,
+                            self.conv_kernel_size - 1,
+                            dtype=new_conv_state.dtype,
+                            device=new_conv_state.device,
+                        ),
+                    ],
+                    dim=0,
+                )
             new_conv_state = new_conv_state + self.conv_state_buffer * 0
 
         mixed_post_conv = mixed_post_conv.transpose(
@@ -643,10 +680,25 @@ class NeuronGatedDeltaNet(nn.Module):
 
         if is_decode:
             # Load recurrent state from buffer (bf16 -> f32)
-            recurrent_state = self.recurrent_state_buffer.float()
+            # Slice to actual batch_size (buffer may be alloc_batch_size > batch_size)
+            recurrent_state = self.recurrent_state_buffer[:batch_size].float()
             output, new_recurrent_state = self._recurrent_step(
                 query, key, value, g, beta, recurrent_state
             )
+            # Pad to alloc_batch_size and touch full buffer for alias
+            alloc_bs = self.recurrent_state_buffer.shape[0]
+            if batch_size < alloc_bs:
+                new_recurrent_state = torch.cat(
+                    [
+                        new_recurrent_state,
+                        self.recurrent_state_buffer[batch_size:].float() * 0,
+                    ],
+                    dim=0,
+                )
+            else:
+                new_recurrent_state = (
+                    new_recurrent_state + self.recurrent_state_buffer.float() * 0
+                )
         else:
             # Context encoding with NKI recurrent kernel -- returns (output, final_state)
             output, new_recurrent_state = self._nki_recurrent_forward(
@@ -657,6 +709,24 @@ class NeuronGatedDeltaNet(nn.Module):
             # During CTE, we don't USE the old state (NKI kernel starts from zero),
             # but the alias requires the parameter to be part of the traced graph.
             # Adding * 0 ensures the old buffer is read but has no numeric effect.
+            # Pad to alloc_batch_size for alias compatibility.
+            alloc_bs = self.recurrent_state_buffer.shape[0]
+            if batch_size < alloc_bs:
+                pad_size = alloc_bs - batch_size
+                new_recurrent_state = torch.cat(
+                    [
+                        new_recurrent_state,
+                        torch.zeros(
+                            pad_size,
+                            self.num_v_heads,
+                            self.head_k_dim,
+                            self.head_v_dim,
+                            dtype=new_recurrent_state.dtype,
+                            device=new_recurrent_state.device,
+                        ),
+                    ],
+                    dim=0,
+                )
             new_recurrent_state = (
                 new_recurrent_state + self.recurrent_state_buffer.float() * 0
             )
@@ -1141,8 +1211,15 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             )
         else:
             # Token generation (decode)
+            # Fix BS>1: compute_for_token_gen expects 4D mask (B, H, q_len, S)
+            # but NxDI passes 2D (B, S). With BS=1, (1, S) broadcasts to
+            # (1,1,1,S) correctly. With BS>1, (B, S) right-aligns to (1,1,B,S)
+            # causing the batch dim to leak into q_len in torch.where.
+            tkg_mask = attention_mask
+            if tkg_mask is not None and tkg_mask.ndim == 2:
+                tkg_mask = tkg_mask.unsqueeze(1).unsqueeze(2)  # (B, S) -> (B, 1, 1, S)
             attn_output = self.compute_for_token_gen(
-                Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+                Q, K, V, position_ids, past_key_value, tkg_mask, active_mask
             )
 
         # attn_output is (B, H, S, head_dim) -- transpose to (B, S, H, head_dim)
@@ -1647,6 +1724,27 @@ class NeuronQwen35MoeModel(NeuronBaseModel):
         deltanet_state_tensors = []  # Collect DeltaNet states
         cos_cache = None
         sin_cache = None
+
+        # Convert 2D attention_mask (B, S) to 4D causal mask (B, 1, S, S) for
+        # the softmax attention fallback path (perform_prefill with head_dim>128).
+        # With BS=1, the 2D mask broadcasts accidentally. With BS>1, it doesn't.
+        # Flash attention doesn't use this mask (uses internal causal masking).
+        if (
+            attention_mask is not None
+            and attention_mask.ndim == 2
+            and is_for_context_encoding
+        ):
+            # Build causal mask: position i can attend to positions 0..i
+            causal = torch.ones(
+                (seq_length, seq_length),
+                dtype=torch.bool,
+                device=attention_mask.device,
+            ).tril()
+            # Combine with padding mask: (B, 1, 1, S) & (1, 1, S, S)
+            padding_4d = attention_mask[:, None, None, :].to(torch.bool)  # (B, 1, 1, S)
+            attention_mask = (causal[None, None, :, :] & padding_4d).to(
+                attention_mask.dtype
+            )  # (B, 1, S, S)
 
         # Phase 2 mRoPE: Pre-compute cos/sin from 3D position_ids when available.
         # For CTE with VL content, rotary_position_ids is (3, B, S) with T/H/W positions.
@@ -2508,18 +2606,158 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
         empties = [torch.empty(0) for _ in range(14)]
 
         if self._is_prefill(position_ids):
-            outputs = self.context_encoding_model(
-                input_ids,  # 0
-                attention_mask,  # 1
-                position_ids,  # 2
-                seq_ids,  # 3
-                sampling_params,  # 4
-                prev_hidden,  # 5
-                adapter_ids,  # 6
-                *empties,  # 7-20
-                mrope_position_ids,  # 21
-                vision_embeddings,  # 22
-                vision_mask,  # 23
+            # -----------------------------------------------------------
+            # CTE batch splitting: handle ctx_batch_size < tkg_batch_size
+            # -----------------------------------------------------------
+            # NxDI's model_wrapper.forward() splits batches by slicing ALL
+            # args along dim 0, which corrupts M-RoPE position_ids (shape
+            # [3, B, S] -- batch is dim 1, not dim 0). It also pads to
+            # max_batch_size (=tkg_batch_size) instead of ctx_batch_size.
+            #
+            # Fix: split batches here with correct dim handling, then pass
+            # each chunk with batch_size == ctx_batch_size so the wrapper
+            # takes the fast path (no internal splitting/padding).
+            # -----------------------------------------------------------
+            ctx_bs = self.context_encoding_model.neuron_config.batch_size
+            output_logits = []
+
+            for cb in range(0, batch_size, ctx_bs):
+                cb_end = min(cb + ctx_bs, batch_size)
+                actual_chunk = cb_end - cb
+
+                # Slice standard 2D args along dim 0 (batch dim)
+                chunk_input_ids = input_ids[cb:cb_end]
+                chunk_attn_mask = attention_mask[cb:cb_end]
+                chunk_pos_ids = position_ids[cb:cb_end]
+                chunk_seq_ids = seq_ids[cb:cb_end]
+                chunk_sampling = sampling_params[cb:cb_end]
+                chunk_prev_hidden = (
+                    prev_hidden[cb:cb_end]
+                    if prev_hidden is not None
+                    and hasattr(prev_hidden, "ndim")
+                    and prev_hidden.ndim > 0
+                    and prev_hidden.shape[0] > 0
+                    else prev_hidden
+                )
+                chunk_adapter_ids = (
+                    adapter_ids[cb:cb_end]
+                    if adapter_ids is not None
+                    and hasattr(adapter_ids, "ndim")
+                    and adapter_ids.ndim > 0
+                    and adapter_ids.shape[0] > 0
+                    else adapter_ids
+                )
+
+                # M-RoPE: slice along dim 1 (batch dim for [3, B, S])
+                if mrope_position_ids.ndim == 3:
+                    chunk_mrope = mrope_position_ids[:, cb:cb_end, :]
+                else:
+                    chunk_mrope = mrope_position_ids  # empty tensor for TKG
+
+                # Vision args: slice along dim 0 if batched
+                if vision_embeddings.ndim == 3:
+                    chunk_vis_emb = vision_embeddings[cb:cb_end]
+                    chunk_vis_mask = vision_mask[cb:cb_end]
+                else:
+                    chunk_vis_emb = vision_embeddings
+                    chunk_vis_mask = vision_mask
+
+                # Pad if chunk is smaller than ctx_batch_size
+                if actual_chunk < ctx_bs:
+                    pad_n = ctx_bs - actual_chunk
+                    chunk_input_ids = torch.cat(
+                        [chunk_input_ids, chunk_input_ids[:1].expand(pad_n, -1)], dim=0
+                    )
+                    chunk_attn_mask = torch.cat(
+                        [chunk_attn_mask, chunk_attn_mask[:1].expand(pad_n, -1)], dim=0
+                    )
+                    chunk_pos_ids = torch.cat(
+                        [chunk_pos_ids, chunk_pos_ids[:1].expand(pad_n, -1)], dim=0
+                    )
+                    # Pad seq_ids with unused IDs
+                    pad_seq = torch.arange(
+                        batch_size, batch_size + pad_n, dtype=chunk_seq_ids.dtype
+                    )
+                    chunk_seq_ids = torch.cat([chunk_seq_ids, pad_seq], dim=0)
+                    chunk_sampling = torch.cat(
+                        [chunk_sampling, chunk_sampling[:1].expand(pad_n, -1)], dim=0
+                    )
+                    if (
+                        chunk_prev_hidden is not None
+                        and hasattr(chunk_prev_hidden, "ndim")
+                        and chunk_prev_hidden.ndim > 0
+                        and chunk_prev_hidden.shape[0] > 0
+                    ):
+                        chunk_prev_hidden = torch.cat(
+                            [
+                                chunk_prev_hidden,
+                                chunk_prev_hidden[:1].expand(pad_n, -1),
+                            ],
+                            dim=0,
+                        )
+                    if (
+                        chunk_adapter_ids is not None
+                        and hasattr(chunk_adapter_ids, "ndim")
+                        and chunk_adapter_ids.ndim > 0
+                        and chunk_adapter_ids.shape[0] > 0
+                    ):
+                        chunk_adapter_ids = torch.cat(
+                            [
+                                chunk_adapter_ids,
+                                chunk_adapter_ids[:1].expand(pad_n, -1),
+                            ],
+                            dim=0,
+                        )
+                    if chunk_mrope.ndim == 3:
+                        chunk_mrope = torch.cat(
+                            [chunk_mrope, chunk_mrope[:, :1, :].expand(-1, pad_n, -1)],
+                            dim=1,
+                        )
+                    if chunk_vis_emb.ndim == 3:
+                        chunk_vis_emb = torch.cat(
+                            [
+                                chunk_vis_emb,
+                                torch.zeros(
+                                    (pad_n,) + chunk_vis_emb.shape[1:],
+                                    dtype=chunk_vis_emb.dtype,
+                                ),
+                            ],
+                            dim=0,
+                        )
+                        chunk_vis_mask = torch.cat(
+                            [
+                                chunk_vis_mask,
+                                torch.full(
+                                    (pad_n,) + chunk_vis_mask.shape[1:],
+                                    fill_value=seq_len - 1,
+                                    dtype=chunk_vis_mask.dtype,
+                                ),
+                            ],
+                            dim=0,
+                        )
+
+                chunk_out = self.context_encoding_model(
+                    chunk_input_ids,  # 0
+                    chunk_attn_mask,  # 1
+                    chunk_pos_ids,  # 2
+                    chunk_seq_ids,  # 3
+                    chunk_sampling,  # 4
+                    chunk_prev_hidden,  # 5
+                    chunk_adapter_ids,  # 6
+                    *empties,  # 7-20
+                    chunk_mrope,  # 21
+                    chunk_vis_emb,  # 22
+                    chunk_vis_mask,  # 23
+                )
+                # Slice off padding from output logits
+                if actual_chunk < ctx_bs:
+                    chunk_out = chunk_out[:actual_chunk]
+                output_logits.append(chunk_out)
+
+            outputs = (
+                torch.cat(output_logits, dim=0)
+                if len(output_logits) > 1
+                else output_logits[0]
             )
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
