@@ -579,6 +579,27 @@ class ModelWrapper(torch.nn.Module):
             **self.model_init_kwargs,
         )
 
+
+    @staticmethod
+    def _batch_slice_arg(arg, start, end):
+        """Slice a single argument along its batch dimension.
+
+        Most tensors have batch as dim 0, but M-RoPE rotary_position_ids
+        has shape [3, B, S] where batch is dim 1.  Empty tensors and None
+        are passed through unchanged.
+        """
+        if arg is None:
+            return arg
+        if not isinstance(arg, torch.Tensor):
+            return arg
+        if arg.numel() == 0:
+            return arg
+        # 3D tensor with dim 0 == 3: M-RoPE [3, B, S] -- slice dim 1
+        if arg.dim() == 3 and arg.shape[0] == 3:
+            return arg[:, start:end, :].contiguous()
+        # Default: slice dim 0
+        return arg[start:end]
+
     def _forward_with_pad(self, *args):
         # Note: NxD's tracing flow (Model Builder) does not yet support kwargs, because of which we cannot support
         # optional parameters. Kwargs support is being added as a part of the new Model Builder API. Until then we
@@ -588,7 +609,7 @@ class ModelWrapper(torch.nn.Module):
         sampling_params = args[4]
         if self.is_block_kv_layout:
             medusa_args = None
-        elif len(args) > 5:
+        elif self.is_medusa and len(args) > 5:
             medusa_args = args[5:8]
         else:
             medusa_args = None
@@ -726,6 +747,55 @@ class ModelWrapper(torch.nn.Module):
             if self.neuron_config.enable_eagle_speculation:
                 eagle_empty_args = args[11:16]
                 for arg in eagle_empty_args:
+                    padded_args.append(arg)
+
+
+        # Forward any remaining args (positions 5+) that weren't handled above.
+        # Models like Qwen3.5 pass 24 args (including DeltaNet state buffers,
+        # M-RoPE position_ids, and vision inputs at positions 5-23). Without
+        # forwarding these, the compiled TorchScript model receives too few
+        # arguments and raises "missing value for argument".
+        #
+        # Most remaining args are torch.empty(0) or None and don't need batch
+        # padding. The exception is 3D M-RoPE rotary_position_ids at the
+        # standard position (index 21 in the full arg list), which has shape
+        # [3, B, S] and needs padding along dim 1 (the batch dimension).
+        if len(padded_args) < len(args):
+            target_bs = self.neuron_config.batch_size
+            for i in range(len(padded_args), len(args)):
+                arg = args[i]
+                if arg is None:
+                    # None args (e.g. prev_hidden, adapter_ids after set_none_if_empty)
+                    # were traced as 1D tensors of shape [batch_size]. Reconstruct a
+                    # zero tensor of the expected batch size so TorchScript accepts it.
+                    padded_args.append(torch.zeros(target_bs, dtype=torch.int32))
+                elif (
+                    isinstance(arg, torch.Tensor)
+                    and arg.dim() == 3
+                    and arg.shape[0] == 3
+                ):
+                    # M-RoPE rotary_position_ids: [3, B, S] -- pad along dim 1
+                    rotary = arg
+                    if rotary.shape[1] < target_bs:
+                        pad_size = target_bs - rotary.shape[1]
+                        padding = rotary[:, 0:1, :].expand(-1, pad_size, -1)
+                        rotary = torch.cat([rotary, padding], dim=1)
+                    padded_args.append(rotary.contiguous())
+                elif (
+                    isinstance(arg, torch.Tensor)
+                    and arg.numel() > 0
+                    and arg.shape[0] > 0
+                ):
+                    # Batched tensor -- pad along dim 0
+                    padded_args.append(
+                        pad_helper(
+                            arg,
+                            pad_type="repeat_first_batchline",
+                            batch_sort_indices=indices,
+                        )
+                    )
+                else:
+                    # Empty tensor or scalar -- pass through as-is
                     padded_args.append(arg)
 
         outputs = self._forward(*padded_args)
@@ -1517,8 +1587,9 @@ class ModelWrapper(torch.nn.Module):
 
                 # pad to next bucket for context encoding with bs > 1
                 # batch_arg represent single prompt in batch of prompts
+                bs = self.neuron_config.batch_size
                 batch_args = [
-                    arg[cur_batch : cur_batch + self.neuron_config.batch_size] for arg in args
+                    self._batch_slice_arg(arg, cur_batch, cur_batch + bs) for arg in args
                 ]
                 batch_args = self.vllm_cte_repadding(batch_args)
 
@@ -1536,7 +1607,7 @@ class ModelWrapper(torch.nn.Module):
                 was_padded = True
                 outputs = self._forward_with_pad(
                     *[
-                        arg[cur_batch:input_batch_size] if not is_ranked_io(arg) else arg
+                        self._batch_slice_arg(arg, cur_batch, input_batch_size) if not is_ranked_io(arg) else arg
                         for arg in args
                     ]
                 )
