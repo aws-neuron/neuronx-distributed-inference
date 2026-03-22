@@ -69,7 +69,7 @@ At N=2048, the TriMul intermediate tensor `[128, N, N]` requires ~128 GB -- exce
 | MSA type B | 44.5s | 1 | Separate NEFF |
 | TemplatePairBlock | 8.7s | 2 | 1 x replace_weights |
 | DiffCond._forward() | 4.0s | 1 | Shared weights |
-| Decomposed sub-ops (14 segments, N=384) | 66.4s | 48 | 47 x replace_weights per segment |
+| Decomposed sub-ops (N=384) | ~60-70s | 48 | 47 x replace_weights per segment |
 
 ### End-to-End Benchmark (Monolithic, N=256)
 
@@ -267,9 +267,9 @@ PYTHONPATH=src:/home/ubuntu/openfold-3:$PYTHONPATH \
     pytest test/integration/test_model.py -v -s
 ```
 
-The test suite includes 10 tests (all PASS, 557s total on trn2.3xlarge):
+The test suite includes 11 tests (all PASS on trn2.3xlarge):
 - 6 monolithic block tests (PairFormer, weight replacement, MSA-A, MSA-B, Template, DiffCond) at N=128
-- 4 decomposed tests (TriMulOut, TriMulIn, TriAttnStart, full layer) at N=384
+- 5 decomposed tests (FusedTriMulOutIn, TriMulOut, TriMulIn, TriAttnStart, full layer) at N=384
 
 ## Architecture Details
 
@@ -281,7 +281,7 @@ The test suite includes 10 tests (all PASS, 557s total on trn2.3xlarge):
 
 | N Range | TriMul Strategy | TriAttn/APB Strategy | Calls/Layer |
 |---------|----------------|---------------------|-------------|
-| 257-384 | Full TriMul (1 call each) | Merged (1 call each) | **7** |
+| 257-384 | Fused TriMulOut+In (1 call) | Merged (1 call each) | **5** |
 | 385-512 | Proj + merged BMM+Output (2 calls each) | Merged (1 call each) | **9** |
 | 513-1024 | 3-segment (3 calls each) | 2-segment (2 calls each) | **14** |
 | >1024 | 3-segment (3 calls each) | 2-seg + chunked MHA (chunk=128) | **14+C** |
@@ -289,6 +289,7 @@ The test suite includes 10 tests (all PASS, 557s total on trn2.3xlarge):
 C = 2 * ceil(N / 128) extra calls for chunked TriAttn MHA.
 
 **Merged segment speedups** (validated on SDK 2.28):
+- Fused TriMulOut+TriMulIn at N=384: ~30% faster than two separate full TriMul calls (7→5 calls/layer)
 - Full TriMul at N=384: 1.57x faster than 3-segment (182ms vs 285ms)
 - Merged TriAttn at N=384-512: 1.68-1.79x faster than 2-segment
 - Merged AttnPairBias at N=384-512: 1.17-1.31x faster than 2-segment
@@ -298,6 +299,7 @@ Sub-op maximum compilation sizes:
 
 | Sub-Op | Segments | Technique | Compiles To |
 |--------|----------|-----------|-------------|
+| FusedTriMulOut+In | 1 (fused) | Both TriMul ops in one trace | N=384 |
 | TriMulOut | 1 (full) or 3 (decomposed) | Full at N<=384, 3-seg at N>384 | N=2048+ |
 | TriMulIn | 1 (full) or 3 (decomposed) | Same as TriMulOut | N=2048+ |
 | TriAttnStart | 1 (merged) or 2 (decomposed) | Merged at N<=512, 2-seg at N>512 | N=1024 (full MHA) |
@@ -318,6 +320,7 @@ Each sub-op is compiled once, then weights are replaced for all 48 layers.
 | Finer TriMul (3 segments each) | 512 | Split TriMul projection from matmul |
 | Finer TriAttn/APB (2 segments each) | 1024 | Split bias computation from MHA |
 | Chunked TriAttn MHA | **2048** | Chunk MHA rows to fit in HBM |
+| Fused TriMulOut+In (SDK 2.28) | 384 | Both TriMul ops in single trace (7→5 calls/layer) |
 | Merged segments (SDK 2.28) | 384-512 | Full TriMul + merged TriAttn/APB at small N |
 | Optimized chunk size | 2048 | chunk_size=128 (8% faster, half the calls vs 64) |
 
@@ -388,6 +391,6 @@ All patches are applied automatically by `patch_openfold3_source()` or the `Open
 
 | File | Description |
 |------|-------------|
-| `src/modeling_openfold3.py` | Main module: monolithic wrappers, decomposed sub-op wrappers, merged wrappers, N-range-aware DecomposedPairFormerCompiler, OpenFold3NeuronPipeline |
+| `src/modeling_openfold3.py` | Main module: monolithic wrappers, decomposed sub-op wrappers, fused/merged wrappers, N-range-aware DecomposedPairFormerCompiler, OpenFold3NeuronPipeline |
 | `src/__init__.py` | Package exports |
-| `test/integration/test_model.py` | 10 accuracy tests: 6 monolithic + 4 decomposed, all using neuron_allclose |
+| `test/integration/test_model.py` | 11 accuracy tests: 6 monolithic + 5 decomposed, all using neuron_allclose |

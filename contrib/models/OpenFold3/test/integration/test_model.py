@@ -492,7 +492,61 @@ RTOL_DECOMP = 0.05
 
 
 class TestDecomposedTriMul:
-    """Test decomposed TriMul (3 segments) against CPU reference."""
+    """Test decomposed and fused TriMul against CPU reference."""
+
+    def test_fused_trimul_out_in(self, openfold3_model):
+        """Compile FusedTriMulOutIn and validate against CPU reference."""
+        from modeling_openfold3 import FusedTriMulOutInWrapper
+
+        N = DECOMP_N_TOKEN
+        block0 = openfold3_model.pairformer_stack.blocks[0]
+        ps = block0.pair_stack
+        trace_kwargs = dict(
+            compiler_args=["--target", "trn2"],
+            inline_weights_to_neff=False,
+        )
+
+        z_in = torch.randn(1, N, N, TEST_C_Z)
+
+        # CPU reference: run both TriMul ops sequentially with residuals
+        with torch.no_grad():
+            z_cpu = z_in.clone()
+            z_cpu = z_cpu + ps.tri_mul_out(
+                z_cpu,
+                mask=None,
+                inplace_safe=False,
+                use_cueq_triangle_kernels=False,
+                _add_with_inplace=False,
+            )
+            z_cpu = z_cpu + ps.tri_mul_in(
+                z_cpu,
+                mask=None,
+                inplace_safe=False,
+                use_cueq_triangle_kernels=False,
+                _add_with_inplace=False,
+            )
+
+        # Compile fused wrapper
+        wrapper = FusedTriMulOutInWrapper(ps.tri_mul_out, ps.tri_mul_in)
+        wrapper.eval()
+
+        t0 = time.time()
+        compiled = torch_neuronx.trace(wrapper, (z_in,), **trace_kwargs)
+        compile_time = time.time() - t0
+        print(f"\n  FusedTriMulOutIn compile time: {compile_time:.1f}s")
+
+        with torch.no_grad():
+            z_neu = compiled(z_in.clone())
+
+        result = torch_neuronx.testing.neuron_allclose(
+            z_cpu, z_neu, rtol=RTOL_DECOMP, atol=ATOL_DECOMP
+        )
+        cos = F.cosine_similarity(
+            z_cpu.flatten().unsqueeze(0), z_neu.flatten().unsqueeze(0)
+        ).item()
+        print(f"  FusedTriMulOutIn N={N}: neuron_allclose={result}, cos={cos:.6f}")
+
+        assert result, f"FusedTriMulOutIn at N={N} failed neuron_allclose"
 
     def test_trimul_out_decomposition(self, openfold3_model):
         """Compile TriMulOut as 3 segments and validate against CPU monolithic."""

@@ -10,12 +10,12 @@ Two compilation strategies are supported:
   1. **Monolithic** (N <= 256): Each PairFormerBlock is traced as a
      single unit. Fast compilation, low overhead, 12.1x speedup per layer.
 
-  2. **Decomposed** (N > 256, up to 2048): PairFormerBlock is split into
-     sub-operations, each traced independently. Strategy auto-selected by N:
-       - N=257-384: Full TriMul + merged TriAttn/APB (7 calls/layer)
-       - N=385-512: Proj+merged BMM/Output + merged TriAttn/APB (9 calls/layer)
-       - N=513-1024: 3-seg TriMul + 2-seg TriAttn/APB (14 calls/layer)
-       - N>1024: Same + chunked TriAttn MHA (14+2*ceil(N/128) calls/layer)
+   2. **Decomposed** (N > 256, up to 2048): PairFormerBlock is split into
+      sub-operations, each traced independently. Strategy auto-selected by N:
+        - N=257-384: Fused TriMulOut+In + merged TriAttn/APB (5 calls/layer)
+        - N=385-512: Proj+merged BMM/Output + merged TriAttn/APB (9 calls/layer)
+        - N=513-1024: 3-seg TriMul + 2-seg TriAttn/APB (14 calls/layer)
+        - N>1024: Same + chunked TriAttn MHA (14+2*ceil(N/128) calls/layer)
 
 Five model components are compiled:
   1. PairFormerBlock (48 layers) - main trunk
@@ -57,6 +57,9 @@ CHUNKED_ATTN_CHUNK_SIZE = 128  # Number of rows per MHA chunk
 # Merged segment thresholds (validated on SDK 2.28)
 # Below these N values, merged wrappers compile successfully and are faster.
 # Above these, compiler crashes (NCC_ITEN404/NCC_INLA001) require decomposition.
+FUSED_TRIMUL_OUT_IN_MAX_N = (
+    384  # Fused TriMulOut+TriMulIn compiles at N<=384 (~30% faster)
+)
 MERGED_TRIMUL_MAX_N = 384  # Full TriMul compiles at N<=384 (1.57x vs 3-seg)
 MERGED_TRIMUL_BMM_OUTPUT_MAX_N = 512  # BMM+Output merge compiles at N<=512 (1.12-1.13x)
 MERGED_ATTN_MAX_N = 512  # Merged TriAttn/APB compile at N<=512 (1.68-1.79x)
@@ -507,6 +510,93 @@ class TriMulFullWrapper(nn.Module):
         return p * g
 
 
+class FusedTriMulOutInWrapper(nn.Module):
+    """Fused TriMulOut + TriMulIn in one trace: both triangle multiplications
+    applied sequentially with residual connections.
+
+    Eliminates 1 call/layer by combining both TriMul operations (outgoing
+    and incoming) into a single traced model. Compiles at N <= 384 on
+    SDK 2.28 (SBUF overflow at N=512). ~30% faster than two separate
+    TriMulFullWrapper calls at N=384.
+
+    Input: z [1, N, N, C_Z]
+    Output: z_updated [1, N, N, C_Z] (after both TriMulOut and TriMulIn residuals)
+    """
+
+    def __init__(self, tri_mul_out, tri_mul_in):
+        super().__init__()
+        # TriMulOut components
+        self.out_layer_norm_in = tri_mul_out.layer_norm_in
+        self.out_linear_a_g = tri_mul_out.linear_a_g
+        self.out_linear_a_p = tri_mul_out.linear_a_p
+        self.out_linear_b_g = tri_mul_out.linear_b_g
+        self.out_linear_b_p = tri_mul_out.linear_b_p
+        self.out_layer_norm_out = tri_mul_out.layer_norm_out
+        self.out_linear_z = tri_mul_out.linear_z
+        self.out_linear_g = tri_mul_out.linear_g
+        self.out_outgoing = tri_mul_out._outgoing
+
+        # TriMulIn components
+        self.in_layer_norm_in = tri_mul_in.layer_norm_in
+        self.in_linear_a_g = tri_mul_in.linear_a_g
+        self.in_linear_a_p = tri_mul_in.linear_a_p
+        self.in_linear_b_g = tri_mul_in.linear_b_g
+        self.in_linear_b_p = tri_mul_in.linear_b_p
+        self.in_layer_norm_out = tri_mul_in.layer_norm_out
+        self.in_linear_z = tri_mul_in.linear_z
+        self.in_linear_g = tri_mul_in.linear_g
+        self.in_outgoing = tri_mul_in._outgoing
+
+        self.sigmoid = nn.Sigmoid()
+
+    def _run_trimul(self, z, ln_in, a_g, a_p, b_g, b_p, ln_out, lz, lg, outgoing):
+        """Run one TriMul operation (shared logic for out and in)."""
+        z_norm = ln_in(z)
+        a = self.sigmoid(a_g(z_norm)) * a_p(z_norm)
+        b = self.sigmoid(b_g(z_norm)) * b_p(z_norm)
+        if outgoing:
+            a = a.permute(0, 3, 1, 2).contiguous()
+            b = b.permute(0, 3, 2, 1).contiguous()
+        else:
+            a = a.permute(0, 3, 2, 1).contiguous()
+            b = b.permute(0, 3, 1, 2).contiguous()
+        p = torch.einsum("...ij,...jk->...ik", a, b)
+        p = p.permute(0, 2, 3, 1).contiguous()
+        p = ln_out(p)
+        p = lz(p)
+        g = self.sigmoid(lg(z_norm))
+        return p * g
+
+    def forward(self, z):
+        # TriMulOut + residual
+        z = z + self._run_trimul(
+            z,
+            self.out_layer_norm_in,
+            self.out_linear_a_g,
+            self.out_linear_a_p,
+            self.out_linear_b_g,
+            self.out_linear_b_p,
+            self.out_layer_norm_out,
+            self.out_linear_z,
+            self.out_linear_g,
+            self.out_outgoing,
+        )
+        # TriMulIn + residual
+        z = z + self._run_trimul(
+            z,
+            self.in_layer_norm_in,
+            self.in_linear_a_g,
+            self.in_linear_a_p,
+            self.in_linear_b_g,
+            self.in_linear_b_p,
+            self.in_layer_norm_out,
+            self.in_linear_z,
+            self.in_linear_g,
+            self.in_outgoing,
+        )
+        return z
+
+
 class TriMulBmmOutputWrapper(nn.Module):
     """Merged TriMul BMM + Output: einsum -> permute -> LayerNorm -> linear -> gate.
 
@@ -636,7 +726,7 @@ class DecomposedPairFormerCompiler:
     enabling compilation at sequence lengths up to N=2048+. The
     decomposition strategy is selected automatically based on N:
 
-      N=257-384:  Full TriMul (1 call) + merged TriAttn/APB (1 call each)
+      N=257-384:  Fused TriMulOut+In (1 call) + merged TriAttn/APB (1 call each)
       N=385-512:  Proj + merged BMM+Output (2 calls) + merged TriAttn/APB
       N=513-1024: 3-segment TriMul + 2-segment TriAttn/APB
       N>1024:     Same as above + chunked TriAttn MHA (chunk_size=128)
@@ -645,7 +735,7 @@ class DecomposedPairFormerCompiler:
 
       | N Range   | TriMul | TriAttn | APB | PTrans | STrans | Total |
       |-----------|--------|---------|-----|--------|--------|-------|
-      | 257-384   | 1+1=2  | 1+1=2   | 1   | 1      | 1      | 7     |
+      | 257-384   | 1      | 1+1=2   | 1   | 1      | 1      | **5** |
       | 385-512   | 2+2=4  | 1+1=2   | 1   | 1      | 1      | 9     |
       | 513-1024  | 3+3=6  | 2+2=4   | 2   | 1      | 1      | 14    |
       | >1024     | 3+3=6  | 2+2=4*  | 2   | 1      | 1      | 14+C  |
@@ -678,9 +768,14 @@ class DecomposedPairFormerCompiler:
         self.use_chunked = n_token > CHUNKED_ATTN_THRESHOLD
 
         # Strategy flags based on N range
-        self.use_full_trimul = n_token <= MERGED_TRIMUL_MAX_N
+        self.use_fused_trimul_out_in = n_token <= FUSED_TRIMUL_OUT_IN_MAX_N
+        self.use_full_trimul = (
+            not self.use_fused_trimul_out_in and n_token <= MERGED_TRIMUL_MAX_N
+        )
         self.use_merged_bmm_output = (
-            not self.use_full_trimul and n_token <= MERGED_TRIMUL_BMM_OUTPUT_MAX_N
+            not self.use_fused_trimul_out_in
+            and not self.use_full_trimul
+            and n_token <= MERGED_TRIMUL_BMM_OUTPUT_MAX_N
         )
         self.use_merged_attn = n_token <= MERGED_ATTN_MAX_N
 
@@ -691,7 +786,9 @@ class DecomposedPairFormerCompiler:
     def _determine_strategy_label(self) -> str:
         """Return a human-readable label for the current strategy."""
         N = self.n_token
-        if self.use_full_trimul:
+        if self.use_fused_trimul_out_in:
+            return f"fused-trimul-out+in + merged-attn (N={N}, 5 calls/layer)"
+        elif self.use_full_trimul:
             return f"full-trimul + merged-attn (N={N}, 7 calls/layer)"
         elif self.use_merged_bmm_output:
             return f"proj+merged-bmmout + merged-attn (N={N}, 9 calls/layer)"
@@ -732,7 +829,22 @@ class DecomposedPairFormerCompiler:
         # TriMul compilation (strategy depends on N)
         # ================================================================
 
-        if self.use_full_trimul:
+        if self.use_fused_trimul_out_in:
+            # N <= 384: Fused TriMulOut+TriMulIn in single trace (~30% faster)
+            print("  Compiling TriMulOut+TriMulIn (fused)...", end=" ", flush=True)
+            t0 = time.time()
+            w = FusedTriMulOutInWrapper(
+                block0.pair_stack.tri_mul_out,
+                block0.pair_stack.tri_mul_in,
+            )
+            w.eval()
+            self.sub_ops["trimul_fused"] = torch_neuronx.trace(
+                w, (z_dummy,), **trace_kwargs
+            )
+            self.compile_times["trimul_fused"] = time.time() - t0
+            print(f"OK ({self.compile_times['trimul_fused']:.1f}s)")
+
+        elif self.use_full_trimul:
             # N <= 384: Full TriMul in single trace (1.57x faster than 3-seg)
             for name, tri_mul in [
                 ("tmout", block0.pair_stack.tri_mul_out),
@@ -970,7 +1082,11 @@ class DecomposedPairFormerCompiler:
         ps = block.pair_stack
 
         # TriMul weight replacement (strategy-dependent)
-        if self.use_full_trimul:
+        if self.use_fused_trimul_out_in:
+            w = FusedTriMulOutInWrapper(ps.tri_mul_out, ps.tri_mul_in)
+            torch_neuronx.replace_weights(self.sub_ops["trimul_fused"], w.state_dict())
+
+        elif self.use_full_trimul:
             for name, tri_mul in [
                 ("tmout", ps.tri_mul_out),
                 ("tmin", ps.tri_mul_in),
@@ -1105,11 +1221,14 @@ class DecomposedPairFormerCompiler:
         block = self.model.pairformer_stack.blocks[layer_idx]
         self._replace_weights_for_layer(block)
 
-        # TriMulOut
-        z = z + self._run_trimul("tmout", z)
-
-        # TriMulIn
-        z = z + self._run_trimul("tmin", z)
+        # TriMulOut + TriMulIn (fused or separate)
+        if self.use_fused_trimul_out_in:
+            # Fused: single call does both TriMulOut and TriMulIn with residuals
+            z = self.sub_ops["trimul_fused"](z)
+        else:
+            # Separate: two calls with residuals
+            z = z + self._run_trimul("tmout", z)
+            z = z + self._run_trimul("tmin", z)
 
         # TriAttnStart
         z = z + self._run_triattn("tas", z)
