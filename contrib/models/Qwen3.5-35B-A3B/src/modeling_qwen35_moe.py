@@ -700,9 +700,11 @@ class NeuronGatedDeltaNet(nn.Module):
                     new_recurrent_state + self.recurrent_state_buffer.float() * 0
                 )
         else:
-            # Context encoding with NKI recurrent kernel -- returns (output, final_state)
-            output, new_recurrent_state = self._nki_recurrent_forward(
-                query, key, value, g, beta
+            # Context encoding with chunked forward -- returns (output, final_state)
+            # chunk_forward(64) is 6.4x faster than NKI recurrent at seq_len=2048
+            # (2.2s vs 14.4s TTFT). See Task 12 benchmark results.
+            output, new_recurrent_state = self._chunk_forward(
+                query, key, value, g, beta, output_final_state=True
             )
             # IMPORTANT: Touch recurrent_state_buffer during CTE so XLA can find it
             # in the lowering context (it's aliased via input_output_aliases).
