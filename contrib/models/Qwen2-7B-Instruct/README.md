@@ -30,6 +30,25 @@ NeuronX Distributed Inference implementation of Qwen2 7B Instruct.
 
 **Status:** ✅ VALIDATED
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.27 | 0.00 |
+| MBU (%) | 0.52 | 0.42 |
+| HFU (%) | 0.27 | 0.00 |
+| Execution Time (us) | 0.03 | 0.04 |
+| HBM Read | 7.18 GB | 7.08 GB |
+| HBM Write | 86.63 MB | 2.58 MB |
+
+**Throughput:** 28.35 tok/s | **Compile Time:** 426.10s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python

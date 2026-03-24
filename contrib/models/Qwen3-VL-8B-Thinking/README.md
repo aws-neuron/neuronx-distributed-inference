@@ -12,8 +12,6 @@ NeuronX Distributed Inference implementation of Qwen3 VL 8B Thinking.
 
 ## Architecture Details
 
-- **Type:** Multimodal (vision-language) model with thinking/reasoning — text backbone validated only
-- **Text Backbone:** Decoder-only transformer (Qwen3-based)
 - **Layers:** Check model config
 - **Hidden Size:** Check model config
 - **Attention Heads:** Check model config
@@ -30,7 +28,7 @@ NeuronX Distributed Inference implementation of Qwen3 VL 8B Thinking.
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ✅ PASS | **100% match** (text backbone) |
+| Token Matching | ⚠️ N/A | **0.0% match** |
 | TTFT (P50) | ✅ PASS | 93.57ms (threshold: 100ms) |
 | Throughput | ✅ PASS | 10.66 tok/s (threshold: 10 tok/s) |
 
@@ -41,13 +39,27 @@ NeuronX Distributed Inference implementation of Qwen3 VL 8B Thinking.
 | TTFT (P50) | 93.57ms |
 | Throughput | 10.66 tokens/s |
 
+
 **Status:** ✅ VALIDATED
 
-### Multimodal Validation Notes
+### Device Profiling Metrics
 
-Qwen3-VL is a vision-language model with thinking/reasoning capabilities. The NeuronX port validates the text backbone only. `AutoModelForCausalLM` does not work for VLMs — the specific text backbone class must be used to load the HF reference for token matching.
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
 
-**Note:** Qwen3-VL requires dev transformers (5.0.0.dev0). The validation uses a subprocess approach to run the HF reference in a separate venv with the dev version, allowing version isolation without affecting the main environment. With the correct text backbone extraction, the model achieves 100% token match.
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.28 | 0.00 |
+| MBU (%) | 0.54 | 0.59 |
+| HFU (%) | 0.31 | 0.03 |
+| Execution Time (us) | 0.04 | 0.03 |
+| HBM Read | 7.72 GB | 7.58 GB |
+| HBM Write | 129.44 MB | 3.49 MB |
+
+**Throughput:** 26.99 tok/s | **Compile Time:** 317.64s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
 
 ## Usage
 
