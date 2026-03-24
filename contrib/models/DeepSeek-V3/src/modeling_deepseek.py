@@ -838,9 +838,8 @@ class NeuronDeepseekV3ForCausalLM(NeuronBaseForCausalLM):
         return convert_deepseek_v3_hf_to_neuron_state_dict(state_dict, config)
 
     def get_compiler_args(self):
-        """Return None to use framework defaults.
-
-        The framework's ModelWrapper builds platform-appropriate compiler args
-        including --lnc, --vectorize-strided-dma, optimization levels, etc.
-        """
-        return None
+        """Return compiler args with --enable-mixed-precision-accumulation for FP32 matmul
+        accumulation, matching Mixtral/DBRX/Qwen3 MoE/Qwen2 patterns."""
+        args = custom_compiler_args()
+        args += f" --lnc={self.config.neuron_config.logical_nc_config}"
+        return args
