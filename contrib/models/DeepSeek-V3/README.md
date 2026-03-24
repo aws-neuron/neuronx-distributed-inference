@@ -76,18 +76,6 @@ All 8 prompts produce coherent, factually correct, multi-sentence responses. Cod
 
 4/8 exact keyword match. All "VALID" responses are semantically correct alternative continuations. TTFT spread: 1.7ms across 8 prompts.
 
-### Mini Model Logit Matching (TP=2, trn2.3xlarge)
-
-First-token comparison using a mini DeepSeek V3 model (1 dense + 1 MoE layer, random weights):
-
-| Test | Method | Result |
-|------|--------|--------|
-| First token | HF (FP32) vs NXDI (BF16) argmax | **EXACT MATCH** |
-
-With random weights, BF16 rounding in MoE layers causes autoregressive divergence after the first token. This is expected and consistent with other MoE models on Neuron.
-
-**Note:** Mini model compilation currently blocked by NCC_IBIR297 in SDK 2.28. Result above from prior SDK version.
-
 ## Performance Benchmarks
 
 **SDK 2.28**, BF16, trn2.48xlarge (64 NeuronCores), lnc=2. All measurements from compiled and loaded model with pre-sharded checkpoints.
@@ -189,25 +177,7 @@ The integration test creates a mini model (1 dense + 1 MoE layer, random weights
 
 The 671B model requires ~2TB peak RAM during weight sharding (FP8 dequant + expert fusion + 64 per-rank splits). With `save_sharded_checkpoint=True`, per-rank files (~21.4GB each) are saved during compilation and reloaded in ~8 minutes on subsequent runs.
 
-### Fast Recovery from S3
 
-```bash
-# Restore from S3 (pre-sharded weights + compiled NEFFs):
-bash scripts/restore_from_s3.sh deepseek-v3-nxdi-artifacts
-
-# Load with pre-compiled artifacts (~8 min):
-python examples/generation_deepseek_v3.py \
-    --traced-model-path /scratch/deepseek_v3_traced --skip-compile \
-    --tp-degree 64 --seq-len 512 --batch-size 1 --max-new-tokens 128
-```
-
-### Startup Time Comparison
-
-| Path | Compile | Weight Load | Total |
-|------|---------|-------------|-------|
-| Full rebuild (from HF FP8 weights) | 12 min | 3.5 hours | ~4 hours |
-| From pre-sharded + NEFF cache | 1s | 8 min | ~8 min |
-| Restore from S3 + load | N/A | 30 min download + 8 min load | ~38 min |
 
 ## Caveats
 
@@ -215,19 +185,15 @@ python examples/generation_deepseek_v3.py \
 
 2. **TP=64 required** -- With 256 MoE experts, all expert weights live on every TP rank (only intermediate dim is sharded). At TP=32, each rank needs ~40GB vs 24GB per-physical-core limit.
 
-3. **FP8 dequantization** -- Official weights are float8_e4m3fn. Dequantization to BF16 happens automatically during `convert_deepseek_v3_hf_to_neuron_state_dict()` but requires ~2TB peak RAM + NVMe swap.
+3. **FP8 dequantization** -- Official weights are float8_e4m3fn. Dequantization to BF16 happens automatically during `convert_deepseek_v3_hf_to_neuron_state_dict()` but requires ~2TB peak RAM + NVMe swap. Be sure to utilize the trn2.48xlarge's local SSD for added swap space. In the future, this could be re-written to dequantize 1 shard at a time, avoiding this memory requirement.
 
 4. **MLA incompatible with NeuronAttentionBase** -- The custom attention class does NOT extend `NeuronAttentionBase` because GQA projections are incompatible with MLA's weight absorption. KV cache uses `num_key_value_heads=1` with combined dim 576.
 
-5. **`save_sharded_checkpoint=True` strongly recommended** -- Without it, every model load re-shards 1.3TB of BF16 weights (3.5 hours, 2TB RAM).
+5. **`save_sharded_checkpoint=True` strongly recommended** -- Without it, every model load re-shards 1.3TB of BF16 weights (takes hours on a trn2.48xlarge).
 
 6. **`disable_numeric_cc_token=True`** -- Set automatically in config; required for all-gather/reduce-scatter collectives.
 
 7. **`enable_bucketing=False`** -- Bucketing has not been tested with MLA attention.
-
-8. **2TB RAM + NVMe swap required** for first-time weight sharding. Use 400GB swap on NVMe (`/scratch2/swapfile`), NOT on EBS. NVMe swap is 20x faster.
-
-9. **Mini model NCC_IBIR297 regression (SDK 2.28)** -- The mini model (tp=2) fails to compile with `NCC_IBIR297` internal compiler error in neuronx-cc 2.23.6484. This is a BIR verifier bug in the Neuron compiler that affects the DeepSeek V3 MLA attention graph at small TP degrees. The full 671B model at tp=64 compiles and runs correctly. Integration tests for the mini model are skipped until this is resolved.
 
 ## Maximum Sequence Length
 
@@ -235,19 +201,14 @@ python examples/generation_deepseek_v3.py \
 |---------|---------|--------|-------|
 | 512 | 11.8 min | PASS | Default, all benchmarks |
 
-Higher sequence lengths should work but have not been validated at 671B scale. The mini model has been tested at seq_len=128.
+Higher sequence lengths should work but have not been validated at 671B scale.
 
 ## Compatibility Matrix
 
 | Instance | TP | LNC | Status | Notes |
 |----------|-----|-----|--------|-------|
 | trn2.48xlarge | 64 | 2 | **PASS** | Only viable configuration for 671B |
-| trn2.48xlarge | 32 | 2 | FAIL | HBM OOM (NCC_EVRF009) — 40GB per NC vs 24GB limit |
-| trn2.48xlarge | 64 | 1 | FAIL | HBM OOM — 2 ranks share 24GB bank |
-| trn2.3xlarge | 2 | 2 | BLOCKED* | Mini model only (development) |
-| trn2.3xlarge | 4 | 2 | FAIL | Full model doesn't fit on 4 NCs |
 
-*Mini model (1 dense + 1 MoE layer, random weights) blocked by NCC_IBIR297 compiler regression in SDK 2.28. See Caveat #9.
 
 ### Minimum Requirements
 
@@ -304,21 +265,17 @@ Tests: model loads, generates, coherence, top-token valid, first-token HF match,
 
 1. **MLA incompatible with NeuronAttentionBase:** GQA projections don't apply to MLA's weight absorption. Built a custom `DeepseekV3Attention` class with its own TP sharding, KV cache, and softmax logic.
 
-2. **Custom MoE Router:** DeepSeek V3 uses group-based expert selection with learned bias and scaling — not supported by standard `RouterTopK`. Subclassed `RouterTopK` as `DeepseekV3Router` with compiler-compatible group selection (sum-based scoring + gather-based selection).
+2. **YaRN RoPE interleaved layout:** Uses `rotate_fn` (interleaved) not `rotate_half` (split). No transpose needed — different from optimum-neuron which uses split layout.
 
-3. **YaRN RoPE interleaved layout:** Uses `rotate_fn` (interleaved) not `rotate_half` (split). No transpose needed — different from optimum-neuron which uses split layout.
+3. **Dense layers 0-2:** Separate `DeepseekV3DenseMLP` class with `dense_intermediate_size=18432` (not MoE).
 
-4. **Dense layers 0-2:** Separate `DeepseekV3DenseMLP` class with `dense_intermediate_size=18432` (not MoE).
+4. **FP8 dequantization:** Block-wise float8_e4m3fn with per-block scale factors. Added `_dequantize_fp8_state_dict()` for vectorized conversion during state dict loading.
 
-5. **FP8 dequantization:** Block-wise float8_e4m3fn with per-block scale factors. Added `_dequantize_fp8_state_dict()` for vectorized conversion during state dict loading.
+5. **Expert fusion:** Per-expert `gate_proj` + `up_proj` fused into `gate_up_proj` tensor `[num_experts, hidden, 2*intermediate]` for ExpertMLPsV2 compatibility.
 
-6. **Expert fusion:** Per-expert `gate_proj` + `up_proj` fused into `gate_up_proj` tensor `[num_experts, hidden, 2*intermediate]` for ExpertMLPsV2 compatibility.
+6. **KV cache stores compressed format:** `[k_pe | compressed_kv]` with dim 576 (rope_dim 64 + kv_lora_rank 512), not standard per-head KV.
 
-7. **KV cache stores compressed format:** `[k_pe | compressed_kv]` with dim 576 (rope_dim 64 + kv_lora_rank 512), not standard per-head KV.
-
-8. **Weight sharding peak RAM ~2TB:** Framework loads full state dict + 64 per-rank shards in memory. Python allocator doesn't return freed FP8 pages to OS. Requires NVMe swap.
-
-9. **TP=32 HBM OOM:** 256 experts all on every rank. Only intermediate dim is sharded, so each rank carries ~40GB at TP=32 vs 24GB HBM limit. Fixed by using TP=64.
+7. **TP=32 HBM OOM:** 256 experts on every rank. Each rank carries ~40GB at TP=32 vs 24GB HBM limit. Fixed by using TP=64 and LNC=2.
 
 ## vLLM Integration
 
@@ -335,24 +292,20 @@ VLLM_PLUGINS=neuron vllm serve /path/to/DeepSeek-V3-0324-FP8 \
     --additional-config '{"override_neuron_config": {"logical_nc_config": 2, "enable_bucketing": false, "save_sharded_checkpoint": true}}'
 ```
 
-**Critical:** `NEURON_COMPILED_ARTIFACTS` env var is required to reuse pre-compiled NEFFs. Without it, vLLM deletes the compiled artifacts directory on each startup.
+**Note:** `NEURON_COMPILED_ARTIFACTS` env var is required to reuse pre-compiled NEFFs. Without it, vLLM deletes the compiled artifacts directory on each startup.
 
-**Critical:** `--additional-config` with `logical_nc_config: 2` is required. Without it, compilation fails with NCC_IBIR297 internal error.
+**Note:** `--additional-config` with `logical_nc_config: 2` is required. Without it, compilation fails with NCC_IBIR297 internal error.
 
 ### Fast Startup Recipe
 
 1. Compile NEFFs (~2.5 min or 1s from cache)
 2. Kill vLLM immediately after "Finished Compilation for all HLOs"
-3. Symlink pre-sharded weights from Phase 8 to the artifacts dir
+3. Symlink pre-sharded weights from to the artifacts dir
 4. Restart vLLM with `NEURON_COMPILED_ARTIFACTS` — loads in ~8 min
-
-See `PLAN_deepseek_v3.md` Phase 11 for full details.
 
 ## Example Checkpoints
 
 - `deepseek-ai/DeepSeek-V3-0324` (FP8, 642GB, requires `trust_remote_code=True`)
-- Pre-sharded weights on S3: `s3://deepseek-v3-nxdi-artifacts/deepseek-v3-0324/sharded_weights/` (1.37TB, 64 per-rank files)
-- Compiled NEFFs on S3: `s3://deepseek-v3-nxdi-artifacts/deepseek-v3-0324/traced_model/` (96MB)
 
 ## Maintainer
 
