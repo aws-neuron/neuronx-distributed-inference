@@ -71,52 +71,34 @@ def _dequantize_fp8_state_dict(state_dict: dict, block_size: int = 128) -> dict:
     if not scale_inv_keys:
         return state_dict
 
-    total = len(scale_inv_keys)
-    logger.info("Dequantizing %d FP8 weights to BF16 (block_size=%d)...", total, block_size)
+    logger.info("Dequantizing %d FP8 weights to BF16 (block_size=%d)...", len(scale_inv_keys), block_size)
 
-    for idx, scale_key in enumerate(scale_inv_keys):
-        if idx % 1000 == 0 and idx > 0:
-            logger.info("  Dequantized %d/%d weights...", idx, total)
-            gc.collect()
+    for scale_key in scale_inv_keys:
         weight_key = scale_key.replace(".weight_scale_inv", ".weight")
         if weight_key not in state_dict:
+            del state_dict[scale_key]
             continue
 
         weight = state_dict[weight_key]
         scale_inv = state_dict[scale_key]
 
         if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-            # Already in a standard dtype, just remove the scale key
             del state_dict[scale_key]
             continue
 
         M, N = weight.shape
-        num_blocks_m = (M + block_size - 1) // block_size
-        num_blocks_n = (N + block_size - 1) // block_size
-
-        # Pad weight to block-aligned shape if needed
-        pad_m = num_blocks_m * block_size - M
-        pad_n = num_blocks_n * block_size - N
-        if pad_m or pad_n:
-            weight_f32 = torch.zeros(num_blocks_m * block_size, num_blocks_n * block_size, dtype=torch.float32)
-            weight_f32[:M, :N] = weight.to(torch.float32)
-        else:
-            weight_f32 = weight.to(torch.float32)
-
-        # Reshape to blocks and multiply by scale factors
-        # weight_f32: (num_blocks_m, block_size, num_blocks_n, block_size)
-        # scale_inv:  (num_blocks_m, num_blocks_n)
-        weight_f32 = weight_f32.view(num_blocks_m, block_size, num_blocks_n, block_size)
-        weight_f32 = weight_f32 * scale_inv[:num_blocks_m, :num_blocks_n].unsqueeze(1).unsqueeze(3)
-        weight_f32 = weight_f32.view(num_blocks_m * block_size, num_blocks_n * block_size)
-
-        state_dict[weight_key] = weight_f32[:M, :N].to(torch.bfloat16)
+        scales_expanded = (
+            scale_inv
+            .repeat_interleave(block_size, dim=0)
+            .repeat_interleave(block_size, dim=1)
+        )
+        scaled = weight.to(torch.float32) * scales_expanded[:M, :N].to(torch.float32)
+        state_dict[weight_key] = scaled.to(torch.bfloat16)
         del state_dict[scale_key]
 
-    # Remove any remaining scale_inv keys that didn't have matching weights
-    for key in list(state_dict.keys()):
-        if key.endswith(".weight_scale_inv"):
-            del state_dict[key]
+    # Remove any remaining orphan scale_inv keys
+    for key in [k for k in state_dict if k.endswith(".weight_scale_inv")]:
+        del state_dict[key]
 
     gc.collect()
     logger.info("FP8 dequantization complete.")

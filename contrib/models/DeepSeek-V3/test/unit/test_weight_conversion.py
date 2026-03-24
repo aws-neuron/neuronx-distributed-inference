@@ -195,5 +195,83 @@ class TestStateDictConversion(unittest.TestCase):
         torch.testing.assert_close(result["layers.0.mlp.shared_experts.gate_proj.weight"], original_shared_gate)
 
 
+class TestFP8Dequantization(unittest.TestCase):
+    """Tests for _dequantize_fp8_state_dict."""
+
+    def _make_fp8_state_dict(self, M=256, N=384, block_size=128, num_weights=3):
+        """Create a fake FP8 state dict with known scale factors."""
+        sd = {}
+        torch.manual_seed(42)
+        num_blocks_m = (M + block_size - 1) // block_size
+        num_blocks_n = (N + block_size - 1) // block_size
+        for i in range(num_weights):
+            # Create FP8 weight by casting from BF16
+            w_bf16 = torch.randn(M, N, dtype=torch.bfloat16) * 0.1
+            sd[f"layer.{i}.weight"] = w_bf16.to(torch.float8_e4m3fn)
+            sd[f"layer.{i}.weight_scale_inv"] = torch.rand(
+                num_blocks_m, num_blocks_n, dtype=torch.float32
+            ) + 0.5
+        return sd
+
+    def test_dequant_matches_reference(self):
+        """New repeat_interleave impl must match old reshape impl exactly."""
+        from src.modeling_deepseek import _dequantize_fp8_state_dict
+
+        block_size = 128
+        # Test with non-aligned dimensions to exercise the padding/slice path
+        for M, N in [(256, 384), (300, 500), (128, 128), (1, 200)]:
+            sd = self._make_fp8_state_dict(M=M, N=N, block_size=block_size)
+
+            # Reference: manual reshape approach (copy of old code)
+            sd_ref = {k: v.clone() for k, v in sd.items()}
+            for scale_key in [k for k in sd_ref if k.endswith(".weight_scale_inv")]:
+                weight_key = scale_key.replace(".weight_scale_inv", ".weight")
+                weight = sd_ref[weight_key]
+                scale_inv = sd_ref[scale_key]
+                Mw, Nw = weight.shape
+                nbm = (Mw + block_size - 1) // block_size
+                nbn = (Nw + block_size - 1) // block_size
+                w_f32 = torch.zeros(nbm * block_size, nbn * block_size, dtype=torch.float32)
+                w_f32[:Mw, :Nw] = weight.to(torch.float32)
+                w_f32 = w_f32.view(nbm, block_size, nbn, block_size)
+                w_f32 = w_f32 * scale_inv[:nbm, :nbn].unsqueeze(1).unsqueeze(3)
+                w_f32 = w_f32.view(nbm * block_size, nbn * block_size)
+                sd_ref[weight_key] = w_f32[:Mw, :Nw].to(torch.bfloat16)
+                del sd_ref[scale_key]
+
+            # New implementation
+            sd_new = {k: v.clone() for k, v in sd.items()}
+            _dequantize_fp8_state_dict(sd_new, block_size=block_size)
+
+            # Compare
+            for key in sd_ref:
+                if key.endswith(".weight"):
+                    torch.testing.assert_close(
+                        sd_new[key], sd_ref[key],
+                        msg=f"Mismatch at {key} for shape ({M}, {N})"
+                    )
+
+    def test_non_fp8_weights_unchanged(self):
+        """BF16 weights with scale_inv keys should be left alone (scale removed)."""
+        from src.modeling_deepseek import _dequantize_fp8_state_dict
+
+        sd = {
+            "layer.0.weight": torch.randn(64, 64, dtype=torch.bfloat16),
+            "layer.0.weight_scale_inv": torch.ones(1, 1, dtype=torch.float32),
+        }
+        original = sd["layer.0.weight"].clone()
+        _dequantize_fp8_state_dict(sd, block_size=128)
+        torch.testing.assert_close(sd["layer.0.weight"], original)
+        assert "layer.0.weight_scale_inv" not in sd
+
+    def test_empty_state_dict(self):
+        """No-op on state dict with no scale keys."""
+        from src.modeling_deepseek import _dequantize_fp8_state_dict
+
+        sd = {"layer.0.weight": torch.randn(64, 64)}
+        _dequantize_fp8_state_dict(sd, block_size=128)
+        assert "layer.0.weight" in sd
+
+
 if __name__ == "__main__":
     unittest.main()
