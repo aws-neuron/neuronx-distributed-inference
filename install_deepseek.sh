@@ -113,7 +113,6 @@ from neuronx_distributed_inference.models.deepseek.modeling_deepseek import (
     DeepseekV3Attention,
     DeepseekV3DenseMLP,
     DeepseekV3InferenceConfig,
-    DeepseekV3Router,
     NeuronDeepseekV3DecoderLayer,
     NeuronDeepseekV3ForCausalLM,
     NeuronDeepseekV3Model,

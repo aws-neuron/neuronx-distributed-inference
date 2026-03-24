@@ -50,15 +50,11 @@ from src.rope_util import (
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import manual_softmax
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
-from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module, initialize_moe_process_group
-from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
-from neuronx_distributed.modules.moe.model import MoE
-from neuronx_distributed.modules.moe.routing import RouterTopK
-from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig
-from neuronx_distributed.modules.moe.shared_experts import SharedExperts
-from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
+from neuronx_distributed.modules.moe.routing import GroupLimitedRouter
 from transformers import AutoModelForCausalLM
 from transformers.activations import ACT2FN
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +131,7 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
     0. Dequantize FP8 weights to BF16 (if present)
     1. Add rank utility tensors for TP sharding
     2. Rename router weights: gate.weight -> router.linear_router.weight
-    3. Rename e_score_correction_bias for custom router (Phase 3)
+    3. Rename e_score_correction_bias -> router.e_score_correction_bias
     4. Fuse gate_proj + up_proj into gate_up_proj for each expert
     5. Stack down_proj weights across experts
     6. Skip dense layers (first_k_dense_replace layers)
@@ -179,7 +175,7 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
             )
             del state_dict[router_key]
 
-        # Rename e_score_correction_bias for the custom router
+        # Rename e_score_correction_bias for GroupLimitedRouter
         bias_key = f"layers.{layer_idx}.mlp.gate.e_score_correction_bias"
         if bias_key in state_dict:
             state_dict[f"layers.{layer_idx}.mlp.router.e_score_correction_bias"] = (
@@ -242,6 +238,45 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
 class DeepseekV3NeuronConfig(MoENeuronConfig):
     """Neuron hardware configuration for DeepSeek V3 MoE model."""
     pass
+
+
+class DeepseekV3Router(GroupLimitedRouter):
+    """
+    GroupLimitedRouter with DeepSeek V3's routed_scaling_factor.
+
+    After group-limited top-k selection, the selected affinities are
+    L1-normalized and then scaled by routed_scaling_factor (2.5).
+    This replaces the normalize_top_k_affinities step in ExpertMLPsV2,
+    so the config must set normalize_top_k_affinities=False.
+    """
+
+    def __init__(self, routed_scaling_factor: float = 2.5, **kwargs):
+        super().__init__(**kwargs)
+        self.routed_scaling_factor = routed_scaling_factor
+        # e_score_correction_bias is a trained parameter loaded from checkpoint.
+        # GroupLimitedRouter references it in noaux_tc_top_k but doesn't register it.
+        self.e_score_correction_bias = nn.Parameter(
+            torch.zeros(self.num_experts, dtype=torch.float32)
+        )
+
+    def forward(self, hidden_states):
+        router_logits = self.get_router_logits(hidden_states)
+        expert_affinities = self.apply_activation_fn(router_logits)
+        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
+
+        topk_idx, _ = self.noaux_tc_top_k(expert_affinities)
+        topk_idx = topk_idx.detach().to(dtype=torch.long)
+
+        # Gather affinities for selected experts, normalize, and scale
+        topk_weights = expert_affinities.gather(1, topk_idx)  # (T, top_k)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights * self.routed_scaling_factor
+
+        # Scatter back to dense (T, E) layout for ExpertMLPsV2
+        expert_affinities_scaled = torch.zeros_like(expert_affinities)
+        expert_affinities_scaled.scatter_(1, topk_idx, topk_weights)
+
+        return router_logits, expert_affinities_scaled, topk_idx
 
 
 class DeepseekV3InferenceConfig(InferenceConfig):
@@ -307,7 +342,8 @@ class DeepseekV3InferenceConfig(InferenceConfig):
         if hasattr(self.neuron_config, "router_config"):
             self.neuron_config.router_config.dtype = torch.float32
             self.neuron_config.router_config.act_fn = "sigmoid"
-            self.neuron_config.normalize_top_k_affinities = True
+            # Normalization + scaling is handled by DeepseekV3Router, not ExpertMLPsV2
+            self.neuron_config.normalize_top_k_affinities = False
 
         # Disable numeric CC token (workaround for all-gather/reduce-scatter)
         self.neuron_config.disable_numeric_cc_token = True
@@ -343,24 +379,7 @@ def get_rmsnorm_cls():
     # Initialize to the appropriate implementation of RMSNorm
     # If infer on NXD -> CustomRMSNorm
     # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
-    return DeepseekV3RMSNorm if cpu_mode() else CustomRMSNorm
-
-
-class DeepseekV3RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        DeepseekV3RMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+    return LlamaRMSNorm if cpu_mode() else CustomRMSNorm
 
 
 def custom_compiler_args():
@@ -413,170 +432,6 @@ class DeepseekV3DenseMLP(nn.Module):
             self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
         )
         return (output,)
-
-
-class DeepseekV3Router(RouterTopK):
-    """Router with group-based expert selection for DeepSeek V3.
-
-    DeepSeek V3 uses noaux_tc routing with group-based selection:
-    1. Compute sigmoid(logits) as affinities
-    2. Add e_score_correction_bias for expert SELECTION only
-    3. Group experts (n_group groups), score each group by top-2 sum
-    4. Select top topk_group groups, mask non-selected groups
-    5. Select top-K experts from masked scores
-    6. Gather weights from ORIGINAL affinities (no bias), normalize, scale
-    """
-
-    def __init__(self, n_group=8, topk_group=4, routed_scaling_factor=2.5,
-                 norm_topk_prob=True, **kwargs):
-        super().__init__(**kwargs)
-        self.n_group = n_group
-        self.topk_group = topk_group
-        self.routed_scaling_factor = routed_scaling_factor
-        self.norm_topk_prob = norm_topk_prob
-        self.e_score_correction_bias = nn.Parameter(
-            torch.zeros(kwargs["num_experts"], dtype=kwargs.get("dtype", torch.float32))
-        )
-
-    def forward(self, hidden_states):
-        router_logits = self.get_router_logits(hidden_states)
-        expert_affinities = self.apply_activation_fn(router_logits)
-
-        # Add bias for selection only
-        scores_for_choice = expert_affinities + self.e_score_correction_bias.unsqueeze(0)
-
-        # Group-based selection using compiler-compatible 2-topk pattern.
-        # (3 chained topk ops trigger unsupported sort HLO on trn2, so we use
-        # sum for group scoring instead of topk(2).sum, and gather+reshape+topk
-        # instead of scatter+mask+topk.)
-        experts_per_group = self.num_experts // self.n_group
-        grouped_scores = scores_for_choice.view(-1, self.n_group, experts_per_group)
-
-        # Score each group by sum of its expert scores (approximates topk(2).sum)
-        group_scores = grouped_scores.sum(dim=-1)  # (T, n_group)
-
-        # Select top topk_group groups, then gather their expert scores
-        _, group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=True)
-        # group_idx: (T, topk_group)
-        selected_groups = torch.gather(
-            grouped_scores, 1,
-            group_idx.unsqueeze(-1).expand(-1, -1, experts_per_group)
-        )  # (T, topk_group, experts_per_group)
-
-        # Flatten selected groups and pick top-K experts within them
-        flat_scores = selected_groups.reshape(-1, self.topk_group * experts_per_group)
-        _, flat_expert_idx = torch.topk(flat_scores, k=self.top_k, dim=-1, sorted=True)
-
-        # Map flat indices back to global expert indices:
-        # flat_expert_idx values are in [0, topk_group * experts_per_group).
-        # Convert to (which_selected_group, offset_within_group), then to global index.
-        selected_group_ord = flat_expert_idx // experts_per_group  # which of the topk selected groups
-        within_group_offset = flat_expert_idx % experts_per_group
-        # Map selected_group_ord -> actual group index via group_idx
-        actual_group = torch.gather(group_idx, 1, selected_group_ord)
-        expert_index = actual_group * experts_per_group + within_group_offset
-
-        # Gather weights from ORIGINAL affinities (no bias), normalize, scale
-        topk_weights = expert_affinities.gather(1, expert_index)
-        if self.norm_topk_prob and self.top_k > 1:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        topk_weights = topk_weights * self.routed_scaling_factor
-
-        # Write normalized+scaled affinities back to full tensor
-        expert_affinities = torch.zeros_like(expert_affinities)
-        expert_affinities.scatter_(1, expert_index, topk_weights)
-
-        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
-        expert_index = expert_index.detach().to(dtype=torch.long)
-        return router_logits, expert_affinities, expert_index
-
-
-def _build_deepseek_moe(config: "DeepseekV3InferenceConfig"):
-    """Build MoE module with DeepSeek V3's group-based routing."""
-    enabled_hybrid_sharding = config.neuron_config.hybrid_sharding_config is not None
-    (moe_tkg_tensor_model_parallel_group, moe_tkg_expert_model_parallel_group,
-     moe_cte_tensor_model_parallel_group, moe_cte_expert_model_parallel_group) = \
-        initialize_moe_process_group(config, enabled_hybrid_sharding)
-
-    router = DeepseekV3Router(
-        n_group=getattr(config, "n_group", 8),
-        topk_group=getattr(config, "topk_group", 4),
-        routed_scaling_factor=getattr(config, "routed_scaling_factor", 2.5),
-        norm_topk_prob=getattr(config, "norm_topk_prob", True),
-        num_experts=config.num_local_experts,
-        top_k=config.num_experts_per_tok,
-        hidden_size=config.hidden_size,
-        dtype=config.neuron_config.router_config.dtype,
-        act_fn=config.neuron_config.router_config.act_fn,
-        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
-        sequence_dimension=1,
-    )
-
-    hidden_size_actual = getattr(config, "original_hidden_size", None)
-    intermediate_size_actual = getattr(config, "original_intermediate_size", None)
-
-    expert_mlps = ExpertMLPsV2(
-        routed_experts_mlp_config=RoutedExpertsMLPOpsConfig(
-            num_experts=config.num_local_experts,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_size_actual=hidden_size_actual,
-            intermediate_size_actual=intermediate_size_actual,
-            is_hidden_dim_shuffled=config.neuron_config.is_hidden_dim_shuffled,
-            is_intermediate_dim_shuffled=config.neuron_config.is_intermediate_dim_shuffled,
-            top_k=config.num_experts_per_tok,
-            hidden_act=config.hidden_act,
-            glu_mlp=config.neuron_config.glu_mlp,
-            glu_type=config.neuron_config.glu_type,
-            hidden_act_scaling_factor=config.neuron_config.hidden_act_scaling_factor,
-            hidden_act_bias=config.neuron_config.hidden_act_bias,
-            use_index_calc_kernel=config.neuron_config.use_index_calc_kernel,
-            gate_clamp_upper_limit=config.neuron_config.gate_clamp_upper_limit,
-            gate_clamp_lower_limit=config.neuron_config.gate_clamp_lower_limit,
-            up_clamp_upper_limit=config.neuron_config.up_clamp_upper_limit,
-            up_clamp_lower_limit=config.neuron_config.up_clamp_lower_limit,
-            early_expert_affinity_modulation=config.neuron_config.early_expert_affinity_modulation,
-            normalize_top_k_affinities=False,  # Router handles normalization+scaling
-            enable_spmd_rank=config.neuron_config.blockwise_matmul_config.parallelize_token_to_block_mapping,
-        ),
-        blockwise_matmul_config=config.neuron_config.blockwise_matmul_config,
-        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
-        dtype=config.neuron_config.torch_dtype,
-        is_prefill=config.neuron_config.is_prefill_stage,
-        enabled_hybrid_sharding=enabled_hybrid_sharding,
-        tensor_model_parallel_group=parallel_state.get_tensor_model_parallel_group(),
-        expert_model_parallel_group=parallel_state.get_expert_model_parallel_group(),
-        cte_tensor_model_parallel_group=moe_cte_tensor_model_parallel_group,
-        cte_expert_model_parallel_group=moe_cte_expert_model_parallel_group,
-        tkg_tensor_model_parallel_group=moe_tkg_tensor_model_parallel_group,
-        tkg_expert_model_parallel_group=moe_tkg_expert_model_parallel_group,
-    )
-
-    shared_experts = None
-    if config.n_shared_experts:
-        shared_experts = SharedExperts(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            num_shared_experts=config.n_shared_experts,
-            hidden_act=config.hidden_act,
-            dtype=config.neuron_config.torch_dtype,
-            reduce_dtype=config.neuron_config.rpl_reduce_dtype,
-            fused_gate_up_projection=config.neuron_config.fused_shared_experts,
-            sequence_parallel_enabled=config.neuron_config.shared_experts_sequence_parallel_enabled,
-            transpose_weights=config.neuron_config.transpose_shared_experts_weights,
-        )
-
-    moe = MoE(
-        router=router,
-        expert_mlps=expert_mlps,
-        shared_experts=shared_experts,
-        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
-        return_expert_index=config.neuron_config.return_expert_index,
-        return_router_logits=config.neuron_config.return_router_logits,
-        sequence_dimension=1,
-    )
-    moe.eval()
-    return moe
 
 
 class DeepseekV3Attention(NeuronAttentionBase):
@@ -831,7 +686,7 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
         self.is_dense_layer = layer_idx < getattr(config, "first_k_dense_replace", 3)
 
         self.self_attn = DeepseekV3Attention(config=config, layer_idx=layer_idx)
-        self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
+        self.moe_fused_nki_kernel_enabled = getattr(config.neuron_config, "moe_fused_nki_kernel_enabled", False)
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
@@ -849,7 +704,21 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
                 config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
             )
         else:
-            self.mlp = _build_deepseek_moe(config)
+            self.mlp = initialize_moe_module(config=config)
+
+        # Swap in DeepseekV3Router (GroupLimitedRouter + routed_scaling_factor)
+        if not self.is_dense_layer:
+            self.mlp.router = DeepseekV3Router(
+                routed_scaling_factor=getattr(config, "routed_scaling_factor", 2.5),
+                num_experts=config.num_local_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                n_group=getattr(config, "n_group", 8),
+                topk_group=getattr(config, "topk_group", 4),
+                dtype=config.neuron_config.router_config.dtype,
+                sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+                sequence_dimension=1,
+            )
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
@@ -987,7 +856,7 @@ class NeuronDeepseekV3ForCausalLM(NeuronBaseForCausalLM):
         return convert_deepseek_v3_hf_to_neuron_state_dict(state_dict, config)
 
     def get_compiler_args(self):
-        """Return None to use framework defaults (matching Moonlight pattern).
+        """Return None to use framework defaults.
 
         The framework's ModelWrapper builds platform-appropriate compiler args
         including --lnc, --vectorize-strided-dma, optimization levels, etc.
