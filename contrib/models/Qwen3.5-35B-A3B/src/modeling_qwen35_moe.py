@@ -851,6 +851,31 @@ class Qwen35MoeInferenceConfig(InferenceConfig):
         self.neuron_config.disable_numeric_cc_token = True
         self.neuron_config.normalize_top_k_affinities = True
 
+    def add_derived_config(self):
+        """Promote text_config fields before validation.
+
+        When loaded via vLLM, the HF config has a multimodal-style layout
+        where model fields live inside text_config rather than at the top
+        level. This method promotes them so that validate_config() and the
+        rest of the model can access them as direct attributes.
+        """
+        if hasattr(self, "text_config") and not hasattr(self, "hidden_size"):
+            tc = self.text_config
+            for attr in dir(tc):
+                if not attr.startswith("_") and not hasattr(self, attr):
+                    setattr(self, attr, getattr(tc, attr))
+
+        # rope_theta lives inside rope_parameters in the HF config
+        if not hasattr(self, "rope_theta"):
+            rope_params = getattr(self, "rope_parameters", None)
+            if rope_params is not None:
+                if isinstance(rope_params, dict):
+                    self.rope_theta = rope_params.get("rope_theta", 10000000)
+                else:
+                    self.rope_theta = getattr(rope_params, "rope_theta", 10000000)
+
+        super().add_derived_config()
+
     def maybe_pad_intermediate(self):
         moe_tp_degree = self.neuron_config.moe_tp_degree
         I_TP = self.moe_intermediate_size // moe_tp_degree
