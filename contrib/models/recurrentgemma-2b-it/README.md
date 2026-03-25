@@ -40,6 +40,25 @@ NeuronX Distributed Inference implementation of recurrentgemma 2b it.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-20
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.20 | 0.00 |
+| MBU (%) | 0.47 | 0.62 |
+| HFU (%) | 0.21 | 0.00 |
+| Execution Time (us) | 0.03 | 0.02 |
+| HBM Read | 5.41 GB | 5.37 GB |
+| HBM Write | 44.76 MB | 1.11 MB |
+
+**Throughput:** 34.13 tok/s | **Compile Time:** 133.12s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -104,6 +123,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

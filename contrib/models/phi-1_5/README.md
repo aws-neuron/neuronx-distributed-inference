@@ -95,6 +95,25 @@ mlp_output = self.mlp(hidden_states)
 hidden_states = residual + attn_output + mlp_output
 ```
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.07 | 0.00 |
+| MBU (%) | 0.42 | 0.54 |
+| HFU (%) | 0.08 | 0.00 |
+| Execution Time (us) | 0.02 | 0.01 |
+| HBM Read | 3.87 GB | 1.33 GB |
+| HBM Write | 55.34 MB | 798.9 KB |
+
+**Throughput:** 43.13 tok/s | **Compile Time:** 172.73s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python

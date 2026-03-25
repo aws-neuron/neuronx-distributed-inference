@@ -35,6 +35,25 @@ NeuronX Distributed Inference implementation of Seed OSS 36B Instruct.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=8, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.38 | 0.00 |
+| MBU (%) | 0.21 | 0.60 |
+| HFU (%) | 0.40 | 0.01 |
+| Execution Time (us) | 0.13 | 0.04 |
+| HBM Read | 9.92 GB | 8.87 GB |
+| HBM Write | 1.06 GB | 5.78 MB |
+
+**Throughput:** 7.59 tok/s | **Compile Time:** 1007.27s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -99,6 +118,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

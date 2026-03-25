@@ -37,6 +37,25 @@ NeuronX Distributed Inference implementation of VaultGemma 1B.
 
 **Status:** ✅ VALIDATED
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-21
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.24 | 0.00 |
+| MBU (%) | 0.58 | 0.51 |
+| HFU (%) | 0.25 | 0.00 |
+| Execution Time (us) | 0.01 | 0.01 |
+| HBM Read | 2.08 GB | 2.09 GB |
+| HBM Write | 14.12 MB | 106.5 KB |
+
+**Throughput:** 106.83 tok/s | **Compile Time:** 194.46s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python

@@ -13,25 +13,47 @@ NeuronX Distributed Inference implementation of Falcon H1 0.5B Instruct.
 
 ## Validation Results
 
-**Validated:** 2026-01-29  
-**Configuration:** TP=0, batch_size=None, seq_len=None, None
+**Validated:** 2026-02-06  
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
 
 ### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
-| Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ LOW | **45.0% match** |
-| Throughput | ⚠️ SLOW | 9.00 tok/s (threshold: 10 tok/s) |
+| Smoke Test | ✅ PASS | Model compiles and loads |
+| Token Matching | ❌ FAIL | **0% match** (Mamba SSM implementation needs work) |
 
-### Performance Metrics
+**Status:** ⚠️ NEEDS WORK
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 9.00 tokens/s |
+### Notes
 
+This is a Mamba2 + Attention hybrid model with complex SSM (State Space Model) computation.
+The current implementation compiles but produces incorrect outputs due to differences in the
+Mamba SSM computation between the HuggingFace implementation and the NeuronX port.
 
-**Status:** ⚠️ VALIDATED
+**Known Issues:**
+- Mamba SSM chunked computation not matching HuggingFace exactly
+- MuP (Maximal Update Parameterization) multipliers may need verification
+- Complex state management for SSM not fully implemented
+
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.00 | 0.00 |
+| MBU (%) | 0.01 | 0.27 |
+| HFU (%) | 0.01 | 0.01 |
+| Execution Time (us) | 0.15 | 0.01 |
+| HBM Read | 576.79 MB | 553.79 MB |
+| HBM Write | 104.68 MB | 3.26 MB |
+
+**Throughput:** 7.37 tok/s | **Compile Time:** 357.80s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
 
 ## Usage
 
@@ -97,6 +119,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-06

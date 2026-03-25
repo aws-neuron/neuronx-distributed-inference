@@ -35,6 +35,25 @@ NeuronX Distributed Inference implementation of Ministral 4b instruct.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.42 | 0.00 |
+| MBU (%) | 0.23 | 0.61 |
+| HFU (%) | 0.45 | 0.00 |
+| Execution Time (us) | 0.06 | 0.02 |
+| HBM Read | 4.81 GB | 4.33 GB |
+| HBM Write | 478.84 MB | 2.40 MB |
+
+**Throughput:** 17.24 tok/s | **Compile Time:** 254.38s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -99,6 +118,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

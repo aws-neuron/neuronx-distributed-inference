@@ -35,6 +35,25 @@ NeuronX Distributed Inference implementation of internlm3 8b instruct.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-20
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.35 | 0.00 |
+| MBU (%) | 0.19 | 0.59 |
+| HFU (%) | 0.37 | 0.00 |
+| Execution Time (us) | 0.13 | 0.03 |
+| HBM Read | 9.01 GB | 8.30 GB |
+| HBM Write | 668.06 MB | 4.57 MB |
+
+**Throughput:** 8.95 tok/s | **Compile Time:** 275.75s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -99,6 +118,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

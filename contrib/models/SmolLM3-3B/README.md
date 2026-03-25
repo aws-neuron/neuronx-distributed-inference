@@ -30,6 +30,25 @@ NeuronX Distributed Inference implementation of SmolLM3 3B.
 
 **Status:** ✅ VALIDATED
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.14 | 0.00 |
+| MBU (%) | 0.28 | 0.30 |
+| HFU (%) | 0.15 | 0.00 |
+| Execution Time (us) | 0.03 | 0.03 |
+| HBM Read | 3.11 GB | 3.08 GB |
+| HBM Write | 34.54 MB | 2.50 MB |
+
+**Throughput:** 34.40 tok/s | **Compile Time:** 267.18s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python

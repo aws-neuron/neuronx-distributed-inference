@@ -12,13 +12,11 @@ NeuronX Distributed Inference implementation of Ovis2.5 9B.
 
 ## Architecture Details
 
-- **Type:** Multimodal (vision-language) model — text backbone validated only
-- **Text Backbone:** Decoder-only transformer
-- **Layers:** See model config
-- **Hidden Size:** See model config
-- **Attention Heads:** See model config
-- **Vocabulary:** See model config
-- **Max Position Embeddings:** See model config
+- **Layers:** Check model config
+- **Hidden Size:** Check model config
+- **Attention Heads:** Check model config
+- **Vocabulary:** Check model config
+- **Max Position Embeddings:** Check model config
 
 ## Validation Results
 
@@ -30,7 +28,7 @@ NeuronX Distributed Inference implementation of Ovis2.5 9B.
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ✅ PASS | **100% match** (text backbone) |
+| Token Matching | ⚠️ N/A | **0.0% match** |
 | TTFT (P50) | ✅ PASS | 32.92ms (threshold: 100ms) |
 | Throughput | ✅ PASS | 30.03 tok/s (threshold: 10 tok/s) |
 
@@ -41,11 +39,27 @@ NeuronX Distributed Inference implementation of Ovis2.5 9B.
 | TTFT (P50) | 32.92ms |
 | Throughput | 30.03 tokens/s |
 
+
 **Status:** ✅ VALIDATED
 
-### Multimodal Validation Notes
+### Device Profiling Metrics
 
-Ovis2.5 is a vision-language model. The NeuronX port validates the text backbone only. `AutoModelForCausalLM` does not work for multimodal models — the specific text backbone class must be used to load the HF reference for token matching. With the correct text backbone extraction, the model achieves 100% token match.
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-21
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.27 | 0.00 |
+| MBU (%) | 0.54 | 0.59 |
+| HFU (%) | 0.31 | 0.03 |
+| Execution Time (us) | 0.04 | 0.03 |
+| HBM Read | 7.72 GB | 7.58 GB |
+| HBM Write | 129.44 MB | 3.49 MB |
+
+**Throughput:** 27.36 tok/s | **Compile Time:** 412.67s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
 
 ## Usage
 

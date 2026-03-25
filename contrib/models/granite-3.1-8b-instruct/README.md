@@ -63,6 +63,25 @@ This implementation includes critical fixes for Granite's custom scaling:
 
 4. **Residual Multiplier**: Applied in `NeuronGraniteDecoderLayer` to scale residual connections.
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.29 | 0.00 |
+| MBU (%) | 0.54 | 0.61 |
+| HFU (%) | 0.31 | 0.01 |
+| Execution Time (us) | 0.04 | 0.03 |
+| HBM Read | 8.30 GB | 8.19 GB |
+| HBM Write | 100.60 MB | 3.28 MB |
+
+**Throughput:** 25.37 tok/s | **Compile Time:** 317.64s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python

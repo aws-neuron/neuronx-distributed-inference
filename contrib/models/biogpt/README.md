@@ -26,6 +26,25 @@ NeuronX Distributed Inference implementation of biogpt.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.34 | 0.00 |
+| MBU (%) | 0.19 | 0.38 |
+| HFU (%) | 0.40 | 0.03 |
+| Execution Time (us) | 0.01 | 0.00 |
+| HBM Read | 749.99 MB | 741.80 MB |
+| HBM Write | 102.14 MB | 317.0 KB |
+
+**Throughput:** 87.29 tok/s | **Compile Time:** 98.19s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -90,6 +109,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29
