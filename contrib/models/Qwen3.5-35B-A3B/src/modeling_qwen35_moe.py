@@ -487,6 +487,10 @@ class NeuronGatedDeltaNet(nn.Module):
         # Determine mode: context encoding (prefill) vs token generation (decode)
         is_decode = past_key_value is not None
 
+        # Extract seq_ids from kwargs (passed by decoder layer from get_model_output).
+        # seq_ids maps each element in the current batch to its slot in the state buffer.
+        seq_ids = kwargs.get("seq_ids", None)
+
         # --- Mask padding tokens for DeltaNet ---
         # NxDI passes attention_mask as BOOLEAN (B, 1, S, S) where True=valid, False=pad.
         # DeltaNet has no attention mask in its recurrence -- padding tokens contaminate
@@ -544,7 +548,10 @@ class NeuronGatedDeltaNet(nn.Module):
             # We need 4 consecutive values for conv1d kernel_size=4.
             # Build window: [conv_state[:, :, 0:3], new_token] = (B, 8192, 4)
             # Slice to actual batch_size (buffer may be alloc_batch_size > batch_size)
-            conv_state = self.conv_state_buffer[:batch_size]  # (B, 8192, 3)
+            if seq_ids is not None:
+                conv_state = torch.index_select(self.conv_state_buffer, 0, seq_ids)  # (B, 8192, 3)
+            else:
+                conv_state = self.conv_state_buffer[:batch_size]  # (B, 8192, 3)
             conv_input = torch.cat([conv_state, mixed], dim=-1)  # (B, 8192, 4)
 
             # Apply depthwise conv1d manually (kernel_size=4, groups=conv_dim):
@@ -563,9 +570,12 @@ class NeuronGatedDeltaNet(nn.Module):
             new_conv_state = torch.cat(
                 [conv_state[:, :, 1:], mixed], dim=-1
             )  # (B, 8192, 3)
-            # Pad to alloc_batch_size and touch full buffer for alias
+            # Scatter updated state back to correct buffer slots using seq_ids.
             alloc_bs = self.conv_state_buffer.shape[0]
-            if batch_size < alloc_bs:
+            if seq_ids is not None:
+                idx = seq_ids.view(-1, 1, 1).expand_as(new_conv_state)
+                new_conv_state = (self.conv_state_buffer * 1).scatter(0, idx, new_conv_state)
+            elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
                 new_conv_state = torch.cat(
                     [
@@ -613,9 +623,12 @@ class NeuronGatedDeltaNet(nn.Module):
             # padding), but the alias requires the parameter to be part of the
             # traced graph. Adding * 0 ensures the old buffer is read but has
             # no numeric effect on new_conv_state.
-            # Pad new_conv_state to alloc_batch_size for alias compatibility.
+            # Scatter new_conv_state to correct buffer slots using seq_ids.
             alloc_bs = self.conv_state_buffer.shape[0]
-            if batch_size < alloc_bs:
+            if seq_ids is not None:
+                idx = seq_ids.view(-1, 1, 1).expand_as(new_conv_state)
+                new_conv_state = (self.conv_state_buffer * 1).scatter(0, idx, new_conv_state)
+            elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
                 new_conv_state = torch.cat(
                     [
@@ -630,7 +643,9 @@ class NeuronGatedDeltaNet(nn.Module):
                     ],
                     dim=0,
                 )
-            new_conv_state = new_conv_state + self.conv_state_buffer * 0
+                new_conv_state = new_conv_state + self.conv_state_buffer * 0
+            else:
+                new_conv_state = new_conv_state + self.conv_state_buffer * 0
 
         mixed_post_conv = mixed_post_conv.transpose(
             1, 2
@@ -681,13 +696,19 @@ class NeuronGatedDeltaNet(nn.Module):
         if is_decode:
             # Load recurrent state from buffer (bf16 -> f32)
             # Slice to actual batch_size (buffer may be alloc_batch_size > batch_size)
-            recurrent_state = self.recurrent_state_buffer[:batch_size].float()
+            if seq_ids is not None:
+                recurrent_state = torch.index_select(self.recurrent_state_buffer, 0, seq_ids).float()
+            else:
+                recurrent_state = self.recurrent_state_buffer[:batch_size].float()
             output, new_recurrent_state = self._recurrent_step(
                 query, key, value, g, beta, recurrent_state
             )
-            # Pad to alloc_batch_size and touch full buffer for alias
+            # Scatter updated state back to correct buffer slots using seq_ids.
             alloc_bs = self.recurrent_state_buffer.shape[0]
-            if batch_size < alloc_bs:
+            if seq_ids is not None:
+                idx = seq_ids.view(-1, 1, 1, 1).expand_as(new_recurrent_state)
+                new_recurrent_state = (self.recurrent_state_buffer.float() * 1).scatter(0, idx, new_recurrent_state)
+            elif batch_size < alloc_bs:
                 new_recurrent_state = torch.cat(
                     [
                         new_recurrent_state,
@@ -711,9 +732,12 @@ class NeuronGatedDeltaNet(nn.Module):
             # During CTE, we don't USE the old state (NKI kernel starts from zero),
             # but the alias requires the parameter to be part of the traced graph.
             # Adding * 0 ensures the old buffer is read but has no numeric effect.
-            # Pad to alloc_batch_size for alias compatibility.
+            # Scatter new_recurrent_state to correct buffer slots using seq_ids.
             alloc_bs = self.recurrent_state_buffer.shape[0]
-            if batch_size < alloc_bs:
+            if seq_ids is not None:
+                idx = seq_ids.view(-1, 1, 1, 1).expand_as(new_recurrent_state)
+                new_recurrent_state = (self.recurrent_state_buffer.float() * 1).scatter(0, idx, new_recurrent_state)
+            elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
                 new_recurrent_state = torch.cat(
                     [
@@ -729,9 +753,13 @@ class NeuronGatedDeltaNet(nn.Module):
                     ],
                     dim=0,
                 )
-            new_recurrent_state = (
-                new_recurrent_state + self.recurrent_state_buffer.float() * 0
-            )
+                new_recurrent_state = (
+                    new_recurrent_state + self.recurrent_state_buffer.float() * 0
+                )
+            else:
+                new_recurrent_state = (
+                    new_recurrent_state + self.recurrent_state_buffer.float() * 0
+                )
 
         # Cast recurrent state back to storage dtype (f32 -> bf16)
         new_recurrent_state = new_recurrent_state.to(hidden_states.dtype)

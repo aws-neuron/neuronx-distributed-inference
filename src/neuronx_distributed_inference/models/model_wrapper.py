@@ -786,14 +786,26 @@ class ModelWrapper(torch.nn.Module):
                     and arg.numel() > 0
                     and arg.shape[0] > 0
                 ):
-                    # Batched tensor -- pad along dim 0
-                    padded_args.append(
-                        pad_helper(
-                            arg,
-                            pad_type="repeat_first_batchline",
-                            batch_sort_indices=indices,
+                    # Batched tensor -- pad along dim 0.
+                    # 1D tensors (e.g. prev_hidden=[B], adapter_ids=[B]) must
+                    # stay 1D after padding. pad_helper's repeat_first_batchline
+                    # does tensor[0].unsqueeze(0).repeat(N, 1) which converts
+                    # 1D [B] -> 2D [target_bs, 1] instead of [target_bs].
+                    # Handle 1D directly with zero-fill to preserve shape.
+                    if arg.dim() == 1:
+                        padded = torch.zeros(target_bs, dtype=arg.dtype)
+                        padded[: arg.shape[0]] = arg
+                        if indices is not None:
+                            padded = torch.index_select(padded, 0, indices)
+                        padded_args.append(padded)
+                    else:
+                        padded_args.append(
+                            pad_helper(
+                                arg,
+                                pad_type="repeat_first_batchline",
+                                batch_sort_indices=indices,
+                            )
                         )
-                    )
                 else:
                     # Empty tensor or scalar -- pass through as-is
                     padded_args.append(arg)
