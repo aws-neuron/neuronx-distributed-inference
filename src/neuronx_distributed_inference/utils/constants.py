@@ -13,7 +13,6 @@ from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
 from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl_vision import NeuronQwen3VLForImageEncoding
 from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl import NeuronQwen3VLForCausalLM
-from neuronx_distributed_inference.models.deepseek.modeling_deepseek import NeuronDeepseekV3ForCausalLM
 from neuronx_distributed_inference.models.pixtral.modeling_pixtral import NeuronPixtralForCausalLM
 from neuronx_distributed_inference.models.pixtral.modeling_pixtral_vision import NeuronPixtralForImageEncoding
 
@@ -62,5 +61,4 @@ MODEL_TYPES = {
     "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
     "qwen3_vl": {"causal-lm": NeuronQwen3VLForCausalLM,
                  "image-encoding": NeuronQwen3VLForImageEncoding},
-    "deepseek_v3": {"causal-lm": NeuronDeepseekV3ForCausalLM},
 }

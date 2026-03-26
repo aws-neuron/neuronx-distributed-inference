@@ -1,13 +1,14 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for DeepseekV3Router (group-based expert selection).
 
 Tests the custom router against a pure-PyTorch reference implementation
-matching the compiler-compatible group selection algorithm.
-
-Note: Our router uses sum-based group scoring (instead of topk(2).sum) and
-gather-based expert selection (instead of scatter/mask/topk) for compiler
-compatibility. This produces different results from the HF reference on
-edge cases but is equivalent for the common case where group differences
-are well-separated.
+matching the GroupLimitedRouter.noaux_tc_top_k algorithm:
+  1. Sigmoid activation in fp64
+  2. Group scoring via topk(k=2).sum per group
+  3. Mask-then-topk expert selection
+  4. L1 normalization + routed_scaling_factor
 """
 
 import pytest
@@ -17,51 +18,49 @@ from torch import nn
 from unittest.mock import patch
 
 
-class ReferenceCompilerCompatRouter(nn.Module):
-    """Reference implementation matching our compiler-compatible algorithm exactly."""
+class ReferenceGroupLimitedRouter(nn.Module):
+    """Reference matching GroupLimitedRouter.noaux_tc_top_k + DeepseekV3Router.forward."""
 
     def __init__(self, num_experts, top_k, hidden_size, n_group, topk_group,
-                 routed_scaling_factor, norm_topk_prob):
+                 routed_scaling_factor):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.n_group = n_group
         self.topk_group = topk_group
         self.routed_scaling_factor = routed_scaling_factor
-        self.norm_topk_prob = norm_topk_prob
         self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
         self.e_score_correction_bias = nn.Parameter(torch.zeros(num_experts))
 
     def forward(self, hidden_states):
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        router_logits = F.linear(hidden_states.float(), self.weight.float())
-        scores = router_logits.sigmoid()
-
-        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        batch_size = hidden_states.shape[0]
         experts_per_group = self.num_experts // self.n_group
-        grouped_scores = scores_for_choice.view(-1, self.n_group, experts_per_group)
 
-        # Sum-based group scoring (compiler-compatible approximation)
-        group_scores = grouped_scores.sum(dim=-1)
+        # RouterBase: linear + sigmoid in fp64
+        router_logits = F.linear(hidden_states.float(), self.weight.float())
+        scores = torch.sigmoid(router_logits.to(torch.float64)).to(hidden_states.dtype)
 
-        # Select top groups, gather their scores, flatten, select top-K
-        _, group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=True)
-        selected_groups = torch.gather(
-            grouped_scores, 1,
-            group_idx.unsqueeze(-1).expand(-1, -1, experts_per_group)
+        # noaux_tc_top_k: add bias, group score = topk(k=2).sum per group
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        group_scores = torch.topk(
+            scores_for_choice.view(batch_size, self.n_group, -1), k=2
+        )[0].sum(dim=-1)
+
+        # Select top groups, build mask, mask-then-topk
+        group_idx = torch.topk(group_scores, k=self.topk_group)[1]
+        group_mask = torch.scatter(
+            input=torch.zeros_like(group_scores), dim=1,
+            index=group_idx, src=torch.ones_like(group_scores),
         )
-        flat_scores = selected_groups.reshape(-1, self.topk_group * experts_per_group)
-        _, flat_expert_idx = torch.topk(flat_scores, k=self.top_k, dim=-1, sorted=True)
+        score_mask = group_mask.unsqueeze(-1).expand(
+            batch_size, self.n_group, experts_per_group
+        ).reshape(batch_size, -1)
+        masked_scores = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+        _, topk_indices = torch.topk(masked_scores, k=self.top_k)
 
-        # Map back to global expert indices
-        selected_group_ord = flat_expert_idx // experts_per_group
-        within_group_offset = flat_expert_idx % experts_per_group
-        actual_group = torch.gather(group_idx, 1, selected_group_ord)
-        topk_indices = actual_group * experts_per_group + within_group_offset
-
+        # DeepseekV3Router.forward: gather, L1-norm, scale
         topk_weights = scores.gather(1, topk_indices)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights * self.routed_scaling_factor
 
         return topk_indices, topk_weights
@@ -85,23 +84,21 @@ _PARALLEL_PATCHES = [
 
 
 def _create_neuron_router(num_experts, top_k, hidden_size, n_group, topk_group,
-                           routed_scaling_factor, norm_topk_prob):
+                           routed_scaling_factor):
     """Create DeepseekV3Router with mocked parallel state."""
-    from neuronx_distributed_inference.models.deepseek.modeling_deepseek import DeepseekV3Router
+    from src.modeling_deepseek import DeepseekV3Router
 
     for p in _PARALLEL_PATCHES:
         p.start()
     try:
         router = DeepseekV3Router(
-            n_group=n_group,
-            topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
-            norm_topk_prob=norm_topk_prob,
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
+            n_group=n_group,
+            topk_group=topk_group,
             dtype=torch.float32,
-            act_fn="sigmoid",
         )
     finally:
         for p in _PARALLEL_PATCHES:
@@ -118,14 +115,13 @@ def router_config():
         n_group=8,
         topk_group=4,
         routed_scaling_factor=2.5,
-        norm_topk_prob=True,
     )
 
 
 @pytest.fixture
 def router_and_ref(router_config):
     """Create a DeepseekV3Router and matching reference, with shared weights."""
-    ref = ReferenceCompilerCompatRouter(**router_config)
+    ref = ReferenceGroupLimitedRouter(**router_config)
     neuron_router = _create_neuron_router(**router_config)
 
     with torch.no_grad():
@@ -187,7 +183,7 @@ class TestDeepseekV3Router:
         )
 
     def test_scaling_factor_applied(self, router_and_ref, router_config):
-        """Weights should sum to approximately routed_scaling_factor per token."""
+        """Weights should sum to routed_scaling_factor per token (L1 norm + scale)."""
         neuron_router, _ = router_and_ref
         torch.manual_seed(42)
         x = torch.randn(32, router_config["hidden_size"])
@@ -242,12 +238,12 @@ class TestDeepseekV3Router:
         router = _create_neuron_router(
             num_experts=num_experts, top_k=top_k, hidden_size=hidden_size,
             n_group=n_group, topk_group=topk_group,
-            routed_scaling_factor=2.5, norm_topk_prob=True,
+            routed_scaling_factor=2.5,
         )
-        ref = ReferenceCompilerCompatRouter(
+        ref = ReferenceGroupLimitedRouter(
             num_experts=num_experts, top_k=top_k, hidden_size=hidden_size,
             n_group=n_group, topk_group=topk_group,
-            routed_scaling_factor=2.5, norm_topk_prob=True,
+            routed_scaling_factor=2.5,
         )
 
         with torch.no_grad():
@@ -265,27 +261,6 @@ class TestDeepseekV3Router:
         ref_sorted, _ = ref_indices.sort(dim=-1)
         neuron_sorted, _ = expert_index.sort(dim=-1)
         assert torch.equal(ref_sorted, neuron_sorted)
-
-    def test_no_normalization(self):
-        """When norm_topk_prob=False, weights are not normalized."""
-        router = _create_neuron_router(
-            num_experts=16, top_k=4, hidden_size=32,
-            n_group=2, topk_group=1,
-            routed_scaling_factor=2.5, norm_topk_prob=False,
-        )
-
-        torch.manual_seed(99)
-        x = torch.randn(4, 32)
-        _, expert_affinities, expert_index = router(x)
-        topk_weights = expert_affinities.gather(1, expert_index)
-
-        # All weights should be positive (sigmoid * scaling_factor)
-        assert (topk_weights > 0).all()
-        # Without normalization, sum should NOT equal routed_scaling_factor
-        weight_sums = topk_weights.sum(dim=-1)
-        assert not torch.allclose(weight_sums, torch.tensor(2.5)), (
-            "Weight sums equal scaling factor even without normalization — unexpected"
-        )
 
 
 if __name__ == "__main__":
