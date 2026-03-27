@@ -50,6 +50,7 @@ AUDIO_FILE = os.environ.get(
         "..",
         "..",
         "..",
+        "..",
         "examples",
         "audio-sample.mp3",
     ),
