@@ -125,6 +125,9 @@ print(result["text"])
 ### Prerequisites
 
 ```bash
+# ffmpeg is required by openai-whisper for audio decoding
+sudo apt-get install -y ffmpeg
+
 pip install openai-whisper pytest
 ```
 
@@ -154,6 +157,7 @@ The integration test:
 
 ## Dependencies
 
+- `ffmpeg` (system package, required by openai-whisper for audio decoding)
 - `openai-whisper` (provides base `Whisper` class and decoding loop)
 - `transformers` (for `WhisperModel.from_pretrained` weight loading and `sinusoids`)
 - `neuronx-distributed-inference` (NxDI base classes, model wrapper, config)
@@ -165,4 +169,4 @@ Jim Burtoft (jimburtoft)
 
 ## Last Updated
 
-2026-03-26
+2026-03-27
