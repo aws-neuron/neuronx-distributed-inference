@@ -1,1 +1,4 @@
-from .modeling_gemma3 import NeuronGemma3ForCausalLM, Gemma3InferenceConfig
+from .modeling_gemma3 import (
+    Gemma3_1B_InferenceConfig,
+    NeuronGemma3_1B_ForCausalLM,
+)
