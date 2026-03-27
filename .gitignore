@@ -140,6 +140,7 @@ src/neuronx_distributed.egg-info/
 *.whl
 **/.DS_Store
 __pycache__
+global_metric_store.json
 
 # Compiler artifacts
 neuronxcc*
