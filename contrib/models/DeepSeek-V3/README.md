@@ -122,6 +122,8 @@ TTFT consistent at ~1,700ms across all batch sizes. Throughput scales sub-linear
 | TPOT (token generation, p50) | 20.5 ms |
 | TTFT (context encoding, 256 tokens) | 1,667 ms |
 
+The 671B model requires ~2TB peak RAM during weight sharding (FP8 dequant + expert fusion + 64 per-rank splits). With `save_sharded_checkpoint=True`, per-rank files (~21.4GB each) are saved during compilation and reloaded in ~8 minutes on subsequent runs.
+
 ### Key Observations
 
 - **Single-request throughput: 48.7 tok/s** (NXDI native) or **33 tok/s** (vLLM with continuous batching overhead)
@@ -173,12 +175,6 @@ tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
 
 The integration test creates a mini model (1 dense + 1 MoE layer, random weights, vocab=32000) that runs on any instance with 2+ NeuronCores. See `test/integration/test_model.py` for details.
 
-## Pre-Sharded Deployment
-
-The 671B model requires ~2TB peak RAM during weight sharding (FP8 dequant + expert fusion + 64 per-rank splits). With `save_sharded_checkpoint=True`, per-rank files (~21.4GB each) are saved during compilation and reloaded in ~8 minutes on subsequent runs.
-
-
-
 ## Caveats
 
 1. **`logical_nc_config=2` required on trn2** -- lnc=1 causes HBM OOM because pairs of NeuronCores share 24GB HBM banks. Two ranks (~21.4GB each) need ~42.8GB in one 24GB bank.
@@ -197,11 +193,12 @@ The 671B model requires ~2TB peak RAM during weight sharding (FP8 dequant + expe
 
 ## Maximum Sequence Length
 
-| seq_len | Compile | Status | Notes |
-|---------|---------|--------|-------|
-| 512 | 11.8 min | PASS | Default, all benchmarks |
+| seq_len | Compile | Load | Status | Notes |
+|---------|---------|------|--------|-------|
+| 512 | 11.8 min (~1s cached) | PASS | **PASS** | Default, all benchmarks |
+| 1024 | ~10 min (CTE cached) | HBM OOM | **FAIL** | CTE scratchpad (512MB) + TKG (23.1GB) > 24GB per NC pair |
 
-Higher sequence lengths should work but have not been validated at 671B scale.
+seq_len=1024 compiles successfully but fails to load. The TKG model consumes ~23.1GB of the 24GB HBM per NeuronCore pair, leaving insufficient space for the CTE scratchpad.
 
 ## Compatibility Matrix
 
@@ -242,7 +239,7 @@ cd contrib/models/DeepSeek-V3/
 pytest test/unit/ -v
 ```
 
-Tests: config parsing (11), RoPE (3), router (5), weight conversion (11), router in weight_conversion (9) = **39 tests**.
+Tests: config parsing (15), RoPE (3), router (9), weight conversion (10) = **37 tests**.
 
 ### Integration Tests (needs 2+ NeuronCores)
 
