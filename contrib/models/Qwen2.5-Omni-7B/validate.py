@@ -63,9 +63,10 @@ def compile_neuron_model(model_path: str, compiled_path: str, tp_degree: int = 2
         fused_qkv=True,
     )
 
-    config = Qwen2_5OmniInferenceConfig(
-        neuron_config,
-        load_config=load_pretrained_config(model_path),
+    # Use custom from_pretrained which reads thinker_config.text_config
+    config = Qwen2_5OmniInferenceConfig.from_pretrained(
+        model_path,
+        neuron_config=neuron_config,
     )
 
     model = NeuronQwen2_5OmniForCausalLM(model_path, config)
@@ -93,9 +94,10 @@ def load_neuron_model(model_path: str, compiled_path: str, tp_degree: int = 2):
         fused_qkv=True,
     )
 
-    config = Qwen2_5OmniInferenceConfig(
-        neuron_config,
-        load_config=load_pretrained_config(model_path),
+    # Use custom from_pretrained which reads thinker_config.text_config
+    config = Qwen2_5OmniInferenceConfig.from_pretrained(
+        model_path,
+        neuron_config=neuron_config,
     )
 
     model = NeuronQwen2_5OmniForCausalLM(model_path, config)
