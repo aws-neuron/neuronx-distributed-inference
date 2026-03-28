@@ -113,11 +113,12 @@ class Qwen2_5OmniRotaryEmbedding(nn.Module):
             # Expand 2D -> 3D: replicate across temporal, height, width
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         # position_ids is now (3, batch, seq)
-        batch_size = position_ids.shape[1]
+        # HF convention: dim 0 = 3 axes, dim 1 = batch, dim 2 = seq
         inv_freq_expanded = self.inv_freq[None, None, :, None].expand(
-            3, batch_size, -1, 1
-        )
-        position_ids_expanded = position_ids[None, :, None, :].float()
+            position_ids.shape[0], -1, -1, 1
+        )  # (3, 1, dim/2, 1)
+        position_ids_expanded = position_ids[:, :, None, :].float()
+        # (3, batch, 1, seq)
 
         device_type = (
             x.device.type
