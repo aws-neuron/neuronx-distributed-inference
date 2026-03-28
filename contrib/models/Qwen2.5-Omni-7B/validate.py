@@ -138,22 +138,25 @@ def generate_neuron(model, input_ids, max_new_tokens: int):
 def generate_hf_reference(
     model_path: str, tokenizer, prompts: list, max_new_tokens: int
 ):
-    """Generate reference outputs using HuggingFace model on CPU."""
+    """Generate reference outputs using HuggingFace thinker model (bfloat16, CPU).
+
+    The Omni model is not in AutoModelForCausalLM, so we load
+    Qwen2_5OmniThinkerForConditionalGeneration directly, which is the
+    text-only thinker backbone that our Neuron contrib implements.
+    """
     print(f"\n{'=' * 60}")
-    print("Generating HuggingFace reference outputs (CPU)...")
+    print("Generating HuggingFace reference outputs (thinker, bfloat16)...")
     print(f"{'=' * 60}")
 
-    from transformers import AutoModelForCausalLM
+    from transformers import Qwen2_5OmniThinkerForConditionalGeneration
 
-    print("Loading HF model (this may take several minutes for 7B)...")
-    hf_model = AutoModelForCausalLM.from_pretrained(
+    print("Loading HF thinker model (this may take a minute for 7B bfloat16)...")
+    hf_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=torch.float32,
-        device_map="cpu",
-        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
     )
     hf_model.eval()
-    print("HF model loaded.")
+    print("HF thinker model loaded.")
 
     results = {}
     for prompt in prompts:
