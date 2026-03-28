@@ -107,9 +107,15 @@ class Qwen2_5OmniRotaryEmbedding(nn.Module):
         return 1.0 / (self.base ** (freq_indices / self.dim))
 
     def forward(self, x, position_ids):
-        # position_ids: (3, batch, seq) for [temporal, height, width]
+        # position_ids: (batch, seq) from NeuronBaseModel or (3, batch, seq) for M-RoPE
+        # For text-only input, all 3 axes get the same positions.
+        if position_ids.dim() == 2:
+            # Expand 2D -> 3D: replicate across temporal, height, width
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        # position_ids is now (3, batch, seq)
+        batch_size = position_ids.shape[1]
         inv_freq_expanded = self.inv_freq[None, None, :, None].expand(
-            3, position_ids.shape[0], -1, 1
+            3, batch_size, -1, 1
         )
         position_ids_expanded = position_ids[None, :, None, :].float()
 
