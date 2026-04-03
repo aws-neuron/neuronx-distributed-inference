@@ -538,8 +538,6 @@ class DeepseekV3Attention(NeuronAttentionBase):
                 self.num_attention_heads * self.head_dim, self.hidden_size, bias=self.bias
             )
 
-        self.attn_kernel_enabled = self.neuron_config.attn_kernel_enabled
-        self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
 
     def forward(
             self,
