@@ -41,40 +41,109 @@ NeuronX Distributed Inference implementation of DeepSeek V3, a 671B parameter Mi
 - **YaRN RoPE:** Interleaved layout using `rotate_fn` (not `rotate_half`).
 - **Native FP8 Weights:** Official weights are in float8_e4m3fn with block-wise scale factors; automatically dequantized to BF16 during loading.
 
-## Validation Results
 
-**Validated:** 2026-03-19
-**SDK:** NxDI 0.8.0, neuronx-cc 2.23.6484, torch 2.9.0, transformers 4.57.6 (SDK 2.28)
+## Test Results
 
-### Multi-Prompt Generation Quality (671B, trn2.48xlarge, TP=64)
+### Unit Tests (CPU)
 
-Single-request greedy generation (top_k=1) on the full 671B model, 64 output tokens per prompt:
+| Test Module | Tests | Status |
+|-------------|-------|--------|
+| test_config.py | 15 | 15/15 PASS |
+| test_rope.py | 3 | 3/3 PASS |
+| test_router.py | 9 | 9/9 PASS |
+| test_weight_conversion.py | 10 | 10/10 PASS |
+| **Total** | **37** | **37/37 PASS** |
 
-| Prompt | First Token | Output (truncated) | Status |
-|--------|-------------|-------------------|--------|
-| "The capital of France is" | Paris | Paris, which is one of the most important and influential cities in the world... | PASS |
-| "def fibonacci(n):" | if | `if n <= 1: return n else: return fibonacci(n-1) + fibonacci(n-2)` ... | PASS |
-| "The theory of relativity states that" | nothing | nothing can travel faster than the speed of light... | PASS |
-| "In a shocking finding, scientists discovered" | that | that elephants are the only non-human animals that can call each other by names... | PASS |
-| "To make a chocolate cake, you need" | the | the following ingredients: 2 cups sugar, 1 3/4 cups all-purpose flour... | PASS |
-| "The largest ocean on Earth is" | the | the Pacific Ocean, covering approximately 63 million square miles... | PASS |
-| "Machine learning is a subset of" | artificial | artificial intelligence that enables computers to learn from data... | PASS |
-| "The year 2025 will be remembered for" | the | the unprecedented heatwaves that swept across the globe... | PASS |
+### Integration Test (671B, trn2.48xlarge, TP=64)
+
+| Test | Status | Notes |
+|------|--------|-------|
+| Model loads | PASS | Pre-sharded checkpoint load ~8 min |
+| Model generates | PASS | Generates coherent multi-sentence text |
+| Output coherence | PASS | 3+ words, no excessive repetition |
+| Top token valid | PASS | First token decodable and semantically valid |
+| First-token HF match | PASS | Matches HuggingFace FP32 reference |
+| TTFT performance | PASS | ~1,668 ms (256 input tokens) |
+| Throughput | PASS | ~48.7 tok/s (bs=1) |
+
+### Logit Divergence Test (671B, trn2.48xlarge, TP=64, lnc=2, seq=512, bs=1)
+
+  
+#### Teacher-forced results (32 tokens) — **30/32 (93.8%)**
+  
+
+| Pos | Token | Golden Logit | New Logit | Diff | Match |
+| --- | --- | --- | --- | --- | --- |
+| 0   | Paris | 28.000 | 28.125 | +0.125 | YES |
+| 1   | .   | 28.750 | 28.875 | +0.125 | YES |
+| 2   | It  | 25.000 | 25.250 | +0.125 | NO  |
+| 3   | is  | 33.500 | 33.750 | +0.250 | YES |
+| 4   | the | 31.125 | 31.250 | +0.125 | YES |
+| 5   | largest | 31.625 | 31.500 | -0.125 | NO  |
+| 6   | city | 32.750 | 32.750 | 0.000 | YES |
+| 7   | in  | 34.750 | 35.000 | +0.250 | YES |
+| 8   | France | 35.000 | 34.750 | -0.250 | YES |
+| 9   | and | 33.250 | 33.750 | +0.500 | YES |
+| 10  | serves | 33.250 | 33.000 | -0.250 | YES |
+| 11  | as  | 35.750 | 36.000 | +0.250 | YES |
+| 12  | the | 36.500 | 36.250 | -0.250 | YES |
+| 13  | country | 37.750 | 37.750 | 0.000 | YES |
+| 14  | 's  | 35.000 | 35.000 | 0.000 | YES |
+| 15  | political | 36.250 | 35.500 | -0.750 | YES |
+| 16  | ,   | 35.250 | 35.000 | -0.250 | YES |
+| 17  | cultural | 38.750 | 38.000 | -0.750 | YES |
+| 18  | ,   | 35.750 | 35.750 | 0.000 | YES |
+| 19  | and | 37.250 | 36.750 | -0.500 | YES |
+| 20  | economic | 40.500 | 39.500 | -1.000 | YES |
+| 21  | center | 39.750 | 38.750 | -1.000 | YES |
+| 22  | .   | 36.500 | 36.500 | 0.000 | YES |
+| 23  | Paris | 36.000 | 35.750 | -0.250 | YES |
+| 24  | is  | 36.750 | 36.500 | -0.250 | YES |
+| 25  | renowned | 37.250 | 36.750 | -0.500 | YES |
+| 26  | for | 38.250 | 38.750 | +0.500 | YES |
+| 27  | its | 38.000 | 38.000 | 0.000 | YES |
+| 28  | iconic | 37.750 | 38.000 | +0.250 | YES |
+| 29  | landmarks | 42.250 | 41.250 | -1.000 | YES |
+| 30  | such | 40.250 | 39.750 | -0.500 | YES |
+| 31  | as  | 33.750 | 33.500 | -0.250 | YES |
+
+**Logit drift:** mean=-0.168, max=+0.500, min=-1.000, abs_mean=0.324
+
+### Logit divergence summary
+
+| Metric | GroupLimitedRouter (new) |
+| --- | --- |
+| Teacher-forced match | 30/32 (93.8%) |
+| Abs mean logit diff | 0.324 |
+| Max abs logit diff | 1.000 |
+| Free gen match | 3/32 (9.4%) |
+| Free gen pos 2 shift | +0.125 (BF16 tie) |
+
+
+### Multi-Prompt Generation Quality (671B, TP=64)
+
+Single-request greedy generation (top_k=1), 64 output tokens per prompt:
+
+| Prompt | First Token | Status |
+|--------|-------------|--------|
+| "The capital of France is" | Paris | PASS |
+| "def fibonacci(n):" | if | PASS |
+| "The theory of relativity states that" | nothing | PASS |
+| "In a shocking finding, scientists discovered" | that | PASS |
+| "To make a chocolate cake, you need" | the | PASS |
+| "The largest ocean on Earth is" | the | PASS |
+| "Machine learning is a subset of" | artificial | PASS |
+| "The year 2025 will be remembered for" | the | PASS |
 
 All 8 prompts produce coherent, factually correct, multi-sentence responses. Code generation (fibonacci) produces syntactically valid Python.
 
-### First-Token Accuracy (671B, trn2.48xlarge, TP=64)
+### Generation Output (671B, TP=64, seq_len=512, greedy top_k=1)
 
-| Prompt | Expected | Got | TTFT (ms) | Status |
-|--------|----------|-----|-----------|--------|
-| "The capital of France is" | Paris | Paris | 1669.9 | MATCH |
-| "The largest planet in our solar system is" | Jupiter | Jupiter | 1668.2 | MATCH |
-| "The chemical formula for water is" | H | H | 1668.4 | MATCH |
-| "Mount Everest is located in" | the | the | 1668.6 | MATCH |
-| "Barack Obama was the" | 44 | first | 1669.9 | VALID |
-| "Python is a" | programming | powerful | 1669.7 | VALID |
+**Prompt:** "The capital of France is"
 
-4/8 exact keyword match. All "VALID" responses are semantically correct alternative continuations. TTFT spread: 1.7ms across 8 prompts.
+**Output:** Paris, which is one of the most important and influential cities in the world. Paris is located in the northern part of France, on the banks of the Seine River. It is known for its rich history, culture, art, fashion, and cuisine. Some of the most famous landmarks in Paris include the Eiffel Tower, the Louvre Museum, Notre-Dame Cathedral, the Arc de Triomphe, and the Champs-Elysees. Paris is also a major center for business, education, and politics, hosting numerous international organizations and events.
+
+**Status:** PASS -- coherent, factually correct, multi-sentence response.
 
 ## Performance Benchmarks
 
