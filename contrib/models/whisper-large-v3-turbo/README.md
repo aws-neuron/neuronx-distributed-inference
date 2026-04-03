@@ -44,21 +44,16 @@ This is an encoder-decoder model with separate encoder and decoder compilation. 
 | 30.0s | 462.9ms | 64.8x |
 | 90.0s | 1102.2ms | 81.7x |
 
-### Batched (BS=8, trn2.3xlarge, LNC=2, bfloat16)
+### Batched (BS=4, trn2.3xlarge, LNC=2, float16)
 
-| Audio Duration | Batch Latency | Per-Sample | Throughput |
-|---------------|--------------|------------|------------|
-| 5.0s | 630.2ms | 78.8ms | 12.69 audio-sec/wall-sec |
-| 30.0s | 675.5ms | 84.4ms | 11.84 audio-sec/wall-sec |
-| 90.0s | 675.0ms | 84.4ms | 11.85 audio-sec/wall-sec |
+Measured on 7.3s audio (single 30s segment):
 
-### Data Parallel (DP=4 x BS=8, trn2.3xlarge, LNC=2, bfloat16)
+| Config | Batch Latency | Audio/s | Audio-sec/s/core |
+|--------|:---:|:---:|:---:|
+| BS=4, 1 core | 487ms | 8.2 | 59.9 |
+| BS=4, DP=4 | 512ms/core | 31.2 | 56.9 |
 
-| Audio Duration | Aggregate Throughput |
-|---------------|---------------------|
-| 5.0s | **46.65 audio-sec/wall-sec** |
-| 30.0s | **43.75 audio-sec/wall-sec** |
-| 90.0s | **43.27 audio-sec/wall-sec** |
+BS=4 achieves **1.6x** the hardware utilization (audio-sec/s/core) of BS=1. BS=8 causes a decoder latency regression and is not recommended.
 
 ## Usage
 
@@ -117,7 +112,7 @@ print(result["text"])
 **Notes**:
 - TP=1 is recommended. Whisper (809M params) fits on a single NeuronCore.
 - Higher TP degrees are supported for head-sharding but provide no benefit for this model size.
-- For maximum throughput on trn2.3xlarge, use DP=4 x BS=8 with LNC=2 (4 independent model instances).
+- For maximum throughput on trn2.3xlarge, use DP=4 x BS=4 with LNC=2 (4 independent model instances).
 - Each batch size requires separate compilation (BS is baked into the traced graph).
 
 ## Testing
