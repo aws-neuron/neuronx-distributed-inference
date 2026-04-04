@@ -53,6 +53,12 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+# Ensure the contrib root (DeepSeek-V3/) is on sys.path so that `src.*` imports
+# resolve to the local contrib code regardless of how the test is invoked.
+_CONTRIB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _CONTRIB_ROOT not in sys.path:
+    sys.path.insert(0, _CONTRIB_ROOT)
+
 # ── Configuration from environment ──────────────────────────────────────
 
 MODEL_PATH = os.environ.get("DEEPSEEK_MODEL_PATH", "")
@@ -219,7 +225,7 @@ def model_path():
 def compiled_model(model_path):
     """Compile and load the model on Neuron."""
     from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
-    from neuronx_distributed_inference.models.deepseek.modeling_deepseek import (
+    from src.modeling_deepseek import (
         DeepseekV3InferenceConfig,
         NeuronDeepseekV3ForCausalLM,
     )
@@ -466,7 +472,7 @@ if __name__ == "__main__":
 
     # Build model
     from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
-    from neuronx_distributed_inference.models.deepseek.modeling_deepseek import (
+    from src.modeling_deepseek import (
         DeepseekV3InferenceConfig, NeuronDeepseekV3ForCausalLM,
     )
     from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
