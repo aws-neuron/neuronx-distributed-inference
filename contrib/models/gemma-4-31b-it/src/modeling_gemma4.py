@@ -894,9 +894,14 @@ class NeuronGemma4TextModel(NeuronBaseModel):
         custom one that allocates per-layer shapes.
         """
         if self.on_device_sampling:
-            from neuronx_distributed_inference.modules.sampling.utils import (
-                create_sampler,
-            )
+            try:
+                from neuronx_distributed_inference.modules.generation.sampling import (
+                    create_sampler,
+                )
+            except ImportError:
+                from neuronx_distributed_inference.modules.sampling.utils import (
+                    create_sampler,
+                )
 
             lm_head_tp_degree = None
             if hasattr(self, "lm_head") and hasattr(

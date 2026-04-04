@@ -95,58 +95,113 @@ def patched_base_image_to_text_model_forward(
     if seq_ids is None:
         seq_ids = torch.arange(input_ids.shape[0])
 
-    self.preprocess_inputs(
-        input_ids=input_ids,
-        seq_ids=seq_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        sampling_params=sampling_params,
-        prev_hidden=prev_hidden,
-        labels=labels,
-        use_cache=use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        adapter_ids=adapter_ids,
-        medusa_args=medusa_args,
-        return_dict=return_dict,
-        llava_args=llava_args,
-        input_capture_hook=input_capture_hook,
-        slot_mapping=slot_mapping,
-        block_table=block_table,
-        full_context_lens=full_context_lens,
-        computed_context_lens=computed_context_lens,
-    )
-
-    if self.async_mode:
-        outputs, is_run_on_neuron = self._get_model_outputs_async(
+    input_ids, attention_mask, position_ids, seq_ids, sampling_params = (
+        self.preprocess_inputs(
             input_ids=input_ids,
+            seq_ids=seq_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            seq_ids=seq_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
             sampling_params=sampling_params,
             prev_hidden=prev_hidden,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             adapter_ids=adapter_ids,
-            vision_embeddings=vision_embeddings,
-            vision_mask=vision_mask,
             medusa_args=medusa_args,
+            return_dict=return_dict,
             llava_args=llava_args,
+            input_capture_hook=input_capture_hook,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
+            full_context_lens=full_context_lens,
+            computed_context_lens=computed_context_lens,
         )
-    else:
-        outputs, is_run_on_neuron = self._get_model_outputs(
+    )
+
+    # Bypass _get_model_outputs entirely. NxDI 0.8.0 added a
+    # deepstack_vision_embeds arg that gets forwarded to the CTE/TKG
+    # models, but the ImageToTextModelWrapper.input_generator only
+    # traces 24 inputs (no deepstack). Calling the models directly
+    # with exactly 24 positional args avoids the mismatch.
+    _empty = torch.empty(0)
+
+    if self._is_prefill(position_ids):
+        # Prefill: vision tensors must match the traced shapes even for
+        # text-only inputs.  The CTE NEFF was traced with
+        #   vision_embeddings=[batch, seq_len, hidden_size]
+        #   vision_mask=[batch, seq_len, 1]
+        # so we create zero-filled tensors when they are not provided.
+        batch_size = input_ids.shape[0]
+        n_active = input_ids.shape[1]  # == bucket seq_len
+        if vision_embeddings is None or vision_embeddings.numel() == 0:
+            dtype = getattr(self.config, "neuron_config", None)
+            dtype = dtype.torch_dtype if dtype is not None else torch.bfloat16
+            vision_embeddings = torch.zeros(
+                batch_size, n_active, self.config.hidden_size, dtype=dtype
+            )
+        if vision_mask is None or vision_mask.numel() == 0:
+            vision_mask = torch.zeros(batch_size, n_active, 1, dtype=torch.int32)
+
+        outputs = self.context_encoding_model(
             input_ids,
             attention_mask,
             position_ids,
             seq_ids,
             sampling_params,
-            prev_hidden,
-            adapter_ids,
+            _empty,  # prev_hidden
+            _empty,  # adapter_ids
+            _empty,  # accepted_indices
+            _empty,  # current_length
+            _empty,  # medusa_mask
+            _empty,  # scatter_index
+            _empty,  # slot_mapping
+            _empty,  # active_block_table
+            _empty,  # num_queries
+            _empty,  # computed_context_lens
+            _empty,  # tile_q_indices
+            _empty,  # tile_block_tables
+            _empty,  # tile_masks
+            _empty,  # inputs_embeds
+            _empty,  # kv_cache
+            _empty,  # active_mask
+            _empty,  # rotary_position_ids
             vision_embeddings,
             vision_mask,
-            medusa_args,
-            llava_args,
         )
+        self.kv_cache_populated = True
+        is_run_on_neuron = self.context_encoding_model.is_neuron()
+    else:
+        # Token generation: vision tensors must be empty (traced as [0]).
+        outputs = self.token_generation_model(
+            input_ids,
+            attention_mask,
+            position_ids,
+            seq_ids,
+            sampling_params,
+            _empty,  # prev_hidden
+            _empty,  # adapter_ids
+            _empty,  # accepted_indices
+            _empty,  # current_length
+            _empty,  # medusa_mask
+            _empty,  # scatter_index
+            _empty,  # slot_mapping
+            _empty,  # active_block_table
+            _empty,  # num_queries
+            _empty,  # computed_context_lens
+            _empty,  # tile_q_indices
+            _empty,  # tile_block_tables
+            _empty,  # tile_masks
+            _empty,  # inputs_embeds
+            _empty,  # kv_cache
+            _empty,  # active_mask
+            _empty,  # rotary_position_ids
+            _empty,  # vision_embeddings (empty for TKG)
+            _empty,  # vision_mask (empty for TKG)
+        )
+        is_run_on_neuron = self.token_generation_model.is_neuron()
 
     generation_model = self.get_generation_model()
     if not generation_model.is_neuron():

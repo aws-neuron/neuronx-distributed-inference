@@ -86,15 +86,31 @@ def load_pretrained_config(model_path):
     Equivalent to neuronx_distributed_inference.utils.hf_adapter.load_pretrained_config
     but avoids importing hf_adapter (which fails on newer transformers due to
     SampleDecoderOnlyOutput rename).
+
+    Falls back to manual JSON loading if AutoConfig doesn't recognize the
+    model_type (e.g. 'gemma4' on older transformers versions).
     """
+    import json as _json
 
     def load_config(self):
-        config = AutoConfig.from_pretrained(model_path)
-        config_dict = config.to_dict()
+        config = None
+        config_dict = None
 
-        # Preserve original transformers_version
-        if config.transformers_version is not None:
-            config_dict["transformers_version"] = config.transformers_version
+        # Try AutoConfig first
+        try:
+            config = AutoConfig.from_pretrained(model_path)
+            config_dict = config.to_dict()
+        except (ValueError, KeyError):
+            # AutoConfig doesn't recognize model_type — load JSON directly
+            config_path = os.path.join(model_path, "config.json")
+            with open(config_path, "r") as f:
+                config_dict = _json.load(f)
+
+        transformers_version = None
+        if config is not None and hasattr(config, "transformers_version"):
+            transformers_version = config.transformers_version
+        elif "transformers_version" in config_dict:
+            transformers_version = config_dict["transformers_version"]
 
         # Set torch_dtype in NeuronConfig
         hf_dtype = config_dict.get("dtype", config_dict.get("torch_dtype", None))
@@ -111,15 +127,27 @@ def load_pretrained_config(model_path):
             config_dict.pop("dtype", None)
             config_dict.pop("torch_dtype", None)
 
-        # Convert nested PretrainedConfig objects to SimpleNamespace
+        # Convert nested dicts/PretrainedConfig objects to SimpleNamespace
         for k, v in config_dict.items():
-            if isinstance(getattr(config, k, None), PretrainedConfig):
+            if isinstance(v, dict):
+                # Nested config (text_config, vision_config, etc.)
                 config_dict[k] = SimpleNamespace(**v)
-                if config.transformers_version is not None:
-                    config_dict[k].transformers_version = config.transformers_version
+                if transformers_version is not None:
+                    config_dict[k].transformers_version = transformers_version
+            elif config is not None and isinstance(
+                getattr(config, k, None), PretrainedConfig
+            ):
+                config_dict[k] = SimpleNamespace(**v)
+                if transformers_version is not None:
+                    config_dict[k].transformers_version = transformers_version
 
         self.__dict__.update(config_dict)
-        if hasattr(config, "attribute_map"):
+
+        # Ensure _name_or_path is set (HF PretrainedConfig normally does this)
+        if not hasattr(self, "_name_or_path"):
+            self._name_or_path = str(model_path)
+
+        if config is not None and hasattr(config, "attribute_map"):
             self.attribute_map = config.attribute_map
 
     return load_config
@@ -162,6 +190,28 @@ class Gemma4VLMInferenceConfig(ImageToTextInferenceConfig):
         ):
             self.text_config.hidden_act = self.text_config.hidden_activation
             del self.text_config.hidden_activation
+
+        # Set attributes required by NeuronBaseForCausalLM._setup_func_config().
+        # ImageToTextInferenceConfig creates text_config as InferenceConfig, not
+        # our Gemma4InferenceConfig, so these must be set here.
+        for attr, default in [
+            ("output_attentions", False),
+            ("output_hidden_states", False),
+            ("use_return_dict", True),
+            ("attention_bias", False),
+        ]:
+            if not hasattr(self.text_config, attr):
+                setattr(self.text_config, attr, default)
+            if not hasattr(self, attr):
+                setattr(self, attr, default)
+
+        # Ensure pad_token_id and tie_word_embeddings are set
+        if not hasattr(self.text_config, "pad_token_id"):
+            self.text_config.pad_token_id = getattr(self, "pad_token_id", 0)
+        if not hasattr(self.text_config, "tie_word_embeddings"):
+            self.text_config.tie_word_embeddings = getattr(
+                self, "tie_word_embeddings", True
+            )
 
         # Validate unsupported features
         if self.text_config.neuron_config.is_block_kv_layout:
@@ -280,9 +330,10 @@ class Gemma4VisionModelWrapper(Llama4VisionModelWrapper):
                 "Forward called before load. Run load() or load_state_dict() before calling forward"
             )
 
-        # Convert int64 to int32 for Neuron compatibility
-        if not self.neuron_config.on_cpu:
-            args = self.convert_int64_to_int32(*args)
+        # NOTE: Do NOT convert int64→int32 here.  The vision NEFF was
+        # traced with torch.long (int64) position_ids from input_generator().
+        # Converting to int32 triggers a c10::ValueError shape/dtype mismatch
+        # in the Neuron runtime.
 
         pixel_values = args[0]
         input_batch_size = pixel_values.shape[0]
@@ -506,21 +557,16 @@ class NeuronGemma4ForConditionalGeneration(NeuronBaseForImageToText):
 
             # --- VISION WEIGHTS ---
             if "vision_tower" in key or "embed_vision" in key:
-                # model.vision_tower.X -> vision_encoder.vision_model.X
+                # model.vision_tower.X -> vision_model.X
+                # (no vision_encoder prefix — NEFF params are relative to NeuronGemma4VisionModel)
                 if "model.vision_tower." in new_key:
-                    new_key = new_key.replace(
-                        "model.vision_tower.", "vision_encoder.vision_model."
-                    )
+                    new_key = new_key.replace("model.vision_tower.", "vision_model.")
                 elif "vision_tower." in new_key:
-                    new_key = new_key.replace(
-                        "vision_tower.", "vision_encoder.vision_model."
-                    )
+                    new_key = new_key.replace("vision_tower.", "vision_model.")
 
-                # model.embed_vision.X -> vision_encoder.embed_vision.X
+                # model.embed_vision.X -> embed_vision.X
                 if "model.embed_vision." in new_key:
-                    new_key = new_key.replace(
-                        "model.embed_vision.", "vision_encoder.embed_vision."
-                    )
+                    new_key = new_key.replace("model.embed_vision.", "embed_vision.")
 
                 # ColumnParallelLinear/RowParallelLinear: .linear.weight -> .weight
                 new_key = new_key.replace(".linear.weight", ".weight")
@@ -728,6 +774,14 @@ class NeuronGemma4ForConditionalGeneration(NeuronBaseForImageToText):
                 pixel_values.to(self.vision_config.neuron_config.torch_dtype),
                 pixel_position_ids,
             ).to(self.text_config.neuron_config.torch_dtype)
+
+            # Vision encoder returns [total_tokens, hidden] = [B*mm_tokens, D].
+            # Reshape to [B*num_images, mm_tokens_per_image, D] for scatter.
+            if vision_embeddings.dim() == 2:
+                num_images = pixel_values.shape[0]  # B*num_images from caller
+                vision_embeddings = vision_embeddings.view(
+                    num_images, -1, vision_embeddings.shape[-1]
+                )
 
             # Flatten vision embeddings for multi-image
             batch_sz = 1 if vision_mask.dim() == 1 else vision_mask.shape[0]
