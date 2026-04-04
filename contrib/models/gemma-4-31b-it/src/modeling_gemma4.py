@@ -769,6 +769,38 @@ class NeuronGemma4TextModel(NeuronBaseModel):
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
 
+    def scatter_by_index_put(self, h_image, encoded_patches_proj, positions):
+        """
+        Scatter encoded vision patches into the text embedding tensor.
+        Supports batch size >= 1.
+
+        Args:
+            h_image: [B, max_positions, embedding_dim] - text embeddings
+            encoded_patches_proj: [B, num_vision_tokens, embedding_dim] - vision embeddings
+            positions: [B, num_positions, 1] - scatter positions
+        """
+        B, max_positions, embedding_dim = h_image.shape
+        h_image_new = h_image.clone()
+        encoded_patches_flat = encoded_patches_proj.view(-1, embedding_dim)
+        positions = positions.view(-1)
+
+        num_updates_per_batch = positions.shape[0] // B
+        batch_idx = torch.arange(B, device=h_image.device, dtype=positions.dtype)
+        batch_idx = batch_idx.repeat_interleave(num_updates_per_batch)
+
+        h_image_new.index_put_(
+            (batch_idx.long(), positions.long()),
+            encoded_patches_flat,
+            accumulate=False,
+        )
+        return h_image_new
+
+    def encode_vision_to_input(
+        self, inputs_embeds, vision_embeddings, vision_mask
+    ) -> torch.Tensor:
+        """Merge vision embeddings into text embeddings during context encoding."""
+        return self.scatter_by_index_put(inputs_embeds, vision_embeddings, vision_mask)
+
     def init_model(self, config: Gemma4InferenceConfig):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
