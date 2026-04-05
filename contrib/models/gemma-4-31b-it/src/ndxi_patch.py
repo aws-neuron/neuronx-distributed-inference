@@ -1,10 +1,14 @@
 from typing import Callable, List, Optional, Tuple, Union
+import math
+import logging
 
 from neuronx_distributed_inference.utils.tensor_replacement.registry import (
     TensorReplacementRegister,
 )
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+logger = logging.getLogger(__name__)
 
 
 def patched_get_last_kv_window(
@@ -307,6 +311,170 @@ def patched_hf_adapter_prepare_inputs_for_generation(
     return model_inputs
 
 
+# ---------------------------------------------------------------------------
+# NKI Flash Attention kernel integration for head_dim > 128
+# ---------------------------------------------------------------------------
+# Lazy-loaded kernel reference (compiled on first use)
+_nki_flash_attn_kernel = None
+
+
+def _get_nki_flash_attn_kernel():
+    """Lazy-load and JIT-compile the NKI flash attention kernel."""
+    global _nki_flash_attn_kernel
+    if _nki_flash_attn_kernel is not None:
+        return _nki_flash_attn_kernel
+
+    from nki_flash_attn_large_d import flash_attn_large_d
+
+    _nki_flash_attn_kernel = flash_attn_large_d
+    return _nki_flash_attn_kernel
+
+
+def _nki_kernel_perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
+    """
+    Replacement for perform_prefill that uses our custom NKI kernel
+    when head_dim > 128. Falls back to the original method otherwise.
+
+    Input: Q, K, V in BHSD layout [batch, num_heads, seq_len, head_dim]
+    Output: (attn_output in BHDS layout [batch, num_heads, head_dim, seq_len],
+             FlashAttentionStrategy.UNSHARDED_KERNEL)
+    """
+    from neuronx_distributed_inference.modules.attention.attention_base import (
+        FlashAttentionStrategy,
+    )
+    from neuronx_distributed_inference.modules.attention.attention_base import repeat_kv
+
+    if self.head_dim <= 128:
+        return self._orig_perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+
+    # head_dim > 128: use our NKI kernel
+    kernel = _get_nki_flash_attn_kernel()
+
+    # Q is BHSD: (bsz, num_heads, q_len, head_dim)
+    # Reshape to (bsz * num_heads, q_len, head_dim) for kernel (tp_q=True layout)
+    Q_3d = Q.reshape(bsz * self.num_heads, q_len, self.head_dim).to(self.torch_dtype)
+
+    # GQA: replicate K/V heads if needed, then reshape
+    num_kv_heads = self.num_key_value_heads
+    K_active = K  # already (bsz, num_kv_heads, q_len, head_dim)
+    V_active = V
+    K_3d = K_active.reshape(bsz * num_kv_heads, q_len, self.head_dim).to(
+        self.torch_dtype
+    )
+    V_3d = V_active.reshape(bsz * num_kv_heads, q_len, self.head_dim).to(
+        self.torch_dtype
+    )
+
+    # NxDI already applies 1/sqrt(head_dim) scaling to Q in scaled_qk,
+    # but for the kernel path it's applied before the kernel call (line 788)
+    Q_3d = Q_3d / math.sqrt(self.head_dim)
+
+    # Determine sliding window
+    sw = self.sliding_window if self.sliding_window else 0
+
+    # Grid: one program per KV group (kernel handles Q-head fan-out internally)
+    grid_bs = bsz * num_kv_heads
+
+    # Call kernel
+    # kernel expects: q(bs, seq, d), k(bs_kv, seq, d), v(bs_kv, seq, d)
+    # returns: o(bs, d, seq)
+    attn_output = kernel[grid_bs](
+        Q_3d,
+        K_3d,
+        V_3d,
+        scale=1.0,  # scaling already applied to Q
+        use_causal_mask=(attention_mask is not None),
+        sliding_window=sw,
+    )
+
+    # Reshape output from (bsz * num_heads, head_dim, q_len) -> (bsz, num_heads, head_dim, q_len) = BHDS
+    attn_output = attn_output.reshape(bsz, self.num_heads, self.head_dim, q_len)
+
+    return attn_output, FlashAttentionStrategy.UNSHARDED_KERNEL
+
+
+def _nki_kernel_perform_prefill_windowed_attn(
+    self, Q, K, V, q_len, bsz, attention_mask, window_size
+):
+    """
+    Replacement for perform_prefill_windowed_attn that uses our custom NKI kernel
+    when head_dim > 128. Falls back to the original method otherwise.
+
+    Input: Q, K, V in BHSD layout [batch, num_heads, seq_len, head_dim]
+    Output: (attn_output in BHDS layout, FlashAttentionStrategy.UNSHARDED_KERNEL)
+    """
+    from neuronx_distributed_inference.modules.attention.attention_base import (
+        FlashAttentionStrategy,
+    )
+    from neuronx_distributed_inference.modules.attention.attention_base import repeat_kv
+
+    if self.head_dim <= 128:
+        return self._orig_perform_prefill_windowed_attn(
+            Q, K, V, q_len, bsz, attention_mask, window_size
+        )
+
+    # head_dim > 128: use our NKI kernel with sliding window
+    kernel = _get_nki_flash_attn_kernel()
+
+    Q_3d = Q.reshape(bsz * self.num_heads, q_len, self.head_dim).to(self.torch_dtype)
+
+    # For windowed attn, K/V are already replicated by the caller
+    K_active = repeat_kv(K, self.num_key_value_groups)
+    V_active = repeat_kv(V, self.num_key_value_groups)
+    K_3d = K_active.reshape(bsz * self.num_heads, q_len, self.head_dim).to(
+        self.torch_dtype
+    )
+    V_3d = V_active.reshape(bsz * self.num_heads, q_len, self.head_dim).to(
+        self.torch_dtype
+    )
+
+    Q_3d = Q_3d / math.sqrt(self.head_dim)
+
+    sw = window_size if window_size else 0
+
+    grid_bs = bsz * self.num_heads  # After repeat_kv, all heads are present
+
+    attn_output = kernel[grid_bs](
+        Q_3d,
+        K_3d,
+        V_3d,
+        scale=1.0,
+        use_causal_mask=True,
+        sliding_window=sw,
+    )
+
+    attn_output = attn_output.reshape(bsz, self.num_heads, self.head_dim, q_len)
+
+    return attn_output, FlashAttentionStrategy.UNSHARDED_KERNEL
+
+
+def _patch_attention_modules_for_nki_kernel():
+    """
+    Monkey-patch NeuronAttentionBase.perform_prefill and
+    perform_prefill_windowed_attn to use our NKI kernel when head_dim > 128.
+
+    This is called once at import time. The original methods are preserved
+    as _orig_perform_prefill and _orig_perform_prefill_windowed_attn.
+    """
+    from neuronx_distributed_inference.modules.attention.attention_base import (
+        NeuronAttentionBase,
+    )
+
+    # Save originals
+    NeuronAttentionBase._orig_perform_prefill = NeuronAttentionBase.perform_prefill
+    NeuronAttentionBase._orig_perform_prefill_windowed_attn = (
+        NeuronAttentionBase.perform_prefill_windowed_attn
+    )
+
+    # Replace with our wrappers
+    NeuronAttentionBase.perform_prefill = _nki_kernel_perform_prefill
+    NeuronAttentionBase.perform_prefill_windowed_attn = (
+        _nki_kernel_perform_prefill_windowed_attn
+    )
+
+    logger.info("NKI flash attention kernel patch applied for head_dim > 128")
+
+
 def apply_patch() -> None:
     import neuronx_distributed_inference.modules.attention.utils as u
 
@@ -315,6 +483,9 @@ def apply_patch() -> None:
     import neuronx_distributed_inference.models.image_to_text_model_base as mm_base
 
     mm_base.NeuronBaseForImageToText.forward = patched_base_image_to_text_model_forward
+
+    # Patch attention for NKI kernel with head_dim > 128
+    _patch_attention_modules_for_nki_kernel()
 
     try:
         import neuronx_distributed_inference.utils.hf_adapter as hf_adapter
