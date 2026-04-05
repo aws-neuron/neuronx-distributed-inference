@@ -22,6 +22,8 @@ import copy
 import gc
 import logging
 import math
+from torch.nn import functional as F
+
 from importlib import import_module
 from typing import List, Optional, Tuple, Type
 
@@ -82,13 +84,13 @@ from neuronx_distributed_inference.modules.flashdecode.utils import calculate_nu
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 from neuronx_distributed_inference.utils.decorator_peeling import peel_decorations
 from neuronx_distributed_inference.utils.distributed import get_tp_group
+from neuronx_distributed_inference.models.gpt_oss.mx_layout_transform import shuffle_hidden_dim
 
 from neuronxcc.nki._pre_prod_kernels import NormType
 
 from torch_neuronx.utils import get_platform_target
 from neuronxcc.nki import jit
 from neuronxcc.nki.compiler import skip_middle_end_transformations, enable_stack_allocator
-
 logger = logging.getLogger("Neuron")
 
 use_quantization_type = False
@@ -333,6 +335,17 @@ class LlamaInferenceConfig(InferenceConfig):
     @classmethod
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
         return NeuronConfig
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.neuron_config.padded_hidden_size is not None and not hasattr(self, 'original_hidden_size'):
+            self.original_hidden_size = self.hidden_size
+
+        self.hidden_size = (
+            self.neuron_config.padded_hidden_size
+            if self.neuron_config.padded_hidden_size is not None
+            else self.hidden_size
+        )
 
 
 class NeuronLlamaMLP(nn.Module):
@@ -1113,7 +1126,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.self_attn = _LLAMA_MODULE_MAP[config.neuron_config.attn_cls](
-            config=config, tensor_model_parallel_group=get_tp_group(config)
+            config=config
         )
 
         self.init_mlp(config)
@@ -1440,8 +1453,11 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
         """This function should be over-ridden in child classes as needed"""
-
         neuron_config = config.neuron_config
+
+        if neuron_config.is_eagle_draft and neuron_config.is_eagle3 and neuron_config.padded_hidden_size:
+            state_dict = NeuronLlamaForCausalLM._pad_eagle3_draft_hf_state_dict(state_dict, config)
+
         # to facilitate rank usage in attention
         num_layers = config.num_hidden_layers
         tp_degree = neuron_config.tp_degree
@@ -1497,7 +1513,56 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
 
         # to facilitate rank usage in base model
         state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
+        if neuron_config.is_eagle_draft and neuron_config.is_eagle3 and neuron_config.is_full_model_shuffled:
+            fc_shape = state_dict["fc.weight"].shape
+            fc_weight = state_dict["fc.weight"].reshape(fc_shape[0], 3, fc_shape[1] // 3)
+            fc_weight = shuffle_hidden_dim(fc_weight, dim=-1)
+            state_dict["fc.weight"] = fc_weight.reshape(fc_shape)
+
         return state_dict
+
+    @staticmethod
+    def _pad_eagle3_draft_hf_state_dict(state_dict: dict, config: InferenceConfig) -> None:
+        """
+        Pad hidden and intermediate sizes for better compatibility with Neuron hardware.
+        """
+        diff_H = config.hidden_size - config.original_hidden_size
+        state_dict = {k.replace('midlayer', 'layers.0'): v for k, v in state_dict.items()}
+        pad_map = {
+            "fc.weight": {"n_slices": 3, "pad_lens": (0, diff_H, 0, diff_H)},
+            "lm_head.weight": {"n_slices": 0, "pad_lens": (0, diff_H)},
+            "embed_tokens.weight": {"n_slices": 0, "pad_lens": (0, diff_H)},
+            "norm.weight": {"n_slices": 0, "pad_lens": (0, diff_H)},
+            "layers.0.input_layernorm.weight": {"n_slices": 0, "pad_lens": (0, diff_H)},
+            "layers.0.hidden_norm.weight": {"n_slices": 0, "pad_lens": (0, diff_H)},
+            "layers.0.post_attention_layernorm.weight": {"n_slices": 0, "pad_lens": (0, diff_H)},
+            "layers.0.self_attn.q_proj.weight": {"n_slices": 2, "pad_lens": (0, diff_H)},
+            "layers.0.self_attn.k_proj.weight": {"n_slices": 2, "pad_lens": (0, diff_H)},
+            "layers.0.self_attn.v_proj.weight": {"n_slices": 2, "pad_lens": (0, diff_H)},
+            "layers.0.self_attn.o_proj.weight": {"n_slices": 0, "pad_lens": (0, 0, 0, diff_H)},
+            "layers.0.mlp.gate_proj.weight": {"n_slices": 0, "pad_lens": (0, diff_H)},
+            "layers.0.mlp.up_proj.weight": {"n_slices": 0, "pad_lens": (0, diff_H)},
+            "layers.0.mlp.down_proj.weight": {"n_slices": 0, "pad_lens": (0, 0, 0, diff_H)},
+        }
+
+        for key in state_dict.keys():
+            if key in pad_map:
+                shape_before = state_dict[key].shape
+                state_dict[key] = NeuronLlamaForCausalLM._slice_then_pad(state_dict[key], pad_map[key]['pad_lens'], config.original_hidden_size, pad_map[key]['n_slices'])
+                logger.info(f"Padded {key} from {shape_before} to {state_dict[key].shape}")
+        return state_dict
+
+    @staticmethod
+    def _slice_then_pad(tensor, pad_lens, original_size, n_slices):
+        if n_slices > 0:
+            weights = []
+            for i in range(n_slices):
+                w = tensor[:, original_size * i:original_size * (i + 1)]
+                w = F.pad(w, pad_lens)
+                weights.append(w)
+            return torch.concat(weights, dim=1)
+        else:
+            return F.pad(tensor, pad_lens)
 
     @staticmethod
     def update_state_dict_for_tied_weights(state_dict):

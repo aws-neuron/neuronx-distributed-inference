@@ -2,13 +2,19 @@ from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxFo
 from neuronx_distributed_inference.models.gpt_oss.modeling_gpt_oss import NeuronGptOssForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.llama4.modeling_llama4 import NeuronLlama4ForCausalLM
+from neuronx_distributed_inference.models.llama4.modeling_llama4_vision import NeuronLlama4ForImageEncoding
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
 from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMllamaForCausalLM
 from neuronx_distributed_inference.models.mllama.utils import add_instruct
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
+from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl import NeuronQwen2VLForCausalLM
+from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_vision import NeuronQwen2VLForImageEncoding
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl_vision import NeuronQwen3VLForImageEncoding
+from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl import NeuronQwen3VLForCausalLM
 from neuronx_distributed_inference.models.pixtral.modeling_pixtral import NeuronPixtralForCausalLM
+from neuronx_distributed_inference.models.pixtral.modeling_pixtral_vision import NeuronPixtralForImageEncoding
 
 END_TO_END_MODEL = "e2e_model"
 CONTEXT_ENCODING_MODEL = "context_encoding_model"
@@ -41,11 +47,18 @@ MM_TEST_PROMPT = add_instruct("What is in this image? Tell me a story", has_imag
 MODEL_TYPES = {
     "gpt_oss": {"causal-lm": NeuronGptOssForCausalLM},
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
-    "llama4": {"causal-lm": NeuronLlama4ForCausalLM},
+    "llama4": {"causal-lm": NeuronLlama4ForCausalLM,
+               "image-encoding": NeuronLlama4ForImageEncoding},
     "mllama": {"causal-lm": NeuronMllamaForCausalLM},
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
+    "pixtral": {"causal-lm": NeuronPixtralForCausalLM,
+                "image-encoding": NeuronPixtralForImageEncoding},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
+    "qwen2_vl": {"causal-lm": NeuronQwen2VLForCausalLM,
+                 "image-encoding": NeuronQwen2VLForImageEncoding},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
     "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
+    "qwen3_vl": {"causal-lm": NeuronQwen3VLForCausalLM,
+                 "image-encoding": NeuronQwen3VLForImageEncoding},
 }

@@ -47,6 +47,25 @@ NeuronX Distributed Inference implementation of HunYuan-7B-Instruct from Tencent
 
 **Note:** Token matching shows 0.0% as both HF and Neuron models generate repetitive output with standard test prompt. Model requires chat template format for proper inference: `<|startoftext|>{prompt}<|extra_0|>`. With correct template, model generates coherent responses (validated in S3 version).
 
+### Device Profiling Metrics
+
+**Configuration:** TP=8, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.15 | 0.00 |
+| MBU (%) | 0.32 | 0.55 |
+| HFU (%) | 0.17 | 0.00 |
+| Execution Time (us) | 0.02 | 0.01 |
+| HBM Read | 2.02 GB | 1.88 GB |
+| HBM Write | 108.84 MB | 2.83 MB |
+
+**Throughput:** 56.62 tok/s | **Compile Time:** 268.57s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -118,6 +137,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

@@ -686,6 +686,7 @@ def convert_hf_format_state_dict_mxfp4_compute(state_dict: dict, config: Inferen
     neuron_config = config.neuron_config
     assert neuron_config.is_mxfp4_compute, "mxfp4 compute must be enabled for convert_hf_format_state_dict_mxfp4_compute to be applicable"
     num_layers = config.num_hidden_layers
+    moe_tp_degree = config.neuron_config.tp_degree // config.neuron_config.moe_ep_degree
 
     is_full_model_shuffled = neuron_config.is_full_model_shuffled
     if is_full_model_shuffled:
@@ -717,7 +718,7 @@ def convert_hf_format_state_dict_mxfp4_compute(state_dict: dict, config: Inferen
         state_dict[f"layers.{layer}.self_attn.learned_sinks.sink"] = state_dict[f"layers.{layer}.self_attn.sinks"]
         # If attention is run in two different parallelisms across CTE and TKG, we duplicate the weights
         if config.neuron_config.attention_dp_degree != config.neuron_config.cp_degree:
-            state_dict[f"layers.{layer}.self_attn.tkg_learned_sinks.sink"] = state_dict[f"layers.{layer}.self_attn.sinks"]
+            state_dict[f"layers.{layer}.self_attn.tkg_learned_sinks.sink"] = state_dict[f"layers.{layer}.self_attn.sinks"].clone().contiguous()
         del state_dict[f"layers.{layer}.self_attn.sinks"]
 
         # Router shuffled due to o_proj being shuffled
@@ -738,7 +739,7 @@ def convert_hf_format_state_dict_mxfp4_compute(state_dict: dict, config: Inferen
                     weight,
                     scale,
                     bias,
-                    tp_degree=config.neuron_config.tp_degree,
+                    tp_degree=moe_tp_degree,
                     E_size=config.num_local_experts,
                     H_size=config.hidden_size,
                     I_size=config.intermediate_size,
@@ -750,7 +751,7 @@ def convert_hf_format_state_dict_mxfp4_compute(state_dict: dict, config: Inferen
                     convert_down_proj_fp4(weight),
                     scale.transpose(1, 2),
                     bias,
-                    tp_degree=config.neuron_config.tp_degree,
+                    tp_degree=moe_tp_degree,
                     E_size=config.num_local_experts,
                     I_size=config.intermediate_size,
                     H_size=config.hidden_size,

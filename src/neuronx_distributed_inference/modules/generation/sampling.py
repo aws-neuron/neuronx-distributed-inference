@@ -2,15 +2,21 @@ import logging
 from typing import Any, Dict, Union
 
 import torch
+import torch_xla.core.xla_model as xm
+
 from neuronx_distributed.operators.argmax import argmax as nxd_argmax
 from neuronx_distributed.operators.topk import topk as nxd_topk
+from neuronx_distributed.operators.topk import get_topk_implementation
 from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
 from neuronx_distributed.utils.utils import hardware
 from neuronxcc.nki._private_kernels.cumsum import cumsum as nki_cumsum
 from torch_neuronx.utils import get_platform_target
 from torch_neuronx.xla_impl.ops import nki_jit, xla_hlo_call
 
 from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
+from neuronx_distributed_inference.modules.attention.attention_process_groups import get_tp_cp_group_mesh, get_cp_group_mesh
+
 
 logger = logging.getLogger("Neuron")
 
@@ -202,6 +208,38 @@ def prepare_tensor(val: Union[torch.Tensor, list, float]):
     return val
 
 
+def create_sampler(neuron_config: NeuronConfig, lm_head_tp_degree=None, do_sample=None):
+    """
+    Factory method to create appropriate sampler based on configuration
+    """
+    sampling_config = neuron_config.on_device_sampling_config
+    if not sampling_config:
+        return Sampler(neuron_config, do_sample)
+
+    # Check if DataParallelSampler should be used
+    if sampling_config.sampling_dp_degree > 1 and neuron_config.batch_size > 1 and lm_head_tp_degree:
+        can_use_dp_sampler = all([
+            neuron_config.batch_size >= sampling_config.sampling_dp_degree,
+            neuron_config.batch_size % sampling_config.sampling_dp_degree == 0,
+            lm_head_tp_degree == neuron_config.tp_degree,
+            not neuron_config.on_cpu
+        ])
+
+        if can_use_dp_sampler:
+            return DataParallelSampler(neuron_config)
+        else:
+            logger.warning(
+                f"DataParallelSampler requirements not met. Falling back to Sampler. "
+                f"batch_size={neuron_config.batch_size}, "
+                f"sampling_dp_degree={sampling_config.sampling_dp_degree}, "
+                f"lm_head_tp_degree={lm_head_tp_degree}, "
+                f"tp_degree={neuron_config.tp_degree}, "
+                f"on_cpu={neuron_config.on_cpu}"
+            )
+
+    return Sampler(neuron_config, do_sample)
+
+
 class Sampler(torch.nn.Module):
     """
     Use this to implement sampling techniques
@@ -324,7 +362,10 @@ class Sampler(torch.nn.Module):
         return rand_selector
 
     def _multinomial(self, probs, dim, num_samples=1):
+        # Rescale probs_cumsum to account for floating point inaccuracy
         probs_cumsum = cumsum(tensor_in=probs, dim=dim, on_cpu=self.neuron_config.on_cpu)
+        probs_cumsum = probs_cumsum / probs_cumsum[..., -1:]
+        probs_cumsum[..., -1:] = 1  # Ensure last element is 1 to be safe
         rand_selector = self._rand_selector(probs_cumsum, num_samples)
         greater_than_rand = torch.greater(rand_selector, probs_cumsum)
         counts = torch.sum(greater_than_rand, dim=dim).unsqueeze(dim)
@@ -341,6 +382,7 @@ class Sampler(torch.nn.Module):
                 gather_dim=dim,
                 keepdim=False,
                 process_group=self.process_group,
+                disable_argmax_kernel=self.neuron_config.disable_argmax_kernel
             )
             values = torch.ones(tokens.shape, dtype=token_logits.dtype, device=tokens.device)
             if return_values:
@@ -364,6 +406,9 @@ class Sampler(torch.nn.Module):
         top_k_logits_values, top_k_logits_indices = self._top_k_masked(
             token_logits, top_k, dim, rank_id
         )
+        top_k = top_k[:top_k_logits_values.shape[0], ...]
+        top_p = top_p[:top_k_logits_values.shape[0], ...]
+        temperature = temperature[:top_k_logits_values.shape[0], ...]
         if self.is_medusa:
             return top_k_logits_indices
         if self.dynamic or torch.any(temperature != 1.0):
@@ -419,3 +464,118 @@ class Sampler(torch.nn.Module):
             )
         else:
             return self._argmax_sample(token_logits, return_values, dim)
+
+
+class DataParallelSampler(Sampler):
+    """
+    DataParallelSampler for high-throughput sampling scenarios.
+
+    This sampler uses batch sharding to distribute computation across multiple devices
+    and uses the flexible TopK strategy pattern for different TopK implementations.
+    """
+    def __init__(self, neuron_config: NeuronConfig):
+        super().__init__(neuron_config)
+        self.lnc = neuron_config.logical_nc_config
+        self.sampling_config = neuron_config.on_device_sampling_config
+        self.gather_needed = True
+
+        self.all2all_grp_size = self.sampling_config.sampling_dp_degree
+        self.gather_grp_size = self.neuron_config.tp_degree // self.all2all_grp_size
+
+        # Initialize process groups and TopK strategy
+        self._initialize_process_groups()
+
+    def _initialize_process_groups(self):
+        """Initialize process groups for batch sharded operations"""
+        self.all2all_mesh = get_tp_cp_group_mesh(self.neuron_config.tp_degree, self.gather_grp_size, self.neuron_config.switch_cc)
+        self.gather_mesh = get_cp_group_mesh(self.neuron_config.tp_degree, self.gather_grp_size, self.neuron_config.switch_cc)
+        self.all2all_pg = torch.distributed.new_group(
+            self.all2all_mesh,
+            pg_options={"xla_pg_options": {"mesh": self.all2all_mesh}}
+        )
+        self.gather_pg = torch.distributed.new_group(
+            self.gather_mesh,
+            pg_options={"xla_pg_options": {"mesh": self.gather_mesh}}
+        )
+
+        self.rank_id_map = torch.zeros(self.neuron_config.tp_degree, self.all2all_grp_size)
+        for r in range(len(self.all2all_mesh)):
+            for c in range(len(self.all2all_mesh[0])):
+                self.rank_id_map[self.all2all_mesh[r][c]] = torch.tensor(self.all2all_mesh[r])
+
+    def _batch_sharded_topk(self, tensor, k, dim, rank_id):
+        topk_implementation, call_topk_kernel_with_sorted_parameter, _ = get_topk_implementation(use_topk_rotated_kernel=self.top_k_kernel_enabled, lnc=self.lnc, dim=dim, tensor=tensor)
+        tensor = xm.all_to_all(
+            tensor,
+            split_dimension=0,
+            concat_dimension=dim,
+            split_count=self.all2all_grp_size,
+            groups=self.all2all_mesh,
+            pin_layout=False,
+        )
+        bs = tensor.shape[0]
+        # Calculate how many elements each core/rank holds after sharding
+        sharded_size = tensor.shape[dim] // self.all2all_grp_size
+        original_num_dims = len(tensor.shape)
+        if original_num_dims == 2:
+            tensor = tensor.unsqueeze(1)
+
+        local_value, local_index = topk_implementation(tensor, k, dim)
+
+        # need to move to device in forward call, not during init, this will cause lowering issues
+        self.rank_id_map = self.rank_id_map.to(tensor.device)
+
+        # Decompose local indices into shard ID and offset within shard
+        local_index_quotient = local_index // sharded_size  # Which shard (0, 1, 2, ...)
+        local_index_reminder = local_index % sharded_size  # Position within that shard
+        # Map shard IDs to actual rank IDs using the rank_id_map
+        original_shape = local_index_quotient.shape
+        flat_indices = local_index_quotient.flatten()  # (B*S*global_topk)
+        rank_map = self.rank_id_map[rank_id][0]  # (sampling_dp_degree)
+        shard_rank_id = rank_map[flat_indices]
+        shard_rank_id = shard_rank_id.reshape(original_shape)
+        # Convert to global indices: (rank_id * shard_size) + offset_within_shard
+        local_index = shard_rank_id * sharded_size + local_index_reminder
+        if original_num_dims == 2:
+            local_value = local_value.squeeze(1)
+            local_index = local_index.squeeze(1)
+        payload = torch.cat([local_value, local_index], dim=0)
+
+        global_payload = _gather_along_dim(payload, dim, process_group=self.gather_pg)
+        global_values, global_indices = torch.split(global_payload, bs, dim=0)
+        global_indices = global_indices.to(torch.int32)
+
+        values, global_max_local_index = call_topk_kernel_with_sorted_parameter(global_values, k, dim)
+
+        final_indices = torch.gather(global_indices, dim, global_max_local_index)
+        return values, final_indices
+
+    def _top_k_masked(self, logits, top_k, dim, rank_id):
+        # Perform sharded TopK operation
+        sorted_logits, indices = self._batch_sharded_topk(
+            tensor=logits,
+            k=self.global_topk,
+            dim=dim,
+            rank_id=rank_id
+        )
+        vocab_size = sorted_logits.shape[-1]
+        mask = torch.arange(vocab_size, device=logits.device)
+        mask = mask.broadcast_to(*sorted_logits.shape)
+        top_k = top_k[:sorted_logits.shape[0], ...]
+        mask = torch.greater_equal(mask, top_k)
+        sorted_logits = sorted_logits.masked_fill_(mask, self.IGNORED_LOGITS_VALUE)
+        return sorted_logits, indices
+
+    def forward(self, token_logits, sampling_params, return_values=False, rank_id=None):
+        # Override forward to handle final gathering
+        results = super().forward(token_logits, sampling_params, return_values, rank_id)
+        if return_values:
+            top_k_logits_indices, probs_soft_max = results[0], results[1]
+            if self.do_sample or self.dynamic or self.is_medusa:
+                top_k_logits_indices = _gather_along_dim(top_k_logits_indices, 0, process_group=self.all2all_pg)
+                probs_soft_max = _gather_along_dim(probs_soft_max, 0, process_group=self.all2all_pg)
+            return top_k_logits_indices, probs_soft_max
+
+        if self.gather_needed:
+            results = _gather_along_dim(results, 0, process_group=self.all2all_pg)
+        return results.to(torch.int32)

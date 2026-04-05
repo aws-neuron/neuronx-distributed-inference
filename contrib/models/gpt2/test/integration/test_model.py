@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-Integration tests for gpt2 NeuronX implementation.
+Integration tests for GPT-2 NeuronX implementation.
+
+This model uses the GPT-2 architecture with:
+- Conv1D layers (require weight transposition)
+- Non-power-of-2 vocab size (50257, requires padding)
+- Tied embeddings (handled via state dict)
+- LayerNorm (not RMSNorm)
+- Learned positional embeddings (not RoPE)
 """
 
 import pytest
@@ -15,7 +22,7 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 # Import from src directory
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from modeling_gpt2 import *
+from modeling_gpt2 import NeuronGPT2ForCausalLM, GPT2InferenceConfig
 
 
 # Test configuration

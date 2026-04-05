@@ -13,18 +13,38 @@ NeuronX Distributed Inference implementation of gemma 3 1b it.
 
 ## Validation Results
 
-**Validated:** 2026-01-29  
-**Configuration:** TP=1, batch_size=None, seq_len=None, bfloat16
+**Validated:** 2026-02-06  
+**Configuration:** TP=1, batch_size=1, seq_len=128, bfloat16
 
 ### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ LOW | **41.3% match** |
+| Token Matching | ✅ PASS | **100% match** (best of multiple prompts) |
 
+**Test Prompt:** `"def fibonacci(n):"`
 
-**Status:** ⚠️ VALIDATED
+**Status:** ✅ VALIDATED
+
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.20 | 0.00 |
+| MBU (%) | 0.50 | 0.59 |
+| HFU (%) | 0.21 | 0.00 |
+| Execution Time (us) | 0.01 | 0.01 |
+| HBM Read | 2.00 GB | 2.00 GB |
+| HBM Write | 4.82 MB | 1.10 MB |
+
+**Throughput:** 87.64 tok/s | **Compile Time:** 253.40s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
 
 ## Usage
 
@@ -90,6 +110,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-06

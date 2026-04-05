@@ -1,6 +1,7 @@
 import enum
 import logging
 from typing import Optional, Tuple
+import os
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state
@@ -18,6 +19,7 @@ from torch import nn
 from torch.distributed import ProcessGroup
 from torch.nn import functional as F
 from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
+from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.modules.attention.utils import transpose_parallel_linear_layer
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
@@ -42,8 +44,11 @@ _traced_qkv_kernel_bir = nki_jit()(rmsnorm_qkv_isa_kernel)
 _traced_qkv_kernel_fused_add_bir = nki_jit()(rmsnorm_qkv_isa_fused_add_kernel)
 
 try:
-    from neuronxcc.nki._pre_prod_kernels.output_proj import output_proj_kernel
-    _traced_o_proj_kernel = nki_jit()(output_proj_kernel)
+    if os.environ.get("NKI_FRONTEND_FRAMEWORK") == "beta2":
+        from neuronxcc.nki._pre_prod_nkl.output_projection.output_projection_cte import output_projection_cte
+    else:
+        from neuronxcc.nki._pre_prod_kernels.output_proj import output_proj_kernel
+        _traced_o_proj_kernel = nki_jit()(output_proj_kernel)
 except ImportError:
     logger.warning(
         "Use a more recent neuron compiler version to enable output projection kernel"
@@ -324,6 +329,32 @@ class BaseGroupQueryAttention(nn.Module):
 
     def get_num_key_value_heads(self) -> int:
         return self.num_key_value_heads
+
+    def get_bias(
+        self, prefix: str, layer: torch.nn.Module, layer_name: str, model_state_dict: dict
+    ) -> Tuple[torch.Tensor]:
+        if hasattr(layer, "get_bias_from_state_dict"):
+            bias = layer.get_bias_from_state_dict(
+                prefix=f"{prefix}.{layer_name}.", state_dict=model_state_dict
+            )
+        else:
+            bias = model_state_dict.get(f"{prefix}.{layer_name}.bias")
+        return bias
+
+    def set_bias(
+        self,
+        tensor: torch.Tensor,
+        prefix: str,
+        layer: torch.nn.Module,
+        layer_name: str,
+        model_state_dict: dict,
+    ) -> Tuple[torch.Tensor]:
+        if hasattr(layer, "set_bias_to_state_dict"):
+            layer.set_bias_to_state_dict(
+                prefix=f"{prefix}.{layer_name}.", tensor=tensor, state_dict=model_state_dict
+            )
+        else:
+            model_state_dict[f"{prefix}.{layer_name}.bias"] = tensor.clone()
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
         raise NotImplementedError
@@ -817,7 +848,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
     def get_weight(
         self, prefix: str, layer: torch.nn.Module, layer_name, model_state_dict: dict
     ) -> Tuple[torch.Tensor]:
-        if hasattr(layer, "get_weight_from_state_dict"):
+        scale = None
+        input_scale = None
+        if hasattr(layer, "input_scale"):
             weight = layer.get_weight_from_state_dict(
                 prefix=f"{prefix}.{layer_name}.", state_dict=model_state_dict
             )
@@ -825,26 +858,20 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 scale = layer.get_scale_from_state_dict(
                     prefix=f"{prefix}.{layer_name}.", state_dict=model_state_dict
                 )
-            else:
-                scale = None
+                if hasattr(layer, "get_input_scale_from_state_dict"):
+                    input_scale = layer.get_input_scale_from_state_dict(
+                        prefix=f"{prefix}.{layer_name}.", state_dict=model_state_dict
+                    )
         else:
             weight = model_state_dict[f"{prefix}.{layer_name}.weight"]
             if isinstance(layer, BaseQuantizeParallelLinear):
                 scale = model_state_dict[f"{prefix}.{layer_name}.scale"]
-            else:
-                scale = None
-        return weight, scale
+                if hasattr(layer, "input_scale"):
+                    input_scale = layer.get_input_scale_from_state_dict(
+                        prefix=f"{prefix}.{layer_name}.", state_dict=model_state_dict
+                    )
 
-    def get_bias(
-        self, prefix: str, layer: torch.nn.Module, layer_name: str, model_state_dict: dict
-    ) -> Tuple[torch.Tensor]:
-        if hasattr(layer, "get_bias_from_state_dict"):
-            bias = layer.get_bias_from_state_dict(
-                prefix=f"{prefix}.{layer_name}.", state_dict=model_state_dict
-            )
-        else:
-            bias = model_state_dict.get(f"{prefix}.{layer_name}.bias")
-        return bias
+        return weight, scale, input_scale
 
     def set_weight(
         self,
@@ -854,27 +881,15 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         layer_name,
         model_state_dict: dict,
         scale: torch.Tensor = None,
+        input_scale: torch.Tensor = None,
     ) -> Tuple[torch.Tensor]:
         # TODO: set weight to state dict support is pending.
         model_state_dict[f"{prefix}.{layer_name}.weight"] = tensor
         if scale is not None:
             model_state_dict[f"{prefix}.{layer_name}.scale"] = scale
             verify_scale_dimension(tensor=tensor, tensor_scale=scale)
-
-    def set_bias(
-        self,
-        tensor: torch.Tensor,
-        prefix: str,
-        layer: torch.nn.Module,
-        layer_name: str,
-        model_state_dict: dict,
-    ) -> Tuple[torch.Tensor]:
-        if hasattr(layer, "set_bias_to_state_dict"):
-            layer.set_bias_to_state_dict(
-                prefix=f"{prefix}.{layer_name}.", tensor=tensor, state_dict=model_state_dict
-            )
-        else:
-            model_state_dict[f"{prefix}.{layer_name}.bias"] = tensor
+        if input_scale is not None:
+            model_state_dict[f"{prefix}.{layer_name}.input_scale"] = input_scale
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
         prefix_parts = prefix.split(".")
@@ -886,7 +901,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 new_prefix=f"{prefix}.Wqkv",
                 model_state_dict=model_state_dict,
             )
-            qkv_weight, qkv_scale = self.get_weight(
+            # TODO: Add Static Activation support for fused_qkv
+            qkv_weight, qkv_scale, _ = self.get_weight(
                 prefix=prefix, layer=self.Wqkv, layer_name="Wqkv", model_state_dict=model_state_dict
             )
             q_proj_weight, k_proj_weight, v_proj_weight = qkv_weight.split(
@@ -941,19 +957,19 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 model_state_dict=model_state_dict,
             )
 
-            q_proj_weight, q_proj_scale = self.get_weight(
+            q_proj_weight, q_proj_scale, q_proj_input_scale = self.get_weight(
                 prefix=prefix,
                 layer=self.q_proj,
                 layer_name="q_proj",
                 model_state_dict=model_state_dict,
             )
-            k_proj_weight, k_proj_scale = self.get_weight(
+            k_proj_weight, k_proj_scale, k_proj_input_scale = self.get_weight(
                 prefix=prefix,
                 layer=self.k_proj,
                 layer_name="k_proj",
                 model_state_dict=model_state_dict,
             )
-            v_proj_weight, v_proj_scale = self.get_weight(
+            v_proj_weight, v_proj_scale, v_proj_input_scale = self.get_weight(
                 prefix=prefix,
                 layer=self.v_proj,
                 layer_name="v_proj",
@@ -1104,6 +1120,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 layer_name="q_proj",
                 model_state_dict=model_state_dict,
                 scale=q_proj_scale,
+                input_scale=q_proj_input_scale,
             )
             self.set_weight(
                 tensor=k_proj_weight,
@@ -1112,6 +1129,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 layer_name="k_proj",
                 model_state_dict=model_state_dict,
                 scale=k_proj_scale,
+                input_scale=k_proj_input_scale,
             )
             self.set_weight(
                 tensor=v_proj_weight,
@@ -1120,6 +1138,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 layer_name="v_proj",
                 model_state_dict=model_state_dict,
                 scale=v_proj_scale,
+                input_scale=v_proj_input_scale,
             )
 
             if self.bias:
@@ -1242,12 +1261,20 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         if self.bias:
             o_proj_kernel_kwargs["bias"] = self.o_proj.bias.unsqueeze(0) / self.tp_degree
 
-        _traced_o_proj_kernel[(nc(self.logical_nc_config),)](
-            active=kernel_attn_in,
-            weight=self.o_proj.weight,
-            out=out,
-            **o_proj_kernel_kwargs,
-        )
+        if os.environ.get("NKI_FRONTEND_FRAMEWORK") == "beta2":
+            os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
+            out = output_projection_cte[self.logical_nc_config](
+                attention=kernel_attn_in,
+                weight=self.o_proj.weight.data,
+                **o_proj_kernel_kwargs,
+            )
+        else:
+            _traced_o_proj_kernel[(nc(self.logical_nc_config),)](
+                active=kernel_attn_in,
+                weight=self.o_proj.weight,
+                out=out,
+                **o_proj_kernel_kwargs,
+            )
 
         # All-reduce or reduce-scatter, depending on whether SP is enabled
         original_dtype = out.dtype
@@ -1288,6 +1315,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         )
         o_proj_weight = model_state_dict[f"{prefix}.o_proj.weight"]
         o_proj_scale = model_state_dict.get(f"{prefix}.o_proj.scale", None)
+        o_proj_input_scale = model_state_dict.get(f"{prefix}.o_proj.input_scale", None)
 
         if self.sharding_strategy == GQA.REPLICATE_TO_TP_DEGREE:
             o_proj_weight, o_proj_scale = maybe_pad_interleaved(
@@ -1312,5 +1340,19 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         if o_proj_scale is not None:
             model_state_dict[f"{prefix}.o_proj.scale"] = o_proj_scale
             verify_scale_dimension(tensor=o_proj_weight, tensor_scale=o_proj_scale)
+        if o_proj_input_scale is not None:
+            model_state_dict[f"{prefix}.o_proj.input_scale"] = o_proj_input_scale
+
+        o_proj_bias = self.get_bias(
+            prefix=prefix, layer=self.o_proj, layer_name="o_proj", model_state_dict=model_state_dict
+        )
+        if self.bias:
+            self.set_bias(
+                tensor=o_proj_bias,
+                prefix=prefix,
+                layer=self.o_proj,
+                layer_name="o_proj",
+                model_state_dict=model_state_dict,
+            )
 
         return True

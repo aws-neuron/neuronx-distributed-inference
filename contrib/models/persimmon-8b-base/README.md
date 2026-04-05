@@ -48,6 +48,25 @@ NeuronX Distributed Inference implementation of Persimmon-8B-Base from Adept AI.
 
 **Note:** Perfect token matching (100%) demonstrates excellent accuracy. Performance is slower than threshold but model is fully functional and generates correct outputs.
 
+### Device Profiling Metrics
+
+**Configuration:** TP=8, batch_size=1, seq_len=2048, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.27 | 0.00 |
+| MBU (%) | 0.13 | 0.51 |
+| HFU (%) | 0.33 | 0.01 |
+| Execution Time (us) | 0.16 | 0.01 |
+| HBM Read | 7.46 GB | 2.24 GB |
+| HBM Write | 1.51 GB | 2.02 MB |
+
+**Throughput:** 6.64 tok/s | **Compile Time:** 296.07s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -119,6 +138,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

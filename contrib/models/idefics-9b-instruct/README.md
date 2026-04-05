@@ -42,6 +42,25 @@ NeuronX Distributed Inference implementation of idefics 9b instruct.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-21
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.25 | 0.00 |
+| MBU (%) | 0.47 | 0.42 |
+| HFU (%) | 0.25 | 0.01 |
+| Execution Time (us) | 0.07 | 0.08 |
+| HBM Read | 13.97 GB | 13.29 GB |
+| HBM Write | 330.92 MB | 2.00 MB |
+
+**Throughput:** 13.40 tok/s | **Compile Time:** 755.21s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -106,6 +125,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

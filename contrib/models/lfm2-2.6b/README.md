@@ -48,6 +48,25 @@ NeuronX Distributed Inference implementation of LFM2-2.6B, Liquid AI's Language 
 
 **Note:** Token matching shows 0.0% due to HF LlamaForCausalLM fallback generating incorrect output (architecture mismatch). Neuron model generates correct quiz-style output with Paris as the answer. Previous S3 validation showed 75% success rate with correct factual outputs.
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=2048, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-21
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.52 | 0.00 |
+| MBU (%) | 0.32 | 0.60 |
+| HFU (%) | 0.53 | 0.00 |
+| Execution Time (us) | 0.21 | 0.02 |
+| HBM Read | 22.62 GB | 5.20 GB |
+| HBM Write | 5.61 GB | 684.0 KB |
+
+**Throughput:** 4.69 tok/s | **Compile Time:** 682.17s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -119,6 +138,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

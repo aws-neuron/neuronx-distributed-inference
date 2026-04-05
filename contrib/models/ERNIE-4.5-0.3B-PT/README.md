@@ -26,6 +26,25 @@ NeuronX Distributed Inference implementation of ERNIE 4.5 0.3B PT.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.43 | 0.00 |
+| MBU (%) | 0.24 | 0.58 |
+| HFU (%) | 0.47 | 0.01 |
+| Execution Time (us) | 0.01 | 0.00 |
+| HBM Read | 722.59 MB | 732.68 MB |
+| HBM Write | 10.90 MB | 956.4 KB |
+
+**Throughput:** 120.23 tok/s | **Compile Time:** 133.99s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -90,6 +109,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

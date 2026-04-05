@@ -30,6 +30,25 @@ NeuronX Distributed Inference implementation of OLMo 3 7B Think.
 
 **Status:** EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-20
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.17 | 0.00 |
+| MBU (%) | 0.32 | 0.34 |
+| HFU (%) | 0.19 | 0.02 |
+| Execution Time (us) | 0.05 | 0.06 |
+| HBM Read | 7.03 GB | 7.97 GB |
+| HBM Write | 107.01 MB | 3.23 MB |
+
+**Throughput:** 17.99 tok/s | **Compile Time:** 226.27s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -68,6 +87,6 @@ pytest nxdi_contrib_models/models/OLMo-3-7B-Think/test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-30

@@ -488,7 +488,8 @@ def check_accuracy_logits(
     input_start_offsets=None,
     pad_token_id=0,
     image_processor=None,
-    tensor_capture_hook=None
+    tensor_capture_hook=None,
+    generate_fn_divergence=False,
 ):
     """
     DEPRECATED: Please use the function check_accuracy_logits_v2 instead.
@@ -610,7 +611,7 @@ def check_accuracy_logits(
         (initial_attention_mask, expected_attention_mask), dim=1
     )
 
-    def generate_fn_base(input_ids):
+    def generate_fn_base(input_ids, divergence_idx=None):
         input_length = input_ids.shape[1]
         attention_mask = extrapolated_attention_mask[:, :input_length]
         new_tokens = num_tokens_to_check + initial_input_len - input_length
@@ -633,7 +634,8 @@ def check_accuracy_logits(
             output_scores=True,
             generation_config=generation_config,
             **neuron_vision_input_args,
-            tensor_capture_hook=tensor_capture_hook
+            tensor_capture_hook=tensor_capture_hook,
+            divergence_idx=divergence_idx
         )
 
         actual_logits = torch.stack(model_outputs.scores)
@@ -667,13 +669,25 @@ def check_accuracy_logits(
         generate_fn = generate_fn_with_chunked_prefill
     else:
         generate_fn = generate_fn_base
-    passed, results, status_msg = logit_validation(
-        input_ids=initial_input_ids,
-        generate_fn=generate_fn,
-        expected_logits=expected_logits,
-        tol_map=tol_map,
-        divergence_difference_tol=divergence_difference_tol,
-    )
+    
+    # make the logit_validation change backward compatible
+    if get_torch_neuronx_build_version() >= packaging.version.parse("2.11.19230"):
+        passed, results, status_msg = logit_validation(
+            input_ids=initial_input_ids,
+            generate_fn=generate_fn,
+            expected_logits=expected_logits,
+            tol_map=tol_map,
+            divergence_difference_tol=divergence_difference_tol,
+            generate_fn_divergence=generate_fn_divergence
+        )
+    else:
+        passed, results, status_msg = logit_validation(
+            input_ids=initial_input_ids,
+            generate_fn=generate_fn,
+            expected_logits=expected_logits,
+            tol_map=tol_map,
+            divergence_difference_tol=divergence_difference_tol,
+        )
     if not passed:
         raise LogitMatchingValidationError(status_msg, results)
 

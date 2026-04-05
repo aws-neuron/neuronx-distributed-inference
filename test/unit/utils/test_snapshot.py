@@ -167,7 +167,7 @@ class TestGetSnapshotHook:
         
         # Execute hook
         args = (torch.tensor([1, 2, 3]),)
-        hook(mock_traced_model, args, None)
+        hook(mock_traced_model, args)
         
         # Verify calls
         mock_traced_model.nxd_model.router.assert_called_once_with(args)
@@ -199,7 +199,7 @@ class TestGetSnapshotHook:
         
         # Execute hook for request 0 (should be skipped)
         args = (torch.tensor([1, 2, 3]),)
-        hook(mock_traced_model, args, None)
+        hook(mock_traced_model, args)
         
         # Verify no tensors were saved
         mock_get_tensors.assert_not_called()
@@ -234,7 +234,7 @@ class TestGetSnapshotHook:
         
         # Execute hook
         args = (torch.tensor([1, 2, 3]), torch.tensor([1]), torch.tensor([[0, 1, 2]]))
-        hook(mock_traced_model, args, None)
+        hook(mock_traced_model, args)
         
         # Verify calls
         mock_traced_model.nxd_model.router.assert_called_once_with(args)
@@ -270,7 +270,7 @@ class TestGetSnapshotHook:
         
         # Execute hook
         args = (torch.tensor([1, 2, 3]), torch.tensor([1]), torch.tensor([[2]]))
-        hook(mock_traced_model, args, None)
+        hook(mock_traced_model, args)
         
         # Verify no tensors were saved
         mock_get_tensors.assert_not_called()
@@ -513,7 +513,7 @@ class TestIntegration:
         )
         
         args = (torch.tensor([1, 2, 3]),)
-        hook(mock_traced_model, args, None)
+        hook(mock_traced_model, args)
         
         # Verify files were created with correct contents
         expected_files = [
@@ -606,7 +606,7 @@ class TestNxDModelHooks:
         assert result == "original_output"
         
         # Verify hook was called with correct arguments
-        mock_hook.assert_called_once_with(mock_traced_model, args, "original_output")
+        mock_hook.assert_called_once_with(mock_traced_model, args)
     
     def test_wrapped_function_preserves_original_behavior(self, mock_traced_model, mock_hook):
         """Test that wrapped function preserves original function's behavior."""
@@ -630,7 +630,7 @@ class TestNxDModelHooks:
         assert original_calls == [(5, 10)]
         
         # Verify hook was called with correct parameters
-        mock_hook.assert_called_once_with(mock_traced_model, (5,), 10)
+        mock_hook.assert_called_once_with(mock_traced_model, (5,))
     
     def test_unregister_hook_success(self, mock_traced_model, mock_function, mock_hook):
         """Test successful hook unregistration."""
@@ -728,7 +728,7 @@ class TestNxDModelHooks:
         setattr(mock_traced_model.nxd_model, func_name, mock_function)
         
         # Create a hook that raises an exception
-        def failing_hook(traced_model, args, output):
+        def failing_hook(traced_model, args):
             raise ValueError("Hook failed")
         
         register_nxd_model_hook(mock_traced_model, func_name, failing_hook)
@@ -753,8 +753,8 @@ class TestNxDModelHooks:
         with pytest.raises(RuntimeError, match="Original function failed"):
             wrapped_func()
         
-        # Hook should not be called when original function fails
-        mock_hook.assert_not_called()
+        # Hook should be called when original function fails
+        mock_hook.assert_called_once_with(mock_traced_model, ())
 
 # Additional integration tests
 class TestHookIntegration:
@@ -786,7 +786,7 @@ class TestHookIntegration:
         result = wrapped_func("arg1", key="value")
         
         assert result == "original"
-        hook_func.assert_called_once_with(traced_model, ("arg1",), "original")
+        hook_func.assert_called_once_with(traced_model, ("arg1",))
         
         # Unregister hook
         unregister_nxd_model_hooks(traced_model, func_name)

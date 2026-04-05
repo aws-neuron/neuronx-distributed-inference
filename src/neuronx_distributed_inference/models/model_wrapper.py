@@ -1,6 +1,7 @@
 import logging
 import os
 import warnings
+import json
 from functools import partial
 
 from neuronx_distributed.utils.tensor_replacement.model_modification import modify_model_for_tensor_replacement
@@ -28,6 +29,7 @@ from neuronx_distributed_inference.modules.async_execution import (
     is_ranked_io,
 )
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
+from neuronx_distributed_inference.modules.padding import pad_with_first_batchline
 
 CONTEXT_ENCODING_MODEL_TAG = "context_encoding_model"
 TOKEN_GENERATION_MODEL_TAG = "token_generation_model"
@@ -71,8 +73,8 @@ class ModelWrapper(torch.nn.Module):
         self.tag = tag
         self.is_block_kv_layout = config.neuron_config.is_block_kv_layout
         self.is_prefix_caching = config.neuron_config.is_prefix_caching
-        self.is_chunked_prefill = config.neuron_config.is_chunked_prefill
         self.is_medusa = config.neuron_config.is_medusa
+        self.is_batch_bucketing = config.neuron_config.token_generation_batches is not None
 
         base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
         self.compiler_workdir = os.path.join(base_compile_work_dir, self.tag)
@@ -120,15 +122,15 @@ class ModelWrapper(torch.nn.Module):
                 # This is needed because lots of mac-ops happen in kernels which are not visible to the graph partitioner at the moment.
                 hlo2tensorizer += " --modular-flow-mac-threshold=10 "
 
-                if self.is_chunked_prefill:
-                    # To reduce layer boundary that blocks overlapping of DMA
-                    # and compute
-                    self.compiler_args += " --layer-unroll-factor=4 "
-
             else:
                 # NxD will add -O1 if existing compiler args do not have -Ox. We want to
                 # use -O2 for TKG model to avoid function call overheads with Modular flow.
                 self.compiler_args += " -O2 "
+
+            if self.neuron_config.dma_order_config is not None and tag in self.neuron_config.dma_order_config.keys():
+                dma_order_config_str = json.dumps(self.neuron_config.dma_order_config[tag])
+                self.compiler_args += f" --internal-dma-order-constraints='{dma_order_config_str}' "
+                self.compiler_args += " --internal-bir-enable-sb-allocation "
 
             if self.neuron_config.enable_spill_reload_dge:
                 self.compiler_args += " --internal-enable-dge-levels spill_reload "
@@ -207,7 +209,18 @@ class ModelWrapper(torch.nn.Module):
         inputs = []
         for bucket in self.neuron_config.buckets:
             batch_size = self.neuron_config.batch_size
-            if isinstance(bucket, list) and self.neuron_config.is_prefix_caching:
+            # Handle batch bucketing: bucket format is [batch_size, seq_len]
+            # TODO add support for prefix caching
+            if isinstance(bucket, list) and self.is_batch_bucketing and not self.neuron_config.is_prefix_caching:
+                batch_size = bucket[0]
+                seq_bucket = bucket[1]
+                n_active_tokens = (
+                    seq_bucket
+                    if self.neuron_config.bucket_n_active_tokens
+                    else self.neuron_config.n_active_tokens
+                )
+                attention_mask = torch.ones((batch_size, seq_bucket), dtype=torch.int32)
+            elif isinstance(bucket, list) and self.neuron_config.is_prefix_caching:
                 n_active_tokens = (
                     bucket[0]
                     if self.neuron_config.bucket_n_active_tokens
@@ -218,14 +231,6 @@ class ModelWrapper(torch.nn.Module):
                     attention_mask = torch.zeros(1, dtype=torch.int32)
                 else:
                     attention_mask = torch.ones((batch_size, prefix_size), dtype=torch.int32)
-            elif self.is_chunked_prefill and self.tag == CONTEXT_ENCODING_MODEL_TAG:
-                assert isinstance(bucket, list)
-                n_active_tokens = (
-                    bucket[0]
-                    if self.neuron_config.bucket_n_active_tokens
-                    else self.neuron_config.n_active_tokens
-                )  # chunk size
-                attention_mask = torch.ones((batch_size, n_active_tokens), dtype=torch.int32)
             else:
                 n_active_tokens = (
                     bucket
@@ -310,17 +315,6 @@ class ModelWrapper(torch.nn.Module):
                         scatter_index,
                     )
                 )
-            elif self.is_chunked_prefill:
-                input_shape = self._get_input_shape_for_chunked_prefill(
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    seq_ids,
-                    sampling_params,
-                    n_active_tokens,
-                    bucket,
-                )
-                inputs.append(input_shape)
             elif self.is_prefix_caching:
                 input_shape = self._get_input_shape_for_prefix_caching(
                     input_ids,
@@ -331,12 +325,13 @@ class ModelWrapper(torch.nn.Module):
                     batch_size,
                     n_active_tokens,
                     prefix_size,
+                    adapter_ids,
                 )
                 inputs.append(input_shape)
             elif self.neuron_config.tensor_replacement_config:
                 reg = TensorReplacementRegister.get_instance()
                 tf_tensors, tf_masks = reg.example_args(step=1) if self.tag == CONTEXT_ENCODING_MODEL_TAG else reg.example_args(step=2)
-                empties = [torch.empty(0) for i in range(17)]
+                empties = [torch.empty(0) for i in range(18)]
                 inputs.append(
                     (
                         input_ids,
@@ -366,103 +361,6 @@ class ModelWrapper(torch.nn.Module):
 
         return inputs
 
-    def _get_input_shape_for_chunked_prefill(
-        self,
-        input_ids,
-        attention_mask,
-        position_ids,
-        seq_ids,
-        sampling_params,
-        n_active_tokens,
-        bucket,
-    ):
-        cp_config = self.neuron_config.chunked_prefill_config
-
-        if self.neuron_config.is_prefill_stage:
-            assert len(bucket) == 2
-            num_tiles = bucket[1]
-
-            # batch_size is 1 for CTE, so (batch_size, -1) -> (max_num_seqs, -1)
-            sampling_params = sampling_params.expand(cp_config.max_num_seqs, -1)
-
-            slot_mapping = torch.zeros(n_active_tokens, dtype=torch.int32)
-            # CTE reads the whole KV cache blocks, and it uses tile_block_tables
-            # instead of active_block_table
-            active_block_table = torch.empty(0)
-
-            # length of query for each request
-            query_lens = torch.zeros(cp_config.max_num_seqs, dtype=torch.int32)
-            # length of computed context
-            computed_context_lens = torch.zeros(cp_config.max_num_seqs, dtype=torch.int32)
-
-            # params for chunked prefill attn kernel
-            q_tile_size = cp_config.kernel_q_tile_size
-            kv_tile_size = cp_config.kernel_kv_tile_size
-            assert kv_tile_size % self.neuron_config.pa_block_size == 0
-            num_blocks_per_kv_tile = kv_tile_size // self.neuron_config.pa_block_size
-
-            tile_q_indices = torch.zeros(num_tiles, dtype=torch.int32)
-            tile_block_tables = torch.zeros(
-                (num_tiles, num_blocks_per_kv_tile), dtype=torch.int32
-            )
-            tile_masks = torch.zeros(
-                (num_tiles, q_tile_size, kv_tile_size), dtype=torch.bool
-            )
-
-        else:
-            # TKG for chunked prefill will be in batching format (batch_size,
-            # seq_len), in order to reuse existing code path.
-            kv_cache_len = bucket
-            assert n_active_tokens == 1
-
-            slot_mapping = torch.zeros(
-                (cp_config.max_num_seqs, n_active_tokens),
-                dtype=torch.int32,
-            )
-
-            assert kv_cache_len % self.neuron_config.pa_block_size == 0
-            num_blocks_per_seq = kv_cache_len // self.neuron_config.pa_block_size
-            active_block_table = torch.zeros(
-                (cp_config.max_num_seqs, num_blocks_per_seq), dtype=torch.int32
-            )
-
-            # length of query for each request
-            query_lens = torch.zeros(
-                (cp_config.max_num_seqs, n_active_tokens), dtype=torch.int32
-            )
-            # length of computed context length
-            computed_context_lens = torch.zeros(
-                (cp_config.max_num_seqs, n_active_tokens), dtype=torch.int32
-            )
-
-            # Need to ensure CTE and TKG has same number of inputs due to
-            # tracing limitation.
-            tile_q_indices = torch.empty(0)
-            tile_block_tables = torch.empty(0)
-            tile_masks = torch.empty(0)
-
-        input_shape = (
-            input_ids,
-            attention_mask,
-            position_ids,
-            seq_ids,
-            sampling_params,
-            torch.empty(0),  # prev_hidden
-            torch.empty(0),  # adapter_ids
-            torch.empty(0),  # accepted_indices
-            torch.empty(0),  # current_length
-            torch.empty(0),  # medusa_mask
-            torch.empty(0),  # scatter_index
-            slot_mapping,
-            active_block_table,
-            query_lens,
-            computed_context_lens,
-            tile_q_indices,
-            tile_block_tables,
-            tile_masks,
-        )
-        return input_shape
-
     def _get_input_shape_for_prefix_caching(
         self,
         input_ids,
@@ -473,6 +371,7 @@ class ModelWrapper(torch.nn.Module):
         batch_size,
         n_active_tokens,
         prefix_size,
+        adapter_ids,
     ):
         if self.neuron_config.enable_fused_speculation and self.tag == FUSED_SPECULATION_MODEL_TAG:
             slot_mapping = torch.zeros((batch_size, self.neuron_config.speculation_length), dtype=torch.int32)
@@ -495,7 +394,7 @@ class ModelWrapper(torch.nn.Module):
                     seq_ids,
                     sampling_params,
                     torch.empty(0),  # prev_hidden
-                    torch.empty(0),  # adapter_ids
+                    adapter_ids,
                     slot_mapping,
                     active_block_table,
                     num_queries,
@@ -528,7 +427,7 @@ class ModelWrapper(torch.nn.Module):
                     seq_ids,
                     sampling_params,
                     torch.empty(0),  # prev_hidden
-                    torch.empty(0),  # adapter_ids
+                    adapter_ids,
                     slot_mapping,
                     active_block_table,
                     num_queries,
@@ -547,7 +446,7 @@ class ModelWrapper(torch.nn.Module):
                 seq_ids,
                 sampling_params,
                 torch.empty(0),  # prev_hidden
-                torch.empty(0),  # adapter_ids
+                adapter_ids,
                 slot_mapping,
                 active_block_table,
                 num_queries,
@@ -561,7 +460,7 @@ class ModelWrapper(torch.nn.Module):
                 seq_ids,
                 sampling_params,
                 torch.empty(0),  # prev_hidden
-                torch.empty(0),  # adapter_ids
+                adapter_ids,
                 torch.empty(0),  # accepted_indices
                 torch.empty(0),  # current_length
                 torch.empty(0),  # medusa_mask
@@ -579,6 +478,94 @@ class ModelWrapper(torch.nn.Module):
             **self.model_init_kwargs,
         )
 
+    def _pad_tensor_replacement_args(self, args, padded_args, pad_helper, indices):
+        """
+        Add tensor replacement arguments when tensor_replacement_config is enabled.
+        This adds additional tensors and masks for tensor replacement functionality.
+        """
+        reg = TensorReplacementRegister.get_instance()
+        tf_arg_count = len(reg.module_superset)
+
+        # These 2 args are passed in even w/o tensor_replacement_config, hence, keeping the same padding behavior
+        for arg in args[len(padded_args):len(padded_args) + 2]:
+            padded_args.append(pad_helper(arg, batch_sort_indices=indices))
+
+        # Empty tensors that don't need to be padded up to batch dim
+        empty_tensor_count = len(args) - 2 * tf_arg_count
+        for arg in args[len(padded_args):empty_tensor_count]:
+            padded_args.append(arg)
+
+        # Tensors for replacement
+        tf_tensors_start = len(args) - 2 * tf_arg_count
+        tf_tensors_end = len(args) - tf_arg_count
+        for arg in args[tf_tensors_start:tf_tensors_end]:
+            padded_arg = pad_helper(
+                arg,
+                pad_type="repeat_first_batchline",
+                batch_sort_indices=indices,
+            )
+            padded_args.append(padded_arg)
+
+        # Masks for replacement that don't need to be padded up to batch dim
+        for arg in args[-tf_arg_count:]:
+            padded_args.append(arg)
+
+        return padded_args
+
+    def _pad_helper(self, tensor, pad_type="fill_0", batch_sort_indices=None):
+        """
+        As part of continuous batching:
+        * If users provide us input batch size less than compiled batch size, NxDI
+          need to pad the inputs to the compiled batch size.
+        * seq_ids are used to indicate which kv cache line is used for each input batch line.
+          NxDI expects the seq_ids to always be [0, 1, 2, ..., compiled_batch_size) by default.
+        * To fulfill these requirements, NxDI pads the seq_ids with the missing slots and sorts
+          it in ascending order. Every other input args are reordered accordingly and
+          missing slots are padded with `repeat_first_batchline`. While returning back response,
+          we use index selct to pick the outputs corresponding to user provided seq_ids.
+        Eg:
+        Input [[10],[20]] and seq_ids [[3], [2]] with compiled batch size as 4.
+        seq_ids [[3], [2]] -> [[3], [2], [0], [1]] (filled missing slots)    -> [[0], [1], [2], [3]] (sort)
+        Input  [[10],[20]] -> [[10],[20],[10],[10]] (repeat_first_batchline) -> [[10],[10],[20],[10]](reorder)
+
+        As part of continuous batching with prefix caching, the second restriction no longer holds true,
+        so sorting of seq_ids and reordering of input args is no longer needed. Padding is required which is added
+        towards the end using `repeat_first_batchline` with the exception of slot_mapping (set to -1 instead)
+        as this is used to update the block kv cache. While returning back response, we just drop off the
+        padded outputs lines at the end of the batch.
+        Eg:
+        Input [[10],[20]] ; seq_ids [[3], [2]] and slot mapping [[50],[100]] with compiled batch size as 4.
+        seq_ids [[3], [2]]        -> [[3], [2], [0], [1]]  (filled missing slots)
+        Input [[10],[20]]         -> [[10],[20],[10],[10]] (repeat_first_batchline)
+        slot mapping [[50],[100]] -> [[50],[100],[-1], [-1]] (padded with -1)
+        """
+        if tensor is None or tensor.shape[0] == self.neuron_config.batch_size:
+            return tensor
+
+        padded_shape = list(tensor.shape)
+        padded_shape[0] = self.neuron_config.batch_size
+
+        def fill_value_tensor(value):
+            return lambda tensor, padded_shape: torch.full(padded_shape, fill_value=value, dtype=tensor.dtype)
+
+        PAD_TYPES = {
+            "repeat_first_batchline": pad_with_first_batchline,
+            "fill_0": fill_value_tensor(0),
+            "fill_1": fill_value_tensor(1),
+            "fill_-1": fill_value_tensor(-1),
+        }
+
+        if pad_type not in PAD_TYPES:
+            raise ValueError(f"Unknown pad_type '{pad_type}'. Available: {list(PAD_TYPES.keys())}")
+
+        padded_tensor = PAD_TYPES[pad_type](tensor, padded_shape)
+        padded_tensor[: tensor.shape[0]] = tensor
+
+        if batch_sort_indices is not None:
+            padded_tensor = torch.index_select(padded_tensor, 0, batch_sort_indices)
+
+        return padded_tensor
+
     def _forward_with_pad(self, *args):
         # Note: NxD's tracing flow (Model Builder) does not yet support kwargs, because of which we cannot support
         # optional parameters. Kwargs support is being added as a part of the new Model Builder API. Until then we
@@ -588,7 +575,9 @@ class ModelWrapper(torch.nn.Module):
         sampling_params = args[4]
         if self.is_block_kv_layout:
             medusa_args = None
-        elif len(args) > 5:
+        elif len(args) > 5 and not self.neuron_config.tensor_replacement_config:
+            # medusa_args are not compatible with tensor replacement config
+            # as tensor replacement modifies the argument structure
             medusa_args = args[5:8]
         else:
             medusa_args = None
@@ -604,71 +593,24 @@ class ModelWrapper(torch.nn.Module):
                 block_kv_args = args[12:15]
 
         # pad the inputs up to the compiled batch size in the end
-        def pad_helper(tensor, pad_type="fill_0", batch_sort_indices=None):
-            """
-            As part of continuous batching:
-            * If users provide us input batch size less than compiled batch size, NxDI
-              need to pad the inputs to the compiled batch size.
-            * seq_ids are used to indicate which kv cache line is used for each input batch line.
-              NxDI expects the seq_ids to always be [0, 1, 2, ..., compiled_batch_size) by default.
-            * To fulfill these requirements, NxDI pads the seq_ids with the missing slots and sorts
-              it in ascending order. Every other input args are reordered accordingly and
-              missing slots are padded with `repeat_first_batchline`. While returning back response,
-              we use index selct to pick the outputs corresponding to user provided seq_ids.
-            Eg:
-            Input [[10],[20]] and seq_ids [[3], [2]] with compiled batch size as 4.
-            seq_ids [[3], [2]] -> [[3], [2], [0], [1]] (filled missing slots)    -> [[0], [1], [2], [3]] (sort)
-            Input  [[10],[20]] -> [[10],[20],[10],[10]] (repeat_first_batchline) -> [[10],[10],[20],[10]](reorder)
-
-            As part of continuous batching with prefix caching, the second restriction no longer holds true,
-            so sorting of seq_ids and reordering of input args is no longer needed. Padding is required which is added
-            towards the end using `repeat_first_batchline` with the exception of slot_mapping (set to -1 instead)
-            as this is used to update the block kv cache. While returning back response, we just drop off the
-            padded outputs lines at the end of the batch.
-            Eg:
-            Input [[10],[20]] ; seq_ids [[3], [2]] and slot mapping [[50],[100]] with compiled batch size as 4.
-            seq_ids [[3], [2]]        -> [[3], [2], [0], [1]]  (filled missing slots)
-            Input [[10],[20]]         -> [[10],[20],[10],[10]] (repeat_first_batchline)
-            slot mapping [[50],[100]] -> [[50],[100],[-1], [-1]] (padded with -1)
-            """
-            if tensor is None or tensor.shape[0] == self.neuron_config.batch_size:
-                return tensor
-
-            padded_shape = list(tensor.shape)
-            padded_shape[0] = self.neuron_config.batch_size
-
-            def repeat_first_batchline(tensor, padded_shape):
-                return tensor[0].unsqueeze(0).repeat(padded_shape[0], 1).to(tensor.dtype)
-
-            def fill_value_tensor(value):
-                return lambda tensor, padded_shape: torch.full(padded_shape, fill_value=value, dtype=tensor.dtype)
-
-            PAD_TYPES = {
-                "repeat_first_batchline": repeat_first_batchline,
-                "fill_0": fill_value_tensor(0),
-                "fill_1": fill_value_tensor(1),
-                "fill_-1": fill_value_tensor(-1),
-            }
-
-            if pad_type not in PAD_TYPES:
-                raise ValueError(f"Unknown pad_type '{pad_type}'. Available: {list(PAD_TYPES.keys())}")
-
-            padded_tensor = PAD_TYPES[pad_type](tensor, padded_shape)
-            padded_tensor[: tensor.shape[0]] = tensor
-
-            if batch_sort_indices is not None:
-                padded_tensor = torch.index_select(padded_tensor, 0, batch_sort_indices)
-
-            return padded_tensor
-
         reorder_seq_ids = not self.is_prefix_caching
         seq_ids_list = seq_ids.tolist()
+
+        # Determine target batch size for batch bucketing
+        target_batch_size = self.neuron_config.max_batch_size
+
+        if self.is_batch_bucketing and self.tag == TOKEN_GENERATION_MODEL_TAG:
+            # Get the target bucket which includes batch size
+            target_bucket = self.get_target_bucket(*args, strategy="first_fit")
+            if isinstance(target_bucket, list):
+                target_batch_size = target_bucket[0]
+
         if self.config.neuron_config.apply_seq_ids_mask:
-            seq_ids_mask = torch.tensor([1 if x in seq_ids_list else 0 for x in range(self.neuron_config.max_batch_size)])
+            seq_ids_mask = torch.tensor([1 if x in seq_ids_list else 0 for x in range(target_batch_size)])
             logging.debug(f"NxDI: running with seq_ids_mask: {seq_ids_mask}")
         padded_seq_ids = torch.tensor(
             seq_ids_list
-            + [x for x in range(self.neuron_config.max_batch_size) if x not in seq_ids_list],
+            + [x for x in range(target_batch_size) if x not in seq_ids_list],
             dtype=seq_ids.dtype,
         )
         padded_seq_ids, indices = torch.sort(padded_seq_ids) if reorder_seq_ids else (padded_seq_ids, None)
@@ -693,20 +635,20 @@ class ModelWrapper(torch.nn.Module):
                 # =================================
                 padded_args.append(arg)
             else:
-                padded_arg = pad_helper(
+                padded_arg = self._pad_helper(
                     arg,
                     pad_type="repeat_first_batchline",
                     batch_sort_indices=indices,
                 )
                 padded_args.append(padded_arg)
 
-        # for block kv layout the seq_ids may lies outside of range(self.neuron_config.max_batch_size)
+        # for block kv layout the seq_ids may lies outside of range(target_batch_size)
         # therefore, we need to remove potential extra paddings to seq_ids
-        padded_seq_ids = padded_seq_ids[: self.neuron_config.max_batch_size]
+        padded_seq_ids = padded_seq_ids[: target_batch_size]
         padded_args.append(padded_seq_ids)
 
         # pad sampling params by repeating first batchline
-        padded_sampling_params = pad_helper(
+        padded_sampling_params = self._pad_helper(
             sampling_params,
             pad_type="repeat_first_batchline",
             batch_sort_indices=indices,
@@ -715,14 +657,19 @@ class ModelWrapper(torch.nn.Module):
 
         if medusa_args is not None:
             for arg in medusa_args:
-                padded_args.append(pad_helper(arg, batch_sort_indices=indices))
+                padded_args.append(self._pad_helper(arg, batch_sort_indices=indices))
+
+        # Add tensor replacement arguments when tensor_replacement_config is enabled
+        if len(args) > len(padded_args) and self.neuron_config.tensor_replacement_config:
+            padded_args = self._pad_tensor_replacement_args(args, padded_args, self._pad_helper, indices)
 
         if self.is_prefix_caching:
             for arg in block_kv_empty_args:
                 padded_args.append(arg)
-            padded_args.append(pad_helper(block_kv_slot_mapping, pad_type="fill_-1"))
+            padded_args[6] = self._pad_helper(args[6], pad_type="fill_0").view(-1)
+            padded_args.append(self._pad_helper(block_kv_slot_mapping, pad_type="fill_-1"))
             for arg in block_kv_args:
-                padded_args.append(pad_helper(arg, pad_type="repeat_first_batchline"))
+                padded_args.append(self._pad_helper(arg, pad_type="repeat_first_batchline"))
             if self.neuron_config.enable_eagle_speculation:
                 eagle_empty_args = args[11:16]
                 for arg in eagle_empty_args:
@@ -791,9 +738,6 @@ class ModelWrapper(torch.nn.Module):
             or "second fit" bucket.
         """
 
-        if self.is_chunked_prefill:
-            return self._pad_inputs_for_chunked_prefill(args)
-
         VALID_PAD_TYPES = {"max", "first_fit", "second_fit"}
         assert (
             pad_type in VALID_PAD_TYPES
@@ -807,7 +751,12 @@ class ModelWrapper(torch.nn.Module):
             return self._pad_prefix_caching_inputs(*args, pad_type=pad_type)
 
         if pad_type == "first_fit" or pad_type == "second_fit":
-            pad_length = self.get_target_bucket(*args, strategy=pad_type)
+            target_bucket = self.get_target_bucket(*args, strategy=pad_type)
+            # Handle batch bucketing: extract seq_len from [batch_size, seq_len]
+            if isinstance(target_bucket, list) and self.is_batch_bucketing:
+                pad_length = target_bucket[1]  # seq_len
+            else:
+                pad_length = target_bucket
 
         if (self.tag == CONTEXT_ENCODING_MODEL_TAG or self.tag == VISION_ENCODER_MODEL_TAG):
             to_pad = args[:3]
@@ -827,8 +776,17 @@ class ModelWrapper(torch.nn.Module):
                 F.pad(arg, (0, pad_len), "constant", pad_val)
                 for arg, pad_val, pad_len in zip(to_pad, tensor_pad_vals, pad_lengths)
             ]
-            args = (*padded_args, *args[3:])
-            if len(args) == 24 and len(args[23].shape) == 3 and args[23].shape[1] != pad_length:
+
+            # Pad rotary_position_ids if given
+            # use same padding valude as position_ids: 1
+            if len(args) >= 22 and args[21] is not None and args[21].numel() != 0:
+                rotary_position_ids = args[21]
+                rotary_position_ids = F.pad(rotary_position_ids, (0, pad_length - rotary_position_ids.shape[-1]), "constant" , value=1)
+                args = (*padded_args, *args[3:21], rotary_position_ids, *args[22:])
+            else:
+                args = (*padded_args, *args[3:])
+
+            if len(args) >= 24 and len(args[23].shape) == 3 and args[23].shape[1] != pad_length:
                 # Re-generate dummy vision embeddings and mask
                 padded_seq_len = args[0].shape[1]
                 padded_args = []
@@ -865,179 +823,96 @@ class ModelWrapper(torch.nn.Module):
 
         return args
 
-    def _pad_inputs_for_chunked_prefill(self, args):
-        args = list(args)  # convert tuple to list so it can be updated
-
-        cp_config = self.neuron_config.chunked_prefill_config
-        max_num_seqs = cp_config.max_num_seqs
-
-        if self.tag == CONTEXT_ENCODING_MODEL_TAG:
-
-            chunk_size, num_tiles = self.get_target_2d_bucket_for_chunked_prefill(*args)
-
-            kv_tile_size = cp_config.kernel_kv_tile_size
-            assert kv_tile_size % self.neuron_config.pa_block_size == 0
-            num_blocks_per_kv_tile = kv_tile_size // self.neuron_config.pa_block_size
-
-            input_ids = args[0]  # shape (batch_size, seq_len)
-            input_ids = F.pad(
-                input_ids,
-                [0, chunk_size - input_ids.shape[1]],
-                value=self.config.pad_token_id,
-            )
-            args[0] = input_ids
-
-            attention_mask = args[1]  # shape (batch_size, seq_len)
-            attention_mask = F.pad(attention_mask, [0, chunk_size - attention_mask.shape[1]])
-            args[1] = attention_mask
-
-            position_ids = args[2]  # shape (batch_size, seq_len)
-            position_ids = F.pad(position_ids, [0, chunk_size - position_ids.shape[1]])
-            args[2] = position_ids
-
-            sampling_params = args[4]  # shape (max_num_seqs, num_params)
-            sampling_params = F.pad(
-                sampling_params,
-                [0, 0, 0, max_num_seqs - sampling_params.shape[0]],
-            )
-            args[4] = sampling_params
-
-            slot_mapping = args[11]
-            # need to be padded by -1 to avoid overriding existing KV cache.
-            slot_mapping = F.pad(
-                slot_mapping, [0, chunk_size - slot_mapping.shape[0]], value=-1
-            )
-            args[11] = slot_mapping
-
-            # args[12] is active_block_table but it is not needed by CTE
-
-            query_lens = args[13]
-            query_lens = F.pad(query_lens, [0, max_num_seqs - query_lens.shape[0]])
-            args[13] = query_lens
-
-            context_lens = args[14]
-            context_lens = F.pad(context_lens, [0, max_num_seqs - context_lens.shape[0]])
-            args[14] = context_lens
-
-            tile_q_indices = args[15]  # (num_tiles,)
-            tile_q_indices = F.pad(tile_q_indices, [0, num_tiles - tile_q_indices.shape[0]])
-            args[15] = tile_q_indices
-
-            tile_block_tables = args[16]  # (num_tiles, num_blocks_per_tile)
-            tile_block_tables = F.pad(
-                tile_block_tables,
-                [
-                    0,
-                    num_blocks_per_kv_tile - tile_block_tables.shape[1],
-                    0,
-                    num_tiles - tile_block_tables.shape[0],
-                ],
-            )
-            args[16] = tile_block_tables
-
-            tile_masks = args[17]  # (num_tiles, q_tile_size, k_tile_size)
-            tile_masks = F.pad(
-                tile_masks,
-                [0, 0, 0, 0, 0, num_tiles - tile_masks.shape[0]],
-            )
-            args[17] = tile_masks
-        else:
-            kv_cache_len = self.get_target_bucket(*args)
-
-            input_ids = args[0]  # shape (batch_size, 1)
-            input_ids = F.pad(
-                input_ids,
-                [0, 0, 0, max_num_seqs - input_ids.shape[0]],
-                value=self.config.pad_token_id,
-            )
-            args[0] = input_ids
-
-            attention_mask = args[1]  # shape (batch_size, seq_len)
-            attention_mask = F.pad(
-                attention_mask,
-                [
-                    0,
-                    kv_cache_len - attention_mask.shape[1],
-                    0,
-                    max_num_seqs - attention_mask.shape[0],
-                ],
-            )
-            args[1] = attention_mask
-
-            position_ids = args[2]  # shape (batch_size, 1)
-            position_ids = F.pad(
-                position_ids,
-                [0, 0, 0, max_num_seqs - position_ids.shape[0]],
-            )
-            args[2] = position_ids
-
-            sampling_params = args[4]  # shape (max_num_seqs, num_params)
-            sampling_params = F.pad(
-                sampling_params,
-                [0, 0, 0, max_num_seqs - sampling_params.shape[0]],
-            )
-            args[4] = sampling_params
-
-            slot_mapping = args[11]
-            # need to be padded by -1 to avoid overriding existing KV cache.
-            slot_mapping = F.pad(
-                slot_mapping,
-                [0, 0, 0, max_num_seqs - slot_mapping.shape[0]],
-                value=-1,
-            )
-            args[11] = slot_mapping
-
-            assert kv_cache_len % self.neuron_config.pa_block_size == 0
-            num_blocks_per_seq = kv_cache_len // self.neuron_config.pa_block_size
-            block_table = args[12]
-            block_table = F.pad(
-                block_table,
-                [
-                    0,
-                    num_blocks_per_seq - block_table.shape[1],
-                    0,
-                    max_num_seqs - block_table.shape[0]
-                ],
-            )
-            args[12] = block_table
-
-            query_lens = args[13]
-            query_lens = F.pad(query_lens, [0, 0, 0, max_num_seqs - query_lens.shape[0]])
-            args[13] = query_lens
-
-            context_lens = args[14]
-            context_lens = F.pad(context_lens, [0, 0, 0, max_num_seqs - context_lens.shape[0]])
-            args[14] = context_lens
-
-        args = tuple(args)
-        return args
-
     def get_target_bucket(self, *args, strategy="first_fit"):
-        # NOTE: strategy must be a subset of pad_type for consistency
-        input_len = args[1].shape[1]
+        input_len = args[1].shape[1]  # attention_mask
         buckets = self.neuron_config.buckets
         speculation_length = (
             self.neuron_config.speculation_length
-            if self.tag == FUSED_SPECULATION_MODEL_TAG or self.tag == SPECULATION_MODEL_TAG
+            if self.tag in (FUSED_SPECULATION_MODEL_TAG, SPECULATION_MODEL_TAG)
             else 0
         )
-        largest_bucket_idx = len(buckets) - 1
-        for i, bucket in enumerate(buckets):
-            if strategy == "first_fit":
-                if input_len + speculation_length < bucket:
-                    return bucket
-            elif strategy == "second_fit":
-                if input_len < bucket:
-                    return buckets[min(i + 1, largest_bucket_idx)]
 
-        largest_bucket = buckets[largest_bucket_idx]
-        if input_len + speculation_length == largest_bucket:
-            return largest_bucket
-        elif self.neuron_config.allow_input_truncation:
-            return largest_bucket
+        if self.is_batch_bucketing and self.tag == TOKEN_GENERATION_MODEL_TAG:
+            input_batch_size = args[3].shape[0]  # seq_ids
+            return self._get_batch_and_seq_bucket(
+                buckets, input_batch_size, input_len, speculation_length, strategy
+            )
+
+        return self._get_seq_bucket(buckets, input_len, speculation_length, strategy)
+
+    def _get_batch_and_seq_bucket(self, buckets, input_batch_size, input_len, speculation_length, strategy):
+        """
+        Batch and sequence bucket selection.
+        """
+        # TODO add support for async
+        if strategy != "first_fit":
+            raise ValueError(
+                f"{strategy=} is currently not supported for batch bucketing. "
+                "Only strategy='first_fit' is supported."
+            )
+
+        required_len = input_len + speculation_length
+        smallest_fitting = None
+        largest_overall = None
+
+        for bucket in buckets:
+            assert isinstance(bucket, list) and len(bucket) == 2, (
+                f"Expected 2D buckets [batch_size, seq_len] for batch bucketing, "
+                f"but got bucket={bucket}"
+            )
+
+            batch_size, seq_len = bucket
+
+            # Track the largest bucket overall (for fallback)
+            # Select the largest batch size, then the largest sequence length
+            if largest_overall is None:
+                largest_overall = bucket
+            elif batch_size > largest_overall[0]:
+                largest_overall = bucket
+            elif batch_size == largest_overall[0] and seq_len > largest_overall[1]:
+                largest_overall = bucket
+
+            # Track the smallest bucket that fits
+            if input_batch_size <= batch_size and required_len <= seq_len:
+                if smallest_fitting is None:
+                    smallest_fitting = bucket
+                elif batch_size < smallest_fitting[0]:
+                    smallest_fitting = bucket
+                elif batch_size == smallest_fitting[0] and seq_len < smallest_fitting[1]:
+                    smallest_fitting = bucket
+
+        if smallest_fitting is not None:
+            return smallest_fitting
+
+        if largest_overall is not None:
+            # Make sure the largest bucket is valid
+            if self.neuron_config.allow_input_truncation and largest_overall[0] >= input_batch_size:
+                return largest_overall
 
         raise ValueError(
-            f"Input len {input_len} exceeds largest bucket ({largest_bucket}) for {self.tag}"
+            f"Input batch_size={input_batch_size}, seq_len={input_len} exceeds "
+            f"largest bucket batch_size={largest_overall[0]}, seq_len={largest_overall[1]} "
+            f"for {self.tag}. Available buckets are {buckets}."
+        )
+
+    def _get_seq_bucket(self, buckets, input_len, speculation_length, strategy):
+        """
+        Sequence-only bucket selection
+        """
+        required_len = input_len + speculation_length
+        largest = buckets[-1]
+
+        for i, bucket in enumerate(buckets):
+            if strategy == "first_fit" and required_len < bucket:
+                return bucket
+            if strategy == "second_fit" and input_len < bucket:
+                return buckets[min(i + 1, len(buckets) - 1)]
+
+        if required_len == largest or self.neuron_config.allow_input_truncation:
+            return largest
+
+        raise ValueError(
+            f"Input len {input_len} exceeds largest bucket ({largest}) for {self.tag}"
         )
 
     def get_target_2d_bucket_for_prefix_caching(self, *args, strategy="first_fit"):
@@ -1163,35 +1038,6 @@ class ModelWrapper(torch.nn.Module):
             assert prefix_index != len(prefix_buckets), f"Prefix len {horizontal_dim} exceeds largest bucket {prefix_buckets[-1]} for {self.tag}"
             bucket_idx = prefill_index * len(prefix_buckets) + prefix_index
             return buckets[bucket_idx]
-
-    def get_target_2d_bucket_for_chunked_prefill(self, *args):
-        """
-        Get the expected bucket for chunked prefill, for context encoding model
-        only
-
-        For now, this func only supports the "first_fit" strategy
-        """
-        buckets = self.neuron_config.buckets
-        assert buckets == sorted(buckets), f"buckets should be in ascending order, but it is {buckets}"
-        assert self.tag == CONTEXT_ENCODING_MODEL_TAG
-
-        input_ids = args[0]  # shape (batch_size, seq_len)
-        actual_chunk_size = input_ids.shape[1]
-
-        tile_q_indices = args[15]  # shape (num_tiles)
-        actual_num_tiles = tile_q_indices.shape[0]
-
-        for bucket in buckets:
-            bucket_chunk_size, bucket_num_tiles = bucket
-            # If it is equal to the bucket size, the bucket can be used because
-            # it relies on slot mapping to update KV cache.
-            if actual_chunk_size <= bucket_chunk_size and actual_num_tiles <= bucket_num_tiles:
-                return bucket
-
-        raise ValueError(
-            f"Can't find a bucket from {self.neuron_config.buckets} for "
-            f"chunked prefill {self.tag}"
-        )
 
     def _pad_prefix_caching_inputs(self, *args, pad_type="first_fit"):
         if self.tag == CONTEXT_ENCODING_MODEL_TAG and args[0].shape[0] > 1:
@@ -1515,13 +1361,22 @@ class ModelWrapper(torch.nn.Module):
                     f"running foward on batch {cur_batch}:{cur_batch + self.neuron_config.batch_size}"
                 )
 
-                # pad to next bucket for context encoding with bs > 1
-                # batch_arg represent single prompt in batch of prompts
-                batch_args = [
-                    arg[cur_batch : cur_batch + self.neuron_config.batch_size] for arg in args
-                ]
-                batch_args = self.vllm_cte_repadding(batch_args)
+                if not self.neuron_config.tensor_replacement_config:
+                    # pad to next bucket for context encoding with bs > 1
+                    # batch_arg represent single prompt in batch of prompts
+                    batch_args = [
+                        arg[cur_batch : cur_batch + self.neuron_config.batch_size] for arg in args
+                    ]
+                else:
+                    reg = TensorReplacementRegister.get_instance()
+                    tf_arg_count = len(reg.module_superset)
+                    len_args = len(args)
+                    batch_args = [
+                        arg[cur_batch : cur_batch + self.neuron_config.batch_size] for arg in args[:len_args - tf_arg_count]
+                    ]
+                    batch_args.extend(args[len_args - tf_arg_count:])
 
+                batch_args = self.vllm_cte_repadding(batch_args)
                 outputs = self._forward(*batch_args)
 
                 # sequential execution must be done in sync mode to avoid buffer write race conditions
@@ -1534,12 +1389,22 @@ class ModelWrapper(torch.nn.Module):
                     f"running forward on batch {cur_batch}:{input_batch_size}, padded up to {self.neuron_config.batch_size}"
                 )
                 was_padded = True
-                outputs = self._forward_with_pad(
-                    *[
-                        arg[cur_batch:input_batch_size] if not is_ranked_io(arg) else arg
-                        for arg in args
+                if not self.neuron_config.tensor_replacement_config:
+                    outputs = self._forward_with_pad(
+                        *[
+                            arg[cur_batch:input_batch_size] if not is_ranked_io(arg) else arg
+                            for arg in args
+                        ]
+                    )
+                else:
+                    reg = TensorReplacementRegister.get_instance()
+                    tf_arg_count = len(reg.module_superset)
+                    len_args = len(args)
+                    batch_args = [
+                        arg[cur_batch:input_batch_size] for arg in args[:len_args - tf_arg_count]
                     ]
-                )
+                    batch_args.extend(args[len_args - tf_arg_count:])
+                    outputs = self._forward_with_pad(*batch_args)
 
                 # indicates uneven division of batch for sequential execution scenario, which must be run in sync mode
                 if len(output_logits) > 0 and self.async_mode:
@@ -1690,7 +1555,12 @@ class DecoderModelInstance(BaseModelInstance):
                         self.module.draft_model.n_active_tokens = self.module.n_active_tokens
                         self.module.target_model.n_active_tokens = self.module.n_active_tokens
             else:
-                self.module.n_positions = self.neuron_config.buckets[bucket_rank]
+                bucket_value = self.neuron_config.buckets[bucket_rank]
+                # Handle batch bucketing: extract seq_len from [batch_size, seq_len]
+                if isinstance(bucket_value, list) and self.neuron_config.token_generation_batches is not None:
+                    self.module.n_positions = bucket_value[1]  # seq_len
+                else:
+                    self.module.n_positions = bucket_value
             if self.neuron_config.enable_fused_speculation:
                 self.module.draft_model.n_positions = self.module.n_positions
                 self.module.target_model.n_positions = self.module.n_positions
@@ -1798,8 +1668,22 @@ class EncoderModelInstance(BaseModelInstance):
 
 
 def get_trace_callable(model_cls, config: InferenceConfig, bucket_rank=None):
+    import copy
+    config = copy.deepcopy(config)
+
     if bucket_rank is not None:
-        config.neuron_config.n_positions = config.neuron_config.buckets[bucket_rank]
+        bucket_value = config.neuron_config.buckets[bucket_rank]
+        # Handle batch bucketing: extract batch_size and seq_len from [batch_size, seq_len]
+        if isinstance(bucket_value, list) and config.neuron_config.token_generation_batches is not None and not config.neuron_config.is_prefix_caching:
+            # Set batch_size and tkg_batch_size to the bucket's batch size for input generation
+            config.neuron_config.batch_size = bucket_value[0]
+            config.neuron_config.tkg_batch_size = bucket_value[0]
+            # KV cache batch size should remain at max_batch_size (not bucket batch size)
+            # This is because KV cache is shared across all batch buckets
+            # config.neuron_config.kv_cache_batch_size stays at original value
+            config.neuron_config.n_positions = bucket_value[1]
+        else:
+            config.neuron_config.n_positions = bucket_value
     float_model = model_cls(config)
     float_model.eval()
     if config.neuron_config.torch_dtype != torch.float32:

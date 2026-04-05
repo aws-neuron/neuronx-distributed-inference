@@ -44,6 +44,112 @@ from neuronx_distributed_inference.utils.distributed import get_tp_group
 logger = logging.getLogger("Neuron")
 
 
+class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
+    """
+    LongRoPE Scaled Rotary Position Embedding for Phi-3.5.
+    
+    This implements the LongRoPE scaling mechanism that allows Phi-3.5 to handle
+    extended context lengths (up to 128k tokens) by applying position-dependent
+    scaling factors to the rotary embedding.
+    
+    Key features:
+    - Uses short_factor for sequences <= original_max_position_embeddings (4096)
+    - Uses long_factor for longer sequences
+    - Applies a scaling factor based on context length ratio
+    
+    Reference: https://huggingface.co/microsoft/Phi-3.5-mini-instruct
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 131072,
+        base: float = 10000.0,
+        original_max_position_embeddings: int = 4096,
+        short_factor: list = None,
+        long_factor: list = None,
+        device=None,
+    ):
+        """
+        Initialize LongRoPE rotary embedding.
+        
+        Args:
+            dim: Dimension of the rotary embedding (head_dim)
+            max_position_embeddings: Maximum sequence length (131072 for Phi-3.5)
+            base: RoPE theta base (10000.0)
+            original_max_position_embeddings: Original context length (4096)
+            short_factor: Scaling factors for short sequences (list of floats)
+            long_factor: Scaling factors for long sequences (list of floats)
+        """
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.original_max_position_embeddings = original_max_position_embeddings
+        
+        # Store scaling factors
+        self.short_factor = short_factor if short_factor is not None else [1.0] * (dim // 2)
+        self.long_factor = long_factor if long_factor is not None else [1.0] * (dim // 2)
+        
+        # Register buffers for inv_freq (will be computed dynamically)
+        self.register_buffer("inv_freq", None, persistent=False)
+        
+        logger.info(f"Phi3LongRoPEScaledRotaryEmbedding: dim={dim}, base={base}, "
+                   f"max_pos={max_position_embeddings}, "
+                   f"original_max_pos={original_max_position_embeddings}")
+    
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        """
+        Compute rotary position embeddings with LongRoPE scaling.
+        
+        Args:
+            x: Input tensor [batch, heads, seq_len, head_dim]
+            position_ids: Position indices [batch, seq_len]
+            
+        Returns:
+            Tuple of (cos, sin) tensors for rotary embedding
+        """
+        # Determine sequence length from position_ids
+        seq_len = position_ids.max().item() + 1 if position_ids.numel() > 0 else 1
+        
+        # Choose scaling factors based on sequence length
+        if seq_len > self.original_max_position_embeddings:
+            ext_factors = torch.tensor(self.long_factor, dtype=torch.float32, device=x.device)
+        else:
+            ext_factors = torch.tensor(self.short_factor, dtype=torch.float32, device=x.device)
+        
+        # Compute inverse frequencies with scaling
+        inv_freq_shape = torch.arange(0, self.dim, 2, dtype=torch.int64, device=x.device).float() / self.dim
+        inv_freq = 1.0 / (ext_factors * self.base ** inv_freq_shape)
+        
+        # Expand for batch computation
+        # inv_freq: [dim/2] -> [batch, dim/2, 1]
+        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        
+        # position_ids: [batch, seq_len] -> [batch, 1, seq_len]
+        position_ids_expanded = position_ids[:, None, :].float()
+        
+        # Compute frequencies: [batch, dim/2, seq_len] -> [batch, seq_len, dim/2]
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+        
+        # Concatenate for full dimension: [batch, seq_len, dim]
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        # Compute scaling factor for long contexts
+        scale = self.max_position_embeddings / self.original_max_position_embeddings
+        if scale <= 1.0:
+            scaling_factor = 1.0
+        else:
+            scaling_factor = math.sqrt(1 + math.log(scale) / math.log(self.original_max_position_embeddings))
+        
+        # Apply scaling and convert to target dtype
+        cos = (emb.cos() * scaling_factor).to(dtype=x.dtype)
+        sin = (emb.sin() * scaling_factor).to(dtype=x.dtype)
+        
+        return cos, sin
+
+
 def get_rmsnorm_cls():
     """
     Get the appropriate RMSNorm implementation based on execution mode.
@@ -257,8 +363,7 @@ class NeuronPhi3Attention(NeuronAttentionBase):
     NeuronAttentionBase handles creating the separate q_proj, k_proj, v_proj
     through GroupQueryAttention_QKV.
     
-    Phi-3 also supports partial rotary factor, meaning RoPE is applied to
-    only a subset of the head dimensions.
+    Phi-3.5 uses LongRoPE scaling for extended context support (128k tokens).
     """
     
     def __init__(self, config: Phi3InferenceConfig, layer_idx: Optional[int] = None):
@@ -269,18 +374,31 @@ class NeuronPhi3Attention(NeuronAttentionBase):
             config: Model configuration
             layer_idx: Layer index for caching
         """
-        # Phi-3 specific: partial rotary factor
-        partial_rotary_factor = getattr(config, 'partial_rotary_factor', 1.0)
         head_dim = config.hidden_size // config.num_attention_heads
-        rotary_ndims = int(head_dim * partial_rotary_factor)
         
-        # Create rotary embedding
-        # For Phi-3, we use the standard RotaryEmbedding but with the partial dimensions
-        rotary_emb = RotaryEmbedding(
-            rotary_ndims,  # Only apply RoPE to partial dimensions  
-            max_position_embeddings=getattr(config, "max_position_embeddings", 4096),
-            base=getattr(config, "rope_theta", 10000.0),
-        )
+        # Check if LongRoPE scaling is configured
+        rope_scaling = getattr(config, 'rope_scaling', None)
+        
+        if rope_scaling is not None and rope_scaling.get('type') == 'longrope':
+            # Use LongRoPE for Phi-3.5
+            rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(
+                dim=head_dim,
+                max_position_embeddings=getattr(config, "max_position_embeddings", 131072),
+                base=getattr(config, "rope_theta", 10000.0),
+                original_max_position_embeddings=getattr(config, "original_max_position_embeddings", 4096),
+                short_factor=rope_scaling.get('short_factor'),
+                long_factor=rope_scaling.get('long_factor'),
+            )
+            logger.info(f"Using Phi3LongRoPEScaledRotaryEmbedding for layer {layer_idx}")
+        else:
+            # Fall back to standard RotaryEmbedding for non-LongRoPE models
+            partial_rotary_factor = getattr(config, 'partial_rotary_factor', 1.0)
+            rotary_ndims = int(head_dim * partial_rotary_factor)
+            rotary_emb = RotaryEmbedding(
+                rotary_ndims,
+                max_position_embeddings=getattr(config, "max_position_embeddings", 4096),
+                base=getattr(config, "rope_theta", 10000.0),
+            )
         
         # Initialize base attention
         # NeuronAttentionBase will create qkv_proj and o_proj internally
@@ -464,19 +582,23 @@ class NeuronPhi3ForCausalLM(NeuronBaseForCausalLM):
         Convert HuggingFace Phi-3 checkpoint to Neuron format.
         
         Key conversions needed:
-        1. Unfuse QKV projection weights
-        2. Unfuse gate_up MLP projection weights
-        3. Add rank tensors for tensor parallelism
+        1. Strip 'model.' prefix from HuggingFace keys
+        2. Unfuse QKV projection weights and add qkv_proj wrapper prefix
+        3. Unfuse gate_up MLP projection weights
+        4. Map o_proj to o_proj.o_proj for NeuronAttentionBase
+        5. Add rank tensors for tensor parallelism
         
-        Original Phi-3 format:
-            - layers.X.self_attn.qkv_proj.weight: [total_size, hidden_size]
+        HuggingFace Phi-3 format:
+            - model.layers.X.self_attn.qkv_proj.weight: [total_size, hidden_size]
               where total_size = num_heads * head_dim + 2 * num_kv_heads * head_dim
-            - layers.X.mlp.gate_up_proj.weight: [2 * intermediate_size, hidden_size]
+            - model.layers.X.self_attn.o_proj.weight
+            - model.layers.X.mlp.gate_up_proj.weight: [2 * intermediate_size, hidden_size]
         
-        Neuron format needs:
-            - layers.X.self_attn.q_proj.weight
-            - layers.X.self_attn.k_proj.weight
-            - layers.X.self_attn.v_proj.weight
+        Neuron format (NeuronAttentionBase expects):
+            - layers.X.self_attn.qkv_proj.q_proj.weight
+            - layers.X.self_attn.qkv_proj.k_proj.weight
+            - layers.X.self_attn.qkv_proj.v_proj.weight
+            - layers.X.self_attn.o_proj.o_proj.weight
             - layers.X.mlp.gate_proj.weight
             - layers.X.mlp.up_proj.weight
         
@@ -499,9 +621,16 @@ class NeuronPhi3ForCausalLM(NeuronBaseForCausalLM):
         
         # Process each key in the original state dict
         for key, value in state_dict.items():
+            # First, strip 'model.' prefix if present
+            working_key = key
+            if working_key.startswith('model.'):
+                working_key = working_key[6:]  # Remove 'model.' prefix
+            
             # Handle fused QKV projection
-            if '.self_attn.qkv_proj.weight' in key:
-                layer_idx = int(key.split('.')[1])
+            if '.self_attn.qkv_proj.weight' in working_key:
+                # Extract layer index from the key (now without 'model.' prefix)
+                # Format: layers.X.self_attn.qkv_proj.weight
+                layer_idx = int(working_key.split('.')[1])
                 
                 # Split the fused QKV weight
                 # Shape: [num_heads * head_dim + 2 * num_kv_heads * head_dim, hidden_size]
@@ -513,14 +642,15 @@ class NeuronPhi3ForCausalLM(NeuronBaseForCausalLM):
                 k_weight = value[q_size:q_size + k_size, :]
                 v_weight = value[q_size + k_size:q_size + k_size + v_size, :]
                 
-                # Store split weights
-                neuron_state_dict[f"layers.{layer_idx}.self_attn.q_proj.weight"] = q_weight
-                neuron_state_dict[f"layers.{layer_idx}.self_attn.k_proj.weight"] = k_weight
-                neuron_state_dict[f"layers.{layer_idx}.self_attn.v_proj.weight"] = v_weight
+                # Store split weights with qkv_proj wrapper prefix for NeuronAttentionBase
+                neuron_state_dict[f"layers.{layer_idx}.self_attn.qkv_proj.q_proj.weight"] = q_weight
+                neuron_state_dict[f"layers.{layer_idx}.self_attn.qkv_proj.k_proj.weight"] = k_weight
+                neuron_state_dict[f"layers.{layer_idx}.self_attn.qkv_proj.v_proj.weight"] = v_weight
                 
             # Handle fused gate_up projection
-            elif '.mlp.gate_up_proj.weight' in key:
-                layer_idx = int(key.split('.')[1])
+            elif '.mlp.gate_up_proj.weight' in working_key:
+                # Extract layer index
+                layer_idx = int(working_key.split('.')[1])
                 
                 # Split the fused gate_up weight
                 # Shape: [2 * intermediate_size, hidden_size]
@@ -531,14 +661,15 @@ class NeuronPhi3ForCausalLM(NeuronBaseForCausalLM):
                 neuron_state_dict[f"layers.{layer_idx}.mlp.gate_proj.weight"] = gate_weight
                 neuron_state_dict[f"layers.{layer_idx}.mlp.up_proj.weight"] = up_weight
                 
-            # Copy other weights directly
-            elif 'qkv_proj' not in key and 'gate_up_proj' not in key:
-                # Handle model. prefix if present
-                if key.startswith('model.'):
-                    new_key = key[6:]  # Remove 'model.' prefix
-                else:
-                    new_key = key
-                neuron_state_dict[new_key] = value
+            # Handle o_proj - preshard_hook will add the o_proj.o_proj wrapper
+            # So we just need to provide layers.X.self_attn.o_proj.weight
+            elif '.self_attn.o_proj.' in working_key:
+                # Just copy as-is (already stripped 'model.' prefix)
+                neuron_state_dict[working_key] = value
+                
+            # Copy other weights directly (already stripped 'model.' prefix)
+            elif 'qkv_proj' not in working_key and 'gate_up_proj' not in working_key:
+                neuron_state_dict[working_key] = value
         
         # Add rank tensors for tensor parallelism
         for i in range(num_layers):

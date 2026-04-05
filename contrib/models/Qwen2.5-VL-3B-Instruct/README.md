@@ -42,6 +42,25 @@ NeuronX Distributed Inference implementation of Qwen2.5 VL 3B Instruct.
 
 **Status:** ✅ GOOD
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-21
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.13 | 0.00 |
+| MBU (%) | 0.27 | 0.29 |
+| HFU (%) | 0.15 | 0.02 |
+| Execution Time (us) | 0.03 | 0.03 |
+| HBM Read | 3.15 GB | 3.09 GB |
+| HBM Write | 62.86 MB | 3.35 MB |
+
+**Throughput:** 32.98 tok/s | **Compile Time:** 224.93s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -106,6 +125,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

@@ -48,8 +48,20 @@ def init_cpu_env():
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "8080"
     os.environ["RANK"] = "0"
+    os.environ["NXD_CPU_MODE"] = "1"
     torch.distributed.init_process_group(backend="gloo")
     parallel_state.initialize_model_parallel()
+
+
+def destroy_cpu_env():
+    if parallel_state.model_parallel_is_initialized():
+        parallel_state.destroy_model_parallel()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+    from fairscale.nn.model_parallel import destroy_model_parallel
+
+    destroy_model_parallel()
+    os.environ["NXD_CPU_MODE"] = "0"
 
 
 def validate_accuracy(
@@ -220,7 +232,11 @@ def build_module(
 
     if not checkpoint_path.exists():
         _save_checkpoint(
-            module_cls, module_init_kwargs, checkpoint_path, tp_degree, world_size if world_size else tp_degree
+            module_cls,
+            module_init_kwargs,
+            checkpoint_path,
+            tp_degree,
+            world_size if world_size else tp_degree,
         )
 
     if not compiler_workdir.exists():

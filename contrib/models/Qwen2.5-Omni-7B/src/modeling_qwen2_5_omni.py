@@ -141,7 +141,6 @@ class Qwen2_5OmniInferenceConfig(InferenceConfig):
         if neuron_config is None:
             possible_paths = [
                 os.path.join(model_path, "neuron_config.json"),
-                "./agent_artifacts/data/qwen2_5_omni_compiled/neuron_config.json",  # Compiled directory
                 "neuron_config.json",  # Current directory
             ]
             

@@ -2,13 +2,14 @@ import os
 import re
 import tempfile
 from typing import Dict, List, Tuple
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from neuronx_distributed_inference.utils.tensor_replacement.registry import (
     TensorReplacementRegister,
-    _pad_to_shape_right,
+    _overlap_slices,
     _ensure_rank_and_pad_ref_to_target,
     _apply_ref_equiv,
     _FN,
@@ -23,6 +24,31 @@ def _fresh_register():
     TensorReplacementRegister.clear()
     yield
     TensorReplacementRegister.clear()
+
+
+@pytest.fixture
+def fake_neuron_config():
+    """
+    Minimal object with attrs that the registry/_configure might touch.
+    Expand if your code reads more fields.
+    """
+    cfg = SimpleNamespace()
+    # common fields we’ve seen used in this code path
+    cfg.batch_size = 1
+    cfg.ctx_batch_size = 1
+    cfg.tkg_batch_size = 16
+    cfg.output_logits = False
+    cfg.on_device_sampling_config = None
+
+    # replacement/capture configs default to None (tests don’t rely on them)
+    cfg.tensor_capture_config = None
+    cfg.tensor_replacement_config = None
+
+    # misc toggles often checked in MoE/SP paths (safe defaults)
+    cfg.sequence_parallel_enabled = False
+    cfg.strided_context_parallel_kernel_enabled = False
+
+    return cfg
 
 
 def _save_pt(dirpath: str, phase: str, step: int, module: str,
@@ -57,32 +83,73 @@ def _reset_singleton_after_test():
 # ----------------------------------------------------------------------
 # Unit tests: small utilities
 # ----------------------------------------------------------------------
+def test_exact_match_shapes():
+    src = (4, 8)
+    dst = (4, 8)
+    result = _overlap_slices(src, dst)
+    assert result == (slice(0, 4), slice(0, 8))
 
-def test__pad_to_shape_right_ok_and_errors():
-    t = torch.randn(1, 3, 4)
-    out = _pad_to_shape_right(t, torch.Size([1, 5, 6]))
-    assert out.shape == (1, 5, 6)
-    # padding should be zeros in added region
-    assert torch.all(out[:, 3:, :] == 0)
-    assert torch.all(out[:, :, 4:] == 0)
 
-    # rank mismatch
-    with pytest.raises(ValueError, match="rank mismatch"):
-        _ = _pad_to_shape_right(t.squeeze(0), torch.Size([1, 3, 4]))
+def test_src_larger_than_dst():
+    src = (10, 20)
+    dst = (3, 5)
+    result = _overlap_slices(src, dst)
+    assert result == (slice(0, 3), slice(0, 5))
 
-    # cannot shrink
-    with pytest.raises(ValueError, match="cannot shrink"):
-        _ = _pad_to_shape_right(t, torch.Size([1, 2, 4]))
+
+def test_dst_larger_than_src():
+    src = (3, 5)
+    dst = (10, 20)
+    result = _overlap_slices(src, dst)
+    assert result == (slice(0, 3), slice(0, 5))
+
+
+def test_1d_shapes():
+    src = (7,)
+    dst = (4,)
+    result = _overlap_slices(src, dst)
+    assert result == (slice(0, 4),)
+
+
+def test_3d_shapes_mixed():
+    src = (5, 10, 2)
+    dst = (3, 20, 4)
+    result = _overlap_slices(src, dst)
+    assert result == (slice(0, 3), slice(0, 10), slice(0, 2))
+
+
+def test_zero_dimension():
+    src = (0, 5)
+    dst = (4, 3)
+    result = _overlap_slices(src, dst)
+    assert result == (slice(0, 0), slice(0, 3))
+
+
+def test_empty_shapes():
+    src = ()
+    dst = ()
+    result = _overlap_slices(src, dst)
+    assert result == ()
+
+def test_tensor_slice_behavior():
+    src = torch.randn(5, 10)
+    dst = torch.zeros(3, 8)
+    slices = _overlap_slices(src.shape, dst.shape)
+
+    # apply slices
+    dst[slices] = src[slices]
+
+    assert torch.allclose(dst[:3, :8], src[:3, :8])
 
 
 def test__ensure_rank_and_pad_ref_to_target_unsqueeze_then_pad():
     # CPU missing leading batch; target has batch=1
-    cpu = torch.randn(44, 128)         # (S, H)
-    target = torch.Size([1, 512, 128]) # (B, T, H)
+    cpu = torch.zeros(44, 128)         # (S, H)
+    target = torch.ones([1, 512, 128]) * 5.0 # (B, T, H)
     out = _ensure_rank_and_pad_ref_to_target(cpu, target)
     assert out.shape == (1, 512, 128)
     # original content sits at [:, :44, :], rest padded with zeros
-    assert torch.all(out[0, 44:, :] == 0)
+    assert torch.all(out[0, :44, :] == cpu)
 
 
 def test__apply_ref_equiv_basic_and_suffix_preserved():
@@ -117,7 +184,7 @@ def test__FN_regex_examples():
 # Main register behavior
 # ----------------------------------------------------------------------
 
-def test_register_happy_path_builds_shapes_dtypes_packs_and_masks():
+def test_register_happy_path_builds_shapes_dtypes_packs_and_masks(fake_neuron_config):
     cpu_td, neu_td = _mk_dirs()
     cpu_dir, neu_dir = cpu_td.name, neu_td.name
 
@@ -135,20 +202,20 @@ def test_register_happy_path_builds_shapes_dtypes_packs_and_masks():
 
     # Create Neuron files for each module & step (note: suffix required by regex)
     for m in modules_neu:
-        _save_pt(neu_dir, "cte", 1, m, torch.randn(shp_ctx))  # step 1
-        _save_pt(neu_dir, "tkg", 2, m, torch.randn(shp_tkg))  # step 2
-        _save_pt(neu_dir, "tkg", 3, m, torch.randn(shp_tkg))  # step 3
+        _save_pt(neu_dir, "cte", 1, m, torch.ones(shp_ctx))  # step 1
+        _save_pt(neu_dir, "tkg", 2, m, torch.ones(shp_tkg))  # step 2
+        _save_pt(neu_dir, "tkg", 3, m, torch.ones(shp_tkg))  # step 3
 
     # Create CPU files: step1 missing batch (S,H), steps 2-3 have (1,H)
-    cpu_ctx = torch.randn(44, 128)
-    cpu_tkg = torch.randn(1, 128)
+    cpu_ctx = torch.zeros(44, 128)
+    cpu_tkg = torch.zeros(1, 128)
     for m_cpu in modules_cpu:
         _save_pt(cpu_dir, "cte", 1, m_cpu, cpu_ctx.clone())
         _save_pt(cpu_dir, "tkg", 2, m_cpu, cpu_tkg.clone())
         _save_pt(cpu_dir, "tkg", 3, m_cpu, cpu_tkg.clone())
 
     reg = TensorReplacementRegister.get_instance(
-        ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, ref_equiv_map=cpu_equiv
+        ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, config=fake_neuron_config, ref_equiv_map=cpu_equiv
     )
 
     # module_superset in insertion order (stable)
@@ -168,7 +235,7 @@ def test_register_happy_path_builds_shapes_dtypes_packs_and_masks():
     assert reg.packed_step[1][modules_neu[0]].shape == shp_ctx
     assert reg.packed_step[2][modules_neu[1]].shape == shp_tkg
     # check padding happened for ctx (44 -> 512)
-    assert torch.all(reg.packed_step[1][modules_neu[0]][0, 44:, :] == 0)
+    assert torch.all(reg.packed_step[1][modules_neu[0]][0, :44, :] == 0)
 
     # masks: ones for modules present in tr_map for that step
     for s in (1, 2, 3):
@@ -180,9 +247,11 @@ def test_register_happy_path_builds_shapes_dtypes_packs_and_masks():
 
     # example_args returns zeros matching shapes + zero masks
     ex_tensors, ex_masks = reg.example_args(step=2)
+    # expected example shape uses config batch, not captured tensor batch
+    expected_ex_shape = torch.Size([fake_neuron_config.tkg_batch_size, 1, 128])
     assert len(ex_tensors) == len(modules_neu) == len(ex_masks)
     for t, m, mname in zip(ex_tensors, ex_masks, modules_neu):
-        assert t.shape == shp_tkg
+        assert t.shape == expected_ex_shape
         assert torch.all(t == 0)
         assert m.dtype == torch.bool and m.numel() == 1 and not m.item()
 
@@ -192,7 +261,7 @@ def test_register_happy_path_builds_shapes_dtypes_packs_and_masks():
     assert st_masks[0].dtype == torch.bool and st_masks[0].item()
 
 
-def test_register_ignores_non_requested_modules_and_handles_empty_dirs():
+def test_register_ignores_non_requested_modules_and_handles_empty_dirs(fake_neuron_config):
     cpu_td, neu_td = _mk_dirs()
     cpu_dir, neu_dir = cpu_td.name, neu_td.name
 
@@ -208,7 +277,7 @@ def test_register_ignores_non_requested_modules_and_handles_empty_dirs():
     _save_pt(cpu_dir, "cte", 1, "layers.0.mlp.gate", torch.randn(4, 8))
 
     reg = TensorReplacementRegister.get_instance(
-        ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, ref_equiv_map=cpu_equiv
+        ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, config=fake_neuron_config, ref_equiv_map=cpu_equiv
     )
     # Only the requested module should appear
     assert reg.module_superset == ["layers.0.mlp.router.linear_router"]
@@ -227,7 +296,7 @@ def test_register_errors_when_neuron_shape_missing_for_requested_module():
 
     with pytest.raises(ValueError, match=r"Expected non-zero tkg_shapes"):
         _ = TensorReplacementRegister.get_instance(
-            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, ref_equiv_map=cpu_equiv
+            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, config=fake_neuron_config, ref_equiv_map=cpu_equiv
         )
 
 
@@ -249,7 +318,7 @@ def test_register_errors_on_mixed_cpu_dtypes_across_steps():
 
     with pytest.raises(ValueError, match="Mixed dtypes across steps"):
         _ = TensorReplacementRegister.get_instance(
-            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, ref_equiv_map=cpu_equiv
+            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, config=fake_neuron_config, ref_equiv_map=cpu_equiv
         )
 
 
@@ -271,7 +340,7 @@ def test_register_errors_on_rank_mismatch_across_steps():
 
     with pytest.raises(ValueError, match="Rank mismatch"):
         _ = TensorReplacementRegister.get_instance(
-            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, ref_equiv_map=cpu_equiv
+            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, config=fake_neuron_config, ref_equiv_map=cpu_equiv
         )
 
 
@@ -299,7 +368,7 @@ def test_register_errors_on_shape_mismatch_across_tkg_steps():
 
     with pytest.raises(ValueError, match="Shape mismatch across tkg steps"):
         _ = TensorReplacementRegister.get_instance(
-            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, ref_equiv_map=cpu_equiv
+            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, config=fake_neuron_config, ref_equiv_map=cpu_equiv
         )
 
 
@@ -324,11 +393,11 @@ def test_register_duplicate_files_for_same_module_step_raises():
 
     with pytest.raises(ValueError, match="already been recorded"):
         _ = TensorReplacementRegister.get_instance(
-            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, ref_equiv_map=cpu_equiv
+            ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, config=fake_neuron_config, ref_equiv_map=cpu_equiv
         )
 
 
-def test_example_and_step_args_lengths_and_order():
+def test_example_and_step_args_lengths_and_order(fake_neuron_config):
     """
     Ensure example_args/step_args follow module_superset order and lengths.
     """
@@ -350,7 +419,7 @@ def test_example_and_step_args_lengths_and_order():
     _save_pt(cpu_dir, "tkg", 2, "layers.1.mlp.gate", torch.randn(1, 8))
 
     reg = TensorReplacementRegister.get_instance(
-        ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, ref_equiv_map=cpu_equiv
+        ref_dir=cpu_dir, neuron_dir=neu_dir, tr_map=tr_map, config=fake_neuron_config, ref_equiv_map=cpu_equiv
     )
 
     ex_t, ex_m = reg.example_args(2)

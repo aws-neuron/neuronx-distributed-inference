@@ -198,11 +198,20 @@ def preprocess_quantized_linear_layer(layer):
 
 
 def move_heads_front(
-    tensor: Tensor, bsz: int, seq_len: int, num_head: int, head_dim: int, layernorm=None
+    tensor: Tensor, bsz: int, seq_len: int, num_head: int, head_dim: int, layernorm=None, post_transpose_layernorm: bool = False
 ) -> Tensor:
-    """Reshape input tensor: BSHD -> BHSD, and apply layer normalization if layernorm is specified"""
+    """
+    Reshape input tensor: BSHD -> BHSD, and if post_transpose_layernorm is True we transpose BHSD -> BSHD.
+    Then apply layer normalization if layernorm is specified.
+    """
     tensor = tensor.view(bsz, seq_len, num_head, head_dim)
+
     if layernorm:
+        if post_transpose_layernorm:
+            tensor = tensor.transpose(1, 2).contiguous()
+            tensor = layernorm(tensor)
+            return tensor
+
         tensor = layernorm(tensor)
     return tensor.transpose(1, 2).contiguous()
 
@@ -298,18 +307,25 @@ class RotaryEmbedding(nn.Module):
     """
     Adapted from Llama 4.0 impl https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/models
     /llama/modeling_llama.py#L96-L145
+
+    Extended to support linear scaling impl from https://github.com/huggingface/transformers/blob/
+    cd74917ffc3e8f84e4a886052c5ab32b7ac623cc/src/transformers/modeling_rope_utils.py#L122
     """
 
-    def __init__(self, dim, max_position_embeddings=2048, base=10000):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, factor : float = None):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.register_buffer("inv_freq", None, persistent=False)
+        self.factor = factor
 
     def get_inv_freqs(self, device: Optional[torch.device] = None) -> torch.Tensor:
         freq_indices = torch.arange(0, self.dim, 2, dtype=torch.float, device=device)
-        return 1.0 / (self.base ** (freq_indices / self.dim))
+        inv_freq = 1.0 / (self.base ** (freq_indices / self.dim))
+        if self.factor is not None:
+            inv_freq = inv_freq / self.factor
+        return inv_freq
 
     @torch.no_grad()
     def forward(self, x, position_ids):
@@ -533,7 +549,7 @@ def get_context_parallel_reordered_dp_mapping(world_size: int, cp_degree: int, d
         mapping += offset_tp_mapping
 
     # The above ordering assumes a continuous ordering in decode, when we have 8x8 that's not the case.
-    if dp_degree == 8 and dp_tp_size == 8:
+    if (dp_degree == 8 or dp_degree == 16) and dp_tp_size == 8:
         shuffle_accounted_ordering = [-1] * world_size
         true_ordering = sum(get_tp_cp_group_mesh(world_size, dp_degree, switch_cc), [])
 
@@ -752,6 +768,15 @@ def get_cp8_tp8_rank_ordering(world_size, cp_degree, switch_cc: bool = False, de
     needed to correct for the sharding such that the discontiguous ranks get the right weights.
     """
     non_contiguous_mesh = tp_mesh_8_by_8(switch_cc)
+    return _get_non_contiguous_rank_ordering(non_contiguous_mesh, world_size, cp_degree, device)
+
+
+def _get_non_contiguous_rank_ordering(
+    non_contiguous_mesh,
+    world_size,
+    cp_degree,
+    device=torch.device("cpu"),
+):
     non_contiguous_mesh = sum(non_contiguous_mesh, [])
 
     contiguous_mesh = _fully_contiguous_tp_mesh(world_size, cp_degree)

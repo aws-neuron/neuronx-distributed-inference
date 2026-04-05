@@ -93,7 +93,7 @@ def execute_model_prefix_caching(
             input_dict["seq_ids"],
             input_dict["sampling_params"],
             torch.empty(0),  # prev_hidden
-            torch.empty(0),  # adapter_ids
+            input_dict["adapter_ids"],
             torch.empty(0),  # accepted_indices
             torch.empty(0),  # current_length
             torch.empty(0),  # medusa_mask
@@ -112,7 +112,7 @@ def execute_model_prefix_caching(
             input_dict["seq_ids"],
             input_dict["sampling_params"],
             torch.empty(0),  # prev_hidden
-            torch.empty(0),  # adapter_ids
+            input_dict["adapter_ids"],
             input_dict["slot_mapping"],
             input_dict["block_table"],
             input_dict["num_queries"],

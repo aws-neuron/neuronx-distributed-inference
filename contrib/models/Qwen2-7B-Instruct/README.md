@@ -16,25 +16,38 @@ NeuronX Distributed Inference implementation of Qwen2 7B Instruct.
 
 ## Validation Results
 
-**Validated:** 2026-01-29  
-**Configuration:** TP=2, batch_size=None, seq_len=None, None
+**Validated:** 2026-02-06  
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
 
 ### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ LOW | **70.0% match** |
-| Throughput | ✅ PASS | 13.83 tok/s (threshold: 10 tok/s) |
+| Token Matching | ✅ PASS | **100% match** (best of multiple prompts) |
 
-### Performance Metrics
+**Test Prompt:** `"def fibonacci(n):"`
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 13.83 tokens/s |
+**Status:** ✅ VALIDATED
 
+### Device Profiling Metrics
 
-**Status:** ⚠️ VALIDATED
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.27 | 0.00 |
+| MBU (%) | 0.52 | 0.42 |
+| HFU (%) | 0.27 | 0.00 |
+| Execution Time (us) | 0.03 | 0.04 |
+| HBM Read | 7.18 GB | 7.08 GB |
+| HBM Write | 86.63 MB | 2.58 MB |
+
+**Throughput:** 28.35 tok/s | **Compile Time:** 426.10s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
 
 ## Usage
 
@@ -100,6 +113,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-06

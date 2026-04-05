@@ -1,4 +1,4 @@
-transformers==4.56.*
+transformers==4.57.*
 huggingface-hub
 diffusers==0.32.0
 sentencepiece

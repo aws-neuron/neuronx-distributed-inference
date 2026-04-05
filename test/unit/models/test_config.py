@@ -18,6 +18,8 @@ from neuronx_distributed_inference.models.config import (
     InferenceConfig,
     NeuronConfig,
     ChunkedPrefillConfig,
+    MoENeuronConfig,
+    RouterConfig,
     get_platform_lnc,
 )
 from neuronx_distributed_inference.models.mllama.modeling_mllama import (
@@ -408,15 +410,22 @@ def test_serialize_deserialize_mllama_inference_config():
     assert deserialized_config.neuron_config.tp_degree == 1
 
 
+def serialize_deserialize(
+    config: InferenceConfig, config_cls: Type[InferenceConfig] = InferenceConfig
+):
+    with tempfile.TemporaryDirectory() as model_path:
+        config.save(model_path)
+        deserialized_config = config_cls.load(model_path)
+    return deserialized_config
+
+
 def verify_serialize_deserialize(
     config: InferenceConfig, config_cls: Type[InferenceConfig] = InferenceConfig
 ):
     """Verify that the config is identical after being serialized and deserialized."""
-    with tempfile.TemporaryDirectory() as model_path:
-        config.save(model_path)
-        deserialized_config = config_cls.load(model_path)
-        assert config.to_json_string() == deserialized_config.to_json_string()
-        return deserialized_config
+    deserialized_config = serialize_deserialize(config, config_cls)
+    assert config.to_json_string() == deserialized_config.to_json_string()
+    return deserialized_config
 
 
 class TestGetPlatformLNC(unittest.TestCase):
@@ -515,3 +524,100 @@ def test_get_draft_neuron_class():
     fused_spec_config_dict = {"draft_model_cls": None}
     result = InferenceConfig.get_draft_neuron_class(fused_spec_config_dict)
     assert result is None
+
+def test_router_config_default():
+    config = MoENeuronConfig()
+    assert isinstance(config.router_config, RouterConfig)
+    assert config.router_config.act_fn == "softmax"
+    assert config.router_config.dtype == torch.float32
+
+def test_router_config_from_dict():
+    router_dict = {"act_fn": "gelu", "dtype": torch.float16}
+    config = MoENeuronConfig(router_config=router_dict)
+    assert isinstance(config.router_config, RouterConfig)
+    assert config.router_config.act_fn == "gelu"
+    assert config.router_config.dtype == torch.float16
+
+def test_router_config_from_kwargs():
+    config = MoENeuronConfig(router_act_fn="gelu", router_dtype=torch.float16)
+    assert isinstance(config.router_config, RouterConfig)
+    assert config.router_config.act_fn == "gelu"
+    assert config.router_config.dtype == torch.float16
+
+def test_router_config_kwargs_string_dtype():
+    config = MoENeuronConfig(router_act_fn="relu", router_dtype="bfloat16")
+    assert config.router_config.act_fn == "relu"
+    assert config.router_config.dtype == torch.bfloat16
+
+def test_router_config_dict_takes_precedence():
+    router_dict = {"act_fn": "gelu", "dtype": torch.float16}
+    config = MoENeuronConfig(
+        router_config=router_dict,
+        router_act_fn="relu",
+        router_dtype=torch.bfloat16
+    )
+    assert config.router_config.act_fn == "gelu"
+    assert config.router_config.dtype == torch.float16
+
+class MoeInferenceConfig(InferenceConfig):
+    @classmethod
+    def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
+        return MoENeuronConfig
+
+def test_serialize_deserialize_moe_neuron_config_with_router_config():
+    router_config = {"act_fn": "gelu", "dtype": torch.float16}
+    moe_config = MoENeuronConfig(router_config=router_config)
+    config = MoeInferenceConfig(neuron_config=moe_config)
+
+    assert config.neuron_config.router_config.act_fn == "gelu"
+    assert config.neuron_config.router_config.dtype == torch.float16
+    
+    deserialized_config = verify_serialize_deserialize(config, MoeInferenceConfig)
+    assert deserialized_config.neuron_config.router_config.act_fn == "gelu"
+    assert deserialized_config.neuron_config.router_config.dtype == torch.float16
+    assert isinstance(deserialized_config.neuron_config.router_config.dtype, torch.dtype)
+
+def test_serialize_deserialize_moe_neuron_config_with_router_kwargs():
+    moe_config = MoENeuronConfig(router_act_fn="relu", router_dtype="bfloat16")
+    config = MoeInferenceConfig(neuron_config=moe_config)
+
+    assert config.neuron_config.router_config.act_fn == "relu"
+    assert config.neuron_config.router_config.dtype == torch.bfloat16
+    deserialized_config = verify_serialize_deserialize(config, MoeInferenceConfig)
+    assert deserialized_config.neuron_config.router_config.act_fn == "relu"
+    assert deserialized_config.neuron_config.router_config.dtype == torch.bfloat16
+    assert isinstance(deserialized_config.neuron_config.router_config.dtype, torch.dtype)
+
+def test_serialize_deserialize_moe_neuron_config_router_default_dtype():
+    moe_config = MoENeuronConfig()
+    config = MoeInferenceConfig(neuron_config=moe_config)
+    
+    assert config.neuron_config.router_config.dtype == torch.float32
+    
+    deserialized_config = verify_serialize_deserialize(config, MoeInferenceConfig)
+    assert deserialized_config.neuron_config.router_config.dtype == torch.float32
+    assert isinstance(deserialized_config.neuron_config.router_config.dtype, torch.dtype)
+
+def test_serialize_deserialize_neuron_config_dma_order_config():
+    neuron_config = NeuronConfig()
+    config = InferenceConfig(neuron_config=neuron_config)
+
+    assert config.neuron_config.dma_order_config is None
+    config.neuron_config.dma_order_config = {
+        "fused_speculation_model": {
+            "add_order_constraints": False,
+            "sbuf_alloc_limit": 0.8,
+            "constraint_ops": [
+                {"allocate": True, "kernel_name": "attn_MK", "start_layer": 4, "output_name": "gamma_sb"},
+                {"allocate": True, "kernel_name": "attn_MK", "start_layer": 4, "output_name": "qkv_bias_sb"},
+                {"allocate": True, "kernel_name": "attn_MK", "output_name": "qkv_w_sb"},
+                {"allocate": False, "kernel_name": "attn_MK", "output_name": "mask_sb"},
+            ]
+        }
+    }
+
+    deserialized_config = verify_serialize_deserialize(config, InferenceConfig)
+    assert deserialized_config.neuron_config.dma_order_config == config.neuron_config.dma_order_config
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

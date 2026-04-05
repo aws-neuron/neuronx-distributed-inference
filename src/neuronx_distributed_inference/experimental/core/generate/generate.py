@@ -1,8 +1,21 @@
-import copy
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
+
+
+@dataclass
+class GenerateResult:
+    """
+    Result object for the generate function.
+
+    Attributes:
+        prompt_tokens: List of token sequences with generated tokens appended
+        logits: List of logits tensors from each generation step (optional)
+    """
+    prompt_tokens: List[List[int]]
+    logits: Optional[List[torch.Tensor]] = None
 
 
 def generate(
@@ -11,15 +24,32 @@ def generate(
     prompt_tokens: List[List[int]],
     stop_tokens: List[int],
     pad_token: int,
-):
+    return_logits: bool = False,
+) -> GenerateResult:
     """
     A simple greedy generation implementation.
 
     For now it only supports running on device with AoT, and greedy sampling.
 
+    Args:
+        model: The model to use for generation
+        max_len: Maximum length of generated sequences
+        prompt_tokens: List of token sequences to use as prompts
+        stop_tokens: List of token IDs that indicate end of generation
+        pad_token: Token ID to use for padding
+        return_logits: Whether to return logits from each generation step.
+                      If False, logits are not collected, saving memory.
+
+    Returns:
+        GenerateResult containing:
+        - prompt_tokens: List of token sequences with generated tokens appended
+        - logits: List of logits tensors from each generation step (if return_logits=True),
+                 each with shape [batch_size, vocab_size]. None if return_logits=False.
+
     TODO: Generalize it to support more use cases.
     """
-    prompt_tokens = copy.deepcopy(prompt_tokens)
+    # Remove all pad tokens (if present) from each sequence
+    prompt_tokens = [[token for token in prompt if token != pad_token] for prompt in prompt_tokens]
 
     # Track max pos per batch
     last_pos = torch.tensor([len(prompt) - 1 for prompt in prompt_tokens], dtype=torch.int32)
@@ -37,6 +67,9 @@ def generate(
     # A tensor to keep track of generation completion per batch line
     is_gen_complete = torch.full((input_bs, 1), False)
 
+    # List to store logits from each generation step (only if requested)
+    generated_logits = [] if return_logits else None
+
     while True:
         kwargs = {
             "input_tokens": input_tokens,
@@ -44,6 +77,10 @@ def generate(
             "attention_mask": attention_mask,
         }
         logits = model.forward(**kwargs)
+
+        # Store the logits for the last position only if requested
+        if return_logits:
+            generated_logits.append(logits[:, -1].clone())
 
         last_pos = last_pos + 1
 
@@ -70,4 +107,4 @@ def generate(
         attention_mask = F.pad(attention_mask, (0, 1), "constant", 0)
         attention_mask[torch.arange(last_pos.shape[0]), last_pos] = 1
 
-    return prompt_tokens
+    return GenerateResult(prompt_tokens=prompt_tokens, logits=generated_logits)

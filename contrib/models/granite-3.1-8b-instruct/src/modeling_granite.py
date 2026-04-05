@@ -1,5 +1,6 @@
 # coding=utf-8
 # Copyright 2024 IBM and the HuggingFace Inc. team. All rights reserved.
+# Adapted for NeuronX Distributed Inference.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,16 +16,20 @@
 """
 NeuronX Distributed Inference implementation of Granite model.
 
-This implementation ports the Granite model from:
+FIXED VERSION - Addresses critical accuracy issues:
+1. attention_multiplier: Applied by scaling Q before attention computation
+2. logits_scaling: Applied by dividing logits after lm_head
+3. embedding_multiplier: Applied in forward pass (not to weights for tied embeddings)
 
 Key differences from Llama:
 1. embedding_multiplier: Scales input embeddings (default: 12.0)
 2. logits_scaling: Scales output logits (default: 16.0)
 3. residual_multiplier: Scales residual connections (default: 0.22)
-4. attention_multiplier: Custom attention scaling (default: 0.0078125)
+4. attention_multiplier: Custom attention scaling (default: 0.0078125 = 1/head_dim)
 """
 
 import logging
+import math
 from typing import List, Optional, Tuple, Type
 
 import torch
@@ -237,21 +242,34 @@ class NeuronGraniteAttention(NeuronAttentionBase):
     """
     Granite attention layer for NeuronX.
     
-    Key differences from Llama attention:
-    - Uses attention_multiplier instead of 1/sqrt(head_dim) for scaling
+    CRITICAL FIX: Granite uses attention_multiplier (0.0078125 = 1/head_dim)
+    instead of the standard 1/sqrt(head_dim) = 0.0884.
     
-    Inherits from NeuronAttentionBase which provides:
-    - Column parallel Q, K, V projections
-    - Row parallel output projection
-    - Rotary position embeddings
-    - KV cache management
+    The NeuronX attention kernels apply 1/sqrt(head_dim) scaling internally:
+    - Context encoding (perform_prefill): Q = Q / sqrt(head_dim)
+    - Token generation (compute_for_token_gen): scores = Q @ K^T / sqrt(head_dim)
+    
+    To convert from standard scaling to Granite's attention_multiplier:
+    - Standard: Q @ K^T / sqrt(head_dim)
+    - Granite: Q @ K^T * attention_multiplier
+    
+    We need to pre-scale Q by a correction factor:
+    - (Q * correction) / sqrt(head_dim) = Q * attention_multiplier
+    - correction = attention_multiplier * sqrt(head_dim)
+    - correction = 0.0078125 * sqrt(128) = 0.0078125 * 11.31 = 0.0884
     """
 
     def __init__(self, config: InferenceConfig, tensor_model_parallel_group=None):
         # Get Granite-specific attention multiplier
-        # In Granite, scaling is attention_multiplier (e.g., 0.0078125)
-        # instead of the standard 1/sqrt(head_dim)
-        self.attention_multiplier = getattr(config, "attention_multiplier", 1.0 / (config.hidden_size // config.num_attention_heads) ** 0.5)
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.attention_multiplier = getattr(config, "attention_multiplier", 1.0 / head_dim)
+        
+        # Compute the correction factor to convert from standard 1/sqrt(head_dim) to attention_multiplier
+        # The kernel applies: scores = Q @ K^T / sqrt(head_dim)
+        # We want: scores = Q @ K^T * attention_multiplier
+        # So: (Q * correction) @ K^T / sqrt(head_dim) = Q @ K^T * attention_multiplier
+        # correction = attention_multiplier * sqrt(head_dim)
+        self.q_scale_factor = self.attention_multiplier * math.sqrt(head_dim)
         
         # Initialize the base attention class
         super().__init__(
@@ -260,30 +278,94 @@ class NeuronGraniteAttention(NeuronAttentionBase):
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
-            head_dim=getattr(config, "head_dim", config.hidden_size // config.num_attention_heads),
+            head_dim=head_dim,
             rotary_emb=self._get_rope(config),
             num_cores_per_group=config.num_cores_per_group,
             qkv_bias=getattr(config, "attention_bias", False),
             o_bias=getattr(config, "attention_bias", False),
             rms_norm_eps=config.rms_norm_eps,
         )
-        
-        # Store attention multiplier for use in attention computation
-        # Note: NeuronAttentionBase uses self.scaling which defaults to 1/sqrt(head_dim)
-        # We need to override the scaling used in attention computation
 
     def _get_rope(self, config: InferenceConfig):
-        """
-        Get the rotary position embedding module for Granite.
-        
-        Granite uses standard RoPE without scaling.
-        """
+        """Get the rotary position embedding module for Granite."""
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         return RotaryEmbedding(
             head_dim,
             max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
         )
+    
+    def prep_qkv_tensors(
+        self,
+        position_ids,
+        hidden_states,
+        past_key_value,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        rmsnorm=None,
+        skip_rope=False,
+        residual=None,
+        use_polar_compatible_rope=False,
+    ):
+        """
+        Override prep_qkv_tensors to apply Granite's attention_multiplier.
+        
+        Since the flash attention kernel uses scale=1.0, we need to apply
+        the attention_multiplier ourselves by scaling Q.
+        """
+        from neuronx_distributed_inference.modules.attention.utils import (
+            apply_rotary_pos_emb,
+            move_heads_front,
+        )
+        
+        # Get QKV projections through the base class's qkv_proj
+        Q, K, V, residual = self.get_qkv_proj()(
+            hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids, residual=residual
+        )
+        
+        # Reshape to heads
+        bsz, q_len, _ = hidden_states.size()
+        if getattr(self, 'qkv_proj_sp_enabled', False):
+            q_len *= self.tensor_model_parallel_group.size()
+        
+        # BSHD -> BHSD layout
+        Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=None)
+        K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+        V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+        
+        # Apply rotary embeddings
+        if not skip_rope and self.rotary_emb is not None:
+            if cos_cache is None or sin_cache is None:
+                cos_cache, sin_cache = self.rotary_emb(V, position_ids)
+            Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
+        
+        # CRITICAL FIX: Apply Granite's attention_multiplier by scaling Q
+        # The attention kernels compute: softmax((Q / sqrt(head_dim)) @ K^T) @ V
+        # But Granite wants: softmax(Q @ K^T * attention_multiplier) @ V
+        #
+        # To convert: (Q * correction) / sqrt(head_dim) @ K^T = Q @ K^T * attention_multiplier
+        # correction = attention_multiplier * sqrt(head_dim) = 0.0078125 * 11.31 = 0.0884
+        Q = Q * self.q_scale_factor
+        
+        # Gather KV to full S when CP is enabled
+        if past_key_value is None and getattr(self, 'cp_degree', 1) > 1:
+            from neuronx_distributed.parallel_layers.mappings import gather_from_tensor_model_parallel_region_with_dim
+            from neuronx_distributed_inference.modules.attention.attention_process_groups import get_context_parallel_attention_cp_group
+            from neuronx_distributed_inference.modules.attention.utils import order_strided_tensor
+            from neuronx_distributed_inference.modules.attention.attention_base import FlashAttentionStrategy
+            
+            stacked_kv = torch.stack([K, V], dim=0)
+            stacked_kv = gather_from_tensor_model_parallel_region_with_dim(
+                stacked_kv,
+                gather_dim=3,
+                process_group=get_context_parallel_attention_cp_group(),
+            )
+            if self.get_flash_attention_strategy_cp(q_len * self.cp_degree) == FlashAttentionStrategy.STRIDED_CONTEXT_PARALLEL_KERNEL:
+                stacked_kv = order_strided_tensor(stacked_kv, 3, self.cp_degree)
+            K, V = torch.unbind(stacked_kv, dim=0)
+        
+        return Q, K, V, cos_cache, sin_cache, residual
 
 
 class NeuronGraniteDecoderLayer(nn.Module):
@@ -376,13 +458,46 @@ class NeuronGraniteDecoderLayer(nn.Module):
         return outputs
 
 
+class ScaledColumnParallelLinear(ColumnParallelLinear):
+    """
+    ColumnParallelLinear that applies logits_scaling after the linear projection.
+    
+    This is needed for Granite which divides logits by logits_scaling (16.0)
+    after the lm_head projection.
+    """
+    
+    def __init__(self, *args, logits_scaling: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logits_scaling = logits_scaling
+    
+    def forward(self, x):
+        output = super().forward(x)
+        # Apply Granite's logits_scaling
+        return output / self.logits_scaling
+
+
+class ScaledLinear(nn.Linear):
+    """
+    Linear layer that applies logits_scaling after the linear projection.
+    For non-parallel mode (CPU testing).
+    """
+    
+    def __init__(self, *args, logits_scaling: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logits_scaling = logits_scaling
+    
+    def forward(self, x):
+        output = super().forward(x)
+        return output / self.logits_scaling
+
+
 class NeuronGraniteModel(NeuronBaseModel):
     """
     Granite model for NeuronX.
     
-    Key differences from Llama:
-    - Input embeddings are scaled by embedding_multiplier (applied to weights at load time)
-    - Output logits are scaled by 1/logits_scaling
+    CRITICAL FIXES:
+    1. embedding_multiplier: Applied in forward pass via get_model_output override
+    2. logits_scaling: Applied via ScaledColumnParallelLinear in lm_head
     """
 
     def setup_attr_for_model(self, config: InferenceConfig):
@@ -395,7 +510,7 @@ class NeuronGraniteModel(NeuronBaseModel):
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
         
-        # Granite-specific multipliers (stored for reference, applied during weight conversion)
+        # Granite-specific multipliers
         self.embedding_multiplier = getattr(config, "embedding_multiplier", 1.0)
         self.logits_scaling = getattr(config, "logits_scaling", 1.0)
 
@@ -404,7 +519,7 @@ class NeuronGraniteModel(NeuronBaseModel):
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
         
-        # Token embeddings (embedding_multiplier is applied to weights at load time)
+        # Token embeddings - embedding_multiplier is applied in forward(), not here
         if parallel_state.model_parallel_is_initialized():
             self.embed_tokens = ParallelEmbedding(
                 config.vocab_size,
@@ -418,7 +533,8 @@ class NeuronGraniteModel(NeuronBaseModel):
                 tensor_model_parallel_group=get_tp_group(config),
             )
 
-            self.lm_head = ColumnParallelLinear(
+            # CRITICAL FIX: Use ScaledColumnParallelLinear to apply logits_scaling
+            self.lm_head = ScaledColumnParallelLinear(
                 config.hidden_size,
                 config.vocab_size,
                 gather_output=not self.on_device_sampling,
@@ -426,14 +542,20 @@ class NeuronGraniteModel(NeuronBaseModel):
                 bias=False,
                 pad=True,
                 tensor_model_parallel_group=get_tp_group(config),
+                logits_scaling=self.logits_scaling,
             )
         else:
             self.embed_tokens = nn.Embedding(
                 config.vocab_size, 
                 config.hidden_size, 
-                self.padding_idx
+                self.padding_idx,
             )
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = ScaledLinear(
+                config.hidden_size, 
+                config.vocab_size, 
+                bias=False,
+                logits_scaling=self.logits_scaling,
+            )
 
         # Decoder layers
         self.layers = nn.ModuleList(
@@ -442,6 +564,59 @@ class NeuronGraniteModel(NeuronBaseModel):
 
         # Final layer norm
         self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+
+    def get_model_output(
+        self,
+        input_ids: torch.LongTensor = None,
+        seq_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        active_mask: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        prev_hidden: Optional[torch.FloatTensor] = None,
+        adapter_ids: Optional[torch.LongTensor] = None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
+        update_cache: bool = False,
+        is_for_context_encoding: bool = False,
+        vision_embeddings: Optional[torch.FloatTensor] = None,
+        vision_mask: Optional[torch.BoolTensor] = None,
+        local_attn_mask: Optional[torch.Tensor] = None,
+        windowed_context_encoding_window_idx: int = -1,
+        **kwargs,
+    ):
+        """
+        Override get_model_output to apply Granite's embedding_multiplier.
+        
+        Granite multiplies embeddings by embedding_multiplier (12.0) AFTER the embedding
+        lookup. This is critical for correct model behavior.
+        """
+        # Apply Granite embedding_multiplier if we need to compute embeddings
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+            # Apply Granite's embedding_multiplier (12.0)
+            inputs_embeds = inputs_embeds * self.embedding_multiplier
+        
+        # Call parent's get_model_output with pre-computed embeddings
+        return super().get_model_output(
+            input_ids=input_ids,
+            seq_ids=seq_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            active_mask=active_mask,
+            inputs_embeds=inputs_embeds,  # Pass scaled embeddings
+            prev_hidden=prev_hidden,
+            adapter_ids=adapter_ids,
+            rotary_position_ids=rotary_position_ids,
+            update_cache=update_cache,
+            is_for_context_encoding=is_for_context_encoding,
+            vision_embeddings=vision_embeddings,
+            vision_mask=vision_mask,
+            local_attn_mask=local_attn_mask,
+            windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+            **kwargs,
+        )
 
 
 class NeuronGraniteForCausalLM(NeuronBaseForCausalLM):
@@ -465,72 +640,44 @@ class NeuronGraniteForCausalLM(NeuronBaseForCausalLM):
         """
         Convert HuggingFace state dict to Neuron format.
         
-        Performs the following transformations:
-        1. Adds rank_util.rank for tensor parallelism
-        2. Applies Granite's embedding_multiplier to embedding weights
-        3. Maps attention projection weights to NeuronAttentionBase structure:
-           - self_attn.q_proj.weight → self_attn.qkv_proj.q_proj.weight
-           - self_attn.k_proj.weight → self_attn.qkv_proj.k_proj.weight
-           - self_attn.v_proj.weight → self_attn.qkv_proj.v_proj.weight
-           - self_attn.o_proj.weight → self_attn.o_proj.o_proj.weight
+        IMPORTANT: The framework's preshard_hook in GroupQueryAttention_QKV and 
+        GroupQueryAttention_O automatically handles the key renaming:
+        - q_proj.weight -> qkv_proj.q_proj.weight
+        - k_proj.weight -> qkv_proj.k_proj.weight
+        - v_proj.weight -> qkv_proj.v_proj.weight
+        - o_proj.weight -> o_proj.o_proj.weight
         
-        Args:
-            state_dict: HuggingFace model state dictionary
-            config: Model configuration
-            
-        Returns:
-            Neuron-compatible state dictionary
+        So we should NOT rename these keys here.
+        
+        IMPORTANT: For Granite with tie_word_embeddings=True:
+        - embedding_multiplier is applied in the forward pass, NOT to weights
+        - lm_head.weight is tied to embed_tokens.weight (same weights)
+        - logits_scaling is applied in the forward pass via ScaledColumnParallelLinear
         """
         neuron_config = config.neuron_config
         num_layers = config.num_hidden_layers
         tp_degree = neuron_config.tp_degree
         
-        # Get Granite-specific multipliers
-        embedding_multiplier = getattr(config, "embedding_multiplier", 1.0)
+        # NOTE: Do NOT apply embedding_multiplier to weights!
+        # For tied weights, this would incorrectly scale the lm_head weights.
+        # Instead, embedding_multiplier is applied in the forward pass.
         
-        # Apply embedding_multiplier to embedding weights
-        # This is mathematically equivalent to multiplying the output of embed_tokens
-        if "embed_tokens.weight" in state_dict:
-            state_dict["embed_tokens.weight"] = state_dict["embed_tokens.weight"] * embedding_multiplier
-        
-        # Map attention projection weights to NeuronAttentionBase structure
+        # Add rank_util tensors required by NeuronAttentionBase
         for i in range(num_layers):
-            # Map QKV projections
-            for proj in ["q", "k", "v"]:
-                old_key = f"layers.{i}.self_attn.{proj}_proj.weight"
-                new_key = f"layers.{i}.self_attn.qkv_proj.{proj}_proj.weight"
-                if old_key in state_dict:
-                    state_dict[new_key] = state_dict.pop(old_key)
-            
-            # Map output projection
-            old_o_key = f"layers.{i}.self_attn.o_proj.weight"
-            new_o_key = f"layers.{i}.self_attn.o_proj.o_proj.weight"
-            if old_o_key in state_dict:
-                state_dict[new_o_key] = state_dict.pop(old_o_key)
-            
-            # Add rank information for tensor parallelism in attention layers
             state_dict[f"layers.{i}.self_attn.rank_util.rank"] = torch.arange(
                 0, tp_degree, dtype=torch.int32
             )
 
-        # Add rank information for base model
         state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
         
         return state_dict
 
     @staticmethod
     def update_state_dict_for_tied_weights(state_dict):
-        """
-        Handle tied weights between embeddings and LM head.
-        
-        Granite uses tie_word_embeddings=True by default.
-        Note: The embedding_multiplier is already applied to embed_tokens.weight,
-        but we also need to apply 1/logits_scaling for the lm_head.
-        Since they share weights in HF, we need to be careful here.
-        
-        For tied weights, lm_head.weight = embed_tokens.weight (already scaled by embedding_multiplier)
-        The logits_scaling is typically applied in the forward pass, not to weights.
-        """
+        """Handle tied weights between embeddings and LM head."""
+        # Granite uses tie_word_embeddings=True
+        # The lm_head.weight should be the same as embed_tokens.weight
+        # Note: embedding_multiplier is applied in forward pass, not to weights
         if "embed_tokens.weight" in state_dict and "lm_head.weight" not in state_dict:
             state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"].clone()
 
@@ -548,4 +695,6 @@ __all__ = [
     "NeuronGraniteMLP",
     "NeuronGraniteAttention",
     "NeuronGraniteDecoderLayer",
+    "ScaledColumnParallelLinear",
+    "ScaledLinear",
 ]

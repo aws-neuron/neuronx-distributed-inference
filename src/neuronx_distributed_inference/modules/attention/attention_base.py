@@ -23,9 +23,6 @@ from neuronx_distributed_inference.modules.attention.attention_process_groups im
     get_data_parallel_attention_dp_group,
     get_data_parallel_attention_tp_group,
 )
-from neuronx_distributed_inference.modules.chunked_prefill.flash_pa_with_schedule import (
-    flash_paged_attention_with_schedule,
-)
 from neuronx_distributed_inference.modules.sliding_window.attention import (
     flash_fwd, FlashConfig, DEFAULT_SLIDING_WINDOW_SEQ_TILE_SIZE, MIN_SLIDING_WINDOW_SEQ_TILE_SIZE
 )
@@ -66,10 +63,12 @@ from neuronx_distributed.parallel_layers.mappings import (
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
     gather_from_tensor_model_parallel_region_with_dim,
+    reduce_scatter_to_tensor_model_parallel_region_with_dim
 )
 from neuronx_distributed_inference.utils.distributed import (
     get_tp_group,
     split_along_dim,
+    split_along_dim0_kernel_wrapper,
     get_cp_rank,
     get_dp_rank,
     get_kv_head_group_number,
@@ -177,6 +176,19 @@ class QKNormPlacement(Enum):
     POST_ROPE = 1
 
 
+class EPDispatchOption(Enum):
+    """
+    Expert Parallelism dispatch collective communication options.
+
+    AR_AG: AllReduce from local TP group followed by AllGather from DP group
+    RS_AG: ReduceScatter across local TP group followed by AllGather from global TP group
+    AG_AR: AllGather from DP group followed by AllReduce from local TP group
+    """
+    AR_AG = "AR_AG"
+    RS_AG = "RS_AG"
+    AG_AR = "AG_AR"
+
+
 @dataclass(frozen=True)
 class NeuronAttentionBaseOutput:
     hidden_states: torch.tensor
@@ -220,6 +232,7 @@ class NeuronAttentionBase(nn.Module):
                  qk_norm_placement: QKNormPlacement = QKNormPlacement.PRE_ROPE,
                  q_layernorm: Callable = None,
                  k_layernorm: Callable = None,
+                 post_transpose_layernorm: bool = False,
                  clip_qkv: float = None,
                  qkv_bias: bool = False,
                  o_bias: bool = False,
@@ -300,9 +313,10 @@ class NeuronAttentionBase(nn.Module):
         self.attn_block_tkg_nki_kernel_enabled = self.neuron_config.attn_block_tkg_nki_kernel_enabled
         self.attn_block_tkg_nki_kernel_cache_update = self.neuron_config.attn_block_tkg_nki_kernel_cache_update
         self.attn_block_cte_nki_kernel_enabled = self.neuron_config.attn_block_cte_nki_kernel_enabled
-        self.k_cache_transposed = self.neuron_config.k_cache_transposed
+        self.k_cache_transposed = self.neuron_config.k_cache_transposed and self.sliding_window is None
         self.logical_nc_config = self.neuron_config.logical_nc_config
         self.qk_layernorm = self.neuron_config.qk_layernorm
+        self.post_transpose_layernorm = post_transpose_layernorm
 
         if self.sliding_window and self.neuron_config.enable_fused_speculation:
             assert self.attn_block_tkg_nki_kernel_enabled and self.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention, 'Currently we only support speculative decoding with sliding window attention when the cascaded tkg attention kernel is enabled'
@@ -338,6 +352,8 @@ class NeuronAttentionBase(nn.Module):
         self.qk_norm = None
         if use_qk_norm:
             self.init_qk_norm()
+
+        self.ep_dispatch_cc_option = EPDispatchOption(self.neuron_config.ep_dispatch_cc_option)
 
     def init_tkg_cp_qkv_o_proj(self, process_group, rank_ordering=None):
         qkv_hidden_size = self.hidden_size * 2 if self.is_eagle3_draft else self.hidden_size
@@ -392,7 +408,7 @@ class NeuronAttentionBase(nn.Module):
         if self.cp_degree == 1 and self.dp_degree > 1:
             validate_tp_prefill_to_dp_decode(self.num_key_value_heads, self.neuron_config.tp_degree, self.dp_degree)
             cte_rank_ordering = get_context_parallel_reordered_tp_mapping(self.neuron_config.tp_degree, self.dp_degree, self.num_key_value_heads)
-        elif self.cp_degree == 8 and self.tp_degree == 8:
+        elif self.cp_degree == 8 and self.neuron_config.tp_degree // self.cp_degree == 8:
             cte_rank_ordering = get_cp8_tp8_rank_ordering(self.neuron_config.tp_degree, self.cp_degree, switch_cc=self.neuron_config.switch_cc)
 
         qkv_hidden_size = self.hidden_size * 2 if self.is_eagle3_draft else self.hidden_size
@@ -590,10 +606,10 @@ class NeuronAttentionBase(nn.Module):
         if self.qkv_proj_sp_enabled:
             q_len *= self.tensor_model_parallel_group.size()
         Q = move_heads_front(
-            Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm
+            Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm, post_transpose_layernorm=self.post_transpose_layernorm
         )
         K = move_heads_front(
-            K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm
+            K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm, post_transpose_layernorm=self.post_transpose_layernorm
         )
         V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
 
@@ -705,7 +721,7 @@ class NeuronAttentionBase(nn.Module):
                 kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
                 use_dma_transpose=True,
                 global_n_tiles=self.cp_degree,
-                tile_i=cp_rank,
+                tile_i=cp_rank.reshape((1, 1)),
                 strided_q_slicing=True,
                 **cp_fa_kernel_kwargs,
             )
@@ -1606,6 +1622,60 @@ class NeuronAttentionBase(nn.Module):
 
         return attn_output, k_output
 
+    def get_rope_cache_for_kernel(self, hidden_states: torch.Tensor,
+                                  rotary_position_ids: Optional[torch.LongTensor],
+                                  cos_cache: Optional[torch.Tensor] = None,
+                                  sin_cache: Optional[torch.Tensor] = None):
+        bsz, q_len, _ = hidden_states.size()
+        # Prepare cosine and sine coefficients.
+        assert (
+            self.rotary_emb is not None
+        ), "attn-block-tkg-nki-kernel-enabled always implements RoPE so self.rotary_emb must be specified."
+        if cos_cache is None or sin_cache is None:
+            cos_cache, sin_cache = self.rotary_emb(hidden_states, rotary_position_ids)
+            assert cos_cache.shape == (
+                bsz,
+                q_len,
+                self.head_dim,
+            ), f"cos_cache.shape: {cos_cache.shape}"
+
+            # Take first half and reshape to [dim//2, batch_size, seq_len]
+            cos_cache = cos_cache[..., : cos_cache.shape[-1] // 2].permute(2, 0, 1)
+            sin_cache = sin_cache[..., : sin_cache.shape[-1] // 2].permute(2, 0, 1)
+
+        return cos_cache, sin_cache
+
+    def get_attention_mask_for_kernel(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor):
+        bsz, q_len, _ = hidden_states.size()
+        q_heads = self.num_heads
+        # Prepare causal masks.
+        s_prior = attention_mask.shape[-1]  # Current bucket's context length.
+        expected_cache_mask_shape = [(bsz, 1, q_len, s_prior), (bsz, q_heads, q_len, s_prior)]
+        assert (
+            attention_mask.shape in expected_cache_mask_shape
+        ), f"{attention_mask.shape} not matching any of expected shapes of {expected_cache_mask_shape}"
+        # Duplicate the mask across q_heads, no op if mask already has q_heads in dim-1.
+        attention_mask = attention_mask.expand(-1, q_heads, -1, -1)
+        return attention_mask
+
+    def get_active_mask_for_kernel(self, hidden_states: torch.Tensor, active_mask: torch.Tensor):
+        bsz, q_len, _ = hidden_states.size()
+        q_heads = self.num_heads
+
+        the_dtype = hidden_states.dtype
+        the_device = hidden_states.device
+        expected_active_mask_shape = (bsz, 1, q_len, q_len)
+        if q_len == 1 or active_mask is None:
+            active_mask = torch.ones(expected_active_mask_shape, dtype=the_dtype, device=the_device)
+        else:
+            assert (
+                active_mask.shape == expected_active_mask_shape
+            ), f"{active_mask.shape} != {expected_active_mask_shape}"
+
+        # Duplicate the mask across q_heads
+        active_mask = active_mask.expand(-1, q_heads, -1, -1)
+        return active_mask
+
     def attention_block_tokengen_nki_kernel(
         self,
         hidden_states: torch.Tensor,
@@ -1763,6 +1833,8 @@ class NeuronAttentionBase(nn.Module):
             tkg_kernel_kwargs["sink"] = self.get_learned_sinks().unsqueeze(-1)
         if not use_online_softmax:
             tkg_kernel_kwargs["use_online_softmax"] = False
+        if self.neuron_config.attn_block_tkg_nki_kernel_disable_gpsimd_sb2sb:
+            tkg_kernel_kwargs["use_gpsimd_sb2sb"] = False
 
         # applies to padded checkpoints
         if hasattr(self.config, "original_hidden_size"):
@@ -1801,9 +1873,23 @@ class NeuronAttentionBase(nn.Module):
                 attn_output, 1, process_group=self.tensor_model_parallel_group
             )
         else:
-            attn_output = reduce_from_tensor_model_parallel_region(
-                attn_output, process_group=self.tensor_model_parallel_group
-            )
+            if self.ep_dispatch_cc_option == EPDispatchOption.AR_AG:
+                # option 1
+                attn_output = reduce_from_tensor_model_parallel_region(
+                    attn_output, process_group=self.tensor_model_parallel_group
+                )
+            elif self.ep_dispatch_cc_option == EPDispatchOption.RS_AG:
+                # option 2
+                attn_output = reduce_scatter_to_tensor_model_parallel_region_with_dim(
+                    attn_output, partition_dim=0, process_group=self.tensor_model_parallel_group
+                )
+            elif self.ep_dispatch_cc_option == EPDispatchOption.AG_AR:
+                # option 3
+                attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                    attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
+                )
+            else:
+                raise ValueError(f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}")
 
         if not update_cache_in_kernel:
             # K in dBS, V in BSd, we want to output BNSd where N is 1.
@@ -1986,58 +2072,6 @@ class NeuronAttentionBase(nn.Module):
 
         return attn_output
 
-    def perform_contexted_prefill(self, Q, K, V, past_key_value, attention_mask, **kwargs):
-        """
-        Attention computation for chunked prefill
-
-        For chunked prefill, all prompts are concatenated along the seq dim, so
-        the batch size is always one.
-        """
-        batch_size, num_q_heads, q_len, head_dim = Q.size()
-        dtype = Q.dtype
-
-        K_cache = past_key_value[0]
-        V_cache = past_key_value[1]
-        num_kv_heads_per_rank = K_cache.size()[1]
-
-        tile_q_indices = kwargs.get("tile_q_indices")
-        tile_block_tables = kwargs.get("tile_block_tables")
-        tile_masks = kwargs.get("tile_masks")
-
-        active_mask = attention_mask[0, 0, :, :]
-
-        # Q: BHSD -> (1, n_q_heads, d, seq_q)
-        Q = Q.permute(0, 1, 3, 2)
-        # K: BHSD -> (1, n_kv_heads, d, seq_k)
-        K = K.permute(0, 1, 3, 2)
-        # V: BHSD -> (1, n_kv_heads, seq_v, d)
-        # K_cache: (num_blocks, n_kv_heads, block_size, d)
-        # V_cache: (num_blocks, n_kv_heads, block_size, d)
-
-        # attn_output is in BHSD layout
-        attn_output = flash_paged_attention_with_schedule[batch_size, num_kv_heads_per_rank](
-            Q,
-            K,
-            V,
-            K_cache,
-            V_cache,
-            tile_q_indices,
-            tile_block_tables,
-            tile_masks,
-            active_mask,
-            softmax_scale=None,
-            mixed_precision=True,
-        )
-
-        # Clear the ouput at the padding positions
-        num_queries = kwargs.get("num_queries")
-        output_mask = torch.arange(q_len, dtype=dtype, device=Q.device) < torch.sum(
-            num_queries, dtype=dtype
-        )
-        output_mask = output_mask[None, None, :, None]
-        attn_output *= output_mask
-        return attn_output
-
     def attention_context_encode(self, Q, K, V, q_len, bsz, attention_mask, past_key_value=None, active_mask=None):
         if past_key_value is None:
             attn_output, flash_attn_strategy = self.perform_prefill(Q, K, V, q_len, bsz, attention_mask)
@@ -2133,17 +2167,6 @@ class NeuronAttentionBase(nn.Module):
                 active_mask,
                 is_prefix_caching=True,
             )
-
-        if self.neuron_config.is_chunked_prefill:
-            q_len = Q.shape[2]  # Q shape: BHSD
-            # If a TKG model is enabled for chunked prefill, decoding-only
-            # requests will be passed to the base TKG code
-            # path self.compute_for_token_gen()
-            if q_len > 1:
-                # Can process both prefilling and decoding requests
-                return self.perform_contexted_prefill(
-                    Q, K, V, past_key_value, attention_mask, **kwargs
-                )
 
         if self.flash_decoding_enabled:
             assert active_mask is not None, "Flash decoding requires active mask is not None!"
@@ -2306,18 +2329,23 @@ class NeuronAttentionBase(nn.Module):
             attention_mask, hidden_states, position_ids, cos_cache, sin_cache = self._split_inputs_for_context_parallel(attention_mask, hidden_states, position_ids, cos_cache, sin_cache)
 
         if is_data_parallel:
-            # split all inputs into B/DP pieces based on the dp_rank, each specified dim is the batch dim
-
+            # split hidden_states into B/DP pieces based on the dp_rank
             dp_rank = get_dp_rank(self.rank_util.get_rank(), self.tp_degree, self.dp_degree, self.neuron_config.switch_cc)
-
-            hidden_states = split_along_dim(
-                hidden_states, dim=0, rank=dp_rank, num_partitions=self.dp_degree
+            hidden_states = split_along_dim0_kernel_wrapper(
+                tensor=hidden_states,
+                rank=dp_rank,
+                num_partitions=self.dp_degree,
+                lnc=self.logical_nc_config,
             )
             attention_mask = split_along_dim(
                 attention_mask, dim=0, rank=dp_rank, num_partitions=self.dp_degree
             )
             position_ids = split_along_dim(
                 position_ids, dim=0, rank=dp_rank, num_partitions=self.dp_degree
+            )
+
+            active_mask = split_along_dim(
+                active_mask, dim=0, rank=dp_rank, num_partitions=self.dp_degree
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -2387,10 +2415,23 @@ class NeuronAttentionBase(nn.Module):
                 )
 
             if is_data_parallel:
-                attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                    attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
-                )
-
+                if self.ep_dispatch_cc_option == EPDispatchOption.AR_AG:
+                    # option 1
+                    attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                        attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
+                    )
+                elif self.ep_dispatch_cc_option == EPDispatchOption.RS_AG:
+                    # option 2
+                    attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                        attn_output, gather_dim=0, process_group=nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
+                    )
+                elif self.ep_dispatch_cc_option == EPDispatchOption.AG_AR:
+                    # option 3
+                    attn_output = reduce_from_tensor_model_parallel_region(
+                        attn_output, process_group=self.tensor_model_parallel_group
+                    )
+                else:
+                    raise ValueError(f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}")
             return NeuronAttentionBaseOutput(attn_output, KV, cos_cache, sin_cache)
 
         if self.attn_block_cte_nki_kernel_enabled and not is_token_gen and not self.neuron_config.is_prefix_caching:
@@ -3016,9 +3057,23 @@ class NeuronAttentionBase(nn.Module):
             )
 
         if is_data_parallel:
-            attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
-            )
+            if self.ep_dispatch_cc_option == EPDispatchOption.AR_AG:
+                # option 1
+                attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                    attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
+                )
+            elif self.ep_dispatch_cc_option == EPDispatchOption.RS_AG:
+                # option 2
+                attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                    attn_output, gather_dim=0, process_group=nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
+                )
+            elif self.ep_dispatch_cc_option == EPDispatchOption.AG_AR:
+                # option 3
+                attn_output = reduce_from_tensor_model_parallel_region(
+                    attn_output, process_group=self.tensor_model_parallel_group
+                )
+            else:
+                raise ValueError(f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}")
 
         return NeuronAttentionBaseOutput(attn_output, KV, cos_cache, sin_cache)
 
@@ -3052,18 +3107,22 @@ class NeuronAttentionBase(nn.Module):
             attention_mask, hidden_states, position_ids, cos_cache, sin_cache = self._split_inputs_for_context_parallel(attention_mask, hidden_states, position_ids, cos_cache, sin_cache)
 
         if is_data_parallel:
-            # split all inputs into B/DP pieces based on the dp_rank, each specified dim is the batch dim
-
+            # split hidden_states into B/DP pieces based on the dp_rank
             dp_rank = get_dp_rank(self.rank_util.get_rank(), self.tp_degree, self.dp_degree, self.neuron_config.switch_cc)
-
-            hidden_states = split_along_dim(
-                hidden_states, dim=0, rank=dp_rank, num_partitions=self.dp_degree
+            hidden_states = split_along_dim0_kernel_wrapper(
+                tensor=hidden_states,
+                rank=dp_rank,
+                num_partitions=self.dp_degree,
+                lnc=self.logical_nc_config,
             )
             attention_mask = split_along_dim(
                 attention_mask, dim=0, rank=dp_rank, num_partitions=self.dp_degree
             )
             position_ids = split_along_dim(
                 position_ids, dim=0, rank=dp_rank, num_partitions=self.dp_degree
+            )
+            active_mask = split_along_dim(
+                active_mask, dim=0, rank=dp_rank, num_partitions=self.dp_degree
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -3140,6 +3199,12 @@ class NeuronAttentionBase(nn.Module):
         if is_context_parallel and not self.sequence_parallel_enabled:
             attn_output = gather_from_tensor_model_parallel_region_with_dim(
                 attn_output, gather_dim=1, process_group=get_context_parallel_attention_cp_group()
+            )
+
+        # Gather the attention output which is sharded on batch_dimension if data-parallel is enabled
+        if is_data_parallel:
+            attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
             )
 
         return NeuronAttentionBaseOutput(attn_output, kv, cos_cache, sin_cache, residual)

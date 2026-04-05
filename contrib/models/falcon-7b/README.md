@@ -35,6 +35,25 @@ NeuronX Distributed Inference implementation of falcon 7b.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.25 | 0.00 |
+| MBU (%) | 0.24 | 0.50 |
+| HFU (%) | 0.26 | 0.00 |
+| Execution Time (us) | 0.15 | 0.03 |
+| HBM Read | 14.06 GB | 6.97 GB |
+| HBM Write | 720.29 MB | 1.77 MB |
+
+**Throughput:** 6.58 tok/s | **Compile Time:** 558.79s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -99,6 +118,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29
