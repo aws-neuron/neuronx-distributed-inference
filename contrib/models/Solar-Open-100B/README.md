@@ -50,25 +50,64 @@ Validated using `logit_validation` (CPU HuggingFace reference vs Neuron, 16 toke
 
 ### Performance Metrics
 
+**Best configuration** (with attention NKI kernels enabled):
+
 | Phase | Metric | Value |
 |-------|--------|-------|
-| CTE (prefill) | Median latency | 341.7 ms |
-| CTE (prefill) | P95 latency | 342.4 ms |
-| TKG (decode) | Median latency | 10.20 ms |
-| TKG (decode) | P95 latency | 10.57 ms |
-| TKG (decode) | Median throughput | 98.0 tok/s |
-| E2E (50 tokens) | TTFT | 342.3 ms |
-| E2E (50 tokens) | TPOT | 10.47 ms |
-| E2E (50 tokens) | Output tok/s | 95.5 |
-| Startup | Compile (fresh) | ~445 s |
+| CTE (prefill) | Median latency | 1,565 ms |
+| TKG (decode) | Median latency | 11.83 ms |
+| TKG (decode) | Throughput | 84.5 tok/s |
+| Startup | Compile (fresh) | ~640 s |
 | Startup | Weight loading | ~220 s |
 
-*Configuration: seq_len=128, batch=1, BF16, tp=64. Measured over 100 CTE runs and 100 TKG steps.*
+*Configuration: seq_len=4096, batch=1, BF16, tp=64, `fused_qkv=True`, `qkv_kernel_enabled=True`, `qkv_nki_kernel_enabled=True`. Measured over 100 iterations.*
+
+### Attention NKI Kernel Optimization
+
+Enabling attention NKI kernels yields a **34% TKG improvement** and **65.6% CTE improvement** over baseline. MoE NKI kernels cannot be used (see Known Issues).
+
+| Config | CTE (ms) | TKG (ms) | tok/s | TKG Delta |
+|--------|----------|----------|-------|-----------|
+| Baseline (no kernels) | 4,547 | 17.91 | 55.8 | --- |
+| QKV kernel | 1,568 | 12.20 | 81.9 | -31.9% |
+| + out_proj kernel | 1,568 | 12.99 | 77.0 | -27.5% |
+| + block TKG attn kernel | 1,567 | 11.95 | 83.6 | -33.3% |
+| **+ QKV NKI kernel (best)** | **1,565** | **11.83** | **84.5** | **-34.0%** |
+| All kernels combined | 1,565 | 11.99 | 83.4 | -33.1% |
+
+*All tested at seq_len=4096, batch=1, tp=64, bf16.*
+
+### Sequence Length Sweep
+
+| seq_len | CTE (ms) | TKG (ms) | TKG tok/s | Status |
+|---------|----------|----------|-----------|--------|
+| 1,024 | 2,094 | 17.77 | 56.3 | PASS |
+| 2,048 | 2,671 | 17.79 | 56.2 | PASS |
+| 4,096 | 4,551 | 18.17 | 55.0 | PASS |
+| 8,192 | 6,585 | 18.22 | 54.9 | PASS |
+| 16,384 | 12,340 | 19.18 | 52.1 | PASS |
+| 32,768 | 35,053 | 20.38 | 49.1 | PASS |
+| 65,536 | --- | --- | --- | FAIL |
+
+*Baseline (no kernels), batch=1, tp=64, bf16. Maximum supported seq_len: 32,768.*
+
+### Batch Size Sweep
+
+| batch | CTE (ms) | TKG (ms) | tok/s/batch | Total tok/s | Status |
+|-------|----------|----------|-------------|-------------|--------|
+| 1 | 4,551 | 18.17 | 55.0 | 55.0 | PASS |
+| 2 | 3,387 | 14.67 | 68.2 | 136.3 | PASS |
+| 4 | 8,955 | 17.51 | 57.1 | 228.5 | PASS |
+| 8+ | --- | --- | --- | --- | FAIL |
+
+*Baseline (no kernels), seq_len=4096, tp=64, bf16. Maximum batch_size at seq_len=4096: 4.*
 
 ### Known Issues
 
-- **NKI kernels disabled:** MoE intermediate size per shard (1280/64=20) is too small for existing NKI kernels. Falls back to `torch_blockwise_matmul_inference`.
-- **Flash attention disabled:** seq_len=128 does not meet the LNC2 minimum (1024 divisible by 512, or <1024 divisible by 256).
+- **MoE NKI kernels disabled:** MoE intermediate size per shard (1280/64=20) is too small for existing NKI kernels (require I/tp % 128 == 0). Falls back to `torch_blockwise_matmul_inference`. Both `moe_fused_nki_kernel_enabled` and `expert_mlp_nki_kernel_enabled` must be set to `False`.
+- **Attention NKI kernels enabled:** QKV kernel and QKV NKI kernel provide a 34% TKG improvement. The output projection kernel slightly hurts performance at these dimensions and should be left disabled.
+- **seq_len=65536 fails:** "Could not serialize module proto" error. Maximum supported seq_len is 32,768.
+- **batch_size >= 8 fails at seq_len=4096:** Same serialization error. Maximum batch_size at seq_len=4096 is 4.
 - **CPU reference logits require transformers >= 5.0:** The `solar_open` model type was added in transformers 5.0. The NxDI inference venv uses transformers 4.57.6 (which works for Neuron compilation/inference), but generating CPU reference logits for `logit_validation` requires a separate environment with transformers >= 5.0. Pre-computed reference logits are loaded from disk by the test.
 
 ## Required Instance
@@ -97,10 +136,14 @@ with open(f"{model_path}/config.json") as f:
 neuron_config = MoENeuronConfig(
     tp_degree=64,
     batch_size=1,
-    seq_len=128,
-    n_active_tokens=128,
+    seq_len=4096,
+    n_active_tokens=4096,
     torch_dtype=torch.bfloat16,
-    # NKI kernels must be disabled (I/tp=20 too small)
+    # Attention NKI kernels (34% TKG improvement)
+    fused_qkv=True,
+    qkv_kernel_enabled=True,
+    qkv_nki_kernel_enabled=True,
+    # MoE NKI kernels must be disabled (I/tp=20 too small)
     moe_fused_nki_kernel_enabled=False,
     expert_mlp_nki_kernel_enabled=False,
 )

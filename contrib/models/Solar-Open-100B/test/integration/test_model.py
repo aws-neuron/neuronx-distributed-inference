@@ -35,7 +35,7 @@ from modeling_solar_open import NeuronSolarOpenForCausalLM, SolarOpenInferenceCo
 
 # Test configuration -- update these paths for your environment
 MODEL_PATH = "/mnt/models/Solar-Open-100B-weights"
-COMPILED_MODEL_PATH = "/mnt/models/solar_compiled"
+COMPILED_MODEL_PATH = "/mnt/models/solar_compiled_qkv_nki"
 CPU_REFERENCE_LOGITS_PATH = "/mnt/models/solar_cpu_reference_logits.pt"
 
 # Logit validation settings
@@ -62,9 +62,14 @@ def create_model(model_path: str, compiled_path: str):
     neuron_config = MoENeuronConfig(
         tp_degree=64,
         batch_size=1,
-        seq_len=128,
-        n_active_tokens=128,
+        seq_len=4096,
+        n_active_tokens=4096,
         torch_dtype=torch.bfloat16,
+        # Attention NKI kernels (34% TKG improvement)
+        fused_qkv=True,
+        qkv_kernel_enabled=True,
+        qkv_nki_kernel_enabled=True,
+        # MoE NKI kernels must be disabled (I/tp=20 too small)
         moe_fused_nki_kernel_enabled=False,
         expert_mlp_nki_kernel_enabled=False,
     )
