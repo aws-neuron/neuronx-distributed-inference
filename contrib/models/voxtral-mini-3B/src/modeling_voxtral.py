@@ -182,7 +182,7 @@ class VoxtralForCausalLM(NeuronBaseForImageToText):
         """Return Neuron compiler flags. Auto-detects trn2 for --lnc=2."""
         try:
             result = subprocess.run(
-                ["neuron-ls", "--json-output"],
+                ["neuron-ls"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -514,14 +514,34 @@ class NeuronApplicationVoxtral:
             gc.collect()
 
             example_input = torch.randn(1, 128, 3000, dtype=self.dtype)
+
+            # Build encoder compiler args — match decoder optimization level
+            enc_compiler_args = [
+                "--auto-cast",
+                "matmult",
+                "--model-type=transformer",
+                "-O1",
+                "--tensorizer-options=--enable-ccop-compute-overlap "
+                "--cc-pipeline-tiling-factor=2 --vectorize-strided-dma",
+            ]
+            # Auto-detect trn2 for --lnc=2
+            try:
+                result = subprocess.run(
+                    ["neuron-ls"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if "trn2" in result.stdout.lower():
+                    enc_compiler_args.append("--lnc=2")
+            except Exception:
+                pass
+
+            logger.info(f"Encoder compiler args: {enc_compiler_args}")
             traced = torch_neuronx.trace(
                 enc,
                 example_input,
-                compiler_args=[
-                    "--auto-cast",
-                    "matmult",
-                    "--model-type=transformer",
-                ],
+                compiler_args=enc_compiler_args,
                 inline_weights_to_neff=False,
             )
             os.makedirs(os.path.dirname(audio_encoder_path), exist_ok=True)
