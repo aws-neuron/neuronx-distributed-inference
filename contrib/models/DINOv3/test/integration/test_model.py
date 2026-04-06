@@ -92,17 +92,20 @@ def get_neuron_core_count():
         return 0
 
 
-def compile_and_cache(model_key, config):
-    """Compile a DINOv3 model, caching the NEFF on disk."""
+def compile_and_cache(cpu_model, model_key, config):
+    """Compile a DINOv3 model for Neuron, tracing from the given CPU model.
+
+    IMPORTANT: The cpu_model must be the same instance used for accuracy
+    validation. Since pretrained=False gives different random weights on
+    each call, we must trace the exact model we compare against.
+    """
     os.makedirs(SAVED_DIR, exist_ok=True)
     save_path = os.path.join(SAVED_DIR, f"dinov3_{model_key}_bs1.pt")
 
-    if os.path.isfile(save_path):
-        return torch.jit.load(save_path)
-
-    model = load_dinov3_model(config["hub_name"], repo_dir=REPO_DIR)
+    # Do NOT use cached NEFFs -- they were traced from a different model instance.
+    # Always re-trace from the provided cpu_model to ensure weight consistency.
     model_neuron = trace_dinov3(
-        model,
+        cpu_model,
         is_convnext=config["is_convnext"],
         save_path=save_path,
     )
@@ -124,7 +127,7 @@ def vit_b_cpu():
 
 @pytest.fixture(scope="module")
 def vit_b_neuron(vit_b_cpu):
-    return compile_and_cache("vit_b", TEST_MODELS["vit_b"])
+    return compile_and_cache(vit_b_cpu, "vit_b", TEST_MODELS["vit_b"])
 
 
 @pytest.fixture(scope="module")
@@ -134,7 +137,9 @@ def convnext_tiny_cpu():
 
 @pytest.fixture(scope="module")
 def convnext_tiny_neuron(convnext_tiny_cpu):
-    return compile_and_cache("convnext_tiny", TEST_MODELS["convnext_tiny"])
+    return compile_and_cache(
+        convnext_tiny_cpu, "convnext_tiny", TEST_MODELS["convnext_tiny"]
+    )
 
 
 # --- Test Classes ---
@@ -319,9 +324,9 @@ if __name__ == "__main__":
             cpu_out = cpu_model(example)
         print(f"[2] CPU output shape: {cpu_out.shape}")
 
-        # 3. Compile
+        # 3. Compile (from the same cpu_model for weight consistency)
         print(f"[3] Compiling for Neuron...")
-        neuron_model = compile_and_cache(model_key, config)
+        neuron_model = compile_and_cache(cpu_model, model_key, config)
 
         # 4. Smoke test
         neuron_out = neuron_model(example)
