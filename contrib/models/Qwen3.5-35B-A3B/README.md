@@ -185,8 +185,6 @@ config = Qwen35MoeInferenceConfig(neuron_config=neuron_config, **config_dict)
 # Compile, load, and run
 model = NeuronQwen35MoeForCausalLM(model_path=model_path, config=config)
 
-# Remove XLA_DISABLE_FUNCTIONALIZATION (set by torch_neuronx import)
-os.environ.pop("XLA_DISABLE_FUNCTIONALIZATION", None)
 
 model.compile(compiled_model_path)
 model.load(compiled_model_path)

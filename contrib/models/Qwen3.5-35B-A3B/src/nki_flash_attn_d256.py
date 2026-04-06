@@ -1,9 +1,16 @@
 """
 Flash attention for d=256 with causal masking.
 
-NKI kernel for SDK 2.28. Uses neuronxcc.nki (old API, compatible with nki_jit
-torchxla mode). Supports head_dim=256 by tiling the QK matmul contraction
-dimension in 2 chunks of 128. Uses NKI affine_select for causal masking.
+NKI kernel for SDK 2.28+. Uses neuronxcc.nki.jit (compat API, works within
+torch_neuronx.trace). Supports head_dim=256 via 2x128 QK contraction tiling.
+Uses NKI affine_select for causal masking, activation_reduce for fused exp+sum.
+
+Improvements over original (Task 17):
+  1. V layout [kv, d] -- already in place from original kernel
+  2. activation_reduce for fused exp+sum -- already in place
+  3. 1D grid (bs * kv_heads) -- required for nki.jit, correct for GQA
+  4. Post-matmul scaling -- avoids bf16 tensor_scalar, scale applied in f32
+  5. dma_transpose for P: NOT applied -- deferred to Task 20 (pipelined kernel)
 
 Run on trn2:
     source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
@@ -15,6 +22,7 @@ import os
 
 os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
 
+import math
 import numpy as np
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
@@ -40,12 +48,11 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
     Returns:
         o: (bs, n_heads, seq_q, 256) -- bfloat16
 
-    Launch grid: flash_attn_d256[bs * nk_heads](q, k, v, ...)
-    GQA is handled internally via q_h_per_k_h = n_heads // nk_heads.
+    Grid: kernel[bs * nk_heads](...) -- 1D grid over batch*kv_heads.
+    Each program handles all Q heads sharing one KV head (GQA).
 
     The QK matmul is tiled: QK = Q0^T @ K0 + Q1^T @ K1
-    where Q0/Q1 are the first/second 128 dims of Q along head_dim,
-    and similarly for K0/K1.
+    where Q0/Q1 are the first/second 128 dims of Q along head_dim.
     """
     b, h, d, seqlen_q = q.shape
     _, k_h, _, seqlen_k = k.shape
@@ -54,13 +61,12 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
 
     q_h_per_k_h = h // k_h
 
-    # Output allocated inside kernel (immutable input params in SDK 2.28)
-    o = nl.ndarray((b, h, seqlen_q, d), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    o = nl.ndarray((b, h, seqlen_q, d), dtype=q.dtype, buffer=nl.shared_hbm)
 
-    # 1D grid: flatten (batch, kv_head) into linear index
-    linear_id = nl.program_id(axis=0)
-    batch_id = linear_id // k_h
-    head_id = linear_id % k_h
+    # 1D grid: flatten batch and KV-head dims
+    pid = nl.program_id(axis=0)
+    batch_id = pid // k_h
+    head_id = pid % k_h  # KV head index
 
     scale = 1.0 / (d**0.5)
     n_q_tiles = seqlen_q // B_P
@@ -68,6 +74,8 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
     NEG_INF = -9984.0
 
     for i_q_h in nl.affine_range(q_h_per_k_h):
+        q_head_idx = head_id * q_h_per_k_h + i_q_h
+
         for qi in nl.sequential_range(n_q_tiles):
             # Accumulators
             o_acc = nl.zeros((par_dim(B_P), d), dtype=np.float32, buffer=nl.sbuf)
@@ -75,13 +83,13 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
             l_acc = nl.full((par_dim(B_P), 1), fill_value=NEG_INF, dtype=np.float32)
 
             # Load Q tile: 2 chunks of (128, 128)
-            q_h_idx = head_id * q_h_per_k_h + i_q_h
-            q_hbm = q[batch_id, q_h_idx]
             q0 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16)
-            q0[:, :] = nl.load(q_hbm[nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)]) * scale
+            q0[:, :] = nl.load(
+                q[batch_id, q_head_idx, nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)]
+            )
             q1 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16)
-            q1[:, :] = (
-                nl.load(q_hbm[nl.ds(D_TILE, D_TILE), nl.ds(qi * B_P, B_P)]) * scale
+            q1[:, :] = nl.load(
+                q[batch_id, q_head_idx, nl.ds(D_TILE, D_TILE), nl.ds(qi * B_P, B_P)]
             )
 
             for kvi in nl.sequential_range(n_kv_tiles):
@@ -107,19 +115,19 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                         ]
                     )
 
-                    # Tiled QK matmul: (128,128)^T @ (p128,512) -> (p128,512) accumulated
+                    # Tiled QK matmul: Q0^T @ K0 + Q1^T @ K1 -> (B_P, B_F) in PSUM
                     qk = nl.ndarray(
                         (par_dim(B_P), B_F), dtype=np.float32, buffer=nl.psum
                     )
                     qk[:, :] = nl.matmul(q0, k0, transpose_x=True)
                     qk[:, :] += nl.matmul(q1, k1, transpose_x=True)
 
-                    # Move to SBUF for masking
+                    # Move to SBUF for masking and softmax
                     qk_sbuf = nl.ndarray(
                         (par_dim(B_P), B_F), dtype=np.float32, buffer=nl.sbuf
                     )
 
-                    # Apply causal mask
+                    # Apply causal mask (transfers PSUM -> SBUF)
                     if use_causal_mask:
                         i_q, i_k = nl.mgrid[0:B_P, 0:B_F]
                         q_pos = qi * B_P + i_q
@@ -135,6 +143,9 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                     else:
                         qk_sbuf[:, :] = nl.copy(qk, dtype=np.float32)
 
+                    # Apply scale post-matmul (in f32 SBUF, avoids bf16 precision loss)
+                    qk_sbuf[...] = nisa.tensor_scalar(qk_sbuf, nl.multiply, scale)
+
                     # Row max
                     new_max = nisa.tensor_reduce(
                         np.max, qk_sbuf, axis=(1,), dtype=np.float32, negate=False
@@ -144,11 +155,11 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                     m_acc[:, 0] = nl.maximum(m_prev, new_max)
                     m_cur = m_acc[:, 0]
 
-                    # Rescale previous output
+                    # Rescale previous output: o_acc *= exp(m_prev - m_cur)
                     alpha = nisa.activation(np.exp, m_cur, bias=m_prev, scale=-1.0)
                     o_acc[...] = nl.multiply(o_acc, alpha)
 
-                    # exp(qk - max) and row sum
+                    # exp(qk - max) and row sum via activation_reduce
                     p = nl.ndarray((par_dim(B_P), B_F), dtype=nl.bfloat16)
                     p_sum = nl.ndarray((par_dim(B_P), 1), dtype=np.float32)
                     p[:, :] = nisa.activation_reduce(
@@ -170,7 +181,7 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                             dtype=nl.bfloat16,
                         )
 
-                    # Transpose p for PV matmul
+                    # Transpose P for PV matmul: P[B_P, B_F] in 4 chunks of 128x128
                     p_t = nl.ndarray((par_dim(B_P), B_F), dtype=nl.bfloat16)
                     for ti in nl.affine_range(B_F // B_P):
                         p_t_tmp = nl.ndarray(
@@ -197,7 +208,7 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
 
                     o_acc[:, :] = nl.add(o_acc, pv)
 
-                    # Update log-sum-exp
+                    # Update log-sum-exp: l = m + log(exp(l - m) + p_sum)
                     exp_l = nisa.activation(nl.exp, m_cur, bias=l_acc[:, 0], scale=-1.0)
                     l_acc[:, 0] = nl.add(
                         m_cur, nisa.activation(nl.log, exp_l, bias=p_sum[:, 0])
@@ -209,7 +220,7 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
             )
             out = nl.multiply(o_acc, final_exp, dtype=nl.bfloat16)
             nl.store(
-                o[batch_id, q_h_idx, nl.ds(qi * B_P, B_P), :],
+                o[batch_id, q_head_idx, nl.ds(qi * B_P, B_P), :],
                 out,
             )
 
@@ -223,21 +234,16 @@ if __name__ == "__main__":
     import time
 
     def reference_causal_attention(q, k, v):
-        """CPU reference: q(b,h,d,sq), k(b,kh,d,sk), v(b,kh,sk,d) -> (b,h,sq,d)
-        Handles GQA by expanding K/V heads to match Q heads."""
-        b, h, d, sq = q.shape
-        _, kh, _, sk = k.shape
-        q_t = q.permute(0, 1, 3, 2).float()  # (b, h, sq, d)
-        k_t = k.permute(0, 1, 3, 2).float()  # (b, kh, sk, d)
-        v_t = v.float()  # (b, kh, sk, d)
-        # Expand KV heads for GQA
-        if h != kh:
-            repeats = h // kh
-            k_t = k_t.repeat_interleave(repeats, dim=1)  # (b, h, sk, d)
-            v_t = v_t.repeat_interleave(repeats, dim=1)  # (b, h, sk, d)
+        """CPU reference: q(b,h,d,sq), k(b,h,d,sk), v(b,h,sk,d) -> (b,h,sq,d)"""
+        d = q.shape[2]
+        q_t = q.permute(0, 1, 3, 2).float()
+        k_t = k.permute(0, 1, 3, 2).float()
+        v_t = v.float()
         scale = 1.0 / (d**0.5)
         attn = q_t @ k_t.transpose(-2, -1) * scale
-        mask = torch.triu(torch.ones(sq, sk, dtype=torch.bool), diagonal=1)
+        mask = torch.triu(
+            torch.ones(q_t.shape[2], k_t.shape[2], dtype=torch.bool), diagonal=1
+        )
         attn = attn.masked_fill(mask, float("-inf"))
         attn = F.softmax(attn, dim=-1)
         return attn @ v_t
@@ -246,24 +252,49 @@ if __name__ == "__main__":
 
     device = xm.xla_device()
 
-    # Test 1: Single head, varying seq lengths
-    for seq_len in [512, 1024]:
-        print(f"\n=== Test: d=256, seq={seq_len}, heads=1, kv_heads=1 ===")
-        bs, heads, kv_heads, d = 1, 1, 1, 256
+    tests = [
+        {"seq": 512, "bs": 1, "heads": 1, "kv_heads": 1, "label": "d256 seq=512 1:1"},
+        {"seq": 1024, "bs": 1, "heads": 1, "kv_heads": 1, "label": "d256 seq=1024 1:1"},
+        {
+            "seq": 512,
+            "bs": 1,
+            "heads": 4,
+            "kv_heads": 1,
+            "label": "d256 seq=512 GQA 4:1",
+        },
+    ]
+
+    for t in tests:
+        seq_len = t["seq"]
+        bs = t["bs"]
+        heads = t["heads"]
+        kv_heads = t["kv_heads"]
+        d = 256
+        print(f"\n=== Testing: {t['label']} ===")
         torch.manual_seed(42)
         q = torch.randn(bs, heads, d, seq_len, dtype=torch.bfloat16)
         k = torch.randn(bs, kv_heads, d, seq_len, dtype=torch.bfloat16)
         v = torch.randn(bs, kv_heads, seq_len, d, dtype=torch.bfloat16)
 
-        ref = reference_causal_attention(q, k, v)
+        # CPU reference uses per-head attention
+        ref_parts = []
+        for h_idx in range(heads):
+            kv_idx = h_idx // (heads // kv_heads)
+            ref_h = reference_causal_attention(
+                q[:, h_idx : h_idx + 1],
+                k[:, kv_idx : kv_idx + 1],
+                v[:, kv_idx : kv_idx + 1],
+            )
+            ref_parts.append(ref_h)
+        ref = torch.cat(ref_parts, dim=1)
 
-        q_dev, k_dev, v_dev = q.to(device), k.to(device), v.to(device)
+        q_dev = q.to(device)
+        k_dev = k.to(device)
+        v_dev = v.to(device)
         t0 = time.time()
-        o_dev = flash_attn_d256[bs * kv_heads](
-            q_dev, k_dev, v_dev, use_causal_mask=True
-        )
+        out = flash_attn_d256[bs * kv_heads](q_dev, k_dev, v_dev, use_causal_mask=True)
         xm.mark_step()
-        out_cpu = o_dev.cpu().float()
+        out_cpu = out.cpu().float()
         t1 = time.time()
 
         cos = F.cosine_similarity(
@@ -274,29 +305,3 @@ if __name__ == "__main__":
         print(f"  Cosine sim: {cos:.6f}")
         print(f"  Max diff: {maxd:.6f}")
         print(f"  {'PASS' if cos > 0.999 else 'FAIL'}")
-
-    # Test 2: GQA - 4 Q heads, 1 KV head (like Qwen3.5 per-TP-rank)
-    print(f"\n=== Test: d=256, seq=512, q_heads=4, kv_heads=1 (GQA 4:1) ===")
-    bs, heads, kv_heads, d, seq_len = 1, 4, 1, 256, 512
-    torch.manual_seed(42)
-    q = torch.randn(bs, heads, d, seq_len, dtype=torch.bfloat16)
-    k = torch.randn(bs, kv_heads, d, seq_len, dtype=torch.bfloat16)
-    v = torch.randn(bs, kv_heads, seq_len, d, dtype=torch.bfloat16)
-
-    ref = reference_causal_attention(q, k, v)
-
-    q_dev, k_dev, v_dev = q.to(device), k.to(device), v.to(device)
-    t0 = time.time()
-    o_dev = flash_attn_d256[bs * kv_heads](q_dev, k_dev, v_dev, use_causal_mask=True)
-    xm.mark_step()
-    out_cpu = o_dev.cpu().float()
-    t1 = time.time()
-
-    cos = F.cosine_similarity(
-        ref.reshape(-1).unsqueeze(0), out_cpu.reshape(-1).unsqueeze(0)
-    ).item()
-    maxd = (ref - out_cpu).abs().max().item()
-    print(f"  Time: {t1 - t0:.1f}s (includes compile)")
-    print(f"  Cosine sim: {cos:.6f}")
-    print(f"  Max diff: {maxd:.6f}")
-    print(f"  {'PASS' if cos > 0.999 else 'FAIL'}")

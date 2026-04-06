@@ -108,7 +108,6 @@ def compiled_model():
 
     if not (compiled_path / "model.pt").exists():
         print(f"Compiling model to {COMPILED_MODEL_PATH}...")
-        os.environ.pop("XLA_DISABLE_FUNCTIONALIZATION", None)
         os.makedirs(COMPILED_MODEL_PATH, exist_ok=True)
         model.compile(COMPILED_MODEL_PATH)
         print("Compilation complete")
@@ -305,7 +304,6 @@ if __name__ == "__main__":
     compiled_path = Path(COMPILED_MODEL_PATH)
     if not (compiled_path / "model.pt").exists():
         print(f"\nCompiling model to {COMPILED_MODEL_PATH}...")
-        os.environ.pop("XLA_DISABLE_FUNCTIONALIZATION", None)
         os.makedirs(COMPILED_MODEL_PATH, exist_ok=True)
         model.compile(COMPILED_MODEL_PATH)
         print("Compilation complete")

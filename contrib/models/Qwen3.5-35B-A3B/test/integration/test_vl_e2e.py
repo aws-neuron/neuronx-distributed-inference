@@ -124,9 +124,6 @@ def stage_compile(config):
 
     os.makedirs(COMPILED_TEXT_PATH, exist_ok=True)
 
-    # Remove XLA_DISABLE_FUNCTIONALIZATION if set (causes compilation issues)
-    if "XLA_DISABLE_FUNCTIONALIZATION" in os.environ:
-        del os.environ["XLA_DISABLE_FUNCTIONALIZATION"]
 
     model = NeuronQwen35MoeForCausalLM(model_path=MODEL_PATH, config=config)
 
