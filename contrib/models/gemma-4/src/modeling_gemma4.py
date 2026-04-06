@@ -50,6 +50,8 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseForCausalLM,
     NeuronBaseModel,
 )
+from neuronx_distributed_inference.models.image_to_text_model_base import NeuronBaseForImageToText
+from neuronx_distributed_inference.models.image_to_text_model_wrapper import ImageToTextModelWrapper
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
@@ -829,6 +831,26 @@ class NeuronGemma4DecoderLayer(nn.Module):
 class NeuronGemma4Model(NeuronBaseModel):
     """Gemma4 base model for NeuronX inference."""
 
+    def encode_vision_to_input(self, inputs_embeds, vision_embeddings, vision_mask):
+        """Replace token positions with pre-computed audio/vision embeddings.
+
+        Uses index_put_ to scatter embeddings at positions specified by vision_mask.
+        This matches the Llama4 scatter_by_index_put pattern used by NxDI.
+
+        Args:
+            inputs_embeds: [B, seq_len, hidden_size] - text token embeddings
+            vision_embeddings: [B, seq_len, hidden_size] - audio embeddings packed sequentially
+            vision_mask: [B, seq_len, 1] - int32 position indices for scatter
+        """
+        _, max_positions, embedding_dim = inputs_embeds.shape
+        result = inputs_embeds.clone()
+        flat_embeds = vision_embeddings.view(-1, embedding_dim)
+        positions = vision_mask.view(-1)
+        num_positions = len(positions)
+        flat_embeds = flat_embeds[:num_positions]
+        result.view(-1, embedding_dim).index_put_((positions,), flat_embeds, accumulate=False)
+        return result
+
     def setup_attr_for_model(self, config: Gemma4InferenceConfig):
         self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
         self.tp_degree = config.neuron_config.tp_degree
@@ -1205,3 +1227,291 @@ def _compensate_pad_norm_weight(w, orig_dim, target_dim):
     padded = torch.zeros(target_dim, dtype=w.dtype, device=w.device)
     padded[:orig_dim] = compensated.to(w.dtype)
     return padded
+
+
+# ====================================================================================
+# Multimodal (Audio/Vision) Conditional Generation
+# ====================================================================================
+
+
+class _MultimodalConfigWrapper:
+    """Wraps a Gemma4InferenceConfig to expose text_config/vision_config
+    as required by NeuronBaseForImageToText."""
+
+    def __init__(self, text_config: Gemma4InferenceConfig):
+        self._text_config = text_config
+        # Proxy all attribute access to text_config by default
+        # text_config and vision_config are the special ones
+
+    @property
+    def text_config(self):
+        return self._text_config
+
+    @property
+    def vision_config(self):
+        return None  # No vision encoder on Neuron
+
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(name)
+        return getattr(self._text_config, name)
+
+    def save(self, path):
+        return self._text_config.save(path)
+
+
+class NeuronGemma4ForConditionalGeneration(NeuronBaseForImageToText):
+    """
+    Gemma4 multimodal model for NeuronX.
+
+    Text decoder runs on Neuron (compiled with ImageToTextModelWrapper input signature
+    which includes vision_embeddings/vision_mask slots).
+
+    Audio/vision encoder runs on CPU (not compiled for Neuron).
+    Pre-computed audio embeddings are passed through vision_embeddings/vision_mask
+    to the Neuron text decoder.
+    """
+
+    # NeuronBaseForImageToText requires these class attributes
+    text_model_cls = NeuronGemma4Model
+    _model_cls = NeuronGemma4Model
+    text_model_wrapper = ImageToTextModelWrapper
+    # We don't use a Neuron-compiled vision model (audio encoder runs on CPU)
+    vision_model_cls = None
+    vision_model_wrapper = None
+
+    _STATE_DICT_MODEL_PREFIX = "model.language_model."
+
+    def __init__(self, model_path, config):
+        # Wrap config to expose text_config/vision_config interface
+        wrapped_config = _MultimodalConfigWrapper(config)
+        super().__init__(
+            text_model_cls=NeuronGemma4Model,
+            vision_model_cls=None,
+            text_model_wrapper=ImageToTextModelWrapper,
+            vision_model_wrapper=None,
+            model_path=model_path,
+            config=wrapped_config,
+        )
+
+    def enable_vision_encoder(self, **kwargs):
+        """No-op: audio encoder runs on CPU, not compiled for Neuron."""
+        self.vision_models = []
+
+    def _get_model_outputs(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        prev_hidden,
+        adapter_ids,
+        vision_embeddings,
+        vision_mask,
+        deepstack_vision_embeds,
+        medusa_args,
+        llava_args,
+        slot_mapping=None,
+        block_table=None,
+        full_context_lens=None,
+        computed_context_lens=None,
+        rotary_position_ids=None,
+    ):
+        """Override to pass empty vision tensors during token generation.
+
+        The compiled TKG model expects vision_embeddings/vision_mask as torch.empty(0),
+        while the base class passes them unchanged for both CTE and TKG.
+        """
+        if rotary_position_ids is None:
+            rotary_position_ids = torch.empty(0)
+
+        # For token generation, use empty vision tensors (audio only in context encoding)
+        empty_ve = torch.zeros(0, dtype=self.neuron_config.torch_dtype)
+        empty_vm = torch.zeros(0, dtype=torch.bool)
+
+        # For context encoding, provide default vision tensors if None
+        # Use S-1 as padding position in mask so index_put_ overwrites a harmless
+        # position instead of BOS (position 0).
+        if vision_embeddings is None:
+            max_ctx = self.neuron_config.max_context_length
+            cte_ve = torch.zeros(
+                input_ids.shape[0], max_ctx,
+                self.text_config.hidden_size, dtype=self.neuron_config.torch_dtype)
+            cte_vm = torch.full(
+                (input_ids.shape[0], max_ctx, 1),
+                max_ctx - 1, dtype=torch.int32)
+        else:
+            cte_ve = vision_embeddings
+            cte_vm = vision_mask
+
+        from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG
+
+        is_prefill = self._is_prefill(position_ids)
+
+        if is_prefill:
+            outputs = self.context_encoding_model(
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                torch.empty(0),  # prev_hidden
+                torch.empty(0),  # adapter_ids
+                torch.empty(0),  # accepted_indices
+                torch.empty(0),  # current_length
+                torch.empty(0),  # medusa_mask
+                torch.empty(0),  # scatter_index
+                torch.empty(0),  # slot_mapping
+                torch.empty(0),  # active_block_table
+                torch.empty(0),  # num_queries
+                torch.empty(0),  # computed_context_lens
+                torch.empty(0),  # tile_q_indices
+                torch.empty(0),  # tile_block_tables
+                torch.empty(0),  # tile_masks
+                torch.empty(0),  # inputs_embeds
+                torch.empty(0),  # kv_cache
+                torch.empty(0),  # active_mask
+                rotary_position_ids,
+                cte_ve,
+                cte_vm,
+                None,  # deepstack_vision_embeds (filtered by wrapper)
+            )
+            self.kv_cache_populated = True
+            is_run_on_neuron = self.context_encoding_model.is_neuron()
+        else:
+            outputs = self.token_generation_model(
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                torch.empty(0),  # prev_hidden
+                torch.empty(0),  # adapter_ids
+                torch.empty(0),  # accepted_indices
+                torch.empty(0),  # current_length
+                torch.empty(0),  # medusa_mask
+                torch.empty(0),  # scatter_index
+                torch.empty(0),  # slot_mapping
+                torch.empty(0),  # active_block_table
+                torch.empty(0),  # num_queries
+                torch.empty(0),  # computed_context_lens
+                torch.empty(0),  # tile_q_indices
+                torch.empty(0),  # tile_block_tables
+                torch.empty(0),  # tile_masks
+                torch.empty(0),  # inputs_embeds
+                torch.empty(0),  # kv_cache
+                torch.empty(0),  # active_mask
+                rotary_position_ids,
+                empty_ve,   # no vision during token generation
+                empty_vm,   # no vision during token generation
+                None,  # deepstack_vision_embeds (filtered by wrapper)
+            )
+            is_run_on_neuron = self.token_generation_model.is_neuron()
+
+        return outputs, is_run_on_neuron
+
+    def _save_configs_to_compiler_workdir(self):
+        """Override to skip vision_config.save() since audio encoder runs on CPU."""
+        import os
+        import copy
+        from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG
+
+        base_compile_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
+        self.config.save(base_compile_work_dir)
+
+        text_model_compile_work_dir = os.path.join(base_compile_work_dir, "text_model")
+        self.config.text_config.save(text_model_compile_work_dir)
+        # Skip vision_config.save() — no vision model on Neuron
+
+        for submodel in self.text_models:
+            for bucket_rank, bucket_size in enumerate(submodel.config.neuron_config.buckets):
+                specific_config = copy.deepcopy(submodel.config)
+                specific_config.neuron_config.buckets = [bucket_size]
+                if submodel.tag == CONTEXT_ENCODING_MODEL_TAG:
+                    specific_config.neuron_config.context_encoding_buckets = specific_config.neuron_config.buckets
+                else:
+                    specific_config.neuron_config.token_generation_buckets = specific_config.neuron_config.buckets
+                submodel_path = os.path.join(text_model_compile_work_dir, submodel.tag, f"_tp0_bk{bucket_rank}")
+                specific_config.save(submodel_path)
+
+    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None, dry_run=False):
+        """Compile text model only (no vision/audio encoder on Neuron)."""
+        import os
+        from neuronx_distributed_inference.models.application_base import (
+            normalize_path, COMPILED_MODEL_FILE_NAME,
+        )
+
+        self.config.save(compiled_model_path)
+        text_path = normalize_path(compiled_model_path) + "text_model/"
+        os.makedirs(text_path, exist_ok=True)
+        # Also create empty vision dir so load() doesn't fail
+        vision_path = normalize_path(compiled_model_path) + "vision_model/"
+        os.makedirs(vision_path, exist_ok=True)
+
+        text_traced = self.get_text_builder(debug).trace(initialize_model_weights=False, dry_run=dry_run)
+        if not dry_run:
+            torch.jit.save(text_traced, text_path + COMPILED_MODEL_FILE_NAME)
+            del text_traced
+
+        self._save_configs_to_compiler_workdir()
+        if dry_run:
+            return
+
+        self.shard_text_weights(text_path, debug, pre_shard_weights_hook)
+        self.is_compiled = True
+
+    def load(self, compiled_model_path, start_rank_id=None, local_ranks_size=None, skip_warmup=False):
+        """Load text model only (no vision model on Neuron)."""
+        import os, time, logging
+        from neuronx_distributed_inference.models.application_base import (
+            normalize_path, COMPILED_MODEL_FILE_NAME,
+        )
+        from safetensors.torch import load_file
+
+        compiled_model_path = normalize_path(compiled_model_path)
+        text_path = os.path.join(compiled_model_path, "text_model/")
+
+        self.text_traced_model = torch.jit.load(os.path.join(text_path, COMPILED_MODEL_FILE_NAME))
+
+        if start_rank_id is None:
+            start_rank_id = self.neuron_config.start_rank_id
+        if local_ranks_size is None:
+            local_ranks_size = self.neuron_config.local_ranks_size
+
+        # Load text weights
+        text_weights = []
+        t0 = time.monotonic()
+        if self.neuron_config.save_sharded_checkpoint:
+            for rank in range(start_rank_id, start_rank_id + local_ranks_size):
+                ckpt = load_file(os.path.join(text_path, f"weights/tp{rank}_sharded_checkpoint.safetensors"))
+                text_weights.append(ckpt)
+        else:
+            text_weights = self.get_text_builder().shard_checkpoint()
+
+        start_rank_tensor = torch.tensor([start_rank_id], dtype=torch.int32, device="cpu")
+        self.text_traced_model.nxd_model.initialize(text_weights, start_rank_tensor)
+        logging.info(f"Finished text weights loading in {time.monotonic() - t0:.1f}s")
+
+        for model_wrapper in self.text_models:
+            model_wrapper.model = self.text_traced_model
+
+        self.is_loaded_to_neuron = True
+        if not self.neuron_config.skip_warmup and not skip_warmup:
+            self.warmup()
+
+    @staticmethod
+    def load_hf_model(model_path, **kwargs):
+        raise NotImplementedError("Gemma4 not in installed transformers.")
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict, config):
+        return NeuronGemma4ForCausalLM.convert_hf_to_neuron_state_dict(state_dict, config)
+
+    @staticmethod
+    def update_state_dict_for_tied_weights(state_dict):
+        return NeuronGemma4ForCausalLM.update_state_dict_for_tied_weights(state_dict)
+
+    @classmethod
+    def get_config_cls(cls):
+        return Gemma4InferenceConfig
