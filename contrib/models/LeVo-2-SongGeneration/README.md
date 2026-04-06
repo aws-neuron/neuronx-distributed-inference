@@ -7,6 +7,7 @@ Text-to-music generation on AWS Trainium2 using Tencent's SongGeneration v2 (LeV
 - **HuggingFace ID:** `lglg666/SongGeneration-v2-medium` (v2-medium), `lglg666/SongGeneration-v2-large` (v2-large)
 - **Shared Assets:** `lglg666/SongGeneration-Runtime` (diffusion, VAE, tokenizer, prompts)
 - **Model Type:** Multi-stage audio generation pipeline (LLM + Diffusion + VAE)
+- **Parameters:** v2-medium: ~2.83B (FP32/BF16), v2-large: ~5.12B (FP32/BF16); shared diffusion: ~1.1B, VAE: ~169M
 - **Architecture:** Dual-Llama AR LM (primary + secondary) with delayed codebook pattern, GPT2-RoPE CFM diffusion backbone (16L), Stable Audio VAE decoder
 - **Output:** Stereo 48kHz WAV audio
 - **License:** Check [HuggingFace model card](https://huggingface.co/lglg666/SongGeneration-v2-medium)
@@ -323,4 +324,4 @@ python contrib/models/LeVo-2-SongGeneration/test/integration/test_model.py
 
 ## Maintainer
 
-Agent Omega (OpenCode)
+@jimburtoft

@@ -40,8 +40,12 @@ import time
 
 import pytest
 import torch
-import torch.nn.functional as F
 import numpy as np
+
+try:
+    from torch_neuronx.testing.validation import neuron_allclose
+except ImportError:
+    neuron_allclose = None
 
 # Add src/ to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
@@ -293,17 +297,22 @@ class TestCompilation:
 class TestGPT2Accuracy:
     """Validate GPT2 diffusion backbone accuracy vs CPU reference."""
 
-    def test_gpt2_cosine_similarity(self, pipeline, gpt2_cpu_reference):
-        """GPT2 Neuron output should have cosine similarity > 0.98 vs CPU."""
+    def test_gpt2_neuron_allclose(self, pipeline, gpt2_cpu_reference):
+        """GPT2 Neuron output should be numerically close to CPU (neuron_allclose)."""
         ref = gpt2_cpu_reference
         neuron_output = pipeline._neuron_gpt2(
             ref["inputs"], ref["mask"], ref["timestep"]
         )
-        cos_sim = F.cosine_similarity(
-            ref["output"].flatten().unsqueeze(0),
-            neuron_output.flatten().unsqueeze(0),
-        ).item()
-        assert cos_sim > 0.98, f"GPT2 cosine similarity {cos_sim:.6f} < 0.98"
+        if neuron_allclose is not None:
+            result = neuron_allclose(
+                neuron_output.cpu(), ref["output"], atol=1e-3, rtol=1e-2
+            )
+            assert result.allclose, f"GPT2 neuron_allclose failed: {result}"
+        else:
+            # Fallback: torch.allclose with same tolerances
+            assert torch.allclose(
+                neuron_output.cpu(), ref["output"], atol=1e-3, rtol=1e-2
+            ), "GPT2 output not close to CPU reference"
 
     def test_gpt2_max_relative_error(self, pipeline, gpt2_cpu_reference):
         """GPT2 p99 relative error should be < 5%."""
@@ -319,15 +328,20 @@ class TestGPT2Accuracy:
 class TestVAEAccuracy:
     """Validate VAE decoder accuracy vs CPU reference."""
 
-    def test_vae_cosine_similarity(self, pipeline, vae_cpu_reference):
-        """VAE Neuron output should have cosine similarity > 0.98 vs CPU."""
+    def test_vae_neuron_allclose(self, pipeline, vae_cpu_reference):
+        """VAE Neuron output should be numerically close to CPU (neuron_allclose)."""
         ref = vae_cpu_reference
         neuron_output = pipeline._neuron_vae(ref["latents"])
-        cos_sim = F.cosine_similarity(
-            ref["output"].flatten().unsqueeze(0),
-            neuron_output.flatten().unsqueeze(0),
-        ).item()
-        assert cos_sim > 0.98, f"VAE cosine similarity {cos_sim:.6f} < 0.98"
+        if neuron_allclose is not None:
+            result = neuron_allclose(
+                neuron_output.cpu(), ref["output"], atol=1e-3, rtol=1e-2
+            )
+            assert result.allclose, f"VAE neuron_allclose failed: {result}"
+        else:
+            # Fallback: torch.allclose with same tolerances
+            assert torch.allclose(
+                neuron_output.cpu(), ref["output"], atol=1e-3, rtol=1e-2
+            ), "VAE output not close to CPU reference"
 
     def test_vae_output_shape(self, pipeline, vae_cpu_reference):
         """VAE output shape should be [1, 2, T_frames * 1920]."""
@@ -556,13 +570,19 @@ if __name__ == "__main__":
             inputs_embeds=test_input, attention_mask=test_mask, time_step=test_ts
         ).last_hidden_state
     neuron_out = model._neuron_gpt2(test_input, test_mask, test_ts)
-    cos_sim = F.cosine_similarity(
-        cpu_out.flatten().unsqueeze(0), neuron_out.flatten().unsqueeze(0)
-    ).item()
-    print(
-        f"  GPT2 cosine similarity: {cos_sim:.6f} "
-        f"{'PASS' if cos_sim > 0.98 else 'FAIL'}"
-    )
+
+    if neuron_allclose is not None:
+        gpt2_result = neuron_allclose(neuron_out.cpu(), cpu_out, atol=1e-3, rtol=1e-2)
+        print(
+            f"  GPT2 neuron_allclose: {gpt2_result.allclose} "
+            f"{'PASS' if gpt2_result.allclose else 'FAIL'}"
+        )
+    else:
+        gpt2_close = torch.allclose(neuron_out.cpu(), cpu_out, atol=1e-3, rtol=1e-2)
+        print(
+            f"  GPT2 torch.allclose(atol=1e-3, rtol=1e-2): "
+            f"{'PASS' if gpt2_close else 'FAIL'}"
+        )
 
     print("\n[3/5] Testing VAE accuracy...")
     from tools.get_1dvae_large import get_model as get_vae
@@ -587,16 +607,23 @@ if __name__ == "__main__":
     with torch.no_grad():
         cpu_vae = vae.decode_audio(test_latents)
     neuron_vae = model._neuron_vae(test_latents)
-    cos_sim_vae = F.cosine_similarity(
-        cpu_vae.flatten().unsqueeze(0), neuron_vae.flatten().unsqueeze(0)
-    ).item()
+
+    if neuron_allclose is not None:
+        vae_result = neuron_allclose(neuron_vae.cpu(), cpu_vae, atol=1e-3, rtol=1e-2)
+        print(
+            f"  VAE neuron_allclose: {vae_result.allclose} "
+            f"{'PASS' if vae_result.allclose else 'FAIL'}"
+        )
+    else:
+        vae_close = torch.allclose(neuron_vae.cpu(), cpu_vae, atol=1e-3, rtol=1e-2)
+        print(
+            f"  VAE torch.allclose(atol=1e-3, rtol=1e-2): "
+            f"{'PASS' if vae_close else 'FAIL'}"
+        )
+
     sig_pow = (cpu_vae**2).mean()
     noise_pow = ((cpu_vae - neuron_vae) ** 2).mean()
     snr = 10 * torch.log10(sig_pow / (noise_pow + 1e-10)).item()
-    print(
-        f"  VAE cosine similarity: {cos_sim_vae:.6f} "
-        f"{'PASS' if cos_sim_vae > 0.98 else 'FAIL'}"
-    )
     print(f"  VAE SNR: {snr:.1f} dB {'PASS' if snr > 20 else 'FAIL'}")
 
     print("\n[4/5] Testing E2E generation...")
