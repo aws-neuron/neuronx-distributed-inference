@@ -852,15 +852,67 @@ class NeuronGemma4TextModel(NeuronBaseModel):
         self.has_mixed_attn = True
         self.sliding_window = config.sliding_window  # SWA window size (1024)
 
-        # Compute per-layer cache sizes: ALL layers use uniform_cache_len because
-        # the KV cache sequence dimension must match the attention mask dimension
-        # in compute_for_token_gen's torch.where(mask, prior_scores, ...).
+        # All layers use a uniform cache size = max(sliding_window, max_length).
+        # This is required because we pass sliding_window=None to the attention base
+        # class (to avoid Discovery #27: OOB in get_last_kv_window when
+        # bucket_size < sliding_window). Without sliding_window on the attention
+        # module, CTE returns K/V of size=input_seq_len which must fit in the cache.
+        # The TKG mask for SWA layers is padded to match in _create_windowed_attn_mask_tkg.
         max_length = config.neuron_config.max_length
         sw = config.sliding_window or max_length
         self._uniform_cache_len = max(sw, max_length)
         self.layer_to_cache_size_mapping = [
             self._uniform_cache_len
         ] * config.num_hidden_layers
+
+    def _create_windowed_attn_mask_tkg(self, attention_mask, window_size, position_ids):
+        """Override: SWA TKG mask must match the uniform KV cache size.
+
+        The base class creates a mask of shape (B, 1, 1, window_size), but our
+        KV caches use _uniform_cache_len = max(sliding_window, max_length).
+        When max_length > sliding_window, the SWA cache has extra slots beyond
+        the window that must be masked out.
+
+        The mask has True for valid prior positions and False for masked positions.
+        For SWA at a given position, only the last (window_size - 1) positions
+        are valid.  The extra slots (beyond window_size) are always False.
+        """
+        batch_size, _ = attention_mask.shape
+        cache_len = self._uniform_cache_len
+
+        if cache_len == window_size:
+            # No padding needed: fall back to base class behavior
+            return super()._create_windowed_attn_mask_tkg(
+                attention_mask, window_size, position_ids
+            )
+
+        # Build a cache_len-sized mask. The SWA KV cache is written with a
+        # rolling index (pos % cache_len). During TKG the base class reads the
+        # full cache of size cache_len, but only the last (window_size - 1)
+        # positions are valid for this query.
+        #
+        # For simplicity we replicate the base-class windowed logic over the
+        # first window_size slots and mask out the rest (slots window_size ..
+        # cache_len - 1 are always False).
+        pos = position_ids[:, 0]
+        idx = torch.arange(window_size, device=attention_mask.device).unsqueeze(0)
+        base_mask = (idx < pos.unsqueeze(1)) & (idx < window_size - 1)
+
+        full_mask = torch.ones(
+            (batch_size, window_size), dtype=torch.bool, device=attention_mask.device
+        )
+        full_mask[:, -1] = False
+
+        seq_less_than_window = pos < window_size - 1
+        window_mask = torch.where(
+            seq_less_than_window.unsqueeze(1), base_mask, full_mask
+        )
+
+        # Pad to cache_len with False (masked out)
+        pad_len = cache_len - window_size
+        padded_mask = F.pad(window_mask, (0, pad_len), value=False)
+
+        return padded_mask[:, None, None, :]
 
     def _create_simple_attn_mask(self, attention_mask):
         """Override: global (non-SWA) mask must match uniform KV cache size.
