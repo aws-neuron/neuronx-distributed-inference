@@ -9,7 +9,7 @@ Supports all 4 variants in a single `modeling_gemma4.py`:
 | E2B | `google/gemma-4-2b-it` | ~2B | Dense, PLE, KV sharing, double-wide MLP |
 | E4B | `google/gemma-4-4b-it` | ~4B | Dense, PLE, KV sharing, double-wide MLP |
 | 12B | `google/gemma-4-12b-it` | ~31B | Dense, attention_k_eq_v, no PLE |
-| 26B-A4B | `google/gemma-4-26B-A4B-it` | ~26B active / ~49B total | MoE (128 experts, top-8), attention_k_eq_v |
+| 26B-A4B | `google/gemma-4-26B-A4B-it` | ~4B active / ~26B total | MoE (128 experts, top-8), attention_k_eq_v |
 
 ## Architecture Details
 
