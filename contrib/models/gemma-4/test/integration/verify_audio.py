@@ -171,6 +171,7 @@ def generate_with_audio(
     eos_token_ids: list,
     audio_token_id: int = 258881,
     pad_token_id: int = 0,
+    repetition_penalty: float = 1.3,
 ) -> torch.Tensor:
     """
     Generate tokens autoregressively using NxDI stateful KV cache.
@@ -189,13 +190,9 @@ def generate_with_audio(
     for step in range(max_new_tokens):
         with torch.no_grad():
             if step == 0:
-                # Replace audio tokens with PAD in input_ids before passing to model.
-                # HF Gemma-4 does this so embed_tokens and PLE see PAD at audio positions,
-                # then encode_vision_to_input replaces the PAD embeddings with audio embeddings.
                 model_input_ids = input_ids.clone()
                 model_input_ids[model_input_ids == audio_token_id] = pad_token_id
 
-                # Context encoding: full sequence + audio embeddings
                 position_ids = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0).expand(B, -1)
                 outputs = model(
                     model_input_ids,
@@ -205,11 +202,8 @@ def generate_with_audio(
                     vision_mask=vision_mask,
                 )
             else:
-                # Token generation: only the new token
                 cur_pos = seq_len + step - 1
                 position_ids = torch.tensor([[cur_pos]], dtype=torch.int32)
-                # Must pass dummy vision tensors (empty = no audio injection)
-                # The compiled model always expects these tensor args
                 dummy_ve = torch.zeros(B, 1, vision_embeddings.shape[2],
                                        dtype=vision_embeddings.dtype)
                 dummy_vm = torch.zeros(B, 1, 1, dtype=torch.int32)
@@ -228,16 +222,26 @@ def generate_with_audio(
         else:
             logits = outputs
 
-        next_token_logits = logits[:, -1, :]
+        next_token_logits = logits[:, -1, :].clone()
+
+        # Apply repetition penalty to previously generated tokens
+        if repetition_penalty != 1.0:
+            prev_tokens = generated_ids[0, seq_len:].tolist()
+            for tok in set(prev_tokens):
+                if next_token_logits[0, tok] > 0:
+                    next_token_logits[0, tok] /= repetition_penalty
+                else:
+                    next_token_logits[0, tok] *= repetition_penalty
+
         next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1).to(torch.int32)
         generated_ids = torch.cat([generated_ids, next_token], dim=-1)
 
-        # Debug: print each token
         tok_id = next_token.item()
-        top5 = torch.topk(next_token_logits[0], 5)
-        print(f"  Step {step}: tok={tok_id} top5_ids={top5.indices.tolist()} top5_vals={[f'{v:.1f}' for v in top5.values.tolist()]}")
+        if step < 30:
+            top5 = torch.topk(next_token_logits[0], 5)
+            print(f"  Step {step}: tok={tok_id} top5_ids={top5.indices.tolist()} "
+                  f"top5_vals={[f'{v:.1f}' for v in top5.values.tolist()]}")
 
-        # Check EOS
         if next_token.item() in eos_token_ids:
             break
 
@@ -371,9 +375,7 @@ def main():
     max_gen = min(args.max_new_tokens, args.seq_len - input_ids.shape[1])
     print(f"  Max generation tokens: {max_gen} (seq_len={args.seq_len}, input={input_ids.shape[1]})")
 
-    print(f"  [DIAG] ve norm at audio pos: {vision_embeddings[0, :actual_audio_tokens].norm(dim=-1).mean():.2f}")
-    print(f"  [DIAG] vm first 5: {vision_mask[0, :5, 0].tolist()}")
-    print(f"  [DIAG] vm pad[0]: {vision_mask[0, actual_audio_tokens, 0].item()}")
+    print(f"  Audio embedding norm: {vision_embeddings[0, :actual_audio_tokens].norm(dim=-1).mean():.2f}")
 
     t0 = time.time()
     generated_ids = generate_with_audio(

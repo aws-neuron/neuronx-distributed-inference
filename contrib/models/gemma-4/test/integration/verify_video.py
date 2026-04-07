@@ -93,11 +93,13 @@ def extract_frames(video_path: str, num_frames: int) -> list:
 
     print(f"  Video: {total_frames} frames, {fps:.1f} fps, {duration:.1f}s")
 
-    # Sample uniformly (like HF do_sample_frames)
+    # Sample uniformly from the middle 80% to avoid title/credit frames
     if num_frames >= total_frames:
         indices = list(range(total_frames))
     else:
-        indices = np.linspace(0, total_frames - 1, num_frames, dtype=int).tolist()
+        start = int(total_frames * 0.1)
+        end = int(total_frames * 0.9)
+        indices = np.linspace(start, end, num_frames, dtype=int).tolist()
 
     frames = []
     for idx in indices:
@@ -132,9 +134,9 @@ def build_video_input_ids(
     """
     Build input_ids with video token placeholders.
 
-    Format:
+    Format (matches HuggingFace Gemma4Processor):
         <bos><start_of_turn>user\n
-        MM:SS <boi><video>*N<eoi>   (per frame)
+        MM:SS <boi><video>*N<eoi> MM:SS <boi><video>*N<eoi> ...
         \nPrompt\n<end_of_turn>\n<start_of_turn>model\n
 
     Args:
@@ -158,19 +160,20 @@ def build_video_input_ids(
 
     user_text = tokenizer.encode("user\n").ids
 
-    # Build frame token sequences
+    # Build frame token sequences (HF format: frames separated by spaces)
     frame_ids = []
-    for num_soft_tokens, timestamp in frame_infos:
+    for i, (num_soft_tokens, timestamp) in enumerate(frame_infos):
         ts_str = format_timestamp(timestamp)
         ts_ids = tokenizer.encode(ts_str + " ").ids
         frame_ids.extend(ts_ids)
         frame_ids.append(boi_id)
         frame_ids.extend([video_token_id] * num_soft_tokens)
         frame_ids.append(eoi_id)
-        # newline between frames
-        frame_ids.extend(tokenizer.encode("\n").ids)
+        # space between frames (matching HF Gemma4Processor)
+        if i < len(frame_infos) - 1:
+            frame_ids.extend(tokenizer.encode(" ").ids)
 
-    prompt_ids = tokenizer.encode(prompt_text).ids
+    prompt_ids = tokenizer.encode("\n" + prompt_text).ids
     model_text = tokenizer.encode("model\n").ids
 
     ids = ([bos_id, start_turn_id] + user_text
@@ -346,7 +349,7 @@ def main():
 
     # ---- Step 4: Build input sequence ----
     print("\n[4/7] Building input sequence...")
-    prompt = "Describe this video."
+    prompt = "Describe what is shown."
     input_ids, video_token_id = build_video_input_ids(frame_infos, prompt, args.model_path)
     print(f"  Input sequence length: {input_ids.shape[1]}")
     print(f"  Video token count: {(input_ids == video_token_id).sum().item()}")
@@ -399,7 +402,7 @@ def main():
 
     t0 = time.time()
     generated_ids = generate_with_video(
-        model, padded_input_ids, vision_embeddings, vision_mask,
+        model, input_ids, vision_embeddings, vision_mask,
         max_new_tokens=max_gen,
         eos_token_ids=eos_token_ids,
         video_token_id=video_token_id,
@@ -412,11 +415,11 @@ def main():
     try:
         from tokenizers import Tokenizer
         tokenizer = Tokenizer.from_file(os.path.join(args.model_path, "tokenizer.json"))
-        new_ids = generated_ids[0, args.seq_len:].tolist()
+        new_ids = generated_ids[0, input_ids.shape[1]:].tolist()
         response = tokenizer.decode(new_ids)
     except Exception as e:
         response = f"[decode error: {e}]"
-        new_ids = generated_ids[0, args.seq_len:].tolist()
+        new_ids = generated_ids[0, input_ids.shape[1]:].tolist()
 
     num_new_tokens = len(new_ids)
     total_time = t1 - t0
