@@ -1,130 +1,46 @@
-# Contrib Model: Qwen2.5 VL 3B Instruct
+# Qwen2.5-VL-3B-Instruct
 
-NeuronX Distributed Inference implementation of Qwen2.5 VL 3B Instruct.
+> **Use the unified implementation at [`Qwen2.5-VL-7B-Instruct`](../Qwen2.5-VL-7B-Instruct/).** That implementation is config-driven and supports all Qwen2.5-VL sizes (3B, 7B, 32B, 72B) including both text-only and vision-language inference.
 
-> **Note:** This implementation has been validated using the **text backbone only**. Vision/image modalities are implemented but not yet verified.
+The code previously in this directory's `src/` was a text-only stub that lacked M-RoPE and the vision encoder. It has been removed to avoid confusion.
 
-## Model Information
+## 3B-Specific Guidance
 
-- **HuggingFace ID:** `Qwen/Qwen2.5-VL-3B-Instruct`
-- **Model Type:** Decoder-only transformer
-- **License:** Check HuggingFace model card
+### Model Dimensions
 
-## Architecture Details
+| Parameter | Value |
+|-----------|-------|
+| Layers | 36 |
+| Hidden Size | 2048 |
+| Attention Heads (Q / KV) | 16 / 2 (GQA) |
+| Intermediate Size | 11008 |
+| Vocab | 152064 |
+| `tie_word_embeddings` | **True** (lm_head shares embed_tokens weights) |
+| M-RoPE sections | [16, 24, 24] (same as all Qwen2.5-VL sizes) |
 
-- **Layers:** Check model config
-- **Hidden Size:** Check model config
-- **Attention Heads:** Check model config
-- **Vocabulary:** Check model config
-- **Max Position Embeddings:** Check model config
+### Recommended Configuration
 
-## Validation Results
+| Instance | TP | TKG tok/s | Compile Time | Weights/Core |
+|----------|----|-----------|--------------|-------------|
+| trn2.3xlarge (LNC=2) | 4 | 104.3 | 56.4s | 2.1 GB |
+| inf2.xlarge | 2 | ~29 | ~148s | ~3 GB |
 
-**Validated:** 2026-01-29  
-**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+- **TP=4 on trn2.3xlarge** is the best option for throughput.
+- **TP=2 on inf2.xlarge** works and is the cheapest option. The model is small enough (~6 GB BF16) to fit in 2 NeuronCores.
+- The MLP NKI kernel compiles for 3B (`intermediate_size/TP = 2752`) but is 13% slower than baseline -- not recommended.
+- Tied weights are handled automatically by `update_state_dict_for_tied_weights` in the unified implementation.
 
-### Test Results
-
-| Test | Status | Result |
-|------|--------|--------|
-| Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ LOW | **67.2% match** |
-| TTFT (P50) | ✅ PASS | 29.82ms (threshold: 100ms) |
-| Throughput | ✅ PASS | 38.20 tok/s (threshold: 10 tok/s) |
-
-### Performance Metrics
-
-| Metric | Value |
-|--------|-------|
-| TTFT (P50) | 29.82ms |
-| Throughput | 38.20 tokens/s |
-
-
-**Status:** ✅ GOOD
-
-### Device Profiling Metrics
-
-**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
-**Instance:** trn1.32xlarge | **Profiled:** 2026-03-21
-
-| Metric | Context Encoding | Token Generation |
-|--------|-----------------|------------------|
-| MFU (%) | 0.13 | 0.00 |
-| MBU (%) | 0.27 | 0.29 |
-| HFU (%) | 0.15 | 0.02 |
-| Execution Time (us) | 0.03 | 0.03 |
-| HBM Read | 3.15 GB | 3.09 GB |
-| HBM Write | 62.86 MB | 3.35 MB |
-
-**Throughput:** 32.98 tok/s | **Compile Time:** 224.93s
-
-> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
-> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
-
-## Usage
+### Quick Start
 
 ```python
-from transformers import AutoTokenizer, GenerationConfig
-from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+# Point model_path at the 3B checkpoint -- same code as VL-7B
+model_path = "/path/to/Qwen2.5-VL-3B-Instruct"
 
-# Import model classes from src
-from src.modeling_qwen2_5_vl_3b_instruct import NeuronQwen25VL3BInstructForCausalLM, Qwen25VL3BInstructInferenceConfig
-
-model_path = "/path/to/Qwen2.5-VL-3B-Instruct/"
-compiled_model_path = "/path/to/compiled/"
-
-# Configure
-neuron_config = NeuronConfig(
-    tp_degree=2,
-    batch_size=1,
-    seq_len=512,
-    torch_dtype=torch.bfloat16,
+# Use the unified implementation from the VL-7B contrib
+from src.modeling_qwen2_5_vl import (
+    NeuronQwen2_5_VLForCausalLM,
+    Qwen2_5_VLInferenceConfig,
 )
-
-config = Qwen25VL3BInstructInferenceConfig(
-    neuron_config,
-    load_config=load_pretrained_config(model_path),
-)
-
-# Compile and load
-model = NeuronQwen25VL3BInstructForCausalLM(model_path, config)
-model.compile(compiled_model_path)
-model.load(compiled_model_path)
-
-# Generate
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-# ... (see integration test for full example)
 ```
 
-## Compatibility Matrix
-
-| Instance/Version | 2.20+ | 2.19 and earlier |
-|------------------|-------|------------------|
-| Trn1             | ✅ Working | Not tested |
-| Inf2             | Not tested | Not tested |
-
-## Testing
-
-Run integration tests:
-
-```bash
-pytest nxdi_contrib_models/models/Qwen2.5-VL-3B-Instruct/test/integration/test_model.py --capture=tee-sys
-```
-
-Or run manually:
-
-```bash
-cd nxdi_contrib_models/models/Qwen2.5-VL-3B-Instruct
-python3 test/integration/test_model.py
-```
-
-## Example Checkpoints
-
-* Qwen/Qwen2.5-VL-3B-Instruct
-
-## Maintainer
-
-Annapurna Labs
-
-**Last Updated:** 2026-01-29
+See the [Qwen2.5-VL-7B-Instruct README](../Qwen2.5-VL-7B-Instruct/README.md) for full usage examples, vllm-neuron serving instructions, and known limitations.
