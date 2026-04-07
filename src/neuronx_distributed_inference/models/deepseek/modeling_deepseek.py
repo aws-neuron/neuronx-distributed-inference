@@ -26,6 +26,7 @@ import torch.utils.checkpoint
 from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     ColumnParallelLinear,
     RowParallelLinear,
+    SPMDRank,
 )
 from neuronx_distributed.parallel_layers.mappings import gather_from_sequence_parallel_region
 from neuronx_distributed.utils import cpu_mode
@@ -36,7 +37,6 @@ from neuronx_distributed_inference.models.deepseek.rope_util import (
     DeepseekV3YarnRotaryEmbedding,
     apply_rotary_pos_emb,
 )
-from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import manual_softmax
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 
@@ -76,32 +76,57 @@ class DeepseekV3RMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-class DeepseekV3Attention(NeuronAttentionBase):
+class DeepseekV3Attention(nn.Module):
+    """
+    Multi-head Latent Attention (MLA) for DeepSeek V3.
+
+    MLA is architecturally different from GQA, so this inherits directly from
+    nn.Module instead of NeuronAttentionBase. All projections (q/kv compressed,
+    kv_b, output) and the forward pass are self-contained here.
+    """
 
     def __init__(self, config: DeepseekV3InferenceConfig, layer_idx: Optional[int] = None, tensor_model_parallel_group=None):
 
-        super().__init__(
-            config=config,
-            tensor_model_parallel_group=tensor_model_parallel_group,
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_attention_heads,  # Not applicable for MLA and set as the same as attn heads
-            head_dim=config.v_head_dim,
-            num_cores_per_group=config.num_cores_per_group,
-            rms_norm_eps=config.rms_norm_eps,
-        )
+        super().__init__()
+
+        # Config
+        self.config = config
+        self.neuron_config = config.neuron_config
+
+        # Tensor parallelism
+        self.tp_degree = config.neuron_config.tp_degree
+        if tensor_model_parallel_group is not None:
+            self.tensor_model_parallel_group = tensor_model_parallel_group
+        else:
+            try:
+                from neuronx_distributed.parallel_layers import parallel_state
+                self.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
+            except Exception:
+                self.tensor_model_parallel_group = None
+        self.rank_util = SPMDRank(world_size=self.tp_degree)
+
+        # Data types
+        self.torch_dtype = getattr(config.neuron_config, "attention_dtype", None) or config.neuron_config.torch_dtype
+        self.rpl_reduce_dtype = getattr(config.neuron_config, "rpl_reduce_dtype", None)
+
+        # Sequence parallelism
+        self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
+
+        # Model dimensions
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+
         self.rotary_emb = DeepseekV3YarnRotaryEmbedding(
             dim=config.qk_rope_head_dim,
             max_position_embeddings=config.max_position_embeddings,
             scaling_factor=config.rope_scaling["factor"],
             base=config.rope_theta,
-            mscale=self.config.rope_scaling["mscale"],
-            mscale_all_dim=self.config.rope_scaling["mscale_all_dim"],
-            beta_fast=self.config.rope_scaling["beta_fast"],
-            beta_slow=self.config.rope_scaling["beta_slow"],
+            mscale=config.rope_scaling["mscale"],
+            mscale_all_dim=config.rope_scaling["mscale_all_dim"],
+            beta_fast=config.rope_scaling["beta_fast"],
+            beta_slow=config.rope_scaling["beta_slow"],
         )
-        # TODO: manual offset qkv_proj created from base class. Refactor base so it doesnt always create this property
-        self.qkv_proj = None
         self.bias = getattr(config, "attention_bias", False)
         self.layer_idx = layer_idx
         assert layer_idx is not None, "Please make sure to provide a `layer_idx` when creating this class."
@@ -112,7 +137,7 @@ class DeepseekV3Attention(NeuronAttentionBase):
         if cpu_mode():
             self.num_heads = self.num_total_heads
         else:
-            self.num_heads = self.num_total_heads // self.config.neuron_config.tp_degree
+            self.num_heads = self.num_total_heads // self.tp_degree
 
         self.q_lora_rank = config.q_lora_rank
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -126,9 +151,9 @@ class DeepseekV3Attention(NeuronAttentionBase):
         self.init_mla_properties()
 
         self.softmax_scale = self.q_head_dim ** (-0.5)
-        if self.config.rope_scaling is not None:
-            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = self.config.rope_scaling["factor"]
+        if config.rope_scaling is not None:
+            mscale_all_dim = config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = config.rope_scaling["factor"]
             if mscale_all_dim:
                 from neuronx_distributed_inference.models.deepseek.rope_util import yarn_get_mscale
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
@@ -198,8 +223,6 @@ class DeepseekV3Attention(NeuronAttentionBase):
                 self.num_attention_heads * self.head_dim, self.hidden_size, bias=self.bias
             )
 
-        self.attn_kernel_enabled = self.neuron_config.attn_kernel_enabled
-        self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
 
     def forward(
             self,
