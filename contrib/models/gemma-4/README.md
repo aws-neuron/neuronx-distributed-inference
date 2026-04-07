@@ -8,7 +8,7 @@ Supports all 4 variants in a single `modeling_gemma4.py`:
 |---------|---------------|--------|-------------|
 | E2B | `google/gemma-4-2b-it` | ~2B | Dense, PLE, KV sharing, double-wide MLP |
 | E4B | `google/gemma-4-4b-it` | ~4B | Dense, PLE, KV sharing, double-wide MLP |
-| 12B | `google/gemma-4-12b-it` | ~31B | Dense, attention_k_eq_v, no PLE |
+| 31B | `google/gemma-4-31B-it` | ~31B | Dense, attention_k_eq_v, no PLE |
 | 26B-A4B | `google/gemma-4-26B-A4B-it` | ~4B active / ~26B total | MoE (128 experts, top-8), attention_k_eq_v |
 
 ## Architecture Details
@@ -21,7 +21,7 @@ Key features handled by this implementation:
   - Sliding: standard RoPE (theta=10000)
   - Full: proportional RoPE (theta=1000000, partial_rotary_factor=0.25)
 - **Q-K-V normalization**: All layers apply RMSNorm to Q, K, and V (V norm has no learnable weight).
-- **attention_k_eq_v**: 12B and 26B-A4B share V=K weights (no separate v_proj).
+- **attention_k_eq_v**: 31B and 26B-A4B share V=K weights (no separate v_proj).
 - **KV sharing**: E2B/E4B reuse KV cache from earlier layers for the last N layers (disabled in v1).
 - **Double-wide MLP**: KV-shared layers use 2x intermediate_size (E2B/E4B).
 - **MoE (Mixture of Experts)**: 26B-A4B has 128 experts with top-8 routing per token, plus a dense MLP in each layer.
@@ -36,7 +36,7 @@ Key features handled by this implementation:
 |---------|-----|-------|---------|-----------|--------|
 | E2B | 2 | 1 | 512 | ~80-120 tok/s | Validated |
 | E4B | 2 | 1 | 512 | ~70-80 tok/s | Validated |
-| 12B | 4 | 1 | 2048 | ~13-23 tok/s | Validated |
+| 31B | 4 | 1 | 2048 | ~13-23 tok/s | Validated |
 | 26B-A4B | 4 | 1 | 2048 | ~43-60 tok/s | Validated |
 
 All variants produce coherent, correct text output verified against reference prompts.
@@ -54,9 +54,9 @@ model_path = "/path/to/gemma-4-2b-it"       # or any variant
 compiled_path = "/path/to/compiled/output"
 
 neuron_config = NeuronConfig(
-    tp_degree=2,              # 2 for E2B/E4B, 4 for 12B/26B
+    tp_degree=2,              # 2 for E2B/E4B, 4 for 31B/26B
     batch_size=1,
-    seq_len=512,              # 512 for E2B/E4B, 2048 for 12B/26B
+    seq_len=512,              # 512 for E2B/E4B, 2048 for 31B/26B
     max_context_length=512,
     torch_dtype=torch.bfloat16,
     save_sharded_checkpoint=True,
@@ -114,10 +114,10 @@ python test/integration/test_model.py
 GEMMA4_VARIANT=26b python test/integration/test_model.py
 
 # With pytest
-GEMMA4_VARIANT=12b pytest test/integration/test_model.py --capture=tee-sys
+GEMMA4_VARIANT=31b pytest test/integration/test_model.py --capture=tee-sys
 ```
 
-Available variants: `e2b`, `e4b`, `12b`, `26b`
+Available variants: `e2b`, `e4b`, `31b`, `26b`
 
 ## Important Notes
 
@@ -130,7 +130,7 @@ Available variants: `e2b`, `e4b`, `12b`, `26b`
 
 - google/gemma-4-2b-it
 - google/gemma-4-4b-it
-- google/gemma-4-12b-it
+- google/gemma-4-31B-it
 - google/gemma-4-26B-A4B-it
 
 ## Maintainer

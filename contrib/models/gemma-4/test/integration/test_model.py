@@ -5,7 +5,7 @@ Integration tests for Gemma-4 NeuronX implementation.
 Supports all 4 Gemma-4 variants:
 - gemma-4-2b-it (E2B): Dense, PLE, KV sharing, double-wide MLP
 - gemma-4-4b-it (E4B): Dense, PLE, KV sharing, double-wide MLP
-- gemma-4-12b-it (31B params): Dense, attention_k_eq_v, no PLE
+- gemma-4-31B-it (31B params): Dense, attention_k_eq_v, no PLE
 - gemma-4-26B-A4B-it: MoE (128 experts, top-8), attention_k_eq_v, no PLE
 
 Tests model compilation, loading, and inference accuracy/performance.
@@ -47,13 +47,13 @@ MODEL_CONFIGS = {
         "seq_len": 512,
         "description": "Gemma-4-4b-it (E4B, dense, PLE)",
     },
-    "12b": {
-        "model_path": os.path.expanduser("~/models/gemma-4-12b-it"),
-        "compiled_path": os.path.expanduser("~/neuron_models/gemma-4-12b-it"),
+    "31b": {
+        "model_path": os.path.expanduser("~/models/gemma-4-31B-it"),
+        "compiled_path": os.path.expanduser("~/neuron_models/gemma-4-31B-it"),
         "tp_degree": 4,
         "batch_size": 1,
         "seq_len": 2048,
-        "description": "Gemma-4-12b-it (31B params, dense, k_eq_v)",
+        "description": "Gemma-4-31B-it (31B params, dense, k_eq_v)",
     },
     "26b": {
         "model_path": os.path.expanduser("~/models/gemma-4-26B-A4B-it"),
@@ -283,7 +283,7 @@ def test_performance_ttft(compiled_model, tokenizer):
     avg_ttft = sum(times) / len(times)
 
     # Threshold varies by model size
-    threshold_ms = 200 if VARIANT in ("12b", "26b") else 100
+    threshold_ms = 200 if VARIANT in ("31b", "26b") else 100
     assert avg_ttft < threshold_ms, f"TTFT {avg_ttft:.2f}ms exceeds {threshold_ms}ms threshold"
     print(f"PASS - TTFT: {avg_ttft:.2f}ms (threshold: {threshold_ms}ms)")
 
@@ -309,7 +309,7 @@ def test_performance_throughput(compiled_model, tokenizer):
     throughput = num_tokens / total_time
 
     # Minimum throughput varies by model size
-    min_throughput = 10 if VARIANT in ("12b", "26b") else 30
+    min_throughput = 10 if VARIANT in ("31b", "26b") else 30
     assert throughput > min_throughput, f"Throughput {throughput:.2f} tok/s below {min_throughput} tok/s"
     print(f"PASS - Throughput: {throughput:.2f} tok/s (min: {min_throughput} tok/s)")
 
