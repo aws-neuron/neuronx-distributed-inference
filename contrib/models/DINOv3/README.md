@@ -64,6 +64,38 @@ DINOv3 models are compiled using two different approaches depending on model siz
 4. **ViT-H+ is HBM-bandwidth limited**: 2.5 GB NEFF saturates single-core HBM bandwidth, resulting in only 10.5 img/s DP=4 (16.6x slower than ViT-L)
 5. **ViT-7B requires TP=4**: 20.1 GB NEFF exceeds single-core HBM. Tensor parallelism via `neuronx-distributed` ModelBuilder achieves 38.8 img/s at 25.77ms latency
 
+### GPU Comparison (A10G g5.xlarge)
+
+| Model | Neuron Best (trn2 DP=4) | GPU Best (A10G torch.compile BS=16) | Winner |
+|-------|------------------------:|------------------------------------:|--------|
+| ViT-B/16 | **440.6 img/s** | 380.0 img/s | Neuron 1.16x |
+| ConvNeXt-Tiny | 364.5 img/s | **1,156.2 img/s** | GPU 3.2x |
+
+Neuron excels on ViT (transformer ops), GPU excels on ConvNeXt (conv ops). The hardware advantage depends on model architecture.
+
+<details>
+<summary>Full GPU results (A10G, PyTorch 2.6)</summary>
+
+**ViT-B/16:**
+
+| Batch Size | Eager (img/s) | torch.compile (img/s) |
+|-----------:|--------------:|----------------------:|
+| 1 | 92.1 | 213.2 |
+| 4 | 240.2 | 302.5 |
+| 8 | 290.1 | 341.0 |
+| 16 | 330.5 | 380.0 |
+
+**ConvNeXt-Tiny:**
+
+| Batch Size | Eager (img/s) | torch.compile (img/s) |
+|-----------:|--------------:|----------------------:|
+| 1 | 213.0 | 571.4 |
+| 4 | 551.7 | 893.5 |
+| 8 | 665.2 | 1,020.3 |
+| 16 | 800.1 | 1,156.2 |
+
+</details>
+
 ## Compatibility
 
 | Component | Version |
