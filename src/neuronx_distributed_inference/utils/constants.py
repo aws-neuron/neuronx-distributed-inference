@@ -15,6 +15,7 @@ from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl_vision impo
 from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl import NeuronQwen3VLForCausalLM
 from neuronx_distributed_inference.models.pixtral.modeling_pixtral import NeuronPixtralForCausalLM
 from neuronx_distributed_inference.models.pixtral.modeling_pixtral_vision import NeuronPixtralForImageEncoding
+from neuronx_distributed_inference.models.gemma3.modeling_gemma3 import NeuronGemma3ForCausalLM
 
 END_TO_END_MODEL = "e2e_model"
 CONTEXT_ENCODING_MODEL = "context_encoding_model"
@@ -59,6 +60,7 @@ MODEL_TYPES = {
                  "image-encoding": NeuronQwen2VLForImageEncoding},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
     "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
+    "gemma3": {"causal-lm": NeuronGemma3ForCausalLM},
     "qwen3_vl": {"causal-lm": NeuronQwen3VLForCausalLM,
                  "image-encoding": NeuronQwen3VLForImageEncoding},
 }

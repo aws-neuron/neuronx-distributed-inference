@@ -2,6 +2,7 @@ import logging
 import os
 import pytest
 import tempfile
+import json
 
 import torch
 import torch.nn as nn
@@ -25,26 +26,13 @@ from neuronx_distributed_inference.utils.testing import build_module, destroy_mp
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# Reading neuron_config test cases from jsons
+# Reading neuron_config test cases
 CURR_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# BS1 baseline TP2 configuration
-BASELINE_NEURON_CONFIG = NeuronConfig(
-    tp_degree=2,
-    cp_degree=1,
-    attention_dp_degree=1,
-    batch_size=1,
-    ctx_batch_size=1,
-    tkg_batch_size=1,
-    max_context_length=1024,
-    seq_len=1024,
-    sequence_parallel_enabled=False,
-    logical_nc_config=2,
-    attn_kernel_enabled=False,
-    is_continuous_batching=False,
-    fused_qkv=False,
-    torch_dtype=torch.float32,
-)
+# Baseline
+with open(os.path.join(CURR_DIR, "neuron_configs/gemma3_baseline.json"), "r") as f:
+    baseline_json = json.load(f)
+BASELINE_NEURON_CONFIG = NeuronConfig(**baseline_json)
 
 
 class CPUGemma3MLPModule(nn.Module):
@@ -183,6 +171,7 @@ def test_gemma3_mlp(neuron_config, rtol):
     # Create configs
     config_path = os.path.join(CURR_DIR, "config.json")
     model_config = Gemma3Config.from_pretrained(config_path).get_text_config()
+    setattr(model_config,"torch_dtype",torch.bfloat16)
 
     neuron_model_config = Gemma3InferenceConfig(
         neuron_config,

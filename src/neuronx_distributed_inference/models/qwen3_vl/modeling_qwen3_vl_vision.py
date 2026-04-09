@@ -1,3 +1,18 @@
+# Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch Qwen3-VL vision model for NxD Inference."""
+
 import logging
 import os
 from typing import List, Optional, Tuple
@@ -8,8 +23,6 @@ from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, Row
 from safetensors.torch import save_file
 from transformers.activations import ACT2FN
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLVisionPatchEmbed,
-    Qwen3VLVisionPatchMerger,
     Qwen3VLVisionRotaryEmbedding,
 )
 
@@ -24,15 +37,70 @@ from neuronx_distributed_inference.modules.attention.attention_base import Neuro
 from neuronx_distributed_inference.modules.attention.utils import apply_rotary_pos_emb
 from neuronx_distributed_inference.modules.padding import (
     pad_tensor,
-    unpad_tensor,
 )
 from neuronx_distributed_inference.modules.checkpoint import load_state_dict
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+VISION_POSITION_ID_PAD_VALUE = -1
+
+
+class NeuronQwen3VLVisionPatchEmbed(nn.Module):
+    """Identical to transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLVisionPatchEmbed except for dtype spec."""
+    def __init__(self, config: InferenceConfig) -> None:
+        super().__init__()
+        self.patch_size = config.patch_size
+        self.temporal_patch_size = config.temporal_patch_size
+        self.in_channels = config.in_channels
+        self.embed_dim = config.hidden_size
+
+        kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
+        self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True, dtype=config.neuron_config.torch_dtype)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Shape of input hidden_states:
+        # [num_images * input_pixel_seqlen, in_channels * patch_size * patch_size * temporal_patch_size]
+        # First dim has been padded to buckeet size on sequence dimension
+        target_dtype = self.proj.weight.dtype
+        hidden_states = hidden_states.view(
+            -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
+        )  # shape [num_images * input_pixel_seqlen, in_channels, temporal_patch_size, patch_size, patch_size]
+        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
+        return hidden_states
+
+
+class NeuronQwen3VLVisionPatchMerger(nn.Module):
+    """
+    Same architecture as transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLVisionPatchMerger
+    but use parallel linear layers and specify dtype.
+    """
+    def __init__(self, config: InferenceConfig, use_postshuffle_norm=False) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.use_postshuffle_norm = use_postshuffle_norm
+        self.norm = nn.LayerNorm(self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6)
+        self.linear_fc1 = ColumnParallelLinear(
+            self.hidden_size,
+            self.hidden_size,
+            gather_output=False,
+            dtype=config.neuron_config.torch_dtype,
+        )
+        self.act_fn = nn.GELU()
+        self.linear_fc2 = RowParallelLinear(
+            self.hidden_size,
+            config.out_hidden_size,
+            input_is_parallel=True,
+            dtype=config.neuron_config.torch_dtype,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
+        x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
+        return x
+
 
 class NeuronQwen3VLVisionAttention(NeuronAttentionBase):
-    """The same as Neuron3VLAttention other than config param name"""
+    """Self-attention similar to *NeuronLlamaAttention* but with qkv_bias=True"""
 
     def __init__(self, config):
         super().__init__(
@@ -129,10 +197,14 @@ class NeuronQwen3VLVisionModel(nn.Module):
 
         self.patch_size = self.vision_config.patch_size
 
+        self.patch_embed = NeuronQwen3VLVisionPatchEmbed(
+            config=self.vision_config,
+        )
+
         self.blocks = nn.ModuleList(
             [NeuronQwen3VLVisionBlock(self.vision_config) for _ in range(self.vision_config.depth)]
         )
-        self.merger = Qwen3VLVisionPatchMerger(
+        self.merger = NeuronQwen3VLVisionPatchMerger(
             config=self.vision_config,
             use_postshuffle_norm=False,
         )
@@ -140,7 +212,7 @@ class NeuronQwen3VLVisionModel(nn.Module):
         self.deepstack_visual_indexes = self.vision_config.deepstack_visual_indexes
         self.deepstack_merger_list = nn.ModuleList(
             [
-                Qwen3VLVisionPatchMerger(
+                NeuronQwen3VLVisionPatchMerger(
                     config=self.vision_config,
                     use_postshuffle_norm=True,
                 )
@@ -148,24 +220,75 @@ class NeuronQwen3VLVisionModel(nn.Module):
             ]
         )
 
+    def pad_to_text_seq_len(self, hidden_states):
+        # pad to maximum seq len as we do not know the length of text tokens
+        padded_length = self.config.neuron_config.seq_len
+        hidden_states = hidden_states.to(self.config.text_config.neuron_config.torch_dtype)
+
+        hidden_size = hidden_states.shape[-1]
+        hidden_states, _ = pad_tensor(hidden_states, (padded_length, hidden_size), pad_value=0)
+
+        # flatten vision outputs
+        hidden_states = hidden_states.view(-1, hidden_size).unsqueeze(0)
+        return hidden_states
+
+    @staticmethod
+    def create_vision_attention_mask_from_pos_ids(vision_position_ids):
+        """
+        Create a block diagonal attention mask where each image attends only to itself.
+
+        Args:
+            vision_position_ids: Integer tensor of shape (total_tokens,)
+                            Contains position IDs where each token is assigned an ID corresponding
+                            to the image it belongs to. Position IDs range from 0 to num_images-1.
+
+        Returns:
+            attention_mask: Boolean tensor of shape (total_tokens, total_tokens)
+                            True where attention is allowed, False where blocked.
+        """
+
+        # Compute the 2D vision attention mask from 1D vision position ids
+        vision_attention_mask = (
+            vision_position_ids.unsqueeze(1) == vision_position_ids.unsqueeze(0)
+        )
+
+        # Exclude padded positions marked as -1
+        valid = (vision_position_ids != VISION_POSITION_ID_PAD_VALUE)  # (bucket_size,)
+        vision_attention_mask = vision_attention_mask * torch.outer(valid, valid)
+
+        return vision_attention_mask
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        pixel_values: torch.Tensor,
         rotary_pos_emb: torch.Tensor,
-        vision_attention_mask: torch.Tensor,
+        pos_emb: torch.Tensor,
+        vision_position_ids: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
-            hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
-                The final hidden states of the model.
+            pixel_values (`torch.Tensor` of shape `(seq_len, in_channels * temporal_patch_size * patch_size * patch_size)`):
+                Pre-processed pixel values padded to bucket size on sequence dim.
             rotary_pos_emb (`torch.Tensor` of shape `(seq_len, head_dim//2)`):
                 Precomputed rotary position embeddings (cos/sin frequencies) for encoding relative positional information in attention.
-            vision_attention_mask (`torch.Tensor` of shape `(seq_len, seq_len)`):
-                Square mask for different images for each image to attend to itself.
+            pos_emb (`torch.Tensor` of shape `(seq_len, head_dim//2)`):
+                Precomputed position embeddings (cos/sin frequencies) for encoding relative positional information in attention.
+            vision_position_ids (`torch.Tensor` of shape `(seq_len, )`):
+                1D position IDs where each token is assigned an ID corresponding to the image it belongs to.
 
         Returns:
             `torch.Tensor`: hidden_states.
         """
+
+        # Patch embedding - essentially a conv3d proj layer
+        hidden_states = self.patch_embed(pixel_values)
+
+        # Add positional embedding
+        hidden_states = hidden_states + pos_emb
+
+        # Create 2D block vision attention mask from vision position ids
+        vision_attention_mask = self.create_vision_attention_mask_from_pos_ids(vision_position_ids)
+
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
@@ -196,8 +319,12 @@ class NeuronQwen3VLVisionModel(nn.Module):
         logger.debug(
             f"\nNeuronQwen3VLVisionModel returning: hidden_states.shape {hidden_states.shape}, deepstack_feature_lists len {len(deepstack_feature_lists)} shape {deepstack_feature_lists[0].shape}"
         )
-
-        return hidden_states, deepstack_feature_lists
+        # pad hidden states and deepstack_feature_lists to max seq len
+        text_model_dtype = self.config.text_config.neuron_config.torch_dtype
+        hidden_states = self.pad_to_text_seq_len(hidden_states)
+        deepstack_feature_lists = [self.pad_to_text_seq_len(x).to(text_model_dtype) for x in deepstack_feature_lists]
+        deepstack_vision_embeds = torch.stack(deepstack_feature_lists)
+        return hidden_states, deepstack_vision_embeds
 
 
 class NeuronQwen3VLVisionModelWrapper(ModelWrapper):
@@ -211,7 +338,7 @@ class NeuronQwen3VLVisionModelWrapper(ModelWrapper):
         # FIXME: when setting to True only return the first output hidden_states, no deepstack_feature_lists
         # but in vision+text mode we want to eliminate Neuron-CPU data transfer time
         # by setting pipeline_execution = True and return_ranked_to_cpu = False
-        pipeline_execution: bool = False,
+        pipeline_execution: bool = True,
         return_ranked_to_cpu: bool = False,
         model_init_kwargs={},
     ) -> None:
@@ -225,6 +352,7 @@ class NeuronQwen3VLVisionModelWrapper(ModelWrapper):
             return_ranked_to_cpu,
             model_init_kwargs,
         )
+        self.pipeline_execution = pipeline_execution
         self.vision_config = config.vision_config
         self.num_grid_per_side = int(config.vision_config.num_position_embeddings**0.5)
         self.spatial_merge_size = config.vision_config.spatial_merge_size
@@ -233,12 +361,6 @@ class NeuronQwen3VLVisionModelWrapper(ModelWrapper):
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
 
         sd = load_state_dict(config._name_or_path)
-
-        self.patch_embed = Qwen3VLVisionPatchEmbed(
-            config=self.vision_config,
-        )
-        self.patch_embed.proj.weight.data = sd["model.visual.patch_embed.proj.weight"].to(config.vision_config.neuron_config.torch_dtype)
-        self.patch_embed.proj.bias.data = sd["model.visual.patch_embed.proj.bias"].to(config.vision_config.neuron_config.torch_dtype)
 
         self.pos_embed = nn.Embedding(
             self.vision_config.num_position_embeddings,
@@ -364,7 +486,7 @@ class NeuronQwen3VLVisionModelWrapper(ModelWrapper):
             pixel_values = torch.ones(
                 [
                     vision_seq_len,
-                    self.config.vision_config.hidden_size,
+                    self.vision_config.in_channels * self.vision_config.temporal_patch_size * self.vision_config.patch_size * self.vision_config.patch_size,
                 ],
                 dtype=self.config.vision_config.neuron_config.torch_dtype,
             )
@@ -377,15 +499,19 @@ class NeuronQwen3VLVisionModelWrapper(ModelWrapper):
                 ],
                 dtype=torch.float32
             )
-            vision_attention_mask = torch.ones(
+            pos_emb = torch.ones(
                 [
                     vision_seq_len,
-                    vision_seq_len,
+                    self.config.vision_config.hidden_size,
                 ],
+                dtype=self.config.vision_config.neuron_config.torch_dtype,
+            )
+            vision_position_ids = torch.zeros(
+                [vision_seq_len, ],
                 dtype=torch.int32
             )
 
-            inputs.append((pixel_values, rotary_pos_emb, vision_attention_mask))
+            inputs.append((pixel_values, rotary_pos_emb, pos_emb, vision_position_ids))
         return inputs
 
     def get_model_instance(self):
@@ -418,34 +544,63 @@ class NeuronQwen3VLVisionModelWrapper(ModelWrapper):
                 return bucket
 
     @staticmethod
-    def create_vision_attention_mask(image_grid_thw: torch.Tensor) -> torch.Tensor:
+    def create_vision_position_ids(image_grid_thw: torch.Tensor) -> torch.Tensor:
         """
-        Create a block diagonal attention mask where each image attends only to itself.
+        Create a 1D vision position id sequence based on which image the vision token belong to.
 
         Args:
             image_grid_thw: Tensor of shape (num_images, 3) where each row is [T, H, W]
                             representing temporal, height, width dimensions
 
         Returns:
-            attention_mask: Boolean tensor of shape (total_tokens, total_tokens)
-                            True where attention is allowed, False where blocked
+            vision_position_ids: Integer tensor of shape (total_tokens,)
+                            Contains position IDs where each token is assigned an ID corresponding
+                            to the image it belongs to. Position IDs range from 0 to num_images-1.
         """
         # Calculate number of tokens per image
         tokens_per_image = image_grid_thw.prod(dim=1)  # T * H * W for each image
-        total_tokens = tokens_per_image.sum().item()
+        tokens_per_image = tokens_per_image.tolist()
+        total_tokens = sum(tokens_per_image)
 
-        # Initialize mask with zeros (no attention)
-        attention_mask = torch.zeros(total_tokens, total_tokens, dtype=torch.bool)
+        # Initialize vision position ids with pad value (-1)
+        vision_position_ids = torch.full([total_tokens, ], VISION_POSITION_ID_PAD_VALUE, dtype=torch.int32)
 
-        # Fill in block diagonal by setting each image's token range to attend to itself
+        # Assign the same position ids to the same image
         start_idx = 0
-        for num_tokens in tokens_per_image:
-            num_tokens = num_tokens.item()
+        for position_id, num_tokens in enumerate(tokens_per_image):
             end_idx = start_idx + num_tokens
-            attention_mask[start_idx:end_idx, start_idx:end_idx] = True
+            vision_position_ids[start_idx:end_idx] = position_id
             start_idx = end_idx
 
-        return attention_mask.to(torch.int32)
+        return vision_position_ids
+
+    def split_outputs(self, ranked_outputs):
+        """Split the ranked outputs into separate hidden states and deepstack feature lists.
+
+        The output from ``forward_ranked`` has a shape of (tp_degree x args), where each
+        ranked output contains multiple arguments bundled together. This method splits
+        them into two separate parameters, each with a shape of (tp_degree x 1), so that
+        the individual ranked arguments can be sent as distinct inputs to the text model.
+
+        Args:
+            ranked_outputs (list[tuple]): A list of length ``tp_degree``, where each
+                element is a tuple of two items:
+                    - ranked_output[0]: The hidden state for that rank.
+                    - ranked_output[1]: The deepstack feature for that rank.
+
+        Returns:
+            tuple[list[list], list[list]]: A tuple containing:
+                - hidden_states (list[list]): A list of length ``tp_degree``, where each
+                element is a single-element list containing the hidden state for that rank.
+                - deepstack_feature_list (list[list]): A list of length ``tp_degree``, where
+                each element is a single-element list containing the deepstack feature for
+                that rank.
+        """
+        hidden_states, deepstack_feature_list = [], []
+        for rank_output in ranked_outputs:
+            hidden_states.append([rank_output[0]])
+            deepstack_feature_list.append([rank_output[1]])
+        return hidden_states, deepstack_feature_list
 
     def forward(self, pixel_values, grid_thw):
         """
@@ -454,20 +609,16 @@ class NeuronQwen3VLVisionModelWrapper(ModelWrapper):
 
         pixel_values = pixel_values.to(self.config.vision_config.neuron_config.torch_dtype)
         grid_thw = grid_thw.to(torch.int32)
-        vision_attention_mask = NeuronQwen3VLVisionModelWrapper.create_vision_attention_mask(grid_thw)
+        vision_position_ids = NeuronQwen3VLVisionModelWrapper.create_vision_position_ids(grid_thw)
 
         if self.model is None:
             raise RuntimeError(
                 "Forward called before load. Run load() or load_state_dict() making calling forward"
             )
 
-        # To support dynamic image shapes, we project image patches and compute rotary positional embeddings on CPU
+        # To support dynamic image shapes, we project image patches and compute learned and rotary positional embeddings on CPU
         # in model wrapper, before calling VisionEncoder's model forward. This is avoid bucketing on grid_thw's num_images since its shape is [num_images, 3]. Hence, we only bucket on sequence length of flattened images.
-        pixel_values = self.patch_embed(pixel_values)
-
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        pixel_values = pixel_values + pos_embeds
-
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)  # shape [seq_len, 2*3*16*16]
         rotary_pos_emb = self.rot_pos_emb(grid_thw).to(torch.float)  # shape [seq_len, 36]
 
         # pad inputs
@@ -476,20 +627,16 @@ class NeuronQwen3VLVisionModelWrapper(ModelWrapper):
             pixel_values, (target_vision_bucket, pixel_values.shape[1])
         )
         padded_rotary_pos_emb, _ = pad_tensor(rotary_pos_emb, (target_vision_bucket, rotary_pos_emb.shape[1]))
-        vision_attention_mask, _ = pad_tensor(vision_attention_mask, (target_vision_bucket, target_vision_bucket), pad_value=0)
+        padded_pos_embeds, _ = pad_tensor(pos_embeds, (target_vision_bucket, pos_embeds.shape[1]), pad_value=0)
+        padded_vision_position_ids, _ = pad_tensor(vision_position_ids, (target_vision_bucket,), pad_value=VISION_POSITION_ID_PAD_VALUE)
+
         # forward
-        hidden_states, deepstack_feature_list = self._forward(padded_pixel_values, padded_rotary_pos_emb, vision_attention_mask)
-        # Unpad outputs to match HF Qwen3VLVisionModel output
-        # Qwen3VLVisionPatchMerger downscale seqlen and upscale hidden size
-        divisor = self.vision_config.spatial_merge_size**2
-        original_idx_slices[0] = [x // divisor for x in original_idx_slices[0]]
-        original_idx_slices[1][1] = self.vision_config.out_hidden_size
-        unpadded_hidden_states = unpad_tensor(hidden_states, original_idx_slices)
-        unpadded_deepstack_feature_list = []
-        for feat in deepstack_feature_list:
-            unpadded_feat = unpad_tensor(feat, original_idx_slices)
-            unpadded_deepstack_feature_list.append(unpadded_feat)
-        return unpadded_hidden_states, unpadded_deepstack_feature_list
+        outputs = self._forward(padded_pixel_values, padded_rotary_pos_emb, padded_pos_embeds, padded_vision_position_ids)
+        if self.pipeline_execution:
+            hidden_states, deepstack_feature_list = self.split_outputs(outputs)
+        else:
+            hidden_states, deepstack_feature_list = outputs
+        return hidden_states, deepstack_feature_list
 
 
 class NeuronQwen3VLForImageEncoding(NeuronApplicationBase):
@@ -510,6 +657,10 @@ class NeuronQwen3VLForImageEncoding(NeuronApplicationBase):
             tag=self._model_cls.__name__,
             compiler_args=self.get_compiler_args(),
             priority_model_idx=0,
+            # we disable pipeline_execution for the vision model
+            # when compiled as a standalone ImageEncoding model
+            pipeline_execution=False,
+            return_ranked_to_cpu=False,
         )
         # will only have one model one tag
         # after compilation, in /tmp/nxd_model,

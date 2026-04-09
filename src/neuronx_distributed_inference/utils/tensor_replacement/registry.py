@@ -24,7 +24,7 @@ from collections import defaultdict
 #
 _FN = re.compile(
     r"^captured_tensors_(?:cte|ctx|tkg)_step_(\d+)_module_([\w\.]+?)"
-    r"(?:[._]outputs?)\.pt$"
+    r"(?:[._]outputs?(?:_\d+)?)\.pt$"
 )
 
 
@@ -41,7 +41,7 @@ def _ensure_rank_and_pad_ref_to_target(
     neu_t: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Normalize CPU tensor `t` to match a 3D Neuron tensor `neu_t`'s shape [B_neu, S_neu, D_neu].
+    Normalize CPU tensor `t` to match Neuron tensor `neu_t`'s shape.
 
     Accepted ref shapes:
       • [S, D]                 (single prompt)
@@ -49,45 +49,64 @@ def _ensure_rank_and_pad_ref_to_target(
       • [B, S, D]              (already batched)
 
     Behavior:
-      • We reshape 2D refs to 3D using S_neu/B candidates; we never reshape `neu_t`.
+      • Handle both 2D and 3D Neuron tensors
+      • We reshape 2D refs to match Neuron tensor rank
       • Overlay rules:
           - If B_ref == B_neu → write overlap for all batches.
           - If B_ref == 1 and B_neu > 1 → write only batch 0.
       • No zero padding — any non-overlap remains from `neu_t`.
     """
-    if neu_t.dim() != 3:
-        raise ValueError(f"Expected neu_t to be 3D, got dim={neu_t.dim()} with shape {tuple(neu_t.shape)}")
+    # Handle 2D Neuron tensors
+    if neu_t.dim() == 2:
+        S_neu, D_neu = neu_t.shape
+        out = neu_t.to(dtype=t.dtype)
 
-    B_neu, S_neu, D_neu = neu_t.shape
-    out = neu_t.to(dtype=t.dtype)
+        if t.dim() == 2:
+            S_ref, D_ref = t.shape
+            if D_ref != D_neu:
+                raise ValueError(f"Expected ref {D_ref} and neuron tensors {D_neu} to have same hidden states")
+        else:
+            raise ValueError(f"Expected ref shape {t.shape} to be 2D for 2D Neuron tensor")
 
-    # Convert t -> 3D if needed
-    if t.dim() == 2:
-        S_flat, D_ref = t.shape
-        if D_ref != D_neu:
-            raise ValueError(f"Expected ref {D_ref} and neuron tensors {D_neu} to have same hidden states")
-    else:
-        raise ValueError(f"Expected ref shape {t.shape} to be 2D")
-
-    if B_neu == 1:
-        # Rule 1: just unsqueeze to [1, S, D]
-        t = t.unsqueeze(0)
-    else:
-        # Rule 2: unpack S into B,S using B_neu (source of truth)
-        if S_flat % B_neu != 0:
-            raise ValueError(
-                f"Cannot unpack 2D ref {tuple(t.shape)} into B={B_neu}: "
-                f"S_flat={S_flat} is not divisible by B_neu={B_neu}."
-            )
-        S_ref = S_flat // B_neu
-        t = t.reshape(B_neu, S_ref, D_ref)
-
-    if t.shape[0] == B_neu:
+        # Direct 2D overlay
         sl = _overlap_slices(t.shape, out.shape)
         out[sl] = t[sl].to(device=out.device, dtype=out.dtype)
         return out
+
+    # Handle 3D Neuron tensors
+    elif neu_t.dim() == 3:
+        B_neu, S_neu, D_neu = neu_t.shape
+        out = neu_t.to(dtype=t.dtype)
+
+        if t.dim() == 2:
+            S_flat, D_ref = t.shape
+            if D_ref != D_neu:
+                raise ValueError(f"Expected ref {D_ref} and neuron tensors {D_neu} to have same hidden states")
+        else:
+            raise ValueError(f"Expected ref shape {t.shape} to be 2D")
+
+        if B_neu == 1:
+            # Rule 1: just unsqueeze to [1, S, D]
+            t = t.unsqueeze(0)
+        else:
+            # Rule 2: unpack S into B,S using B_neu (source of truth)
+            if S_flat % B_neu != 0:
+                raise ValueError(
+                    f"Cannot unpack 2D ref {tuple(t.shape)} into B={B_neu}: "
+                    f"S_flat={S_flat} is not divisible by B_neu={B_neu}."
+                )
+            S_ref = S_flat // B_neu
+            t = t.reshape(B_neu, S_ref, D_ref)
+
+        if t.shape[0] == B_neu:
+            sl = _overlap_slices(t.shape, out.shape)
+            out[sl] = t[sl].to(device=out.device, dtype=out.dtype)
+            return out
+        else:
+            raise ValueError(f"Ref {t.shape} and neuron {B_neu} batch sizes do not match: ")
+
     else:
-        raise ValueError(f"Ref {t.shape} and neuron {B_neu} batch sizes do not match: ")
+        raise ValueError(f"Expected neu_t to be 2D or 3D, got dim={neu_t.dim()} with shape {tuple(neu_t.shape)}")
 
 
 # ------------------------------------------------------------------------------------
@@ -409,15 +428,23 @@ class TensorReplacementRegister:
                 Example: ctx_batch_size=1, batch_size=16, tkg_batch_size=16
                 when run woth 16 prompts as done in logit validation tests
                 router logits in ctx encoding phase will have shp = [16, S, H] although compiler expects [1, S, H]
+
+                For 2D tensors (tensor replacement args), preserve the original captured shape.
+                Only apply batch size correction to regular model inputs (3D+ tensors).
             '''
-            if step == 1:
-                bs = self.config.ctx_batch_size or self.config.batch_size
-            else:
-                bs = self.config.tkg_batch_size or self.config.batch_size
+            # Check if this is a tensor replacement argument (2D tensor)
+            is_tensor_replacement_arg = len(shp) == 2
 
-            if shp[0] != bs:
-                shp = torch.Size((bs, *shp[1:]))
+            if not is_tensor_replacement_arg and len(shp) >= 3:
+                if step == 1:
+                    bs = self.config.ctx_batch_size or self.config.batch_size
+                else:
+                    bs = self.config.tkg_batch_size or self.config.batch_size
 
+                if shp[0] != bs:
+                    shp = torch.Size((bs, *shp[1:]))
+
+            # For tensor replacement args (2D tensors), use original captured shape
             # Zero TF arg with static shape == compiled shape
             tr_list.append(torch.zeros(shp, dtype=dt))
             # Mask is a simple (1,) Bool flag for this module at this step
@@ -446,30 +473,39 @@ class TensorReplacementRegister:
             if not ref_steps:
                 raise ValueError(f"No CPU captures for module '{m}' in steps [1..{step}]")
 
-            batch = neuron_ctx_target.shape[0]
-            hidden = neuron_ctx_target.shape[-1]
-            segments = []
-            for s_idx, s_id in enumerate(ref_steps):
-                seg = ref_step_map[s_id]
+            # For 2D tensors, skip batch reshaping and concatenate directly
+            if neuron_ctx_target.dim() == 2:
+                segments = [ref_step_map[s_id] for s_id in ref_steps]
+            else:
+                batch = neuron_ctx_target.shape[0]
+                hidden = neuron_ctx_target.shape[-1]
+                segments = []
+                for s_idx, s_id in enumerate(ref_steps):
+                    seg = ref_step_map[s_id]
 
-                if seg.dim() == 2:
-                    if seg.shape[0] % batch != 0:
-                        raise ValueError(
-                            f"Cannot reshape {tuple(seg.shape)} into (B={batch}, S, H={hidden})"
-                        )
-                    seg = seg.reshape(batch, -1, hidden)
-                else:
-                    raise ValueError(f"Unsupported rank {seg.dim()} for module '{m}'")
+                    if seg.dim() == 2:
+                        if seg.shape[0] % batch != 0:
+                            raise ValueError(
+                                f"Cannot reshape {tuple(seg.shape)} into (B={batch}, S, H={hidden})"
+                            )
+                        seg = seg.reshape(batch, -1, hidden)
+                    else:
+                        raise ValueError(f"Unsupported rank {seg.dim()} for module '{m}'")
 
-                segments.append(seg)
+                    segments.append(seg)
 
             # Determine sequence dimension for concatenation
             # For 3D tensors (B, S, H), concatenate along sequence dimension (dim=1)
             # For 2D tensors (S, H), concatenate along sequence dimension (dim=0)
             seq_dim = 1 if segments[0].dim() >= 3 else 0
             try:
-                combined_3d = torch.cat(segments, dim=seq_dim)
-                combined = combined_3d.reshape(batch * combined_3d.shape[1], hidden)
+                combined_result = torch.cat(segments, dim=seq_dim)
+                if neuron_ctx_target.dim() == 2:
+                    # For 2D tensors, no reshaping needed - result is already 2D
+                    combined = combined_result
+                else:
+                    # For 3D tensors, flatten to 2D
+                    combined = combined_result.reshape(batch * combined_result.shape[1], hidden)
             except RuntimeError as e:
                 raise RuntimeError(
                     f"Concatenation failed for module '{m}' along dim {seq_dim}. "

@@ -10,8 +10,7 @@ from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
 from neuronx_distributed.modules.moe.model import MoE
 from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.modules.moe.shared_experts import SharedExperts
-from neuronxcc.nki._private_kernels.blockwise_mm import SkipMode
-
+from nkilib.core.moe.moe_cte.moe_cte_utils import SkipMode
 class config:
      def __init__(self,
                   hidden_size: int,
@@ -170,7 +169,8 @@ class TestInitializeMoEModule(unittest.TestCase):
             assert module.expert_mlps.blockwise_matmul_config.block_size == module_config.neuron_config.blockwise_matmul_config.block_size, f"Expected block_size to be {module_config.neuron_config.blockwise_matmul_config.block_size} but got {module.expert_mlps.blockwise_matmul_config.block_size}"
             assert module.expert_mlps.blockwise_matmul_config.use_block_parallel == module_config.neuron_config.blockwise_matmul_config.use_block_parallel, f"Expected use_block_parallel to be {module_config.neuron_config.blockwise_matmul_config.use_block_parallel} but got {module.expert_mlps.blockwise_matmul_config.use_block_parallel}"
             skip_dma = SkipMode(module_config.neuron_config.blockwise_matmul_config.skip_dma_token, module_config.neuron_config.blockwise_matmul_config.skip_dma_weight)
-            assert module.expert_mlps.blockwise_matmul_config.skip_dma == skip_dma, f"Expected use_block_parallel to be {module.expert_mlps.blockwise_matmul_config.skip_dma} but got {skip_dma}"
+            assert module.expert_mlps.blockwise_matmul_config.skip_dma.skip_weight == skip_dma.skip_weight, f"Expected use_block_parallel to be {module.expert_mlps.blockwise_matmul_config.skip_dma} but got {skip_dma}"
+            assert module.expert_mlps.blockwise_matmul_config.skip_dma.skip_token == skip_dma.skip_token, f"Expected use_block_parallel to be {module.expert_mlps.blockwise_matmul_config.skip_dma} but got {skip_dma}"
 
             # Test RoutedExpertsMLPOpsConfig
             assert module.expert_mlps.routed_experts_mlp_config.hidden_size == module_config.hidden_size, f"Expected hidden_size to be {module_config.hidden_size} but got {module.expert_mlps.routed_experts_mlp_config.hidden_size}"

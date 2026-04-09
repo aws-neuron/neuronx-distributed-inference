@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import (
     _helper_concat_and_delete_qkv,
     convert_qwen3_moe_hf_to_neuron_state_dict,
+    convert_state_dict_to_fused_qkv,
 )
 
 
@@ -193,6 +194,289 @@ class TestHelperConcatAndDeleteQKV:
         _helper_concat_and_delete_qkv(state_dict, 0, "bias")
         
         assert state_dict["layers.0.self_attn.Wqkv.bias"].shape == torch.Size([192])
+
+
+class TestConvertStateDictToFusedQKV:
+    """Test suite for convert_state_dict_to_fused_qkv function"""
+
+    @pytest.fixture
+    def mock_config(self):
+        """Create a mock config object for convert_state_dict_to_fused_qkv"""
+        config = MagicMock()
+        config.num_hidden_layers = 3
+        config.neuron_config.quantized_mlp_kernel_enabled = False
+        config.neuron_config.quantized = False
+        
+        # Mock get_modules_to_not_convert to return None by default
+        config.neuron_config.modules_to_not_convert = None
+        return config
+
+    @pytest.fixture
+    def sample_qkv_state_dict(self):
+        """Create a sample state dictionary with QKV weights for multiple layers"""
+        state_dict = {}
+        
+        for layer_idx in range(3):
+            # Add QKV weights
+            state_dict[f"layers.{layer_idx}.self_attn.q_proj.weight"] = torch.randn(128, 64)
+            state_dict[f"layers.{layer_idx}.self_attn.k_proj.weight"] = torch.randn(128, 64)  
+            state_dict[f"layers.{layer_idx}.self_attn.v_proj.weight"] = torch.randn(128, 64)
+            
+            # Add QKV scales (for quantized scenarios)
+            state_dict[f"layers.{layer_idx}.self_attn.q_proj.scale"] = torch.randn(128)
+            state_dict[f"layers.{layer_idx}.self_attn.k_proj.scale"] = torch.randn(128)
+            state_dict[f"layers.{layer_idx}.self_attn.v_proj.scale"] = torch.randn(128)
+            
+        # Add some other weights that should not be affected
+        state_dict["embed_tokens.weight"] = torch.randn(1000, 64)
+        state_dict["norm.weight"] = torch.randn(64)
+        
+        return state_dict
+
+    def test_basic_weight_fusion(self, sample_qkv_state_dict, mock_config):
+        """Test basic QKV weight fusion functionality"""
+        # Store original weights for verification
+        original_weights = {}
+        for layer_idx in range(mock_config.num_hidden_layers):
+            original_weights[layer_idx] = {
+                'q': sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.q_proj.weight"].clone(),
+                'k': sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.k_proj.weight"].clone(),
+                'v': sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.v_proj.weight"].clone(),
+            }
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        # Verify all layers have fused weights
+        for layer_idx in range(mock_config.num_hidden_layers):
+            fused_key = f"layers.{layer_idx}.self_attn.Wqkv.weight"
+            assert fused_key in result
+            
+            # Verify fused weight is correct concatenation
+            expected_fused = torch.cat([
+                original_weights[layer_idx]['q'],
+                original_weights[layer_idx]['k'], 
+                original_weights[layer_idx]['v']
+            ])
+            assert torch.allclose(result[fused_key], expected_fused)
+            
+            # Verify original keys are deleted
+            assert f"layers.{layer_idx}.self_attn.q_proj.weight" not in result
+            assert f"layers.{layer_idx}.self_attn.k_proj.weight" not in result
+            assert f"layers.{layer_idx}.self_attn.v_proj.weight" not in result
+
+    def test_quantized_mlp_kernel_enabled(self, sample_qkv_state_dict, mock_config):
+        """Test scale fusion when quantized_mlp_kernel_enabled is True"""
+        mock_config.neuron_config.quantized_mlp_kernel_enabled = True
+        
+        # Store original scales for verification
+        original_scales = {}
+        for layer_idx in range(mock_config.num_hidden_layers):
+            original_scales[layer_idx] = {
+                'q': sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.q_proj.scale"].clone(),
+                'k': sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.k_proj.scale"].clone(),
+                'v': sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.v_proj.scale"].clone(),
+            }
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        # Verify all layers have fused scales
+        for layer_idx in range(mock_config.num_hidden_layers):
+            fused_scale_key = f"layers.{layer_idx}.self_attn.Wqkv.scale"
+            assert fused_scale_key in result
+            
+            # Verify fused scale is correct concatenation
+            expected_fused_scale = torch.cat([
+                original_scales[layer_idx]['q'],
+                original_scales[layer_idx]['k'],
+                original_scales[layer_idx]['v']
+            ])
+            assert torch.allclose(result[fused_scale_key], expected_fused_scale)
+            
+            # Verify original scale keys are deleted
+            assert f"layers.{layer_idx}.self_attn.q_proj.scale" not in result
+            assert f"layers.{layer_idx}.self_attn.k_proj.scale" not in result
+            assert f"layers.{layer_idx}.self_attn.v_proj.scale" not in result
+
+    def test_quantized_enabled(self, sample_qkv_state_dict, mock_config):
+        """Test scale fusion when quantized is True"""
+        mock_config.neuron_config.quantized = True
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        # Verify all layers have fused scales
+        for layer_idx in range(mock_config.num_hidden_layers):
+            fused_scale_key = f"layers.{layer_idx}.self_attn.Wqkv.scale"
+            assert fused_scale_key in result
+            
+            # Verify original scale keys are deleted
+            assert f"layers.{layer_idx}.self_attn.q_proj.scale" not in result
+            assert f"layers.{layer_idx}.self_attn.k_proj.scale" not in result
+            assert f"layers.{layer_idx}.self_attn.v_proj.scale" not in result
+
+    def test_modules_to_not_convert(self, sample_qkv_state_dict, mock_config):
+        """Test that modules in modules_to_not_convert are skipped for scale fusion"""
+        mock_config.neuron_config.quantized_mlp_kernel_enabled = True
+        mock_config.neuron_config.modules_to_not_convert = [
+            "layers.1.self_attn"  # Skip layer 1
+        ]
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        # Layer 0 and 2 should have fused scales
+        assert "layers.0.self_attn.Wqkv.scale" in result
+        assert "layers.2.self_attn.Wqkv.scale" in result
+        
+        # Layer 1 should NOT have fused scales (should be skipped)
+        assert "layers.1.self_attn.Wqkv.scale" not in result
+        
+        # But layer 1 should still have fused weights
+        assert "layers.1.self_attn.Wqkv.weight" in result
+
+    def test_empty_modules_to_not_convert(self, sample_qkv_state_dict, mock_config):
+        """Test behavior when modules_to_not_convert is empty list"""
+        mock_config.neuron_config.quantized_mlp_kernel_enabled = True
+        mock_config.neuron_config.modules_to_not_convert = []
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        # All layers should have fused scales
+        for layer_idx in range(mock_config.num_hidden_layers):
+            assert f"layers.{layer_idx}.self_attn.Wqkv.scale" in result
+
+    def test_returns_same_object(self, sample_qkv_state_dict, mock_config):
+        """Test that function returns the same dictionary object (in-place modification)"""
+        original_id = id(sample_qkv_state_dict)
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        assert id(result) == original_id
+        assert result is sample_qkv_state_dict
+
+    def test_preserves_unrelated_keys(self, sample_qkv_state_dict, mock_config):
+        """Test that unrelated keys are preserved unchanged"""
+        original_embed = sample_qkv_state_dict["embed_tokens.weight"].clone()
+        original_norm = sample_qkv_state_dict["norm.weight"].clone()
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        # Unrelated keys should be preserved
+        assert "embed_tokens.weight" in result
+        assert "norm.weight" in result
+        assert torch.allclose(result["embed_tokens.weight"], original_embed)
+        assert torch.allclose(result["norm.weight"], original_norm)
+
+    def test_zero_hidden_layers(self, mock_config):
+        """Test with zero hidden layers"""
+        mock_config.num_hidden_layers = 0
+        
+        state_dict = {"embed_tokens.weight": torch.randn(1000, 64)}
+        
+        result = convert_state_dict_to_fused_qkv(state_dict, mock_config)
+        
+        # Should return unchanged dict with no QKV processing
+        assert result == {"embed_tokens.weight": state_dict["embed_tokens.weight"]}
+
+    @patch('gc.collect')
+    def test_gc_collect_called(self, mock_gc_collect, sample_qkv_state_dict, mock_config):
+        """Test that gc.collect() is called"""
+        convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        mock_gc_collect.assert_called_once()
+
+    def test_missing_qkv_weights_raises_error(self, mock_config):
+        """Test behavior when QKV weights are missing"""
+        # Missing v_proj.weight
+        incomplete_state_dict = {
+            "layers.0.self_attn.q_proj.weight": torch.randn(128, 64),
+            "layers.0.self_attn.k_proj.weight": torch.randn(128, 64),
+            # Missing v_proj.weight
+        }
+        
+        with pytest.raises(KeyError):
+            convert_state_dict_to_fused_qkv(incomplete_state_dict, mock_config)
+
+    def test_tensor_dtypes_preserved(self, sample_qkv_state_dict, mock_config):
+        """Test that tensor dtypes are preserved during fusion"""
+        # Set specific dtypes
+        for layer_idx in range(mock_config.num_hidden_layers):
+            sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.q_proj.weight"] = (
+                sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.q_proj.weight"].to(torch.float16)
+            )
+            sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.k_proj.weight"] = (
+                sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.k_proj.weight"].to(torch.float16)
+            )
+            sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.v_proj.weight"] = (
+                sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.v_proj.weight"].to(torch.float16)
+            )
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        # Check that dtype is preserved in fused weights
+        for layer_idx in range(mock_config.num_hidden_layers):
+            fused_weight = result[f"layers.{layer_idx}.self_attn.Wqkv.weight"]
+            assert fused_weight.dtype == torch.float16
+
+    def test_tensor_devices_preserved(self, sample_qkv_state_dict, mock_config):
+        """Test that tensor devices are preserved during fusion"""
+        # Use CPU device (since we're in test environment)
+        device = torch.device('cpu')
+        
+        for layer_idx in range(mock_config.num_hidden_layers):
+            sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.q_proj.weight"] = (
+                sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.q_proj.weight"].to(device)
+            )
+            sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.k_proj.weight"] = (
+                sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.k_proj.weight"].to(device)
+            )
+            sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.v_proj.weight"] = (
+                sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.v_proj.weight"].to(device)
+            )
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        # Check that device is preserved in fused weights
+        for layer_idx in range(mock_config.num_hidden_layers):
+            fused_weight = result[f"layers.{layer_idx}.self_attn.Wqkv.weight"]
+            assert fused_weight.device == device
+
+    def test_fused_weight_shape_correctness(self, sample_qkv_state_dict, mock_config):
+        """Test that fused weights have correct shape"""
+        # Set specific shapes for verification
+        hidden_size = 96  # Divisible by 3 for clean testing
+        seq_len = 32
+        
+        for layer_idx in range(mock_config.num_hidden_layers):
+            sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.q_proj.weight"] = torch.randn(hidden_size, seq_len)
+            sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.k_proj.weight"] = torch.randn(hidden_size, seq_len)
+            sample_qkv_state_dict[f"layers.{layer_idx}.self_attn.v_proj.weight"] = torch.randn(hidden_size, seq_len)
+        
+        result = convert_state_dict_to_fused_qkv(sample_qkv_state_dict, mock_config)
+        
+        # Verify fused weight shapes
+        for layer_idx in range(mock_config.num_hidden_layers):
+            fused_weight = result[f"layers.{layer_idx}.self_attn.Wqkv.weight"]
+            expected_shape = (hidden_size * 3, seq_len)  # Concatenated along first dimension
+            assert fused_weight.shape == expected_shape
+
+    def test_qkv_concatenation_order(self, mock_config):
+        """Test that QKV concatenation maintains correct order (Q, K, V)"""
+        mock_config.num_hidden_layers = 1
+        
+        # Create distinctive tensors to verify order
+        state_dict = {
+            "layers.0.self_attn.q_proj.weight": torch.ones(2, 3),  # All 1s
+            "layers.0.self_attn.k_proj.weight": torch.ones(2, 3) * 2,  # All 2s  
+            "layers.0.self_attn.v_proj.weight": torch.ones(2, 3) * 3,  # All 3s
+        }
+        
+        result = convert_state_dict_to_fused_qkv(state_dict, mock_config)
+        
+        fused_weight = result["layers.0.self_attn.Wqkv.weight"]
+        
+        # Check order: first 2 rows should be 1s (Q), next 2 rows 2s (K), last 2 rows 3s (V)
+        assert torch.allclose(fused_weight[:2], torch.ones(2, 3))      # Q
+        assert torch.allclose(fused_weight[2:4], torch.ones(2, 3) * 2) # K
+        assert torch.allclose(fused_weight[4:6], torch.ones(2, 3) * 3) # V
 
 
 class TestConvertQwen3MoeHfToNeuronStateDict:

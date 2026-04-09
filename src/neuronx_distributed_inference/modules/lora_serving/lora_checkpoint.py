@@ -180,7 +180,10 @@ class LoraCheckpoint:
         return ret
 
     def _get_lora_weight(self, weights, id):
-        return weights[id].squeeze()
+        # If the weights are for streaming ckpt
+        if weights.shape[0] == 1:
+            return weights[id].squeeze()
+        return weights[id + self.lora_config.enable_base_model_only].squeeze()
 
     def _convert_lora_weight(self, ckpt, module, weight_dtype):
         tensor = ckpt.squeeze()

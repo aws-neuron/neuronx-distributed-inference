@@ -366,6 +366,7 @@ class NeuronConfig:
         self.ep_degree = kwargs.pop("ep_degree", 1)
         self.save_sharded_checkpoint = kwargs.pop("save_sharded_checkpoint", False)
         self.skip_sharding = kwargs.pop("skip_sharding", False)
+        self.enable_ve_data_parallel = kwargs.pop("enable_ve_data_parallel", False)
 
         if self.tp_degree % self.cp_degree != 0:
             raise ValueError("TP Degree must be evenly divisible by CP Degree")
@@ -414,6 +415,7 @@ class NeuronConfig:
         self.k_cache_transposed = kwargs.pop("k_cache_transposed", False)
 
         # Kernels
+        self._setup_kernel_target_platform()
         self.attn_kernel_enabled = kwargs.pop("attn_kernel_enabled", None)  # CTE attention kernel.
         self.strided_context_parallel_kernel_enabled = kwargs.pop("strided_context_parallel_kernel_enabled", False)
         self.qkv_kernel_enabled = kwargs.pop("qkv_kernel_enabled", False)
@@ -425,6 +427,9 @@ class NeuronConfig:
         self.qkv_kernel_nbsd_layout = kwargs.pop("qkv_kernel_nbsd_layout", False)
         self.mlp_kernel_enabled = kwargs.pop("mlp_kernel_enabled", False)
         self.mlp_tkg_nki_kernel_enabled = kwargs.pop("mlp_tkg_nki_kernel_enabled", False)
+        if self.mlp_tkg_nki_kernel_enabled:
+            warnings.warn("mlp_tkg_nki_kernel_enabled is deprecated. In a future release, this attribute will be removed")
+            self.mlp_kernel_enabled = self.mlp_tkg_nki_kernel_enabled
         self.fused_rmsnorm_skip_gamma = kwargs.pop("fused_rmsnorm_skip_gamma", False)
         self.mlp_kernel_fuse_residual_add = kwargs.pop("mlp_kernel_fuse_residual_add", False)
         self.qkv_kernel_fuse_residual_add = kwargs.pop("qkv_kernel_fuse_residual_add", False)
@@ -445,24 +450,21 @@ class NeuronConfig:
         self.attn_tkg_nki_kernel_enabled = kwargs.pop("attn_tkg_nki_kernel_enabled", False)
         self.attn_tkg_builtin_kernel_enabled = kwargs.pop("attn_tkg_builtin_kernel_enabled", False)
         self.attn_block_tkg_nki_kernel_enabled = kwargs.pop("attn_block_tkg_nki_kernel_enabled", False)
-        self.attn_block_cte_nki_kernel_enabled = kwargs.pop("attn_block_cte_nki_kernel_enabled", False)
         if self.attn_block_tkg_nki_kernel_enabled:
             assert (
                 self.qkv_kernel_enabled or self.qkv_nki_kernel_enabled
             ), "When attn-block-tkg-nki-kernel-enabled, self.qkv_kernel_enabled or self.qkv_nki_kernel_enabled is also required."
-        if self.attn_block_cte_nki_kernel_enabled:
-            assert (
-                self.attn_block_tkg_nki_kernel_enabled and (self.qkv_kernel_enabled or self.qkv_nki_kernel_enabled)
-            ), "When attn-block-cte-nki-kernel-enabled, attn-block-tkg-nki-kernel-enabled and (qkv_kernel_enabled or qkv_nki_kernel_enabled) are also required."
-        attn_tkg_kernel_enablement = [
-            self.attn_tkg_nki_kernel_enabled,
-            self.attn_tkg_builtin_kernel_enabled,
-            self.attn_block_tkg_nki_kernel_enabled,
-        ]
-        assert sum(attn_tkg_kernel_enablement) <= 1, (
-            "Multiple token-generation attention kernels enabled. Please enable no more than one of: "
-            "[attn-tkg-nki-kernel-enabled, attn-tkg-builtin-kernel-enabled, attn-block-tkg-nki-kernel-enabled]"
-        )
+        # enable attn_block_tkg_nki_kernel_enabled by
+        # attn_tkg_nki_kernel_enabled or attn_tkg_builtin_kernel_enabled
+        if self.attn_tkg_nki_kernel_enabled or self.attn_tkg_builtin_kernel_enabled:
+            if not self.attn_block_tkg_nki_kernel_enabled:
+                warnings.warn(
+                    "attn_tkg_nki_kernel_enabled and attn_tkg_builtin_kernel_enabled are deprecated "
+                    "and replaced by 'attn_block_tkg_nki_kernel_enabled'. "
+                    "In a future release, this attribute will be removed.",
+                    DeprecationWarning,
+                )
+            self.attn_block_tkg_nki_kernel_enabled = True
 
         self.attn_block_tkg_nki_kernel_cache_update = kwargs.pop("attn_block_tkg_nki_kernel_cache_update", False)
         self.attn_block_tkg_nki_kernel_cascaded_attention = kwargs.pop("attn_block_tkg_nki_kernel_cascaded_attention", False)
@@ -474,6 +476,39 @@ class NeuronConfig:
 
         self.attn_block_tkg_nki_kernel_use_online_softmax = kwargs.pop("attn_block_tkg_nki_kernel_use_online_softmax", True)
         self.attn_block_tkg_nki_kernel_disable_gpsimd_sb2sb = kwargs.pop("attn_block_tkg_nki_kernel_disable_gpsimd_sb2sb", False)
+
+        # Deprecated: attn_block_cte_nki_kernel_enabled
+        # When set, auto-enable QKV CTE, attention CTE, and O_proj CTE kernels
+        self.attn_block_cte_nki_kernel_enabled = kwargs.pop("attn_block_cte_nki_kernel_enabled", False)
+        if self.attn_block_cte_nki_kernel_enabled:
+            warnings.warn(
+                "attn_block_cte_nki_kernel_enabled is deprecated. "
+                "Enabling qkv_kernel_enabled, qkv_nki_kernel_enabled, attn_kernel_enabled, and out_proj_kernel_enabled instead. "
+                "In a future release, this attribute will be removed.",
+                DeprecationWarning,
+            )
+            # Error if user explicitly disabled any of the CTE kernels
+            if self.qkv_kernel_enabled is False:
+                raise ValueError(
+                    "Cannot set qkv_kernel_enabled=False when attn_block_cte_nki_kernel_enabled=True."
+                )
+            if self.qkv_nki_kernel_enabled is False:
+                raise ValueError(
+                    "Cannot set qkv_nki_kernel_enabled=False when attn_block_cte_nki_kernel_enabled=True."
+                )
+            if self.attn_kernel_enabled is False:
+                raise ValueError(
+                    "Cannot set attn_kernel_enabled=False when attn_block_cte_nki_kernel_enabled=True."
+                )
+            if self.out_proj_kernel_enabled is False:
+                raise ValueError(
+                    "Cannot set out_proj_kernel_enabled=False when attn_block_cte_nki_kernel_enabled=True."
+                )
+            # Auto-enable all CTE kernels
+            self.qkv_kernel_enabled = True
+            self.qkv_nki_kernel_enabled = True
+            self.attn_kernel_enabled = True
+            self.out_proj_kernel_enabled = True
         self.kv_cache_update_with_kernel = False  # TODO: Set this to be true, dependent on compiler fix tracked through ticket V1970034499
         if self.attention_dp_degree > 1:
             self.kv_cache_batch_size = self.tkg_batch_size // self.attention_dp_degree
@@ -497,7 +532,7 @@ class NeuronConfig:
             (self.is_chunked_prefill, 'contexted prefill'),
             (self.is_block_kv_layout, 'block KV cache'),
         ]
-        if sum(attn_tkg_kernel_enablement) > 0:
+        if self.attn_block_tkg_nki_kernel_enabled:
             for flag, feature in attn_tkg_incompatible_features:
                 assert not flag, f'Attention TKG kernels do not yet support {feature} feature.'
         if self.k_cache_transposed:
@@ -684,6 +719,12 @@ class NeuronConfig:
 
         if self.ep_dispatch_cc_option == "RS_AG" and self.tp_degree > self.tkg_batch_size:
             raise ValueError("EP Dispatch option RS_AG not supported when TP degree > batch size")
+
+    def _setup_kernel_target_platform(self):
+        # setup TARGET_PLATFORM envvar, which is required by
+        # NKI Beta 2 kernels
+        if not os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+            os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
 
     def _get_lnc(self, kwargs):
         env_lnc = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", -1))
@@ -1030,7 +1071,7 @@ class OnDeviceSamplingConfig:
         self.deterministic = kwargs.pop("deterministic", False)
         self.global_topk = kwargs.pop("global_topk", 256)
         self.on_device_sampling_config = kwargs.pop("on_device_sampling_config", True)
-        self.top_k_kernel_enabled = kwargs.pop("top_k_kernel_enabled", False)
+        self.top_k_kernel_enabled = kwargs.pop("top_k_kernel_enabled", hardware(get_platform_target()) != hardware.TRN1)
         self.sampling_dp_degree = kwargs.pop("sampling_dp_degree", 1)
 
 

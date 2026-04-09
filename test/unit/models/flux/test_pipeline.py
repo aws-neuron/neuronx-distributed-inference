@@ -129,9 +129,37 @@ def mock_transformer():
     transformer.config = ConfigNamespace(
         in_channels=64,
         guidance_embeds=True,
+        cfg_parallel_enabled=False,  # Default to False
     )
     transformer.dtype = torch.float32
     transformer.return_value = [torch.randn(1, 256, 64)]
+    
+    # Mock the image_rotary_emb_cache_context context manager
+    transformer.image_rotary_emb_cache_context = MagicMock()
+    transformer.image_rotary_emb_cache_context.return_value.__enter__ = MagicMock(return_value=None)
+    transformer.image_rotary_emb_cache_context.return_value.__exit__ = MagicMock(return_value=None)
+    
+    return transformer
+
+
+@pytest.fixture
+def mock_transformer_with_parallel_cfg():
+    """Create a mock Flux transformer with cfg_parallel_enabled=True"""
+    transformer = MagicMock()
+    transformer.config = ConfigNamespace(
+        in_channels=64,
+        guidance_embeds=True,
+        cfg_parallel_enabled=True,
+    )
+    transformer.dtype = torch.float32
+    # For parallel CFG, return batched output (2x batch size)
+    transformer.return_value = [torch.randn(2, 256, 64)]
+    
+    # Mock the image_rotary_emb_cache_context context manager
+    transformer.image_rotary_emb_cache_context = MagicMock()
+    transformer.image_rotary_emb_cache_context.return_value.__enter__ = MagicMock(return_value=None)
+    transformer.image_rotary_emb_cache_context.return_value.__exit__ = MagicMock(return_value=None)
+    
     return transformer
 
 
@@ -584,6 +612,122 @@ class TestNeuronFluxPipeline:
             assert result is not None
             # Callback should have been called
             assert callback_mock.called
+
+
+class TestNeuronFluxPipelineParallelCFG:
+    """Test suite for NeuronFluxPipeline parallel CFG functionality"""
     
+    @pytest.fixture
+    def flux_pipeline_parallel_cfg(self, mock_scheduler, mock_vae, mock_text_encoder, mock_tokenizer,
+                                   mock_text_encoder_2, mock_tokenizer_2, mock_transformer_with_parallel_cfg):
+        """Create a NeuronFluxPipeline instance with parallel CFG enabled"""
+        from neuronx_distributed_inference.models.diffusers.flux.pipeline import NeuronFluxPipeline
+        
+        pipeline = NeuronFluxPipeline(
+            scheduler=mock_scheduler,
+            vae=mock_vae,
+            text_encoder=mock_text_encoder,
+            tokenizer=mock_tokenizer,
+            text_encoder_2=mock_text_encoder_2,
+            tokenizer_2=mock_tokenizer_2,
+            transformer=mock_transformer_with_parallel_cfg,
+        )
+        return pipeline
+    
+    def test_parallel_cfg_with_negative_prompt(self, flux_pipeline_parallel_cfg):
+        """Test parallel CFG path is used when enabled and negative prompt provided"""
+        with patch.object(flux_pipeline_parallel_cfg, 'progress_bar') as mock_progress:
+            mock_progress.return_value.__enter__ = Mock(return_value=Mock())
+            mock_progress.return_value.__exit__ = Mock(return_value=None)
+            
+            flux_pipeline_parallel_cfg.maybe_free_model_hooks = MagicMock()
+            
+            # This should trigger the parallel CFG path
+            result = flux_pipeline_parallel_cfg(
+                prompt="a beautiful landscape",
+                negative_prompt="ugly, distorted",
+                true_cfg_scale=2.0,
+                height=1024,
+                width=1024,
+                num_inference_steps=2,
+                output_type="latent",
+            )
+            
+            assert result is not None
+            # Verify transformer was called (batched inference)
+            assert flux_pipeline_parallel_cfg.transformer.called
+    
+    def test_parallel_cfg_not_used_without_negative_prompt(self, flux_pipeline_parallel_cfg):
+        """Test that parallel CFG is not used when negative_prompt is None"""
+        with patch.object(flux_pipeline_parallel_cfg, 'progress_bar') as mock_progress:
+            mock_progress.return_value.__enter__ = Mock(return_value=Mock())
+            mock_progress.return_value.__exit__ = Mock(return_value=None)
+            
+            flux_pipeline_parallel_cfg.maybe_free_model_hooks = MagicMock()
+            
+            # Without negative_prompt, should fall back to standard path
+            result = flux_pipeline_parallel_cfg(
+                prompt="a beautiful landscape",
+                negative_prompt=None,  # No negative prompt
+                true_cfg_scale=2.0,
+                height=1024,
+                width=1024,
+                num_inference_steps=2,
+                output_type="latent",
+            )
+            
+            assert result is not None
+    
+    def test_parallel_cfg_not_used_with_low_true_cfg_scale(self, flux_pipeline_parallel_cfg):
+        """Test that parallel CFG is not used when true_cfg_scale <= 1"""
+        with patch.object(flux_pipeline_parallel_cfg, 'progress_bar') as mock_progress:
+            mock_progress.return_value.__enter__ = Mock(return_value=Mock())
+            mock_progress.return_value.__exit__ = Mock(return_value=None)
+            
+            flux_pipeline_parallel_cfg.maybe_free_model_hooks = MagicMock()
+            
+            # With true_cfg_scale=1.0, should fall back to standard path
+            result = flux_pipeline_parallel_cfg(
+                prompt="a beautiful landscape",
+                negative_prompt="ugly",
+                true_cfg_scale=1.0,  # Not greater than 1
+                height=1024,
+                width=1024,
+                num_inference_steps=2,
+                output_type="latent",
+            )
+            
+            assert result is not None
+    
+    def test_parallel_cfg_batches_prompts(self, flux_pipeline_parallel_cfg):
+        """Test that parallel CFG batches positive and negative prompts together"""
+        with patch.object(flux_pipeline_parallel_cfg, 'progress_bar') as mock_progress:
+            mock_progress.return_value.__enter__ = Mock(return_value=Mock())
+            mock_progress.return_value.__exit__ = Mock(return_value=None)
+            
+            flux_pipeline_parallel_cfg.maybe_free_model_hooks = MagicMock()
+            
+            # Trigger parallel CFG
+            flux_pipeline_parallel_cfg(
+                prompt="a beautiful landscape",
+                negative_prompt="ugly, distorted",
+                true_cfg_scale=2.0,
+                height=1024,
+                width=1024,
+                num_inference_steps=2,
+                output_type="latent",
+            )
+            
+            # Verify transformer was called and check the batch dimension
+            assert flux_pipeline_parallel_cfg.transformer.called
+            # The transformer should have been called with batched inputs (2x batch size)
+            call_args = flux_pipeline_parallel_cfg.transformer.call_args
+            if call_args is not None:
+                # Check that hidden_states has batch size 2 (negative + positive)
+                hidden_states = call_args.kwargs.get('hidden_states')
+                if hidden_states is not None:
+                    assert hidden_states.shape[0] == 2  # Batched: [neg, pos]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

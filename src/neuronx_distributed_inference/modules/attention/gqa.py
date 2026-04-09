@@ -1,7 +1,6 @@
 import enum
 import logging
 from typing import Optional, Tuple
-import os
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state
@@ -13,47 +12,21 @@ from neuronx_distributed.parallel_layers.mappings import (
 )
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
 from neuronx_distributed.quantization.quantization_layers import BaseQuantizeParallelLinear
-from neuronxcc.nki.compiler.backends.neuron.dimensions import CCPipeline  # noqa: N813
-from neuronxcc.nki.language import nc
 from torch import nn
 from torch.distributed import ProcessGroup
 from torch.nn import functional as F
-from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
-from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.modules.attention.utils import transpose_parallel_linear_layer
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
-from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_kernel, rmsnorm_qkv_isa_fused_add_kernel
+
+import nki
+from nkilib.core.output_projection.output_projection_cte import output_projection_cte
+from nkilib.core.qkv.qkv import qkv
+from nkilib.core.utils.common_types import NormType, QKVOutputLayout
 
 logger = logging.getLogger("Neuron")
-
-try:
-    from neuronxcc.nki._pre_prod_kernels.qkv import nki_qkv_projection_isa_kernel
-    from neuronxcc.nki._pre_prod_kernels import NormType, QKVOutputLayout
-
-    _traced_qkv_kernel_nki = nki_qkv_projection_isa_kernel
-    is_nki_qkv_kernel_available = True
-
-except ImportError:
-    logger.warning(
-        "Use a more recent neuron compiler version to enable NKI qkv kernel."
-    )
-    is_nki_qkv_kernel_available = False
-
-_traced_qkv_kernel_bir = nki_jit()(rmsnorm_qkv_isa_kernel)
-_traced_qkv_kernel_fused_add_bir = nki_jit()(rmsnorm_qkv_isa_fused_add_kernel)
-
-try:
-    if os.environ.get("NKI_FRONTEND_FRAMEWORK") == "beta2":
-        from neuronxcc.nki._pre_prod_nkl.output_projection.output_projection_cte import output_projection_cte
-    else:
-        from neuronxcc.nki._pre_prod_kernels.output_proj import output_proj_kernel
-        _traced_o_proj_kernel = nki_jit()(output_proj_kernel)
-except ImportError:
-    logger.warning(
-        "Use a more recent neuron compiler version to enable output projection kernel"
-    )
-    _traced_o_proj_kernel = None
+# To satisfy test_gqa
+qkv_kernel = nki.jit(qkv)
 
 
 class GQA(enum.Enum):
@@ -425,8 +398,6 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         self.rms_norm_eps = rms_norm_eps
         self.qkv_kernel_enabled = qkv_kernel_enabled
         self.qkv_nki_kernel_enabled = qkv_nki_kernel_enabled
-        if self.qkv_nki_kernel_enabled:
-            assert is_nki_qkv_kernel_available is True, "Use a more recent neuron compiler version to enable NKI qkv kernel."
         self.fused_rmsnorm = not self.sequence_parallel_enabled
         self.fused_rmsnorm_skip_gamma = fused_rmsnorm_skip_gamma and self.fused_rmsnorm
         self.tiling_factor = tiling_factor
@@ -593,255 +564,69 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         return Q, K, V
 
     def _kernel_qkv_forward(self, hidden_states, rmsnorm, residual, cos_cache, sin_cache):
-        logger.debug(
-            f"QKV kernel: fused_rmsnorm={self.fused_rmsnorm}, skip_gamma={self.fused_rmsnorm_skip_gamma} logical_nc_config={self.logical_nc_config}"
-        )
-        bs, seqlen, h = hidden_states.shape
+        # get shape
+        bs, seqlen, hidden_dim = hidden_states.shape
+        _, fused_qkv_size = self.Wqkv.weight.shape
 
-        padded_seqlen = seqlen
-        # The QKV kernel we are calling here is a unified kernel,
-        # underneath there are two separate kernel implementations: TKG & CTE
-        # We only want to pad the sequence length for the CTE, which has batch * original seqlen > 64
-        if bs * seqlen > 64 and seqlen % 2 != 0:
-            logger.debug("For the CTE QKV kernel pad the sequence length to the next even number")
-            hidden_states = F.pad(
-                hidden_states,
-                pad=(
-                    0,
-                    0,  # hidden_dim: no padding
-                    0,
-                    1,  # seq_dim: pad 1 at end
-                    0,
-                    0,
-                ),  # batch_dim: no padding
-                value=1.0,  # pad non-zeros to avoid possible numerical issues
-            )
-            padded_seqlen = seqlen + 1
-
-        h2, fused_qkv_size = self.Wqkv.weight.shape
-        logger.debug(
-            f"fused QKV projection weight - shape: {self.Wqkv.weight.shape}, dtype: {self.Wqkv.weight.dtype}"
-        )
-
-        # shape checks
-        n = (self.num_attention_heads + 2 * self.num_key_value_heads) // self.tp_degree
-        assert fused_qkv_size == n * self.head_dim
-        assert h == h2
+        qkv_output_layout = QKVOutputLayout.BSD
+        if self.qkv_kernel_nbsd_layout:
+            qkv_output_layout = QKVOutputLayout.NBSd
 
         fused_rmsnorm = self.fused_rmsnorm and rmsnorm is not None
-
-        norm_weights = None
+        qkv_norm_type = NormType.NO_NORM
         if fused_rmsnorm:
-            # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
-            norm_weights = rmsnorm.weight.unsqueeze(0)
-            assert norm_weights.shape == (1, h)
+            qkv_norm_type = NormType.RMS_NORM
+            if self.fused_rmsnorm_skip_gamma:
+                qkv_norm_type = NormType.RMS_NORM_SKIP_GAMMA
 
-        if seqlen <= self.seq_len_threshold_for_cc_tiling:  # Keep regular grid for TKG. Messes up the impl
-            grid = (nc(self.logical_nc_config),)
-        else:  # Add CC pipelining dim for CTE kernel grid
-            grid = (CCPipeline(self.tiling_factor) * nc(self.logical_nc_config),)
+        fuse_rope = cos_cache is not None and sin_cache is not None
 
-        if self.qkv_nki_kernel_enabled:
-            qkv_output_layout = QKVOutputLayout.BSD
-            if self.qkv_kernel_nbsd_layout:
-                qkv_output_layout = QKVOutputLayout.NBSd
-                assert residual is None, "fused_add_qkv only support for nbsd layout"
+        fused_residual_add = False
+        mlp_prev = None
+        attention_prev = None
+        if residual is not None:
+            # attn_out is set to zeros becauses we getting the residual from fused-add-MLP directly
+            # For fused_add to be applied, both mlp_prev and attn_prev cannot be None (kernel requirement).
+            fused_residual_add = True
+            attention_prev = torch.zeros(
+                residual.shape,
+                dtype=residual.dtype,
+                device=residual.device,
+            )
+            mlp_prev = residual
 
-            qkv_norm_type = NormType.NO_NORM
-            if fused_rmsnorm:
-                qkv_norm_type = NormType.RMS_NORM
-                if self.fused_rmsnorm_skip_gamma:
-                    qkv_norm_type = NormType.RMS_NORM_SKIP_GAMMA
+        QKV = qkv_kernel[self.logical_nc_config](
+            input=hidden_states,
+            fused_qkv_weights=self.Wqkv.weight.data,
+            output_layout=qkv_output_layout,
+            bias=self.Wqkv.bias.data.unsqueeze(0) if self.bias else None,
+            fused_residual_add=fused_residual_add,
+            mlp_prev=mlp_prev,
+            attention_prev=attention_prev,
+            fused_norm_type=qkv_norm_type,
+            gamma_norm_weights=rmsnorm.weight.data.unsqueeze(0) if fused_rmsnorm else None,
+            norm_eps=self.rms_norm_eps,
+            fused_rope=fuse_rope,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            d_head=self.head_dim,
+            num_q_heads=self.num_attention_heads // self.tp_degree,
+            num_kv_heads=self.num_key_value_heads // self.tp_degree,
+        )
+        if fused_residual_add:
+            residual = hidden_states
 
-            fuse_rope = cos_cache is not None and sin_cache is not None
-
-            if residual is not None:
-                # attn_out is set to zeros becauses we getting the residual from fused-add-MLP directly
-                # For fused_add to be applied, both mlp_prev and attn_prev cannot be None (kernel requirement).
-                zeros = torch.zeros(
-                    residual.shape,
-                    dtype=residual.dtype,
-                    device=residual.device,
-                )
-
-                # the residual result before QKV is stored back to hidden_states (input0) such that it
-                # can be used by fused-add-MLP later
-
-                kernel_kwargs = {}
-                if fuse_rope:
-                    kernel_kwargs.update({
-                        "cos_cache": cos_cache,
-                        "sin_cache": sin_cache,
-                        "num_q_heads": self.num_attention_heads // self.tp_degree,
-                        "num_kv_heads": self.num_key_value_heads // self.tp_degree,
-                    })
-
-                QKV = _traced_qkv_kernel_nki[grid](
-                    hidden=hidden_states,
-                    qkv_weights=self.Wqkv.weight,
-                    norm_weights=norm_weights,
-                    mlp_prev=residual,
-                    attn_prev=zeros,
-                    output_layout=qkv_output_layout,
-                    eps=self.rms_norm_eps,
-                    norm_type=qkv_norm_type,
-                    # required shape: [1, hidden(sharded)]
-                    bias=self.Wqkv.bias.unsqueeze(0) if self.bias else None,
-                    **kernel_kwargs,
-                )
-                residual = hidden_states  # store residual for MLP
-
-            else:
-                kernel_kwargs = {}
-                if fuse_rope:
-                    kernel_kwargs.update({
-                        "cos_cache": cos_cache,
-                        "sin_cache": sin_cache,
-                        "num_q_heads": self.num_attention_heads // self.tp_degree,
-                        "num_kv_heads": self.num_key_value_heads // self.tp_degree,
-                    })
-
-                QKV = _traced_qkv_kernel_nki[grid](
-                    hidden=hidden_states,
-                    qkv_weights=self.Wqkv.weight,
-                    norm_weights=norm_weights,
-                    output_layout=qkv_output_layout,
-                    eps=self.rms_norm_eps,
-                    norm_type=qkv_norm_type,
-                    # required shape: [1, hidden(sharded)]
-                    bias=self.Wqkv.bias.unsqueeze(0) if self.bias else None,
-                    use_dma_transpose=True,
-                    **kernel_kwargs,
-                )
-
-            if self.qkv_kernel_nbsd_layout:
-                # switch from:
-                #   output layout: [n, b, s, d]
-                #             dim:  0  1  2  3
-                # back to original layout:
-                #   output layout: [b, s, n*d]
-                QKV = (
-                    QKV.permute(1, 2, 0, 3)  # after permute: batch, padded_seqlen, num_heads, d_head
-                    .reshape(bs, padded_seqlen, fused_qkv_size)
-                    .to(hidden_states.dtype)
-                )
-
-        # Original code with old APIs. To be removed once the above NKI API is proven to be stable.
-        else:
-            if self.qkv_kernel_nbsd_layout:
-                QKV = torch.zeros(
-                    n,
-                    bs,
-                    padded_seqlen,
-                    self.head_dim,
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
-
-                if seqlen <= self.seq_len_threshold_for_cc_tiling:  # Keep regular grid for TKG. Messes up the impl
-                    grid = (nc(self.logical_nc_config),)
-                else:  # Add CC pipelining dim for CTE kernel grid
-                    grid = (CCPipeline(self.tiling_factor) * nc(self.logical_nc_config),)
-
-                if residual is not None:
-                    # attn_out is set to zeros becauses we getting the residual from fused-add-MLP directly
-                    # TODO: remove this useless field from qkv kenrel
-                    zeros = torch.zeros(
-                        residual.shape,
-                        dtype=residual.dtype,
-                        device=residual.device,
-                    )
-                    # the residual result before QKV is stored back to hidden_states (input0) such that it
-                    # can be used by fused-add-MLP later
-                    _traced_qkv_kernel_fused_add_bir[grid](
-                        hidden_states,
-                        residual,
-                        zeros,
-                        self.Wqkv.weight,
-                        (
-                            norm_weights
-                            if norm_weights is not None
-                            # cannot pass None to this kernel API
-                            else torch.ones((1, h), device=hidden_states.device)
-                        ),
-                        QKV,
-                        eps=self.rms_norm_eps,
-                        kernel_name="QKV",
-                        # Run RMSNorm inside the kernel if NOT using SP norm
-                        fused_rmsnorm=fused_rmsnorm,
-                        # required shape: [1, hidden(sharded)]
-                        bias=self.Wqkv.bias.unsqueeze(0) if self.bias else None,
-                        skip_gamma=self.fused_rmsnorm_skip_gamma,
-                    )
-                    residual = hidden_states  # store residual for MLP
-                else:
-                    _traced_qkv_kernel_bir[grid](
-                        hidden_states,
-                        self.Wqkv.weight,
-                        (
-                            norm_weights
-                            if norm_weights is not None
-                            # cannot pass None to this kernel API
-                            else torch.ones((1, h), device=hidden_states.device)
-                        ),
-                        QKV,
-                        kernel_name="QKV",
-                        eps=self.rms_norm_eps,
-                        # Run RMSNorm inside the kernel if NOT using SP norm
-                        fused_rmsnorm=fused_rmsnorm,
-                        # required shape: [1, hidden(sharded)]
-                        bias=self.Wqkv.bias.unsqueeze(0) if self.bias else None,
-                        skip_gamma=self.fused_rmsnorm_skip_gamma,
-                        use_dma_transpose=True,
-                    )
-
-                assert QKV.shape == (n, bs, padded_seqlen, self.head_dim)
-
-                # switch from:
-                #   output layout: [n, b, s, d]
-                #             dim:  0  1  2  3
-                # back to original layout:
-                #   output layout: [b, s, n*d]
-                QKV = (
-                    QKV.permute(1, 2, 0, 3)  # after permute: batch, padded_seqlen, num_heads, d_head
-                    .reshape(bs, padded_seqlen, fused_qkv_size)
-                    .to(hidden_states.dtype)
-                )
-
-            else:
-                assert residual is None, "fused_add_qkv only support for nbsd layout"
-                QKV = torch.zeros(
-                    bs,
-                    padded_seqlen,
-                    fused_qkv_size,
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
-
-                # the QKV kernel will automatically switch to the TKG QKV if seqlen==1
-                _traced_qkv_kernel_bir[grid](
-                    hidden_states,
-                    self.Wqkv.weight,
-                    (
-                        norm_weights
-                        if norm_weights is not None
-                        # cannot pass None to this kernel API
-                        else torch.ones((1, h), device=hidden_states.device)
-                    ),
-                    QKV,
-                    kernel_name="QKV",
-                    eps=self.rms_norm_eps,
-                    # Run RMSNorm inside the kernel if NOT using SP norm
-                    fused_rmsnorm=fused_rmsnorm,
-                    # required shape: [1, hidden(sharded)]
-                    bias=self.Wqkv.bias.unsqueeze(0) if self.bias else None,
-                    skip_gamma=self.fused_rmsnorm_skip_gamma,
-                )
-
-        # unpad the last token if it's needed
-        if padded_seqlen != seqlen:
-            QKV = QKV[:, :-1, :]
-        assert QKV.shape == (bs, seqlen, fused_qkv_size)
+        if self.qkv_kernel_nbsd_layout:
+            # switch from:
+            #   output layout: [n, b, s, d]
+            #             dim:  0  1  2  3
+            # back to original layout:
+            #   output layout: [b, s, n*d]
+            QKV = (
+                QKV.permute(1, 2, 0, 3)  # after permute: batch, seqlen, num_heads, d_head
+                .reshape(bs, seqlen, fused_qkv_size)
+                .to(hidden_states.dtype)
+            )
 
         return (*self._split_fused_qkv(QKV), residual)
 
@@ -1256,25 +1041,11 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
 
         out = torch.zeros(B, S, H, dtype=attention_output.dtype, device=attention_output.device)
 
-        # TODO: deperecate this and pass bias as None once the bias argument is available generally.
-        o_proj_kernel_kwargs = {}
-        if self.bias:
-            o_proj_kernel_kwargs["bias"] = self.o_proj.bias.unsqueeze(0) / self.tp_degree
-
-        if os.environ.get("NKI_FRONTEND_FRAMEWORK") == "beta2":
-            os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
-            out = output_projection_cte[self.logical_nc_config](
-                attention=kernel_attn_in,
-                weight=self.o_proj.weight.data,
-                **o_proj_kernel_kwargs,
-            )
-        else:
-            _traced_o_proj_kernel[(nc(self.logical_nc_config),)](
-                active=kernel_attn_in,
-                weight=self.o_proj.weight,
-                out=out,
-                **o_proj_kernel_kwargs,
-            )
+        out = output_projection_cte[self.logical_nc_config](
+            attention=kernel_attn_in,
+            weight=self.o_proj.weight.data,
+            bias=self.o_proj.bias.data.unsqueeze(0) / self.tp_degree if self.bias else None,
+        )
 
         # All-reduce or reduce-scatter, depending on whether SP is enabled
         original_dtype = out.dtype

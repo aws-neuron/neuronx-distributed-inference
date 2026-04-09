@@ -5,9 +5,12 @@ import torch
 from PIL import Image
 from diffusers.utils import load_image
 from neuronx_distributed_inference.models.diffusers.flux.application import (
-    NeuronFluxFillApplication,
+    NeuronFluxApplication,
     create_flux_config,
     get_flux_parallelism_config,
+)
+from neuronx_distributed_inference.models.diffusers.flux.pipeline import (
+    NeuronFluxFillPipeline,
 )
 from neuronx_distributed_inference.utils.random import set_random_seed
 
@@ -31,8 +34,18 @@ def run_flux_inpaint(args):
     image = load_and_resize_image(args.image, args.height, args.width)
     mask_image = load_and_resize_image(args.mask, args.height, args.width)
 
-    world_size, backbone_tp_degree = get_flux_parallelism_config(
-        args.instance_type, args.context_parallel_enabled
+    # Determine backbone_tp_degree: use user-specified value or default based on hardware
+    if args.backbone_tp_degree is not None:
+        backbone_tp_degree = args.backbone_tp_degree
+    else:
+        # Default based on instance type
+        if args.instance_type == "trn1":
+            backbone_tp_degree = 8
+        else:
+            backbone_tp_degree = 4
+
+    world_size = get_flux_parallelism_config(
+        backbone_tp_degree, args.context_parallel_enabled
     )
 
     dtype = torch.bfloat16
@@ -47,7 +60,7 @@ def run_flux_inpaint(args):
         inpaint=True,
     )
 
-    flux_app = NeuronFluxFillApplication(
+    flux_app = NeuronFluxApplication(
         model_path=args.checkpoint_dir,
         text_encoder_config=clip_config,
         text_encoder2_config=t5_config,
@@ -55,6 +68,7 @@ def run_flux_inpaint(args):
         decoder_config=decoder_config,
         height=args.height,
         width=args.width,
+        pipeline_class=NeuronFluxFillPipeline,
     )
     flux_app.compile(args.compile_workdir)
     flux_app.load(args.compile_workdir)
@@ -164,6 +178,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_images", type=int, default=1)
     parser.add_argument("--save_image", action="store_true")
     parser.add_argument("--context_parallel_enabled", action="store_true")
+    parser.add_argument("--backbone_tp_degree", type=int, default=None,
+                        help="Tensor parallelism degree for the backbone model. If not specified, defaults to 8 for trn1 and 4 for others.")
 
     args = parser.parse_args()
     run_flux_inpaint(args)

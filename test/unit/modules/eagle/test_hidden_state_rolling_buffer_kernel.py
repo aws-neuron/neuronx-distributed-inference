@@ -1,11 +1,19 @@
+import os
 import pytest
 import torch
 import torch_xla
+from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.modules.eagle.hidden_state import HiddenStateRollingBuffer
 
 
+def _setup_kernel_target_platform():
+    if not os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+        os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
+
+
 def check_token_generation_rollback(batch_size: int, padding: int, hidden_size: int):
+    _setup_kernel_target_platform()
 
     assert batch_size <= 8 # Hardcoded num_accepted tokens used in the test
 

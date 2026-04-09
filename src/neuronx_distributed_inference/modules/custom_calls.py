@@ -1,15 +1,8 @@
-import math
 import torch
 from torch import nn, ones
-from torch_neuronx.xla_impl.ops import RmsNorm, nki_jit
+from torch_neuronx.xla_impl.ops import RmsNorm
 
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
-
-try:
-    from neuronxcc.nki._private_kernels.cumsum import cumsum as nki_cumsum
-except ImportError:
-    from neuronxcc.nki.kernels.cumsum import cumsum as nki_cumsum
+from nkilib.core.cumsum.cumsum import cumsum as nki_cumsum
 
 
 class CustomRMSNorm(nn.Module):
@@ -41,10 +34,6 @@ class CustomRMSNorm(nn.Module):
         return result.to(original_dtype)
 
 
-# Cumsum
-custom_cumsum = nki_jit()(nki_cumsum)
-
-
 def neuron_cumsum(input):
     """
     NKI implementation of cumsum
@@ -53,35 +42,4 @@ def neuron_cumsum(input):
     1. only accumulates on the last dim
     2. only works with floating dtype
     """
-    output = torch.zeros_like(input)
-    return custom_cumsum(input, output, axis=1)
-
-
-@nki.jit
-def rmsnorm_kernel(x, w, axis, n, eps):
-    bs, seq_len, D = x.shape
-    assert D == w.shape[0]
-
-    out_tensor = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
-
-    ix = nl.arange(128)[:, None]
-    iw = nl.arange(1)[:, None]
-    iy = nl.arange(D)[None, :]
-    w_tile = nl.load(w.reshape((1, D))[iw, iy])
-
-    for b in nl.static_range(bs):
-        for i in nl.affine_range(math.ceil(seq_len / 128)):
-            x_tile = nl.load(x[b][i * 128 + ix, iy], mask=(i * 128 + ix < seq_len))
-            rmsnorm_result = nl.rms_norm(
-                x_tile,
-                w_tile,
-                axis,
-                n,
-                eps,
-                mask=(i * 128 + ix < seq_len),
-            )
-            nl.store(
-                out_tensor[b][i * 128 + ix, iy], value=rmsnorm_result, mask=(i * 128 + ix < seq_len)
-            )
-
-    return out_tensor
+    return nki_cumsum(input, axis=1)

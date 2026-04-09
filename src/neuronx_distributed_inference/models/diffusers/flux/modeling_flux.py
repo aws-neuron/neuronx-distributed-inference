@@ -58,54 +58,66 @@ from neuronx_distributed_inference.models.diffusers.normalization import (
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.utils.distributed import get_dp_rank_spmd
 
-try:
-    from neuronxcc.nki._private_kernels.attention import attention_isa_kernel  # noqa: E402
-except ImportError:
-    from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
+from nkilib.core.attention.attention_cte import attention_cte
 
 from neuronx_distributed.utils.utils import hardware
-from neuronxcc.nki.language import nc
 from torch_neuronx.utils import get_platform_target
-from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.config import InferenceConfig
-from neuronx_distributed_inference.models.diffusers.flux.kernels import matmul_o_proj_kernel
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
     ModuleMarkerStartWrapper,
 )
 from neuronx_distributed_inference.models.model_wrapper import BaseModelInstance, ModelWrapper
-from neuronx_distributed_inference.modules.attention.utils import transpose_parallel_linear_layer
 
 _HARDWARE = hardware(get_platform_target())
 
-
-_flash_fwd_call = nki_jit()(attention_isa_kernel)
+if not os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
 def attention_wrapper_sharded_without_swap(query, key, value):
-    bs, n_head, q_len, d_head = query.shape  # my change
+    """
+    Attention wrapper using NKI attention_cte kernel.
+
+    Input shapes: query, key, value all have shape [bs, n_head, seq_len, d_head]
+    Output shape: [bs, n_head, q_len, d_head]
+
+    Uses tp_q=True, tp_k=True to let the kernel handle transposes internally
+    for better performance (optimized DMA transpose).
+    """
+    bs, n_head, q_len, d_head = query.shape
     k_len = key.shape[2]
     v_len = value.shape[2]
-    q = query.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, q_len))
-    k = key.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, k_len))
-    v = value.clone().reshape((bs * n_head, v_len, d_head))
-    attn_output = torch.zeros((bs * n_head, q_len, d_head), dtype=torch.bfloat16, device=q.device)
+
+    # Only reshape, no permutes - let kernel handle transposes via tp_* flags
+    q = query.reshape((bs * n_head, q_len, d_head))   # [B*H, S, d]
+    k = key.reshape((bs * n_head, k_len, d_head))     # [B*H, S, d]
+    v = value.reshape((bs * n_head, v_len, d_head))   # [B*H, S, d]
 
     vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
     use_sharded_attention_kernel = vc_size == 2
     scale = 1 / math.sqrt(d_head)
 
     if use_sharded_attention_kernel:
-        grid = (nc(2),)
-        _flash_fwd_call[grid](
-            q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap"
+        attn_output = attention_cte[2](
+            q, k, v, scale,
+            causal_mask=False,  # Flux uses bi-directional attention
+            tp_q=True,          # Q is (batch, seqlen, d)
+            tp_k=True,          # K is (batch, seqlen, d) - kernel transposes internally
+            tp_out=False        # Output is (batch, seqlen, d)
         )
     else:
-        _flash_fwd_call(q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
+        attn_output = attention_cte(
+            q, k, v, scale,
+            causal_mask=False,
+            tp_q=True,
+            tp_k=True,
+            tp_out=False
+        )
 
     attn_output = attn_output.reshape((bs, n_head, q_len, d_head))
 
@@ -124,6 +136,8 @@ def attention_wrapper_sharded_without_swap(query, key, value):
 # apply_rotary_emb(...) and norm(...) is not applied to V,
 # and we need to transpose seqlen to dim=0 anyways,
 # for purpose of applying all_gather (all_gather requirement).
+#
+# Uses NKI attention_cte kernel with tp_k=True to let kernel handle K transpose internally.
 def attention_wrapper_context_parallel_single_transformer(query, key, value, process_group):
     bs, n_head, q_len, d_head = query.shape
     # K is assumed to be transposed in CP attention forward function.
@@ -131,9 +145,9 @@ def attention_wrapper_context_parallel_single_transformer(query, key, value, pro
     # V is not transposed in CP attention forward function.
     v_len = value.shape[1]
 
-    query = query.reshape((bs * n_head, q_len, d_head))
-    key = key.reshape((bs * n_head, k_len, d_head))
-    value = value.reshape((v_len, bs * n_head, d_head))
+    query = query.reshape((bs * n_head, q_len, d_head))   # [B*H, S, d]
+    key = key.reshape((bs * n_head, k_len, d_head))       # [B*H, S, d]
+    value = value.reshape((v_len, bs * n_head, d_head))   # [S, B*H, d]
 
     # We are gathering on seqlen, move seqlen to dim=0.
     # K shape: [seqlen, bs * heads, d_head]
@@ -145,7 +159,7 @@ def attention_wrapper_context_parallel_single_transformer(query, key, value, pro
         gather_dim=0,
         process_group=process_group,
     )
-    # Change V shape back to [bs * heads, seqlen, d_head] for SDPA kernel below.
+    # Change V shape to [bs * heads, seqlen, d_head] for kernel.
     value = value.permute(1, 0, 2)
 
     key = gather_from_tensor_model_parallel_region_with_dim(
@@ -153,26 +167,29 @@ def attention_wrapper_context_parallel_single_transformer(query, key, value, pro
         gather_dim=0,
         process_group=process_group,
     )
-    # Change K shape to [bs * heads, d_heads, seqlen] for SDPA kernel below.
-    # Same shape as in the original "attention_wrapper_sharded_without_swap" SDPA wrapper.
-    key = key.permute(1, 2, 0)
+    # Change K shape to [bs * heads, seqlen, d_head] for kernel with tp_k=True.
+    key = key.permute(1, 0, 2)
 
     scale = 1 / math.sqrt(d_head)
-    attn_output = torch.zeros(
-        (bs * n_head, q_len, d_head), dtype=torch.bfloat16, device=query.device
-    )
 
     vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
     use_sharded_attention_kernel = vc_size == 2
 
     if use_sharded_attention_kernel:
-        grid = (nc(2),)
-        _flash_fwd_call[grid](
-            query, key, value, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap"
+        attn_output = attention_cte[2](
+            query, key, value, scale,
+            causal_mask=False,  # Flux uses bi-directional attention
+            tp_q=True,          # Q is (batch, seqlen, d)
+            tp_k=True,          # K is (batch, seqlen, d) - kernel transposes internally
+            tp_out=False        # Output is (batch, seqlen, d)
         )
     else:
-        _flash_fwd_call(
-            query, key, value, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap"
+        attn_output = attention_cte(
+            query, key, value, scale,
+            causal_mask=False,
+            tp_q=True,
+            tp_k=True,
+            tp_out=False
         )
 
     attn_output = attn_output.reshape((bs, n_head, q_len, d_head))
@@ -206,10 +223,9 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
 
         self.data_parallel_group = get_data_parallel_group()
         self.global_rank = SPMDRank(world_size=get_world_group().size())
-        self.context_parallel_enabled = (self.config.neuron_config.world_size != self.config.neuron_config.tp_degree)
-        self.enable_out_proj_kernel = (
-            _HARDWARE == hardware.TRN2 and self.config.neuron_config.world_size != self.config.neuron_config.tp_degree
-        )  # only supports 1024x1024 inputs for now
+
+        self.context_parallel_enabled = getattr(self.config, 'context_parallel_enabled', False)
+        self.cfg_parallel_enabled = getattr(self.config, 'cfg_parallel_enabled', False)
 
         if (out_channels := getattr(self.config, "out_channels", None)) is not None:
             self.out_channels = out_channels
@@ -248,7 +264,6 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
                     attention_head_dim=self.config.attention_head_dim,
                     reduce_dtype=self.config.neuron_config.torch_dtype,
                     context_parallel_enabled=self.context_parallel_enabled,
-                    enable_out_proj_kernel=self.enable_out_proj_kernel,
                 )
                 for i in range(self.config.num_layers)
             ]
@@ -331,11 +346,80 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
                 "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
             )
 
+        # Convert timestep to correct dtype BEFORE scattering
+        timestep = timestep.to(self.config.neuron_config.torch_dtype)
+        if guidance is not None and guidance.numel() > 0:
+            guidance = guidance.to(self.config.neuron_config.torch_dtype)
+
+        # CFG Parallel validation: Assert expected batch size at input
+        if self.cfg_parallel_enabled:
+            assert hidden_states.shape[0] == 2, \
+                f"CFG parallel expects batch_size=2, got hidden_states.shape[0]={hidden_states.shape[0]}"
+            assert encoder_hidden_states.shape[0] == 2, \
+                f"CFG parallel expects batch_size=2, got encoder_hidden_states.shape[0]={encoder_hidden_states.shape[0]}"
+            assert pooled_projections.shape[0] == 2, \
+                f"CFG parallel expects batch_size=2, got pooled_projections.shape[0]={pooled_projections.shape[0]}"
+            assert timestep.shape[0] == 2, \
+                f"CFG parallel expects batch_size=2, got timestep.shape[0]={timestep.shape[0]}"
+
+        dp_rank = get_dp_rank_spmd(
+            global_rank=self.global_rank.get_rank(),
+            tp_degree=get_tensor_model_parallel_size(),
+        )
+
+        # CFG Parallel: scatter inputs along batch dimension
+        if self.cfg_parallel_enabled and hidden_states.shape[0] == 2:
+            # Scatter inputs (each rank gets either negative OR positive)
+            hidden_states = scatter_to_process_group_spmd(
+                hidden_states,
+                partition_dim=0,
+                rank=dp_rank,
+                process_group=self.data_parallel_group,
+            )
+            encoder_hidden_states = scatter_to_process_group_spmd(
+                encoder_hidden_states,
+                partition_dim=0,
+                rank=dp_rank,
+                process_group=self.data_parallel_group,
+            )
+            pooled_projections = scatter_to_process_group_spmd(
+                pooled_projections,
+                partition_dim=0,
+                rank=dp_rank,
+                process_group=self.data_parallel_group,
+            )
+            timestep = scatter_to_process_group_spmd(
+                timestep,
+                partition_dim=0,
+                rank=dp_rank,
+                process_group=self.data_parallel_group,
+            )
+            if guidance is not None and guidance.numel() > 0:
+                guidance = scatter_to_process_group_spmd(
+                    guidance,
+                    partition_dim=0,
+                    rank=dp_rank,
+                    process_group=self.data_parallel_group,
+                )
+
+            # Assert scatter worked correctly for all inputs
+            assert hidden_states.shape[0] == 1, \
+                f"After CFG scatter, batch_size should be 1, got hidden_states.shape[0]={hidden_states.shape[0]}"
+            assert encoder_hidden_states.shape[0] == 1, \
+                f"After CFG scatter, batch_size should be 1, got encoder_hidden_states.shape[0]={encoder_hidden_states.shape[0]}"
+            assert pooled_projections.shape[0] == 1, \
+                f"After CFG scatter, batch_size should be 1, got pooled_projections.shape[0]={pooled_projections.shape[0]}"
+            assert timestep.shape[0] == 1, \
+                f"After CFG scatter, batch_size should be 1, got timestep.shape[0]={timestep.shape[0]}"
+            if guidance is not None and guidance.numel() > 0:
+                assert guidance.shape[0] == 1, \
+                    f"After CFG scatter, batch_size should be 1, got guidance.shape[0]={guidance.shape[0]}"
+
         hidden_states = self.x_embedder(hidden_states)
 
-        timestep = timestep.to(hidden_states.dtype) * 1000
+        timestep = timestep * 1000
         if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype) * 1000
+            guidance = guidance * 1000
 
         temb = (
             self.time_text_embed(timestep, pooled_projections)
@@ -344,15 +428,10 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
         )
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        dp_rank = get_dp_rank_spmd(
-            global_rank=self.global_rank.get_rank(),
-            tp_degree=get_tensor_model_parallel_size(),
-        )
-
         rotary_emb_text = None
         rotary_emb_image = None
 
-        # scatter inputs to DP group
+        # scatter inputs to DP group for context parallel
         if self.context_parallel_enabled:
             # TODO: see if rotary split can only be done in one denoising step and reuse
             rotary_emb_text = image_rotary_emb[: encoder_hidden_states.shape[1]]
@@ -439,8 +518,13 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
         output = self.proj_out(hidden_states)
         output = ModuleMarkerEndWrapper()(output)
 
-        if self.context_parallel_enabled:
-            # gather output
+        if self.cfg_parallel_enabled:
+            # CFG Parallel: gather outputs along batch dimension
+            output = gather_from_tensor_model_parallel_region_with_dim(
+                output, gather_dim=0, process_group=self.data_parallel_group
+            )
+        elif self.context_parallel_enabled:
+            # Context Parallel: gather outputs along sequence dimension
             output = gather_from_tensor_model_parallel_region_with_dim(
                 output, gather_dim=1, process_group=self.data_parallel_group
             )
@@ -576,12 +660,10 @@ class NeuronFluxTransformerBlock(nn.Module):
         qk_norm="rms_norm",
         eps=1e-6,
         context_parallel_enabled=False,
-        enable_out_proj_kernel=False,
     ):
         super().__init__()
 
         self.context_parallel_enabled = context_parallel_enabled
-        self.enable_out_proj_kernel = enable_out_proj_kernel
         self.norm1 = NeuronAdaLayerNormZero(dim)
 
         self.norm1_context = NeuronAdaLayerNormZero(dim)
@@ -599,7 +681,6 @@ class NeuronFluxTransformerBlock(nn.Module):
             eps=eps,
             reduce_dtype=reduce_dtype,
             context_parallel_enabled=self.context_parallel_enabled,
-            enable_out_proj_kernel=self.enable_out_proj_kernel,
         )
 
         self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -824,13 +905,11 @@ class NeuronFluxAttention(nn.Module):
         pad_heads: bool = True,
         reduce_dtype: torch.dtype = torch.bfloat16,
         context_parallel_enabled=False,
-        enable_out_proj_kernel=False,
     ):
         super().__init__()
 
         self.data_parallel_group = get_data_parallel_group()
         self.context_parallel_enabled = context_parallel_enabled
-        self.enable_out_proj_kernel = enable_out_proj_kernel
         self.query_dim = query_dim
         self.use_bias = bias
         self.is_cross_attention = cross_attention_dim is not None
@@ -951,8 +1030,6 @@ class NeuronFluxAttention(nn.Module):
                 )
             )
             self.to_out.append(nn.Dropout(dropout))
-            if self.enable_out_proj_kernel:
-                self.to_out[0].weight = transpose_parallel_linear_layer(self.to_out[0].weight)
         else:
             self.to_out = None
 
@@ -1130,10 +1207,24 @@ class NeuronFluxAttention(nn.Module):
                 )
                 key, value = torch.unbind(stacked_kv, dim=0)
             else:
-                # Removed all_gather from here and moved it inside the context parallel attention kernel wrapper.
-                hidden_states = attention_wrapper_context_parallel_single_transformer(
-                    query, key, value, self.data_parallel_group
-                )
+                if _HARDWARE == hardware.TRN1:
+                    # On Trn1, gather K and V and use plain PyTorch attention instead of NKI kernel
+                    key = gather_from_tensor_model_parallel_region_with_dim(
+                        key, gather_dim=2, process_group=self.data_parallel_group
+                    )
+                    # V is [B, S, H, d], gather along seqlen (dim=1), then transpose to [B, H, S, d]
+                    value = gather_from_tensor_model_parallel_region_with_dim(
+                        value, gather_dim=1, process_group=self.data_parallel_group
+                    )
+                    value = value.transpose(1, 2)
+                    hidden_states = F.scaled_dot_product_attention(
+                        query, key, value, dropout_p=0.0, is_causal=False
+                    )
+                else:
+                    # Removed all_gather from here and moved it inside the context parallel attention kernel wrapper.
+                    hidden_states = attention_wrapper_context_parallel_single_transformer(
+                        query, key, value, self.data_parallel_group
+                    )
 
         # apply rotary for non CP case
         if not self.context_parallel_enabled:
@@ -1141,13 +1232,14 @@ class NeuronFluxAttention(nn.Module):
                 query = apply_rotary_emb(query, image_rotary_emb)
                 key = apply_rotary_emb(key, image_rotary_emb)
 
-        if attention_mask is not None:
+        if attention_mask is not None or _HARDWARE == hardware.TRN1:
+            # Use plain PyTorch SDPA when there's an attention mask or on Trn1 hardware
             hidden_states = F.scaled_dot_product_attention(
                 query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
             )
         else:
             # Already ran SDPA in the single_trasformer_block, context parallel attention case above.
-            # Use the original SDPA wrapper for the remaining cases.
+            # Use the NKI flash attention kernel wrapper for the remaining cases (non-Trn1).
             if not self.context_parallel_enabled or encoder_hidden_states is not None:
                 hidden_states = attention_wrapper_sharded_without_swap(query, key, value)
 
@@ -1161,14 +1253,8 @@ class NeuronFluxAttention(nn.Module):
                 hidden_states[:, encoder_hidden_states.shape[1] :],
             )
 
-            if self.enable_out_proj_kernel:     # Executing out projection kernel.
-                grid = (nc(2),)
-                hidden_states = matmul_o_proj_kernel[grid](
-                    hidden_states.reshape(batch_size, -1, self.heads, head_dim).permute(0, 2, 3, 1), self.to_out[0].weight
-                )
-            else:
-                hidden_states = self.to_out[0](hidden_states)
-                hidden_states = self.to_out[1](hidden_states)
+            hidden_states = self.to_out[0](hidden_states)
+            hidden_states = self.to_out[1](hidden_states)
 
             encoder_hidden_states = self.to_add_out(encoder_hidden_states)
 
@@ -1193,8 +1279,17 @@ def split_along_dim(tensor, dim, rank, data_parallel_group):
 
 
 class FluxBackboneInferenceConfig(InferenceConfig):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, cfg_parallel_enabled: bool = False, context_parallel_enabled: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.cfg_parallel_enabled = cfg_parallel_enabled
+        self.context_parallel_enabled = context_parallel_enabled
+
+        # Validate mutual exclusivity
+        if self.cfg_parallel_enabled and self.context_parallel_enabled:
+            raise ValueError(
+                "cfg_parallel_enabled and context_parallel_enabled are mutually exclusive. "
+                "Only one can be True at a time."
+            )
 
     def get_required_attributes(self) -> List[str]:
         return [
@@ -1237,14 +1332,17 @@ class ModelWrapperFluxBackbone(ModelWrapper):
         pooled_projection_dim = self.config.pooled_projection_dim
         attention_head_dim = self.config.attention_head_dim
         num_patches = self.config.height * self.config.width // ((2 * self.config.vae_scale_factor) ** 2)
+
+        batch_size = 2 if self.config.cfg_parallel_enabled else 1
+
         model_inputs = (
             torch.randn(
-                [1, num_patches, in_channels], dtype=self.config.neuron_config.torch_dtype
+                [batch_size, num_patches, in_channels], dtype=self.config.neuron_config.torch_dtype
             ),
-            torch.randn([1, 512, joint_attention_dim], dtype=self.config.neuron_config.torch_dtype),
-            torch.randn([1, pooled_projection_dim], dtype=self.config.neuron_config.torch_dtype),
-            torch.randn([1], dtype=self.config.neuron_config.torch_dtype),
-            torch.randn([1], dtype=self.config.neuron_config.torch_dtype)
+            torch.randn([batch_size, 512, joint_attention_dim], dtype=self.config.neuron_config.torch_dtype),
+            torch.randn([batch_size, pooled_projection_dim], dtype=self.config.neuron_config.torch_dtype),
+            torch.randn([batch_size], dtype=self.config.neuron_config.torch_dtype),
+            torch.randn([batch_size], dtype=self.config.neuron_config.torch_dtype)
             if self.config.guidance_embeds else torch.tensor([], dtype=self.config.neuron_config.torch_dtype),
             torch.randn([num_patches + 512, attention_head_dim, 2], dtype=self.config.neuron_config.torch_dtype),
         )
@@ -1285,8 +1383,18 @@ class ModelWrapperFluxBackbone(ModelWrapper):
             raise RuntimeError(
                 "Forward called before load. Run load() or load_state_dict() making calling forward"
             )
-        guidance = [] if guidance is None else [guidance]
-        guidance = torch.tensor(guidance, dtype=self.config.neuron_config.torch_dtype)
+        # Convert timestep to correct dtype before passing to compiled model
+        if timestep is not None:
+            timestep = timestep.to(self.config.neuron_config.torch_dtype)
+
+        # Handle guidance: convert to tensor and ensure correct dtype
+        if guidance is None:
+            guidance = torch.tensor([], dtype=self.config.neuron_config.torch_dtype)
+        elif not isinstance(guidance, torch.Tensor):
+            guidance = torch.tensor([guidance], dtype=self.config.neuron_config.torch_dtype)
+        else:
+            # If guidance is already a tensor, convert to correct dtype
+            guidance = guidance.to(self.config.neuron_config.torch_dtype)
 
         # Calculate image_rotary_embedding before the denoising loop
         image_rotary_emb = self.image_rotary_emb
@@ -1329,9 +1437,7 @@ class NeuronFluxBackboneApplication(NeuronApplicationBase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.context_parallel_enabled = (
-            self.config.neuron_config.world_size != self.config.neuron_config.tp_degree
-        )
+        self.context_parallel_enabled = getattr(self.config, 'context_parallel_enabled', False)
         self.model_wrapper = self.get_model_wrapper_cls()
 
         self.model = self.model_wrapper(
@@ -1367,10 +1473,8 @@ class NeuronFluxBackboneApplication(NeuronApplicationBase):
         compiler_args = "--model-type=transformer -O1"
         if self.context_parallel_enabled and _HARDWARE == hardware.TRN1:
             compiler_args = "--model-type=transformer -O2"
-        if self.context_parallel_enabled and _HARDWARE == hardware.TRN2:
-            compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap'"
         else:
-            compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=4'"
+            compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap'"
 
         compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
 

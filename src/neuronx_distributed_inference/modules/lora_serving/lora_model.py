@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 
+import copy
 import torch
 import logging
 from neuronx_distributed.parallel_layers import (
@@ -304,16 +305,25 @@ class AdapterCache:
     needed for the configurable eviction policy (can be LRU or LFU).
     """
 
-    def __init__(self, capacity, adapter_ids=None, eviction_policy="lru"):
+    def __init__(self, capacity, device, adapter_ids=[], eviction_policy="lru", enable_base_model_only=False):
         self.size = 0
         self.capacity = capacity
+        self.device = device  # CPU or device
+        self.enable_base_model_only = enable_base_model_only  # add a dummy adapter for base model only serving or not
+
         # map adapter ID to AdapterCacheEntry
         self.map = {}
         self.eviction_policy = eviction_policy
         self.adapter_id_position_mapping = [-1] * self.capacity
 
-        for idx, adapter_id in enumerate(adapter_ids):
+        init_adapter_ids = copy.deepcopy(adapter_ids)
+        if self.enable_base_model_only:
+            # add a dummy adapter to support base model only serving
+            init_adapter_ids.insert(0, 0)
+
+        for idx, adapter_id in enumerate(init_adapter_ids):
             self.add_adapter(adapter_id, idx)
+            self.update_adapter(adapter_id)
 
     def init_weights_on_cpu(self, adapter_ids, cpu_weights, modules):
         num_ranks = len(cpu_weights)
@@ -321,7 +331,11 @@ class AdapterCache:
             self.map[adapter_id].init_weights_on_cpu(num_ranks)
             for rank in range(num_ranks):
                 for module in modules:
-                    weights = cpu_weights[rank][module][adapter_id]
+                    # LoRA weights for streaming adapter
+                    if cpu_weights[rank][module].shape[0] == 1:
+                        weights = cpu_weights[rank][module][i]
+                    else:
+                        weights = cpu_weights[rank][module][i + self.enable_base_model_only]
                     self.map[adapter_id].update_weights(rank, module, weights)
 
     def update_adapter(self, adapter_id):
@@ -353,11 +367,19 @@ class AdapterCache:
     def is_full(self):
         return self.size == self.capacity
 
+    def _evictable_adapters_map(self):
+        if self.enable_base_model_only:
+            return {k: v for k, v in self.map.items() if k != 0}
+        return self.map
+
+    def _evictable_adapters_items(self):
+        return self._evictable_adapters_map().items()
+
     def evict_adapter(self):
         if self.eviction_policy == "lru":
-            adapter_id, data = min(self.map.items(), key=lambda item: item[1].timestamp)
+            adapter_id, data = min(self._evictable_adapters_items(), key=lambda item: item[1].timestamp)
         elif self.eviction_policy == "lfu":
-            adapter_id, data = min(self.map.items(), key=lambda item: item[1].access_count)
+            adapter_id, data = min(self._evictable_adapters_items(), key=lambda item: (item[1].access_count, item[1].timestamp))
         else:
             raise ValueError(f"Invalid eviction policy {self.eviction_policy}.")
         self.remove_adapter(adapter_id)
@@ -390,7 +412,7 @@ class AdapterCache:
         logger.debug(f"Swap time: {end-start} sec")
 
     def get_adapter_ids(self):
-        return list(self.map.keys())
+        return list(self._evictable_adapters_map().keys())
 
     def get_adapter_id_position_mapping(self):
         return self.adapter_id_position_mapping
@@ -412,7 +434,7 @@ class AdapterCache:
         else:
             # Evict an adapter if there is no space
             evicted_adapter_id, swap_position = self.evict_adapter()
-            logger.info(f"Adapter ID {evicted_adapter_id} is evicted from device HBM.")
+            logger.debug(f"Adapter ID {evicted_adapter_id} is evicted from {self.device} because the cache is full.")
         return swap_position
 
 
@@ -423,12 +445,13 @@ class LoraModelManager:
         # store the adapter_ids for requests with continuous batching
         self.req_ids_to_adapter_ids_mapping = dict()
         self.lora_modules = []
-        self.get_adapter_id_mapping()
+        self.model = None
+        self.init_adapter_id_mapping()
 
         cpu_adapter_ids = [self.lora_adapter_id_mapping[ckpt] for ckpt in self.lora_checkpoint.ckpt_paths_cpu.keys()]
         device_adapter_ids = [self.lora_adapter_id_mapping[ckpt] for ckpt in self.lora_checkpoint.ckpt_paths.keys()]
-        self.cpu_adapter_cache = AdapterCache(self.lora_config.max_cpu_loras, cpu_adapter_ids, self.lora_config.eviction_policy)
-        self.device_adapter_cache = AdapterCache(self.lora_config.max_loras, device_adapter_ids, self.lora_config.eviction_policy)
+        self.cpu_adapter_cache = AdapterCache(self.lora_config.max_cpu_loras, "CPU", cpu_adapter_ids, self.lora_config.eviction_policy, self.lora_config.enable_base_model_only)
+        self.device_adapter_cache = AdapterCache(self.lora_config.max_loras, "device", device_adapter_ids, self.lora_config.eviction_policy, self.lora_config.enable_base_model_only)
 
         # counters for LFU eviction
         self.decay_count = 0
@@ -436,14 +459,31 @@ class LoraModelManager:
 
         self.list_adapters()
 
+    def _get_unique_adapter_id(self):
+        current_id = self.global_adapter_id
+        self.global_adapter_id += 1
+        return current_id
+
+    def _add_adapter_mapping(self, adapter_name, adapter_id):
+        self.lora_adapter_id_mapping[adapter_name] = adapter_id
+        self.lora_adapter_name_mapping[adapter_id] = adapter_name
+
+    def add_adapter_mapping(self, adapter_name):
+        if adapter_name not in self.lora_adapter_id_mapping:
+            adapter_id = self._get_unique_adapter_id()
+            self._add_adapter_mapping(adapter_name, adapter_id)
+
     # methods to convert adapter_ids in string to indices
-    def get_adapter_id_mapping(self):
+    def init_adapter_id_mapping(self):
+        # maps adapter name string, e.g. 'lora_id_1', to numerical adapter ID, e.g. 1
         self.lora_adapter_id_mapping = {}
+        self.lora_adapter_name_mapping = {}
+        self.global_adapter_id = 1 if self.lora_config.enable_base_model_only else 0
         all_ckpt_paths = self.lora_checkpoint.ckpt_paths | self.lora_checkpoint.ckpt_paths_cpu
         if all_ckpt_paths is not None:
-            adapter_ids = all_ckpt_paths.keys()
-            for index, adapter_ids in enumerate(adapter_ids):
-                self.lora_adapter_id_mapping[adapter_ids] = index
+            adapter_names = all_ckpt_paths.keys()
+            for adapter_name in adapter_names:
+                self.add_adapter_mapping(adapter_name)
 
     # LoRA adapter id conversion from string to index
     def convert_adapter_ids_to_indices(self, adapter_ids, batch_size):
@@ -514,6 +554,91 @@ class LoraModelManager:
             cpu_weights,
             self.lora_modules,
         )
+
+        self.model = model  # used for streaming adapters
+
+    def rank_swap(self, rank, weight_idx, weights, adapter_cpu_weights):
+        start = time.monotonic()
+
+        for module in self.lora_modules:
+            neuron_tensor = weights[rank][module]
+            cpu_tensor = adapter_cpu_weights[rank][module]
+            neuron_tensor[weight_idx] = cpu_tensor.clone()
+
+        end = time.monotonic()
+        logger.debug(f"Rank {rank} swap time: {end-start} sec")
+
+    # Performed for CPU cache only since all adapter weights are stored in CPU map
+    def swap_adapters(self, weights, adapter_id, weight_idx):
+        logger.debug(f"Swapping the adapter at position {weight_idx} with adapter ID {adapter_id}.")
+
+        start = time.monotonic()
+        adapter_cpu_weights = self.cpu_adapter_cache.map[adapter_id].weights
+
+        for rank in range(len(weights)):
+            self.rank_swap(rank, weight_idx, weights, adapter_cpu_weights)
+
+        end = time.monotonic()
+        logger.debug(f"Swap time: {end-start} sec")
+
+    def insert_device_adapter(self, adapter_id, device_weights):
+        # Check if adapter is already on device
+        if self.device_adapter_cache.access_adapter(adapter_id):  # hit
+            self.device_adapter_cache.update_adapter(adapter_id)
+        else:  # miss
+            device_swap_position = self.device_adapter_cache.get_swap_position()  # evicts adapter from cache
+            logger.info(f"Swap Adapter ID {adapter_id} to position {device_swap_position} on device.")
+
+            # Perform adapter data swap on device
+            self.swap_adapters(
+                device_weights,
+                adapter_id,
+                device_swap_position,
+            )
+            # Update HBM adapter management
+            self.device_adapter_cache.add_adapter(adapter_id, device_swap_position)
+            self.device_adapter_cache.update_adapter(adapter_id)
+
+    def insert_cpu_adapter(self, adapter_id, cpu_weights=None):
+        if self.cpu_adapter_cache.access_adapter(adapter_id):  # hit
+            self.cpu_adapter_cache.update_adapter(adapter_id)
+        else:  # miss
+
+            # A CPU cache miss can happen due to one of two reasons:
+            # 1. Streaming adapter evicted the adapter from the cache (cpu_weights is None)
+            # 2. Inserting streaming adapter causes a cold miss
+
+            if not cpu_weights:
+                adapter_name = self.lora_adapter_name_mapping[adapter_id]
+                cpu_weights = self.lora_checkpoint.load_streaming_ckpt(self.model, adapter_name, self.lora_checkpoint.ckpt_paths_cpu[adapter_name])
+
+            cpu_swap_position = self.cpu_adapter_cache.get_swap_position()  # evicts adapter from cache
+            logger.debug(f"Swap Adapter ID {adapter_id} to position {cpu_swap_position} on CPU.")
+
+            # Update CPU adapter management (use sharded checkpoints)
+            self.cpu_adapter_cache.add_adapter(adapter_id, cpu_swap_position)
+            self.cpu_adapter_cache.init_weights_on_cpu([adapter_id], cpu_weights, self.lora_modules)
+            self.cpu_adapter_cache.update_adapter(adapter_id)
+
+    # 1. Add adapter ID to adapter mapping
+    # 2. Extract checkpoint information from adapter path
+    # 3. Shard checkpoint on CPU
+    # 4. Load/swap sharded checkpoint into CPU
+    # Note: streaming adapter does not have access to device weights, so cannot
+    # load/swap new adapter into device until it is requested
+    def add_new_cpu_adapter(self, adapter_name, adapter_path):
+        self.add_adapter_mapping(adapter_name)
+
+        # Check if adapter is already loaded into CPU memory
+        adapter_id = self.lora_adapter_id_mapping[adapter_name]
+        streaming_weights = None
+        if not self.cpu_adapter_cache.access_adapter(adapter_id):
+            streaming_weights = self.lora_checkpoint.load_streaming_ckpt(self.model, adapter_name, adapter_path)
+            if not streaming_weights:
+                return False
+
+        self.insert_cpu_adapter(adapter_id, streaming_weights)
+        return True
 
     # Main workflow function for dynamic LoRA adapter swapping
     def dynamic_update_weights_for_lora(self, device_weights, adapter_ids):

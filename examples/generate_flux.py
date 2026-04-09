@@ -17,8 +17,21 @@ DEFAULT_CKPT_DIR = "/shared/flux/FLUX.1-dev/"
 
 def run_flux_generate(args):
     print(f"run_flux_generate with args: {args}")
-    world_size, backbone_tp_degree = get_flux_parallelism_config(
-        args.instance_type, args.context_parallel_enabled
+    
+    # Determine backbone_tp_degree: use user-specified value or default based on hardware
+    if args.backbone_tp_degree is not None:
+        backbone_tp_degree = args.backbone_tp_degree
+    else:
+        # Default based on instance type
+        if args.instance_type == "trn1":
+            backbone_tp_degree = 8
+        else:
+            backbone_tp_degree = 4
+    
+    world_size = get_flux_parallelism_config(
+        backbone_tp_degree,
+        context_parallel_enabled=args.context_parallel_enabled,
+        cfg_parallel_enabled=args.cfg_parallel_enabled
     )
 
     dtype = torch.bfloat16
@@ -30,7 +43,11 @@ def run_flux_generate(args):
         dtype,
         args.height,
         args.width,
+        cfg_parallel_enabled=args.cfg_parallel_enabled,
+        context_parallel_enabled=args.context_parallel_enabled,
     )
+    # backbone_config.num_layers=4
+    # backbone_config.num_single_layers=4
 
     flux_app = NeuronFluxApplication(
         model_path=args.checkpoint_dir,
@@ -41,22 +58,34 @@ def run_flux_generate(args):
         height = args.height,
         width = args.width,
     )
+    # flux_app.compile(args.compile_workdir, debug=True)
     flux_app.compile(args.compile_workdir)
     flux_app.load(args.compile_workdir)
 
+    warmup_rounds = 5
+    print("Warming up the model for better latency testing")
+    
+    # Configure CFG parameters for warmup
+    if args.use_cfg:
+        warmup_negative_prompt = args.negative_prompt
+        warmup_true_cfg_scale = 2.0
+    else:
+        warmup_negative_prompt = None
+        warmup_true_cfg_scale = 1.0
+    
+    for _ in range(warmup_rounds):
+        flux_app(
+            args.prompt,
+            negative_prompt=warmup_negative_prompt,
+            true_cfg_scale=warmup_true_cfg_scale,
+            height=args.height,
+            width=args.width,
+            guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps
+        ).images[0]
+
     if args.profile:
         from torch.profiler import profile, ProfilerActivity
-
-        warmup_rounds = 5
-        print("Warming up the model for better latency testing")
-        for i in range(warmup_rounds):
-            flux_app(
-                args.prompt,
-                height=args.height,
-                width=args.width,
-                guidance_scale=args.guidance_scale,
-                num_inference_steps=args.num_inference_steps
-            ).images[0]
 
         with profile(activities=[ProfilerActivity.CPU], record_shapes=True, profile_memory=True, with_stack=True) as prof:
             _run_flux_helper(flux_app, args)
@@ -69,11 +98,22 @@ def run_flux_generate(args):
 
 def _run_flux_helper(flux_app, args):
     total_time = 0
+    
+    # Configure CFG parameters if use_cfg is enabled
+    if args.use_cfg:
+        negative_prompt = args.negative_prompt
+        true_cfg_scale = 2.0
+    else:
+        negative_prompt = None
+        true_cfg_scale = 1.0
+    
     for i in range(args.num_images):
         start_time = time.time()
 
         image = flux_app(
             args.prompt,
+            negative_prompt=negative_prompt,
+            true_cfg_scale=true_cfg_scale,
             height=args.height,
             width=args.width,
             guidance_scale=args.guidance_scale,
@@ -111,6 +151,18 @@ if __name__ == "__main__":
     parser.add_argument("--num_images", type=int, default=1)
     parser.add_argument("--save_image", action="store_true")
     parser.add_argument("--context_parallel_enabled", action="store_true")
+    parser.add_argument("--use_cfg", action="store_true",
+                        help="Enable CFG inference with negative_prompt and true_cfg_scale=2.0")
+    parser.add_argument("--negative_prompt", type=str, default="",
+                        help="Negative prompt for CFG inference (only used when --use_cfg is enabled)")
+    parser.add_argument("--cfg_parallel_enabled", action="store_true",
+                        help="Enable CFG parallel processing (can only be true when --use_cfg is enabled)")
+    parser.add_argument("--backbone_tp_degree", type=int, default=None,
+                        help="Tensor parallelism degree for the backbone model. If not specified, defaults to 8 for trn1 and 4 for others.")
 
     args = parser.parse_args()
+    
+    # Validate that cfg_parallel_enabled can only be true when use_cfg is enabled
+    if args.cfg_parallel_enabled and not args.use_cfg:
+        parser.error("--cfg_parallel_enabled can only be enabled when --use_cfg is enabled")
     run_flux_generate(args)
