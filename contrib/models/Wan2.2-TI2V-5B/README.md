@@ -21,7 +21,7 @@ NeuronX adaptation of [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/W
 Key parameters:
 - **Denoising steps**: 50 (default)
 - **Context Parallel (CP)**: Splits sequence across 2 ranks, K/V all-gather in self-attention
-- **CFG Parallel**: Splits batch (cond/uncond), no K/V communication, ~13% faster for most resolutions
+- **CFG Parallel**: Splits batch (cond/uncond), no K/V communication, ~11-13% faster for most resolutions (default)
 - **Rolling Cache**: Stateful temporal caching for flicker-free video, ~960MB on-device
 
 ## Performance
@@ -68,11 +68,11 @@ python src/cache_hf_model.py
 ### 3. Compile All Components
 
 ```bash
-# Context Parallel (default)
+# CFG Parallel (default, recommended, fastest for most resolutions)
 bash src/compile.sh
 
-# CFG Parallel (recommended, faster for most resolutions)
-CFG_PARALLEL=1 bash src/compile.sh
+# Context Parallel
+CP=1 bash src/compile.sh
 
 # Custom output directory
 bash src/compile.sh /path/to/output /path/to/compiler_workdir
@@ -83,7 +83,7 @@ Compilation takes ~30-60 minutes.
 ### 4. Run Inference
 
 ```bash
-# Text-to-Video (T2V)
+# Text-to-Video (T2V) - auto-detects CFG or CP from compiled models
 NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_wan2.2_ti2v.py \
     --compiled_models_dir /opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b \
     --prompt "A cat walks on the grass, realistic" \
@@ -96,6 +96,8 @@ NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_wan2.2_ti2v.py \
     --prompt "A cat walks on the grass, realistic" \
     --output output_i2v.mp4
 ```
+
+Note: The run script auto-detects CFG Parallel (`transformer_cfg/`) or Context Parallel (`transformer/`) from compiled models directory.
 
 ## Compatibility Matrix
 

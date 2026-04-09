@@ -2,11 +2,12 @@
 # Wan2.2 TI2V Compilation Script
 #
 # Compiles all models for Wan2.2 text/image-to-video on Trainium2.
-# Transformer: TP=4, CP=2 (Context Parallel), world_size=8
+# Transformer: TP=4, DP=2 (CFG Parallel, default) or TP=4, CP=2 (Context Parallel)
 #
 # Usage:
-#   ./compile.sh                    # Use default directories
+#   ./compile.sh                    # CFG Parallel (default, recommended, fastest)
 #   ./compile.sh /path/to/output    # Custom output directory
+#   CP=1 ./compile.sh               # Context Parallel
 
 set -e
 
@@ -63,17 +64,17 @@ python ${SCRIPT_DIR}/compile_text_encoder.py \
     --tp_degree ${TP_DEGREE} \
     --world_size ${WORLD_SIZE}
 
-# Step 3: Compile Transformer (TP=4, CP=2 or CFG Parallel)
-# Set CFG_PARALLEL=1 to use CFG Parallel (batch=2, no K/V gather) instead of Context Parallel
-CFG_PARALLEL="${CFG_PARALLEL:-0}"
-CFG_FLAG=""
-if [ "${CFG_PARALLEL}" = "1" ]; then
-    CFG_FLAG="--cfg_parallel"
+# Step 3: Compile Transformer (TP=4, CFG Parallel default or CP)
+# Set CP=1 to use Context Parallel instead of CFG Parallel
+CP="${CP:-0}"
+CFG_FLAG="--cfg_parallel"
+if [ "${CP}" = "1" ]; then
+    CFG_FLAG=""
     echo ""
-    echo "[Step 3/4] Compiling Transformer (TP=${TP_DEGREE}, CFG Parallel, batch=2)..."
+    echo "[Step 3/4] Compiling Transformer (TP=${TP_DEGREE}, CP=2, Context Parallel)..."
 else
     echo ""
-    echo "[Step 3/4] Compiling Transformer (TP=${TP_DEGREE}, CP=2)..."
+    echo "[Step 3/4] Compiling Transformer (TP=${TP_DEGREE}, CFG Parallel, batch=2)..."
 fi
 python ${SCRIPT_DIR}/compile_transformer.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
