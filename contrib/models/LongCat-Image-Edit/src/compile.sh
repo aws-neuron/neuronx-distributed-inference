@@ -9,10 +9,10 @@
 #   4. Language Model: Qwen2.5-VL LM with TP=4 (same as Qwen reference)
 #
 # Usage:
-#   ./compile.sh                    # Compile CP (Context Parallel) with defaults
-#   ./compile.sh cfg                # Compile CFG (CFG Parallel, recommended when guidance_scale > 1)
-#   ./compile.sh cp 1024 1024 448 512  # Custom dimensions with CP
+#   ./compile.sh                    # Compile CFG (CFG Parallel, recommended, fastest)
+#   ./compile.sh cp                 # Compile CP (Context Parallel)
 #   ./compile.sh cfg 1024 1024 448 512 # Custom dimensions with CFG
+#   ./compile.sh cp 1024 1024 448 512  # Custom dimensions with CP
 
 set -e
 
@@ -25,7 +25,7 @@ COMPILER_WORKDIR="/opt/dlami/nvme/compiler_workdir"
 VAE_TILE_SIZE=1024
 
 # Check if first argument is mode selector
-MODE="cp"
+MODE="cfg"
 if [[ "$1" == "cp" || "$1" == "cfg" ]]; then
     MODE="$1"
     shift

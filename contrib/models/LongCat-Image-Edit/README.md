@@ -81,14 +81,14 @@ python src/cache_hf_model.py
 ### 3. Compile All Components
 
 ```bash
-# Compile with CFG Parallel (recommended when guidance_scale > 1, ~9% faster)
-bash src/compile.sh cfg
-
-# Compile with Context Parallel (default)
+# Compile with CFG Parallel (default, recommended, fastest)
 bash src/compile.sh
 
+# Compile with Context Parallel
+bash src/compile.sh cp
+
 # Custom dimensions:
-# bash src/compile.sh [cp|cfg] <height> <width> <image_size> <max_seq_len>
+# bash src/compile.sh [cfg|cp] <height> <width> <image_size> <max_seq_len>
 # bash src/compile.sh cfg 1024 1024 448 1024
 ```
 
@@ -97,19 +97,19 @@ Compilation takes ~60-90 minutes total. Compiled models are saved to `/opt/dlami
 ### 4. Run Inference
 
 ```bash
-# CFG Parallel (recommended, fastest)
+# CFG Parallel (default, recommended, fastest)
 NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_longcat_image_edit.py \
     --image assets/test.png \
     --prompt "change the cat to a dog" \
     --seed 43 \
-    --use_cfg_parallel \
     --output output.png
 
-# Context Parallel (default)
+# Context Parallel
 NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_longcat_image_edit.py \
     --image assets/test.png \
     --prompt "change the cat to a dog" \
     --seed 43 \
+    --use_cp \
     --output output.png
 ```
 
@@ -125,7 +125,8 @@ NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_longcat_image_ed
 | `--num_inference_steps` | 50 | Denoising steps |
 | `--guidance_scale` | 4.5 | Guidance scale |
 | `--seed` | 42 | Random seed |
-| `--use_cfg_parallel` | false | Use CFG Parallel transformer (~9% faster) |
+| `--use_cfg_parallel` | true | Use CFG Parallel transformer (default, fastest) |
+| `--use_cp` | false | Use Context Parallel instead of CFG |
 | `--cpu_vision_encoder` | false | Use CPU vision encoder for better accuracy |
 | `--warmup` | false | Run warmup inference first |
 | `--compiled_models_dir` | `/opt/dlami/nvme/compiled_models` | Path to compiled models |

@@ -989,13 +989,20 @@ def main():
                         help="Use CPU text encoder instead of compiled")
     parser.add_argument("--cpu_vision_encoder", action="store_true",
                         help="Use CPU vision encoder for accuracy (Neuron LM still used)")
-    parser.add_argument("--use_cfg_parallel", action="store_true",
-                        help="Use CFG Parallel transformer (batches neg+pos prompts, ~2x denoising speedup). "
-                             "Requires: ./compile.sh cfg")
+    parser.add_argument("--use_cfg_parallel", action="store_true", default=True,
+                        help="Use CFG Parallel transformer (default, fastest). "
+                             "Requires: ./compile.sh cfg (default)")
+    parser.add_argument("--use_cp", action="store_true",
+                        help="Use CP (Context Parallel) transformer instead of CFG. "
+                             "Requires: ./compile.sh cp")
     parser.add_argument("--compiled_models_dir", type=str, default=COMPILED_MODELS_DIR)
     parser.add_argument("--transformer_dir", type=str, default=None,
                         help="Override transformer compiled dir (default: <compiled_models_dir>)")
     args = parser.parse_args()
+
+    # --use_cp overrides the default CFG
+    if args.use_cp:
+        args.use_cfg_parallel = False
 
     set_seed(args.seed)
 
