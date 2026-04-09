@@ -126,31 +126,31 @@ def deltanet_recurrent_fwd(
         )
 
         # ---- Step 4: state += outer(k_t, delta) ----
-        # Compute outer product using nc_matmul with P=1 contraction.
-        # nc_matmul computes: dst = stationary.T @ moving
-        # stationary = k_row (1, 128): P=1, F_s=128 (k values along free dim)
-        # moving = delta_row (1, 128): P=1, F_m=128 (delta values along free dim)
-        # dst = (128, 1) @ (1, 128) = (128, 128)  -- this IS the outer product!
+        # Broadcast multiply: outer[i,j] = k_t[i] * delta[j]
+        # 1) Transpose delta (128,1) -> (1,128) in PSUM
+        # 2) Copy PSUM (1,128) -> SBUF (128,128) -- partition broadcast
+        # 3) Multiply by k_t (128,1) which broadcasts across free dim
+        # This avoids the nc_matmul P=1 outer product (wastes 127/128 TE lanes).
 
-        # Transpose k_t (128, 1) -> k_row (1, 128)
-        k_row_psum = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=k_row_psum, data=k_t)
-        k_row = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=k_row, src=k_row_psum)
-
-        # Transpose delta (128, 1) -> delta_row (1, 128)
+        # Transpose delta to get values along free dimension
         delta_row_psum = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=delta_row_psum, data=delta)
-        delta_row = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=delta_row, src=delta_row_psum)
 
-        # outer product: k_row.T @ delta_row = (128,128) in PSUM
-        outer_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=outer_psum, stationary=k_row, moving=delta_row)
+        # Broadcast (1, 128) PSUM -> (128, 128) SBUF
+        # Each partition row gets the same delta values
+        delta_broadcast = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=delta_broadcast, src=delta_row_psum)
 
-        # Copy outer product from PSUM to SBUF
+        # Element-wise multiply: outer[i,j] = delta_broadcast[i,j] * k_t[i,0]
+        # tensor_scalar broadcasts (P,1) k_t across all F columns
         outer_prod = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=outer_prod, src=outer_psum)
+        nisa.tensor_scalar(
+            dst=outer_prod,
+            data=delta_broadcast,
+            op0=nl.multiply,
+            operand0=k_t,
+            engine=nisa.vector_engine,
+        )
 
         # Accumulate into state
         state_new = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
@@ -272,21 +272,21 @@ def deltanet_recurrent_fwd_state(
         )
 
         # ---- Step 4: state += outer(k_t, delta) ----
-        k_row_psum = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=k_row_psum, data=k_t)
-        k_row = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=k_row, src=k_row_psum)
-
+        # Broadcast multiply: outer[i,j] = k_t[i] * delta[j]
         delta_row_psum = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=delta_row_psum, data=delta)
-        delta_row = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=delta_row, src=delta_row_psum)
 
-        outer_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=outer_psum, stationary=k_row, moving=delta_row)
+        delta_broadcast = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=delta_broadcast, src=delta_row_psum)
 
         outer_prod = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=outer_prod, src=outer_psum)
+        nisa.tensor_scalar(
+            dst=outer_prod,
+            data=delta_broadcast,
+            op0=nl.multiply,
+            operand0=k_t,
+            engine=nisa.vector_engine,
+        )
 
         state_new = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=state_new, data1=state, data2=outer_prod, op=nl.add)

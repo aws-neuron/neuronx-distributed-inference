@@ -49,7 +49,16 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 from nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
 from nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
-from nki_flash_attn_d256 import flash_attn_d256 as _flash_attn_d256_kernel
+from nki_flash_attn_d256_pipe import flash_attn_d256_pipe as _flash_attn_d256_kernel_raw
+
+# Create Beta 2 PyTorchXLAKernel directly (NOT nki_jit which forces compat tracer).
+# The Beta 2 tracer supports LoopVar list indexing required by the pipe kernel.
+from nki._torch_xla import PyTorchXLAKernel as _Beta2XLAKernel
+_flash_attn_d256_kernel = _Beta2XLAKernel(
+    func=_flash_attn_d256_kernel_raw.func,
+    grid=_flash_attn_d256_kernel_raw.grid,
+    opts=_flash_attn_d256_kernel_raw.opts,
+)
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -81,8 +90,53 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
 
+# ============================================================
+# Newton-Raphson Refined RMSNorm (Task 18)
+# ============================================================
+# Hardware rsqrt has systematic negative bias (~-7e-6 mean).
+# Over 80+ RMSNorm applications across 40 layers, this compounds.
+# One Newton refinement step: y' = y * (3 - x*y^2) / 2
+# reduces per-application error from 3.5e-4 to 1.9e-6.
+
+# Toggle: set to True to use Newton-refined rsqrt in RMSNorm
+USE_NEWTON_RMSNORM = False
+
+
+class NewtonRMSNorm(nn.Module):
+    """RMSNorm with Newton-Raphson refined rsqrt for improved numerical accuracy.
+
+    Drop-in replacement for CustomRMSNorm. Uses pure PyTorch ops so the
+    Neuron compiler traces it directly (no opaque custom HLO call).
+    """
+
+    def __init__(self, hidden_size=None, eps=1e-6):
+        super().__init__()
+        self.weight = None
+        if hidden_size is not None:
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.hidden_size = hidden_size
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        original_dtype = hidden_states.dtype
+        x = hidden_states.to(torch.float32)
+        # Variance: mean(x^2) along last dim
+        variance = x.pow(2).mean(-1, keepdim=True)
+        # Initial hardware rsqrt estimate
+        y = torch.rsqrt(variance + self.variance_epsilon)
+        # Newton-Raphson refinement: y' = y * (3 - (var+eps) * y^2) / 2
+        y = y * (3.0 - (variance + self.variance_epsilon) * y * y) * 0.5
+        # Apply normalization and weight
+        result = x * y
+        if self.weight is not None:
+            result = result * self.weight.float()
+        return result.to(original_dtype)
+
+
 def get_rmsnorm_cls():
-    return Qwen3MoeRMSNorm if cpu_mode() else CustomRMSNorm
+    if cpu_mode():
+        return Qwen3MoeRMSNorm
+    return NewtonRMSNorm if USE_NEWTON_RMSNORM else CustomRMSNorm
 
 
 def l2norm(x, dim=-1, eps=1e-6):
@@ -1138,9 +1192,12 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         Q shape: (B, H, S, head_dim) where head_dim=256
         cos/sin shape: (B, S, rope_dim) where rope_dim=64 (from RotaryEmbedding(dim=64))
 
-        Split Q/K along last dim into:
-          q_rope (first 64 dims) -- apply RoPE
-          q_pass (remaining 192 dims) -- pass through unchanged
+        During CTE (prefill): skip RoPE here — the NKI flash attention kernel
+        applies partial RoPE internally using fused cos/sin caches. This avoids
+        the Beta 2 NKI tracer bug (V2169383883) where element-wise ops with
+        model buffers cause tensor args to resolve as None in KLIR.
+
+        During TKG (decode): apply RoPE normally (kernel not used for decode).
         """
         from neuronx_distributed_inference.modules.attention.utils import (
             apply_rotary_pos_emb,
@@ -1150,6 +1207,12 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             if cos_cache is None or sin_cache is None:
                 cos_cache, sin_cache = self.rotary_emb(V, position_ids)
 
+        # During CTE with d256 kernel: skip RoPE, kernel will fuse it internally
+        if self.neuron_config.is_prefill_stage and self.head_dim > 128:
+            # Return pre-RoPE Q, K — kernel applies partial RoPE with cos/sin
+            return Q, K, cos_cache, sin_cache
+
+        # TKG path: apply RoPE normally
         # Split into rope and pass-through portions
         q_rope = Q[..., : self.rope_dim]  # (B, H, S, 64)
         q_pass = Q[..., self.rope_dim :]  # (B, H, S, 192)
@@ -1165,38 +1228,72 @@ class NeuronQwen35Attention(NeuronAttentionBase):
 
         return Q, K, cos_cache, sin_cache
 
-    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
+    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask,
+                       cos_cache=None, sin_cache=None):
         """Override to handle head_dim=256 with custom NKI flash attention kernel.
 
         The standard NxDI NKI flash attention kernel asserts head_dim <= 128.
-        We use our own flash_attn_d256 kernel which tiles the QK contraction
-        into 2x128 chunks, giving ~2-3x TTFT improvement over the softmax fallback.
+        We use our own flash_attn_d256_pipe kernel which tiles the QK contraction
+        into 2x128 chunks with 3-stage software pipelining.
+
+        With fused RoPE: Q/K are pre-RoPE, cos/sin caches are passed to the
+        kernel which applies partial RoPE internally. This avoids the Beta 2
+        NKI tracer bug (V2169383883).
 
         Shape contract:
-          Input Q:  (B, H, S, D=256) -- BHSD
-          Input K:  (B, Hkv, S, D=256) -- BHSD
+          Input Q:  (B, H, S, D=256) -- BHSD (pre-RoPE when cos/sin provided)
+          Input K:  (B, Hkv, S, D=256) -- BHSD (pre-RoPE when cos/sin provided)
           Input V:  (B, Hkv, S, D=256) -- BHSD
-          Kernel q: (B, H, D, S) -- BHDS (transposed)
-          Kernel k: (B, Hkv, D, S) -- BHDS (transposed)
-          Kernel v: (B, Hkv, S, D) -- BHSD (unchanged)
-          Output:   (B, H, S, D) -- BHSD (same as NONE path)
+          cos_cache: (B, S, rope_dim=64) or None
+          sin_cache: (B, S, rope_dim=64) or None
+          Output:   (B, H, S, D) -- BHSD
 
         The kernel requires seq_len divisible by 512 (B_F tile size).
         For smaller seq_lens, fall back to softmax path.
         """
         if self.head_dim > 128 and q_len >= 512 and q_len % 512 == 0:
-            # Reshape for our d=256 kernel: BHSD -> BHDS for Q and K
-            q_kernel = Q.permute(0, 1, 3, 2).contiguous().to(self.torch_dtype)
-            k_kernel = K.permute(0, 1, 3, 2).contiguous().to(self.torch_dtype)
+            # Pass Q, K, V in BHSD layout to d=256 pipelined kernel
+            q_kernel = Q.to(self.torch_dtype)
+            k_kernel = K.to(self.torch_dtype)
             v_kernel = V.contiguous().to(self.torch_dtype)
 
-            n_kv_heads = K.shape[1]
-            grid_size = bsz * n_kv_heads
+            # Prepare cos/sin for kernel: squeeze batch dim (B, S, 64) -> (S, 64)
+            fuse_rope = cos_cache is not None and sin_cache is not None
+            if fuse_rope:
+                cos_kernel = cos_cache[0].to(self.torch_dtype)  # (S, 64)
+                sin_kernel = sin_cache[0].to(self.torch_dtype)  # (S, 64)
+            else:
+                cos_kernel = None
+                sin_kernel = None
 
-            # Kernel returns (B, H, S, D) -- BHSD, same as NONE path
-            attn_output = _flash_attn_d256_kernel[grid_size](
-                q_kernel, k_kernel, v_kernel, use_causal_mask=True
-            )
+            n_kv_heads = K.shape[1]
+            n_q_heads = Q.shape[1]
+            q_h_per_kv = n_q_heads // n_kv_heads
+
+            # Per-(batch, kv_head) loop — kernel processes one KV head at a time
+            out_parts = []
+            for b in range(bsz):
+                for kv_h in range(n_kv_heads):
+                    q_slice = q_kernel[b:b+1, kv_h*q_h_per_kv:(kv_h+1)*q_h_per_kv, :, :]
+                    k_slice = k_kernel[b:b+1, kv_h:kv_h+1, :, :]
+                    v_slice = v_kernel[b:b+1, kv_h:kv_h+1, :, :]
+                    o_part = _flash_attn_d256_kernel(
+                        q_slice, k_slice, v_slice,
+                        cos_cache=cos_kernel,
+                        sin_cache=sin_kernel,
+                        use_causal_mask=True,
+                        q_h_per_k_h=q_h_per_kv,
+                        n_kv_heads=1,
+                        seqlen_q=q_len,
+                        seqlen_kv=q_len,
+                        rope_dim=self.rope_dim if fuse_rope else 0,
+                    )
+                    out_parts.append(o_part)
+
+            # Reassemble: each o_part is (1, q_h_per_kv, S, D)
+            attn_output = torch.cat(out_parts, dim=1)  # (1, total_heads, S, D)
+            if bsz > 1:
+                attn_output = attn_output.reshape(bsz, n_q_heads, q_len, self.head_dim)
 
             return attn_output, FlashAttentionStrategy.NONE
 
@@ -1260,9 +1357,10 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         )
 
         if past_key_value is None:
-            # Context encoding (prefill)
+            # Context encoding (prefill) — pass cos/sin for fused RoPE in kernel
             attn_output, _flash_strategy = self.perform_prefill(
-                Q, K, V, q_len, bsz, attention_mask
+                Q, K, V, q_len, bsz, attention_mask,
+                cos_cache=cos_cache, sin_cache=sin_cache,
             )
         else:
             # Token generation (decode)
