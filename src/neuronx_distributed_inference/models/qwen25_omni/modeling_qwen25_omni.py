@@ -72,8 +72,11 @@ class Qwen25OmniInferenceConfig(InferenceConfig):
                 text_cfg = SimpleNamespace(**text_cfg)
                 thinker_cfg.text_config = text_cfg
 
+            # Text config attributes always take precedence over top-level
+            # defaults from PretrainedConfig (e.g. tie_word_embeddings defaults
+            # to True at the top level but is False in text_config).
             for attr in _TEXT_CONFIG_ATTRS:
-                if hasattr(text_cfg, attr) and not hasattr(self, attr):
+                if hasattr(text_cfg, attr):
                     setattr(self, attr, getattr(text_cfg, attr))
 
             # Set pad_token_id from thinker_config
