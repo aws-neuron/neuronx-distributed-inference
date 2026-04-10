@@ -73,16 +73,16 @@ echo "Results: $RESULTS_DIR"
 echo ""
 
 ###############################################################################
-# Config 1: BS=1, TP=32, non-CB (baseline latency)
-# Qwen2.5-Omni-7B is a dense 7B model, TP=32 is sufficient
+# Config 1: BS=1, TP=4, non-CB (baseline latency)
+# Qwen2.5-Omni-7B is a dense 7B model, TP=4 is sufficient
 ###############################################################################
-CONFIG_NAME="bs1_tp32"
-echo "--- Config 1: BS=1, TP=32, non-CB (baseline) ---"
+CONFIG_NAME="bs1_tp4"
+echo "--- Config 1: BS=1, TP=4, non-CB (baseline) ---"
 
 python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" \
     --tokenizer "$MODEL_PATH" \
-    --tensor-parallel-size 32 \
+    --tensor-parallel-size 4 \
     --max-model-len 4096 \
     --max-num-seqs 1 \
     --no-enable-chunked-prefill \
@@ -91,7 +91,7 @@ python3 -m vllm.entrypoints.openai.api_server \
     --trust_remote_code \
     --additional-config '{
         "override_neuron_config": {
-            "tp_degree": 32,
+            "tp_degree": 4,
             "fused_qkv": false,
             "flash_decoding_enabled": false,
             "sequence_parallel_enabled": false,
@@ -118,33 +118,33 @@ run_bench "$CONFIG_NAME" 1 16
 stop_server
 
 ###############################################################################
-# Config 2: BS=32, TP=32, CB (throughput)
+# Config 2: BS=4, TP=4, CB (throughput)
 ###############################################################################
-CONFIG_NAME="bs32_tp32_cb"
-echo "--- Config 2: BS=32, TP=32, CB ---"
+CONFIG_NAME="bs4_tp4_cb"
+echo "--- Config 2: BS=4, TP=4, CB ---"
 
 python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" \
     --tokenizer "$MODEL_PATH" \
-    --tensor-parallel-size 32 \
+    --tensor-parallel-size 4 \
     --max-model-len 4096 \
-    --max-num-seqs 32 \
+    --max-num-seqs 4 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
     --port $PORT \
     --trust_remote_code \
     --additional-config '{
         "override_neuron_config": {
-            "tp_degree": 32,
+            "tp_degree": 4,
             "fused_qkv": false,
             "flash_decoding_enabled": false,
             "sequence_parallel_enabled": false,
             "qkv_kernel_enabled": false,
             "qkv_nki_kernel_enabled": false,
             "attn_kernel_enabled": false,
-            "batch_size": 32,
+            "batch_size": 4,
             "ctx_batch_size": 1,
-            "tkg_batch_size": 32,
+            "tkg_batch_size": 4,
             "max_context_length": 4096,
             "seq_len": 4096,
             "is_continuous_batching": true,
@@ -161,8 +161,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 wait_for_server
 sanity_check
 run_bench "$CONFIG_NAME" 1 16
-run_bench "$CONFIG_NAME" 16 128
-run_bench "$CONFIG_NAME" 32 128
+run_bench "$CONFIG_NAME" 4 64
 stop_server
 
 echo "=========================================="

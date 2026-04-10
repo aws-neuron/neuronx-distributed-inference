@@ -9,15 +9,28 @@
 # into codec tokens for speech synthesis.
 #
 # Architecture:
+#   - embed_tokens: Embedding(8448, 3584) — codec vocab in Thinker's dim space
 #   - thinker_to_talker_proj: Linear(3584 -> 896)
-#   - embed_tokens: Embedding(8448, 3584)
 #   - 24 Qwen2 decoder layers (GQA: 12 heads, 4 kv_heads, head_dim=128)
 #   - MLP: SiLU gate_proj/up_proj(896->18944), down_proj(18944->896)
 #   - RMSNorm(896)
 #   - codec_head: Linear(896 -> 8448, no bias)
 #
-# Runs on CPU: 12 attention heads not divisible by 32 TP.
-# Uses HF's autoregressive generation with KV cache.
+# Runs on CPU for the following reasons:
+#   1. Non-standard head_dim: hidden_size=896 with 12 heads gives a fractional
+#      head_dim (74.67). The actual head_dim=128 means the attention's internal
+#      dimension (12×128=1536) differs from hidden_size (896), which is
+#      incompatible with NxDI's NeuronAttentionBase (computes head_dim as
+#      hidden_size // num_attention_heads).
+#   2. 3D mRoPE: The Talker uses multimodal rotary position embeddings with
+#      position_ids of shape (3, batch, seq). The initial positions depend on
+#      the Thinker's text output via get_rope_index(), requiring access to
+#      input_text_ids, image/video/audio grid info at each step.
+#   3. Custom input pipeline: Every autoregressive step combines codec token
+#      embeddings (3584-d) with Thinker hidden states, then projects to 896-d.
+#      This per-step thinker-state injection doesn't fit NeuronBaseForCausalLM.
+#   4. Small model: ~690M params in 24 layers — not a performance bottleneck
+#      compared to the 7B Thinker running on Neuron.
 
 """Qwen2.5-Omni Talker model for NXD inference."""
 

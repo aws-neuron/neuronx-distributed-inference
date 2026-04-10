@@ -530,14 +530,20 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         self.vision_models.append(self.vision_encoder_model)
 
     def enable_audio_encoder(self, state_dict=None):
-        """Initialize the audio encoder (runs on CPU).
+        """Initialize the audio encoder (CPU frontend/postprocessor + Neuron transformer).
 
-        The audio encoder is loaded from the converted state dict and kept
-        on CPU. It processes mel spectrograms into audio embeddings that
-        are merged into the text model's input sequence.
+        The audio encoder is a hybrid CPU+Neuron module:
+          - CPU: Conv1d frontend, positional embeddings, chunking
+          - Neuron (TP=4): 32 transformer layers with block-diagonal attention
+          - CPU: AvgPool, LayerNorm, Linear projection
+
+        The CPU components are loaded from the converted state dict.
+        The Neuron transformer must be compiled/loaded separately via
+        compile_audio_encoder() and load_audio_encoder().
 
         Args:
-            state_dict: Converted state dict containing audio_tower.* keys.
+            state_dict: Converted state dict containing audio_tower.* keys
+                (already split into frontend.*, transformer.*, postprocessor.*).
                 If None, the encoder is created with random weights.
         """
         audio_config = getattr(self.config, "audio_config", None)
@@ -561,14 +567,86 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
             self.audio_encoder = AudioEncoderCls(audio_config, dtype=dtype)
 
         self.audio_encoder.eval()
-        logger.info("Audio encoder initialized on CPU")
+        logger.info(
+            "Audio encoder initialized (CPU frontend/postprocessor, "
+            "Neuron transformer pending compile/load)"
+        )
+
+    def compile_audio_encoder(self, compiled_model_path, audio_neuron_config=None):
+        """Compile the audio encoder transformer layers on Neuron.
+
+        Args:
+            compiled_model_path: Path to save compiled model artifacts.
+            audio_neuron_config: Optional NeuronConfig for audio transformer.
+                If None, creates a default config with TP matching the text model.
+        """
+        if self.audio_encoder is None:
+            raise RuntimeError("Call enable_audio_encoder() first")
+
+        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
+            AudioEncoderInferenceConfig,
+            NeuronQwen25OmniForAudioEncoding,
+        )
+
+        audio_config = getattr(self.config, "audio_config", None)
+        if isinstance(audio_config, dict):
+            from types import SimpleNamespace
+            audio_config = SimpleNamespace(**audio_config)
+
+        if audio_neuron_config is None:
+            # Default: match text model TP degree, reasonable seq_len buckets
+            tp_degree = self.neuron_config.tp_degree
+            audio_neuron_config = NeuronConfig(
+                tp_degree=tp_degree,
+                torch_dtype=self.neuron_config.torch_dtype,
+                batch_size=1,
+                # Audio seq_len buckets: typical values after conv
+                buckets=[256, 512, 1024, 1500],
+            )
+
+        audio_inf_config = AudioEncoderInferenceConfig(
+            neuron_config=audio_neuron_config,
+            audio_config=vars(audio_config) if hasattr(audio_config, '__dict__') else audio_config,
+        )
+
+        audio_app = NeuronQwen25OmniForAudioEncoding(audio_inf_config)
+        audio_app.compile(compiled_model_path)
+
+        logger.info("Audio encoder transformer compiled to %s", compiled_model_path)
+        return audio_app
+
+    def load_audio_encoder(self, compiled_model_path, audio_app=None):
+        """Load compiled audio encoder transformer layers.
+
+        Args:
+            compiled_model_path: Path to compiled model artifacts.
+            audio_app: Optional pre-compiled NeuronQwen25OmniForAudioEncoding.
+                If None, creates and loads from compiled_model_path.
+        """
+        if self.audio_encoder is None:
+            raise RuntimeError("Call enable_audio_encoder() first")
+
+        if audio_app is None:
+            from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
+                AudioEncoderInferenceConfig,
+                NeuronQwen25OmniForAudioEncoding,
+            )
+            # Load from compiled artifacts
+            audio_app = NeuronQwen25OmniForAudioEncoding.load(compiled_model_path)
+
+        self.audio_encoder.transformer = audio_app.model
+        logger.info("Audio encoder transformer loaded from %s", compiled_model_path)
 
     def enable_talker(self, state_dict=None):
         """Initialize the Talker model (runs on CPU).
 
         The Talker converts Thinker hidden states into codec tokens for
         speech synthesis. It uses HF's autoregressive generation with
-        KV cache.
+        KV cache. Stays on CPU because:
+          - Non-standard head_dim (128 != 896/12) incompatible with NeuronAttentionBase
+          - 3D mRoPE with per-step position recomputation from Thinker output
+          - Custom input pipeline (embed + thinker_state + project) at every step
+          - Only ~690M params — not a bottleneck vs. the 7B Thinker on Neuron
 
         Args:
             state_dict: Converted state dict containing talker keys.
@@ -768,12 +846,15 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         )
 
         pad_limit = self.get_padding_length(input_ids)
+        is_context_encoding = input_ids.shape[-1] > 1
 
-        # --- Audio encoding (CPU) ---
+        # --- Audio encoding (CPU frontend + Neuron transformer + CPU postprocessor) ---
+        audio_embeddings = None
+        audio_positions = None
         if (
             input_features is not None
             and self.audio_encoder is not None
-            and input_ids.shape[-1] > 1
+            and is_context_encoding
         ):
             audio_token_id = getattr(
                 self.config, "audio_token_id", None
@@ -804,34 +885,57 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
                     aftercnn_lens=aftercnn_lens,
                 )
 
-                # Scatter audio embeddings into input_ids positions
-                audio_mask = (input_ids == audio_token_id)
-                if audio_mask.any() and audio_embeddings is not None:
-                    # Get text embeddings and scatter audio
-                    # Note: this is handled by the text model's embed + scatter
-                    pass  # Audio embeddings will be used during text model forward
+                # Find audio token positions for scattering
+                audio_mask_bool = (input_ids == audio_token_id)
+                if audio_mask_bool.any() and audio_embeddings is not None:
+                    audio_positions = generate_positions_from_mask(
+                        audio_mask_bool.squeeze()
+                    )
 
         # --- Vision encoding (Neuron) ---
+        vision_embeddings = None
+        vision_positions = None
         if (
             (pixel_values is not None)
-            and input_ids.shape[-1] > 1
+            and is_context_encoding
             and pixel_values.sum() != 0
         ):
-            # Run vision encoder
             image_token_id = getattr(self.config, "image_token_id", None) or getattr(
                 self.config, "image_token_index", 151655
             )
-            vision_mask = (input_ids == image_token_id).unsqueeze(-1)
-            vision_mask = vision_mask.to(torch.bool)
-            vision_mask = generate_positions_from_mask(vision_mask.squeeze())
-            vision_mask = pad_positions(vision_mask, pad_limit, (pad_limit - 1))
+            vision_mask_bool = (input_ids == image_token_id)
+            if vision_mask_bool.any():
+                vision_positions = generate_positions_from_mask(
+                    vision_mask_bool.squeeze()
+                )
+                vision_embeddings = self.vision_encoder_model(
+                    pixel_values.to(self.vision_config.neuron_config.torch_dtype),
+                    image_grid_thw,
+                )
 
-            vision_embeddings = self.vision_encoder_model(
-                pixel_values.to(self.vision_config.neuron_config.torch_dtype),
-                image_grid_thw,
-            )
+        # --- Combine multimodal embeddings for scattering ---
+        # The text model's encode_vision_to_input scatters embeddings at
+        # specified positions. We combine audio + vision into one tensor.
+        if audio_embeddings is not None and vision_embeddings is not None:
+            # Both audio and vision present
+            # audio_embeddings is on CPU, vision_embeddings may be on XLA
+            # The model wrapper handles device transfer, so keep on CPU
+            all_embeddings = torch.cat([
+                vision_embeddings.cpu() if vision_embeddings.is_cuda else vision_embeddings,
+                audio_embeddings,
+            ], dim=0)
+            all_positions = torch.cat([vision_positions, audio_positions])
+            vision_embeddings = all_embeddings
+            vision_mask = pad_positions(all_positions, pad_limit, (pad_limit - 1))
+        elif audio_embeddings is not None and audio_positions is not None:
+            # Audio only, no vision
+            vision_embeddings = audio_embeddings
+            vision_mask = pad_positions(audio_positions, pad_limit, (pad_limit - 1))
+        elif vision_embeddings is not None and vision_positions is not None:
+            # Vision only, no audio
+            vision_mask = pad_positions(vision_positions, pad_limit, (pad_limit - 1))
         else:
-            # No vision input - use dummy embeddings
+            # No multimodal input - use dummy embeddings
             vision_embeddings, vision_mask = self._get_text_model_wrapper().get_dummy_vision_inputs(
                 config=self.text_config,
                 input_ids=input_ids,
