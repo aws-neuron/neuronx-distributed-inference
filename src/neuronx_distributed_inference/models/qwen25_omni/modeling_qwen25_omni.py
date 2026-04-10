@@ -61,19 +61,25 @@ class Qwen25OmniInferenceConfig(InferenceConfig):
 
         # Extract text config attributes from nested thinker_config
         if hasattr(self, "thinker_config"):
-            text_cfg = self.thinker_config.text_config
+            thinker_cfg = self.thinker_config
+            # When loaded from saved JSON, thinker_config is a plain dict
+            if isinstance(thinker_cfg, dict):
+                thinker_cfg = SimpleNamespace(**thinker_cfg)
+                self.thinker_config = thinker_cfg
+
+            text_cfg = thinker_cfg.text_config
             if isinstance(text_cfg, dict):
                 text_cfg = SimpleNamespace(**text_cfg)
-                self.thinker_config.text_config = text_cfg
+                thinker_cfg.text_config = text_cfg
 
             for attr in _TEXT_CONFIG_ATTRS:
                 if hasattr(text_cfg, attr) and not hasattr(self, attr):
                     setattr(self, attr, getattr(text_cfg, attr))
 
             # Set pad_token_id from thinker_config
-            if hasattr(self.thinker_config, "pad_token_id"):
+            if hasattr(thinker_cfg, "pad_token_id"):
                 if not hasattr(self, "pad_token_id") or self.pad_token_id is None:
-                    self.pad_token_id = self.thinker_config.pad_token_id
+                    self.pad_token_id = thinker_cfg.pad_token_id
 
     def get_required_attributes(self) -> List[str]:
         return [
