@@ -76,7 +76,7 @@ class Timer:
 # ---------------------------------------------------------------------------
 # Mode 1: Text-only (uses the simpler NeuronQwen25OmniForCausalLM)
 # ---------------------------------------------------------------------------
-def run_text_only():
+def run_text_only(model_path=MODEL_PATH, compiled_path=COMPILED_PATH):
     """Text-only inference using the Thinker model."""
     from neuronx_distributed_inference.models.config import (
         NeuronConfig,
@@ -105,13 +105,13 @@ def run_text_only():
         on_device_sampling_config=OnDeviceSamplingConfig(do_sample=False, top_k=1),
     )
 
-    hf_config = load_pretrained_config(MODEL_PATH)
+    hf_config = load_pretrained_config(model_path)
     config = Qwen25OmniInferenceConfig(neuron_config, load_config=hf_config)
 
-    compiled_dir = os.path.join(COMPILED_PATH, "thinker_tp4")
+    compiled_dir = os.path.join(compiled_path, "thinker_tp4")
 
     with Timer("Create model"):
-        model = NeuronQwen25OmniForCausalLM(MODEL_PATH, config)
+        model = NeuronQwen25OmniForCausalLM(model_path, config)
 
     if not os.path.exists(os.path.join(compiled_dir, "neuron_config.json")):
         with Timer("Compile"):
@@ -122,7 +122,7 @@ def run_text_only():
     with Timer("Load"):
         model.load(compiled_dir)
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     adapter = HuggingFaceGenerationAdapter(model)
@@ -165,11 +165,13 @@ def run_text_only():
 # ---------------------------------------------------------------------------
 # Mode 2: Multimodal (image/audio + text → text, optional speech)
 # ---------------------------------------------------------------------------
-def run_multimodal(mode="full"):
+def run_multimodal(mode="full", model_path=MODEL_PATH, compiled_path=COMPILED_PATH):
     """Multimodal inference: image + audio + text → text (+ optional speech).
 
     Args:
         mode: "image" (image+text), "audio" (audio+text), "full" (image+audio+text)
+        model_path: Path to HF model weights
+        compiled_path: Path for compiled artifacts
     """
     from neuronx_distributed_inference.models.config import (
         NeuronConfig,
@@ -224,17 +226,17 @@ def run_multimodal(mode="full"):
     config = Qwen25OmniMultimodalInferenceConfig(
         text_neuron_config=text_neuron_config,
         vision_neuron_config=vision_neuron_config,
-        load_config=load_pretrained_config(MODEL_PATH),
+        load_config=load_pretrained_config(model_path),
     )
 
-    processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
     # --- Step 2: Create and compile/load the model ---
-    compiled_dir = os.path.join(COMPILED_PATH, "multimodal_tp4")
+    compiled_dir = os.path.join(compiled_path, "multimodal_tp4")
 
     with Timer("Create multimodal model"):
         model = NeuronQwen25OmniMultimodalForCausalLM(
-            model_path=MODEL_PATH, config=config
+            model_path=model_path, config=config
         )
 
     if not os.path.exists(os.path.join(compiled_dir, "neuron_config.json")):
@@ -260,7 +262,7 @@ def run_multimodal(mode="full"):
 
         with Timer("Load HF model for audio weights"):
             hf_model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-                MODEL_PATH,
+                model_path,
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
@@ -275,7 +277,7 @@ def run_multimodal(mode="full"):
 
         model.enable_audio_encoder(audio_sd)
 
-        compiled_audio_dir = os.path.join(COMPILED_PATH, "audio_encoder_tp4")
+        compiled_audio_dir = os.path.join(compiled_path, "audio_encoder_tp4")
         if not os.path.exists(
             os.path.join(compiled_audio_dir, "neuron_config.json")
         ):
@@ -427,18 +429,17 @@ def main():
     )
     args = parser.parse_args()
 
-    global MODEL_PATH, COMPILED_PATH
-    MODEL_PATH = args.model_path
-    COMPILED_PATH = args.compiled_path
+    model_path = args.model_path
+    compiled_path = args.compiled_path
 
-    print(f"Model: {MODEL_PATH}")
-    print(f"Compiled: {COMPILED_PATH}")
+    print(f"Model: {model_path}")
+    print(f"Compiled: {compiled_path}")
     print(f"TP: {TP_DEGREE}")
 
     if args.mode == "text":
-        run_text_only()
+        run_text_only(model_path, compiled_path)
     else:
-        run_multimodal(args.mode)
+        run_multimodal(args.mode, model_path, compiled_path)
 
     print("\nDone!")
 
