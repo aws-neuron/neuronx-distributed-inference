@@ -93,6 +93,69 @@ adapter = HuggingFaceGenerationAdapter(model, tokenizer)
 output = adapter.generate("Hello, how are you?", max_new_tokens=128)
 ```
 
+## vLLM Integration
+
+MiMo-V2-Flash can be served via [vllm-neuron](https://github.com/aws-neuron/vllm-neuron). A patch is required to add MiMo architecture support.
+
+### Setup
+
+```bash
+# 1. Install vllm-neuron
+pip install vllm-neuron
+
+# 2. Apply the MiMo/MiniMax patch
+cd /path/to/vllm-neuron
+git apply /path/to/neuronx-distributed-inference/perf_test/vllm-neuron-mimo-minimax.patch
+pip install -e .
+```
+
+### Serving
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /path/to/MiMo-V2-Flash-BF16 \
+    --tensor-parallel-size 64 \
+    --max-model-len 1024 \
+    --max-num-seqs 32 \
+    --no-enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --trust_remote_code \
+    --additional-config '{
+        "override_neuron_config": {
+            "tp_degree": 64,
+            "logical_nc_config": 2,
+            "fused_qkv": false,
+            "flash_decoding_enabled": false,
+            "sequence_parallel_enabled": true,
+            "glu_mlp": true,
+            "normalize_top_k_affinities": true,
+            "router_config": {"act_fn": "sigmoid", "dtype": "float32"},
+            "moe_tp_degree": 1,
+            "moe_ep_degree": 64,
+            "batch_size": 32,
+            "ctx_batch_size": 1,
+            "tkg_batch_size": 32,
+            "max_context_length": 1024,
+            "seq_len": 1024,
+            "is_continuous_batching": true,
+            "enable_bucketing": true,
+            "async_mode": true,
+            "on_device_sampling_config": {
+                "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
+            }
+        }
+    }'
+```
+
+### Key vLLM Patch Changes
+
+The patch (`perf_test/vllm-neuron-mimo-minimax.patch`) modifies vllm-neuron to:
+- Map MiMo architecture to Qwen2 model loader (MiMo is Qwen2-based)
+- Pass `hf_config` from vLLM to NxDI (required for `trust_remote_code` models)
+- Replace `AutoModelForCausalLM.from_pretrained` with `snapshot_download` for model loading
+
+See `perf_test/1_bench_mimo_v2_flash.sh` for full benchmark configurations with BS=1/32/128.
+
 ## Performance
 
 Standalone NxDI (trn2.48xlarge, BF16, TP=64, EP=64):

@@ -78,6 +78,72 @@ adapter = HuggingFaceGenerationAdapter(model, tokenizer)
 output = adapter.generate("Hello, how are you?", max_new_tokens=128)
 ```
 
+## vLLM Integration
+
+MiniMax-M2 can be served via [vllm-neuron](https://github.com/aws-neuron/vllm-neuron). A patch is required to add MiniMax architecture support.
+
+### Setup
+
+```bash
+# 1. Install vllm-neuron
+pip install vllm-neuron
+
+# 2. Apply the MiMo/MiniMax patch
+cd /path/to/vllm-neuron
+git apply /path/to/neuronx-distributed-inference/perf_test/vllm-neuron-mimo-minimax.patch
+pip install -e .
+```
+
+### Serving
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /path/to/MiniMax-M2-BF16 \
+    --tensor-parallel-size 64 \
+    --max-model-len 1024 \
+    --max-num-seqs 256 \
+    --no-enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --trust_remote_code \
+    --additional-config '{
+        "override_neuron_config": {
+            "tp_degree": 64,
+            "logical_nc_config": 2,
+            "flash_decoding_enabled": false,
+            "sequence_parallel_enabled": true,
+            "glu_mlp": true,
+            "moe_mask_padded_tokens": true,
+            "disable_numeric_cc_token": true,
+            "router_config": {"act_fn": "sigmoid", "dtype": "float32"},
+            "moe_tp_degree": 1,
+            "moe_ep_degree": 64,
+            "batch_size": 256,
+            "ctx_batch_size": 1,
+            "tkg_batch_size": 256,
+            "max_context_length": 1024,
+            "seq_len": 1024,
+            "is_continuous_batching": true,
+            "fused_qkv": false,
+            "enable_bucketing": true,
+            "normalize_top_k_affinities": true,
+            "use_index_calc_kernel": true,
+            "blockwise_matmul_config": {
+                "use_shard_on_intermediate_dynamic_while": true,
+                "skip_dma_token": true
+            },
+            "scratchpad_page_size": 1024
+        }
+    }'
+```
+
+### Key vLLM Patch Changes
+
+The patch (`perf_test/vllm-neuron-mimo-minimax.patch`) modifies vllm-neuron to:
+- Pass `hf_config` from vLLM to NxDI (required for `trust_remote_code` models)
+- Replace `AutoModelForCausalLM.from_pretrained` with `snapshot_download` for model loading
+
+See `perf_test/2_bench_minimax_m2.sh` for full benchmark configurations with BS=1/256.
+
 ## Compatibility Matrix
 
 | Instance/Version | 2.22+ (PyTorch 2.9) | 2.21 and earlier |
