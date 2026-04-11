@@ -222,6 +222,7 @@ def load_nxdi_model(
     max_new_tokens: int = 2048,
     batch_size: int = 1,
     tp_degree: int = 1,
+    compiled_model_path: str = None,
 ):
     """Load BioReason-Pro's Qwen3-4B backbone via NxDI.
 
@@ -283,17 +284,22 @@ def load_nxdi_model(
     config.use_cache = True
     config.is_encoder_decoder = False
 
-    log.info(f"Loading NxDI Qwen3-4B from {model_path}...")
+    # Use separate compiled_model_path if provided (allows per-batch-size compilation)
+    out_path = compiled_model_path or model_path
+    if compiled_model_path:
+        os.makedirs(compiled_model_path, exist_ok=True)
+
+    log.info(f"Loading NxDI Qwen3-4B from {model_path} (compiled to {out_path})...")
     t0 = time.time()
     neuron_model = NeuronQwen3ForCausalLM(model_path, config=config)
 
-    compiled_path = os.path.join(model_path, "model.pt")
+    compiled_path = os.path.join(out_path, "model.pt")
     if os.path.exists(compiled_path):
-        neuron_model.load(model_path)
+        neuron_model.load(out_path)
     else:
         log.info("Compiling (15-20 min for first run)...")
-        neuron_model.compile(model_path)
-        neuron_model.load(model_path)
+        neuron_model.compile(out_path)
+        neuron_model.load(out_path)
 
     log.info(f"NxDI model ready in {time.time() - t0:.1f}s")
     hf_adapter = HuggingFaceGenerationAdapter(neuron_model)
@@ -363,6 +369,7 @@ class BioReasonPipeline:
         max_new_tokens: int = 2048,
         batch_size: int = 1,
         tp_degree: int = 1,
+        compiled_model_path: str = None,
     ):
         """Initialize the BioReason-Pro pipeline.
 
@@ -373,6 +380,8 @@ class BioReasonPipeline:
             max_new_tokens: Max generation tokens (default: 2048)
             batch_size: NxDI batch size (default: 1)
             tp_degree: NxDI tensor parallelism (default: 1)
+            compiled_model_path: Separate path for compiled model artifacts
+                (default: None, uses model_path)
         """
         from transformers import AutoTokenizer, AutoConfig
 
@@ -441,6 +450,7 @@ class BioReasonPipeline:
             max_new_tokens=max_new_tokens,
             batch_size=batch_size,
             tp_degree=tp_degree,
+            compiled_model_path=compiled_model_path,
         )
 
     def _build_inputs_embeds(
