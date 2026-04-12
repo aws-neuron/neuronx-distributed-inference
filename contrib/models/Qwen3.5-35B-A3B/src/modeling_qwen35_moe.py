@@ -51,14 +51,9 @@ from nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
 from nki_deltanet import deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state
 from nki_flash_attn_d256_pipe import flash_attn_d256_pipe as _flash_attn_d256_kernel_raw
 
-# Create Beta 2 PyTorchXLAKernel directly (NOT nki_jit which forces compat tracer).
-# The Beta 2 tracer supports LoopVar list indexing required by the pipe kernel.
-from nki._torch_xla import PyTorchXLAKernel as _Beta2XLAKernel
-_flash_attn_d256_kernel = _Beta2XLAKernel(
-    func=_flash_attn_d256_kernel_raw.func,
-    grid=_flash_attn_d256_kernel_raw.grid,
-    opts=_flash_attn_d256_kernel_raw.opts,
-)
+# NKI 0.3.0: @nki.jit returns nki.Kernel which auto-detects framework.
+# No need for manual PyTorchXLAKernel wrapping (removed in nki 0.3.0).
+_flash_attn_d256_kernel = _flash_attn_d256_kernel_raw
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -86,6 +81,60 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
 logger = logging.getLogger(__name__)
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
+
+
+def _patch_fused_tkg_for_fp32_router():
+    """Patch MoEFusedTKG kernel to use ISA router fallback for float32 routing.
+
+    The fused MoE TKG NKI kernel's router_topk_kernel_nki asserts that input
+    and weight dtypes match. When router_config.dtype=float32 (for accuracy),
+    the hidden states are float32 but router weights are bfloat16, causing
+    an assertion error. The ISA router fallback handles mixed dtypes correctly.
+
+    Must be called before model.compile().
+    """
+    try:
+        import neuronx_distributed.modules.moe.moe_fused_tkg as fused_tkg_mod
+
+        original_kernel = fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call
+        if original_kernel is None:
+            logger.warning(
+                "Fused TKG selective load kernel not available, skipping patch"
+            )
+            return
+
+        class _PatchedKernelCall:
+            """Wrapper that injects use_router_topk_nki_kernel=False."""
+
+            def __init__(self, original):
+                self._original = original
+
+            def __getitem__(self, grid):
+                original_grid_call = self._original[grid]
+
+                def patched_call(*args, **kwargs):
+                    kwargs["use_router_topk_nki_kernel"] = False
+                    return original_grid_call(*args, **kwargs)
+
+                return patched_call
+
+        fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call = (
+            _PatchedKernelCall(original_kernel)
+        )
+
+        # Also patch the forward-all-experts kernel
+        original_all = fused_tkg_mod._moe_tkg_forward_all_experts_nki_call
+        if original_all is not None:
+            fused_tkg_mod._moe_tkg_forward_all_experts_nki_call = _PatchedKernelCall(
+                original_all
+            )
+
+        logger.info("Patched MoEFusedTKG for float32 router (ISA router fallback).")
+    except ImportError:
+        logger.info("moe_fused_tkg module not available, skipping patch")
+    except Exception as e:
+        logger.warning("Failed to patch MoEFusedTKG: %s", e)
+
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
@@ -603,7 +652,9 @@ class NeuronGatedDeltaNet(nn.Module):
             # Build window: [conv_state[:, :, 0:3], new_token] = (B, 8192, 4)
             # Slice to actual batch_size (buffer may be alloc_batch_size > batch_size)
             if seq_ids is not None:
-                conv_state = torch.index_select(self.conv_state_buffer, 0, seq_ids)  # (B, 8192, 3)
+                conv_state = torch.index_select(
+                    self.conv_state_buffer, 0, seq_ids
+                )  # (B, 8192, 3)
             else:
                 conv_state = self.conv_state_buffer[:batch_size]  # (B, 8192, 3)
             conv_input = torch.cat([conv_state, mixed], dim=-1)  # (B, 8192, 4)
@@ -628,7 +679,9 @@ class NeuronGatedDeltaNet(nn.Module):
             alloc_bs = self.conv_state_buffer.shape[0]
             if seq_ids is not None:
                 idx = seq_ids.view(-1, 1, 1).expand_as(new_conv_state)
-                new_conv_state = (self.conv_state_buffer * 1).scatter(0, idx, new_conv_state)
+                new_conv_state = (self.conv_state_buffer * 1).scatter(
+                    0, idx, new_conv_state
+                )
             elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
                 new_conv_state = torch.cat(
@@ -681,7 +734,9 @@ class NeuronGatedDeltaNet(nn.Module):
             alloc_bs = self.conv_state_buffer.shape[0]
             if seq_ids is not None:
                 idx = seq_ids.view(-1, 1, 1).expand_as(new_conv_state)
-                new_conv_state = (self.conv_state_buffer * 1).scatter(0, idx, new_conv_state)
+                new_conv_state = (self.conv_state_buffer * 1).scatter(
+                    0, idx, new_conv_state
+                )
             elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
                 new_conv_state = torch.cat(
@@ -751,7 +806,9 @@ class NeuronGatedDeltaNet(nn.Module):
             # Load recurrent state from buffer (bf16 -> f32)
             # Slice to actual batch_size (buffer may be alloc_batch_size > batch_size)
             if seq_ids is not None:
-                recurrent_state = torch.index_select(self.recurrent_state_buffer, 0, seq_ids).float()
+                recurrent_state = torch.index_select(
+                    self.recurrent_state_buffer, 0, seq_ids
+                ).float()
             else:
                 recurrent_state = self.recurrent_state_buffer[:batch_size].float()
             output, new_recurrent_state = self._recurrent_step(
@@ -761,7 +818,9 @@ class NeuronGatedDeltaNet(nn.Module):
             alloc_bs = self.recurrent_state_buffer.shape[0]
             if seq_ids is not None:
                 idx = seq_ids.view(-1, 1, 1, 1).expand_as(new_recurrent_state)
-                new_recurrent_state = (self.recurrent_state_buffer.float() * 1).scatter(0, idx, new_recurrent_state)
+                new_recurrent_state = (self.recurrent_state_buffer.float() * 1).scatter(
+                    0, idx, new_recurrent_state
+                )
             elif batch_size < alloc_bs:
                 new_recurrent_state = torch.cat(
                     [
@@ -790,7 +849,9 @@ class NeuronGatedDeltaNet(nn.Module):
             alloc_bs = self.recurrent_state_buffer.shape[0]
             if seq_ids is not None:
                 idx = seq_ids.view(-1, 1, 1, 1).expand_as(new_recurrent_state)
-                new_recurrent_state = (self.recurrent_state_buffer.float() * 1).scatter(0, idx, new_recurrent_state)
+                new_recurrent_state = (self.recurrent_state_buffer.float() * 1).scatter(
+                    0, idx, new_recurrent_state
+                )
             elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
                 new_recurrent_state = torch.cat(
@@ -984,6 +1045,11 @@ class Qwen35MoeInferenceConfig(InferenceConfig):
             and I_TP % MOE_TKG_MK_INTERMEDIATE_PER_TP == 0
         ):
             self.moe_fused_nki_kernel_enabled = True
+            # Patch the fused TKG kernel to use the ISA router fallback.
+            # The NKI router_topk_kernel asserts that input and weight dtypes
+            # match, but our router uses float32 for accuracy while weights
+            # are bfloat16. The ISA fallback handles mixed dtypes correctly.
+            _patch_fused_tkg_for_fp32_router()
 
     def get_required_attributes(self) -> List[str]:
         return [
@@ -1228,8 +1294,9 @@ class NeuronQwen35Attention(NeuronAttentionBase):
 
         return Q, K, cos_cache, sin_cache
 
-    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask,
-                       cos_cache=None, sin_cache=None):
+    def perform_prefill(
+        self, Q, K, V, q_len, bsz, attention_mask, cos_cache=None, sin_cache=None
+    ):
         """Override to handle head_dim=256 with custom NKI flash attention kernel.
 
         The standard NxDI NKI flash attention kernel asserts head_dim <= 128.
@@ -1274,11 +1341,15 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             out_parts = []
             for b in range(bsz):
                 for kv_h in range(n_kv_heads):
-                    q_slice = q_kernel[b:b+1, kv_h*q_h_per_kv:(kv_h+1)*q_h_per_kv, :, :]
-                    k_slice = k_kernel[b:b+1, kv_h:kv_h+1, :, :]
-                    v_slice = v_kernel[b:b+1, kv_h:kv_h+1, :, :]
+                    q_slice = q_kernel[
+                        b : b + 1, kv_h * q_h_per_kv : (kv_h + 1) * q_h_per_kv, :, :
+                    ]
+                    k_slice = k_kernel[b : b + 1, kv_h : kv_h + 1, :, :]
+                    v_slice = v_kernel[b : b + 1, kv_h : kv_h + 1, :, :]
                     o_part = _flash_attn_d256_kernel(
-                        q_slice, k_slice, v_slice,
+                        q_slice,
+                        k_slice,
+                        v_slice,
                         cos_cache=cos_kernel,
                         sin_cache=sin_kernel,
                         use_causal_mask=True,
@@ -1359,8 +1430,14 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         if past_key_value is None:
             # Context encoding (prefill) — pass cos/sin for fused RoPE in kernel
             attn_output, _flash_strategy = self.perform_prefill(
-                Q, K, V, q_len, bsz, attention_mask,
-                cos_cache=cos_cache, sin_cache=sin_cache,
+                Q,
+                K,
+                V,
+                q_len,
+                bsz,
+                attention_mask,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
             )
         else:
             # Token generation (decode)
@@ -1397,18 +1474,13 @@ class NeuronQwen35Attention(NeuronAttentionBase):
 class SigmoidGatedSharedExperts(nn.Module):
     """Wrapper around NxDI SharedExperts that adds Qwen3.5's sigmoid gate.
 
-    NxDI's MoE._apply_shared_experts calls:
-        shared_output = self.shared_experts(full_hidden_states, seq_len)
-        output = output + shared_output
-
-    This wrapper intercepts that call and multiplies the shared expert output
-    by sigmoid(gate_linear(input)) before returning, so the MoE's addition
-    already includes the sigmoid gating.
+    Computes: output = sigmoid(x @ gate_weight.T) * SharedExpertMLP(x)
 
     The wrapped SharedExperts uses ColumnParallelLinear (gate/up) and
-    RowParallelLinear(reduce_output=False) (down), so its output is TP-partial.
-    The sigmoid gate (1, hidden_size) operates on full hidden states and produces
-    a per-token scalar — multiplying TP-partial output by a scalar is correct.
+    RowParallelLinear(reduce_output=False) (down), so its MLP output is
+    TP-partial. When called inside MoE._apply_shared_experts (CTE path),
+    the all-reduce is handled by MoE after the addition. When called
+    standalone (TKG path), the caller must reduce the output.
 
     Weight layout:
       shared_experts.gate_proj.weight: (intermediate_size, hidden_size) = (512, 2048)
@@ -1446,10 +1518,7 @@ class SigmoidGatedSharedExperts(nn.Module):
         self.shared_experts.preshard_hook(model_state_dict, prefix)
 
     def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """Compute sigmoid-gated shared expert output.
-
-        Called by MoE._apply_shared_experts as:
-            shared_output = self.shared_experts(full_hidden_states, seq_len)
+        """Compute sigmoid-gated shared expert output (TP-partial).
 
         Args:
             x: (T, H) flattened hidden states (full, not TP-partial)
@@ -1458,7 +1527,7 @@ class SigmoidGatedSharedExperts(nn.Module):
         Returns:
             output: (T, H) sigmoid-gated shared expert output (TP-partial from down_proj)
         """
-        # Compute shared expert MLP output (TP-partial)
+        # Compute shared expert MLP output (TP-partial from down_proj)
         shared_output = self.shared_experts(x, seq_len)
 
         # Apply sigmoid gate: sigmoid(x @ gate_weight.T) -> (T, 1)
@@ -1509,20 +1578,31 @@ class NeuronQwen35DecoderLayer(nn.Module):
         )
 
         if self.moe_fused_nki_kernel_enabled:
+            # Fused TKG mega-kernel: pass rmsnorm=None to avoid aliasing.
+            # CTE path: decoder applies post_attention_layernorm before MoE.
+            # TKG path: fused kernel applies norm internally via its own RMSNorm.
             self.mlp = initialize_moe_module(
                 config=config,
-                rmsnorm=self.post_attention_layernorm,
+                rmsnorm=None,
                 init_tkg_module=True,
             )
+            # Create separate (non-shared) RMSNorm for fused TKG kernel
+            if (
+                hasattr(self.mlp, "moe_fused_tkg")
+                and self.mlp.moe_fused_tkg is not None
+            ):
+                self.mlp.moe_fused_tkg.post_attention_layernorm = get_rmsnorm_cls()(
+                    config.hidden_size, eps=config.rms_norm_eps
+                )
         else:
             self.mlp = initialize_moe_module(config=config)
 
-        # Sigmoid-gated shared expert using NxDI's TP-sharded SharedExperts
-        # Created separately (not via n_shared_experts) because Qwen3.5's
-        # shared_expert_intermediate_size (512) differs from moe_intermediate_size (256).
-        # Injected into MoE.shared_experts so _apply_shared_experts handles it.
-        # NOTE: We assign directly to mlp.shared_experts (not self.sigmoid_gated_...)
-        # so there's only ONE module tree path and weight keys match.
+        # Sigmoid-gated shared expert using NxDI's TP-sharded SharedExperts.
+        # Injected into MoE.shared_experts so CTE's _apply_shared_experts handles
+        # it correctly (TP-partial addition before all-reduce).
+        # Note: MoEFusedTKG.shared_experts was set to None at init time (before
+        # this assignment), so the fused TKG kernel skips shared experts.
+        # During TKG, we handle shared experts manually in the decoder forward.
         self.mlp.shared_experts = SigmoidGatedSharedExperts(config)
 
     def forward(
@@ -1683,12 +1763,18 @@ class NeuronQwen35DecoderLayer(nn.Module):
             # Skip MoE entirely, hidden_states stays as-is (attn residual)
             pass
         else:
-            # MoE FFN (routed experts + sigmoid-gated shared expert via NxDI MoE)
-            # NxDI's _apply_shared_experts calls self.mlp.shared_experts (our
-            # SigmoidGatedSharedExperts wrapper) which adds sigmoid-gated shared
-            # expert output to routed output BEFORE the all-reduce.
+            # MoE FFN (routed experts + sigmoid-gated shared expert)
+            # Shared expert is handled OUTSIDE the MoE module because the fused
+            # TKG kernel cannot apply the sigmoid gate.
             residual = hidden_states
-            if not self.moe_fused_nki_kernel_enabled:
+
+            # Normalization strategy for fused MoE TKG:
+            # - CTE (seq_len > 1): Decoder applies post_attention_layernorm.
+            #   MoE's _forward_compute_bound skips norm (rmsnorm=None).
+            # - TKG (seq_len == 1): Decoder skips post_attention_layernorm.
+            #   Fused kernel applies norm internally using its own RMSNorm.
+            is_tkg = self.moe_fused_nki_kernel_enabled and hidden_states.shape[1] == 1
+            if not is_tkg:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
             is_speculative_decoding = (
@@ -1700,6 +1786,32 @@ class NeuronQwen35DecoderLayer(nn.Module):
                 padding_mask,
                 is_speculative_decoding=is_speculative_decoding,
             )[0]
+
+            # Shared expert handling depends on path:
+            # - CTE: MoE._apply_shared_experts already added shared expert output
+            #   (TP-partial + TP-partial, then all-reduce). Nothing more to do.
+            # - TKG: Fused kernel skipped shared experts (MoEFusedTKG.shared_experts
+            #   is None). We compute it manually and add with an extra all-reduce.
+            if is_tkg:
+                from neuronx_distributed.parallel_layers import (
+                    mappings,
+                    parallel_state,
+                )
+
+                shared_input = self.post_attention_layernorm(residual)
+                shared_input_flat = shared_input.reshape(-1, shared_input.shape[-1])
+                # shared_output is TP-partial (from down_proj reduce_output=False)
+                shared_output = self.mlp.shared_experts(
+                    shared_input_flat, shared_input.shape[1]
+                )
+                # All-reduce to match moe_output which is already fully reduced
+                shared_output = mappings.reduce_from_tensor_model_parallel_region(
+                    shared_output,
+                    process_group=parallel_state.get_tensor_model_parallel_group(),
+                )
+                shared_output = shared_output.view(moe_output.shape)
+                moe_output = moe_output + shared_output
+
             hidden_states = residual + moe_output
 
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)
@@ -2300,6 +2412,23 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
             neuron_state_dict[f"layers.{l}.mlp.shared_experts.sigmoid_gate.weight"] = (
                 neuron_state_dict.pop(seg_key).detach().clone()
             )
+
+        # Fused MoE TKG aliased weights
+        if getattr(config, "moe_fused_nki_kernel_enabled", False):
+            # MoEFusedTKG has a separate (non-shared) RMSNorm that
+            # needs the same weights as post_attention_layernorm.
+            post_attn_key = f"layers.{l}.post_attention_layernorm.weight"
+            if post_attn_key in neuron_state_dict:
+                neuron_state_dict[
+                    f"layers.{l}.mlp.moe_fused_tkg.post_attention_layernorm.weight"
+                ] = neuron_state_dict[post_attn_key].clone()
+
+            # Router transposed weight (required by fused TKG kernel)
+            router_key = f"layers.{l}.mlp.router.linear_router.weight"
+            if router_key in neuron_state_dict:
+                neuron_state_dict[f"layers.{l}.mlp.router.weight_T"] = (
+                    neuron_state_dict[router_key].detach().T.clone()
+                )
 
         gc.collect()
 
