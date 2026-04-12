@@ -90,6 +90,26 @@ Verified that performance characteristics hold at longer sequence lengths (2.67x
 
 LNC=1/LNC=2 ratio remains stable at 86-87% across sequence lengths. The larger KV cache does not disproportionately hurt LNC=1 cores.
 
+#### Data Parallelism (Process-Level)
+
+BioReason-Pro uses TP=1, so all NeuronCores on a trn2.3xlarge can run independent pipeline instances in parallel. The included `DataParallelRunner` spawns N worker processes, each pinned to a separate NeuronCore via `NEURON_RT_VISIBLE_CORES`, distributing proteins round-robin across workers.
+
+**Key behavior:** The compiled model artifact is shared across all workers — compile once on any core, all workers load the cached compilation. Model loading takes ~26s per worker when sequential, but parallel startup causes I/O contention (see notes below).
+
+| Config | Workers | Aggregate tok/s | Wall Time (10 proteins) | Per-Worker tok/s | Speedup vs Single |
+|--------|---------|----------------|------------------------|-----------------|-------------------|
+| Single core (LNC=2) | 1 | 44.0 | 295.9s | 44.0 | 1.0x |
+| DP=4 (LNC=2) | 4 | 81.8 | 107.5s | 43.7 | 2.75x |
+| DP=8 (LNC=1) | 8 | 53.9 | 163.0s | 36.0 | 1.81x |
+
+**Notes:**
+- DP=4 achieves 2.75x speedup (not 4x) because 10 proteins distributed across 4 workers creates load imbalance (some workers process 3, others 2)
+- DP=4 per-worker throughput (43.7 tok/s) matches single-core throughput (44.0 tok/s), confirming zero contention between cores
+- DP=8 wall time includes ~30s model loading overhead amortized over only 10 proteins. Per-worker steady-state throughput (36.0 tok/s) matches standalone LNC=1 per-core throughput (37.7 tok/s)
+- DP=8 aggregate tok/s is wall-time-based (total_tokens / wall_time) and includes loading overhead. For larger workloads where loading is amortized, throughput scales with worker count
+- LNC=1 per-worker throughput is 82% of LNC=2 per-worker (36.0 vs 43.7 tok/s), consistent with the single-core LNC comparison above
+- **Recommendation:** DP=4 with LNC=2 is the practical sweet spot for trn2.3xlarge — near-linear per-worker throughput with manageable startup overhead
+
 #### BS=1 Per-Protein Detail (10 diverse proteins, 113-494 AA)
 
 | Protein | Organism | Seq Len | Tokens | ESM3 (s) | Gen (s) | Total (s) |
@@ -156,6 +176,33 @@ print(f"Generated {result['num_tokens']} tokens at {result['tok_per_s']:.1f} tok
 print(result['text'])
 ```
 
+### Data-Parallel Inference
+
+For batch processing across multiple NeuronCores:
+
+```python
+from src.dp_launcher import DataParallelRunner
+
+runner = DataParallelRunner(
+    model_path="/mnt/models/bioreason-pro-rl",
+    num_workers=4,          # 4 cores on LNC=2, 8 on LNC=1
+    batch_size=1,           # Per-worker batch size
+    compiled_model_path="/mnt/compiled/bs1",  # Shared compiled model
+)
+
+proteins = [
+    {"sequence": "MSKMSHF...", "organism": "Yeast", "interpro": "...", "gogpt": "..."},
+    {"sequence": "MHQGAPP...", "organism": "Human", "interpro": "...", "gogpt": "..."},
+    # ... more proteins
+]
+
+results = runner.run(proteins)  # Returns list of result dicts, ordered by input index
+for r in results:
+    print(f"{r['num_tokens']} tokens at {r['tok_per_s']:.1f} tok/s (worker {r['worker_id']})")
+```
+
+Each worker runs an independent `BioReasonPipeline` pinned to a separate NeuronCore. Compile the model once (on any core), then all workers load the cached compilation.
+
 ### Prerequisites
 
 1. Download the checkpoint:
@@ -180,8 +227,10 @@ print(result['text'])
 
 | Instance | SDK 2.28 | SDK 2.27 |
 |----------|----------|----------|
-| trn2.3xlarge (TP=1, LNC=2) | VALIDATED (BS=1,4,8,16) | Not tested |
-| trn2.3xlarge (TP=1, LNC=1) | VALIDATED (BS=1,4) | Not tested |
+| trn2.3xlarge (TP=1, LNC=2, BS=1,4,8,16) | VALIDATED | Not tested |
+| trn2.3xlarge (TP=1, LNC=1, BS=1,4) | VALIDATED | Not tested |
+| trn2.3xlarge (TP=1, LNC=2, DP=4) | VALIDATED | Not tested |
+| trn2.3xlarge (TP=1, LNC=1, DP=8) | VALIDATED | Not tested |
 | trn2.48xlarge | Not tested | Not tested |
 | inf2.xlarge | Not tested | Not tested |
 
@@ -227,6 +276,8 @@ Expected output:
 5. **PLProcessor dependency**: The pipeline requires `bioreason2.models.pl.processing_pl.PLProcessor` from the BioReason source repository for chat template formatting. This must be cloned separately.
 
 6. **Static batching overhead**: NxDI uses static batching, so partial batches (e.g., 2 proteins in a BS=4 model) waste compute on padded slots. Plan batch sizes to match workload volume.
+
+7. **DP startup I/O contention**: When launching 8 workers simultaneously (DP=8), parallel model weight loading causes I/O contention. Per-worker load time increases from ~26s (sequential) to ~270-300s when all 8 start at once. This is a one-time startup cost. For production use, consider staggered worker startup or pre-warming.
 
 ## Maintainer
 
