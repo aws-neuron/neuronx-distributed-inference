@@ -32,7 +32,7 @@ Key parameters:
 
 | Machine | Config | Total Time | Per Step | Quality |
 |---------|--------|------------|----------|---------|
-| **Trn2** (trn2.48xlarge) | All Neuron, **CFG Parallel** | **20.39s** | 0.41s | Good |
+| **Trn2** (trn2.48xlarge) | All Neuron, **CFG Parallel** | **18.17s** | 0.36s | Good |
 | **Trn2** (trn2.48xlarge) | All Neuron, Context Parallel | 22.39s | 0.45s | Good |
 | **H100** (single GPU, bf16) | Full GPU | 23.61s | 0.47s | Reference |
 
@@ -92,7 +92,7 @@ bash src/compile.sh cp
 # bash src/compile.sh cfg 1024 1024 448 1024
 ```
 
-Compilation takes ~60-90 minutes total. Compiled models are saved to `/opt/dlami/nvme/compiled_models/`.
+Compilation takes ~60-90 minutes total. Compiled models are saved to `/opt/dlami/nvme/compiled_models_longcat/`.
 
 ### 4. Run Inference
 
@@ -129,7 +129,7 @@ NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_longcat_image_ed
 | `--use_cp` | false | Use Context Parallel instead of CFG |
 | `--cpu_vision_encoder` | false | Use CPU vision encoder for better accuracy |
 | `--warmup` | false | Run warmup inference first |
-| `--compiled_models_dir` | `/opt/dlami/nvme/compiled_models` | Path to compiled models |
+| `--compiled_models_dir` | `/opt/dlami/nvme/compiled_models_longcat` | Path to compiled models |
 
 ## Compatibility Matrix
 
@@ -196,4 +196,4 @@ LongCat-Image-Edit/
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-09
+**Last Updated:** 2026-04-13

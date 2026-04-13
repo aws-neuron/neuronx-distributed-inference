@@ -717,7 +717,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wan2.2 TI2V Inference with Context Parallel")
     parser.add_argument("--compiled_models_dir", type=str, default=DEFAULT_COMPILED_MODELS_DIR,
                         help="Directory containing compiled models")
-    parser.add_argument("--height", type=int, default=512, help="Video height")
+    parser.add_argument("--height", type=int, default=384, help="Video height")
     parser.add_argument("--width", type=int, default=512, help="Video width")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames")
     parser.add_argument("--max_sequence_length", type=int, default=512, help="Max text sequence length")

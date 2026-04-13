@@ -27,7 +27,7 @@ COMPILED_MODELS_DIR="${1:-/opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b}"
 COMPILER_WORKDIR="${2:-/opt/dlami/nvme/compiler_workdir_wan2.2_ti2v_5b}"
 
 # Video settings (should match inference)
-HEIGHT=512
+HEIGHT=384
 WIDTH=512
 NUM_FRAMES=81
 MAX_SEQUENCE_LENGTH=512

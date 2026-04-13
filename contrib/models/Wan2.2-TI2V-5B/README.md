@@ -28,7 +28,7 @@ Key parameters:
 
 | Resolution | Frames | Trn2 CP (s) | Trn2 CFG (s) | H100 (s) | Decoder |
 |-----------|--------|-------------|--------------|----------|---------|
-| 512x384 | 81 | 20.67 | **18.32** | 16.13 | stateful rolling |
+| 512x384 | 81 | 20.67 | **15.77** | 16.13 | stateful rolling |
 | 512x384 | 121 | 30.07 | **26.44** | 24.48 | stateful rolling |
 | 640x480 | 81 | **33.20** | 34.10 | 26.06 | stateful rolling |
 | 640x480 | 121 | 49.29 | **45.15** | 39.67 | stateful rolling |
@@ -159,4 +159,4 @@ Wan2.2-TI2V/
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-09
+**Last Updated:** 2026-04-13

@@ -28,16 +28,17 @@ Key parameters:
 
 6 compilation APIs with different parallelism strategies:
 
-| Version | Parallelism | Attention | Per Step | Notes |
-|---------|------------|-----------|----------|-------|
-| **V3 CFG** | TP=4, DP=2 | NKI Flash | **~0.75s** | Fastest, recommended |
-| V3 CP | TP=4, CP=2 | NKI Flash | ~0.77s | Context Parallel |
-| V1 Flash | TP=8 | NKI Flash | ~1.2s | NKI kernel |
-| V2 Flash | TP=8 | NKI Flash | ~1.2s | ModelBuilder + NKI |
-| V2 | TP=8 | Standard SDPA | ~1.2s | ModelBuilder |
-| V1 | TP=8 | Standard SDPA | ~2.4s | Baseline |
+| Version | Parallelism | Attention | Per Step | Total (50 steps) | Notes |
+|---------|------------|-----------|----------|-----------------|-------|
+| **V3 CFG** | TP=4, DP=2 | NKI Flash | **~0.75s** | **~53s** | Fastest, recommended |
+| V3 CP | TP=4, CP=2 | NKI Flash | ~0.77s | ~55s | Context Parallel |
+| V1 Flash | TP=8 | NKI Flash | ~1.2s | ~76s | NKI kernel |
+| V2 Flash | TP=8 | NKI Flash | ~1.2s | ~76s | ModelBuilder + NKI |
+| V2 | TP=8 | Standard SDPA | ~1.2s | ~76s | ModelBuilder |
+| V1 | TP=8 | Standard SDPA | ~2.4s | ~136s | Baseline |
 
-Test: 1024x1024 output, guidance_scale=4.5, 50 steps, trn2.48xlarge.
+Test: 1024x1024 output, guidance_scale=4.0, trn2.48xlarge.
+Total time includes VAE encoding/decoding and text encoding overhead.
 
 ## Prerequisites
 
@@ -89,9 +90,10 @@ Compilation takes ~60-120 minutes total depending on version.
 
 ```bash
 NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_qwen_image_edit.py \
-    --image assets/image1.png \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_qwen_image_edit \
+    --images assets/image1.png \
     --prompt "change the sky to sunset" \
-    --version v3_cfg \
+    --use_v3_cfg \
     --output output.png
 ```
 
@@ -169,4 +171,4 @@ Qwen-Image-Edit/
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-09
+**Last Updated:** 2026-04-13

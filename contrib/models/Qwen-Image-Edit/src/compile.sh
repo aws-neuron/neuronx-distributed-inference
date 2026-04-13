@@ -26,8 +26,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:$PYTHONPATH"
-COMPILED_MODELS_DIR="/opt/dlami/nvme/compiled_models"
-COMPILER_WORKDIR="/opt/dlami/nvme/compiler_workdir"
+COMPILED_MODELS_DIR="/opt/dlami/nvme/compiled_models_qwen_image_edit"
+COMPILER_WORKDIR="/opt/dlami/nvme/compiler_workdir_qwen_image_edit"
 
 # Fixed VAE tile size (VAE uses tiled processing for larger images)
 VAE_TILE_SIZE=512

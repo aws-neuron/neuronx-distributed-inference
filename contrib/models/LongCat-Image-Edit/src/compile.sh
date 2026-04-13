@@ -18,8 +18,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:$PYTHONPATH"
-COMPILED_MODELS_DIR="/opt/dlami/nvme/compiled_models"
-COMPILER_WORKDIR="/opt/dlami/nvme/compiler_workdir"
+COMPILED_MODELS_DIR="/opt/dlami/nvme/compiled_models_longcat"
+COMPILER_WORKDIR="/opt/dlami/nvme/compiler_workdir_longcat"
 
 # VAE compiled for full output size (no tiling needed, avoids seam artifacts)
 VAE_TILE_SIZE=1024
