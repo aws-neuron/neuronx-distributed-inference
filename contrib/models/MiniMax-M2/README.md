@@ -144,6 +144,30 @@ The patch (`perf_test/vllm-neuron-mimo-minimax.patch`) modifies vllm-neuron to:
 
 See `perf_test/2_bench_minimax_m2.sh` for full benchmark configurations with BS=1/256.
 
+## Performance
+
+### vLLM Serving — Config 1 (trn2.48xlarge, BF16, BS=1, TP=64/EP=1, non-CB)
+
+Input/output: 900/90 tokens (random dataset)
+
+| Concurrency | Throughput (tok/s) | TPOT (ms) | TTFT (ms) |
+|-------------|-------------------|-----------|-----------|
+| 1 | 39.28 | 13.56 | 1088 |
+
+### vLLM Serving — Config 2 (trn2.48xlarge, BF16, BS=256, TP=64/EP=64, CB)
+
+Input/output: 900/90 tokens (random dataset)
+
+| Concurrency | Throughput (tok/s) | TPOT (ms) | TTFT (ms) |
+|-------------|-------------------|-----------|-----------|
+| 1 | 5.76 | 173.83 | 165 |
+| 16 | 54.69 | 287.09 | 513 |
+| 32 | 75.85 | 408.66 | 1066 |
+| 128 | 106.72 | 1158.08 | 3950 |
+| 256 | 128.94 | 1860.69 | 11263 |
+
+> **Note:** Large MoE models like MiniMax-M2 require extended engine startup time. Set `VLLM_ENGINE_READY_TIMEOUT_S=3600` before launching the vLLM server.
+
 ## Compatibility Matrix
 
 | Instance/Version | 2.22+ (PyTorch 2.9) | 2.21 and earlier |
@@ -167,4 +191,4 @@ pytest contrib/models/MiniMax-M2/test/integration/test_model.py -v
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-09
+**Last Updated:** 2026-04-13

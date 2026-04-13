@@ -158,13 +158,25 @@ See `perf_test/1_bench_mimo_v2_flash.sh` for full benchmark configurations with 
 
 ## Performance
 
-Standalone NxDI (trn2.48xlarge, BF16, TP=64, EP=64):
+### Standalone NxDI (trn2.48xlarge, BF16, TP=64, EP=64)
 
 | Batch Size | Throughput (tok/s) |
 |------------|-------------------|
 | 1 | 29.92 |
 | 8 | 215.94 |
 | 32 | 649.14 |
+
+### vLLM Serving (trn2.48xlarge, BF16, BS=32, TP=64/EP=64, CB)
+
+Input/output: 900/90 tokens (random dataset)
+
+| Concurrency | Throughput (tok/s) | TPOT (ms) | TTFT (ms) |
+|-------------|-------------------|-----------|-----------|
+| 1 | 27.98 | 33.65 | 222 |
+| 16 | 224.57 | 64.95 | 570 |
+| 32 | 302.61 | 90.23 | 1351 |
+
+> **Note:** Large MoE models like MiMo-V2-Flash require extended engine startup time (~47 min for compile+load). Set `VLLM_ENGINE_READY_TIMEOUT_S=3600` before launching the vLLM server.
 
 ## Compatibility Matrix
 
@@ -196,4 +208,4 @@ pytest contrib/models/MiMo-V2-Flash/test/integration/test_model.py -v
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-09
+**Last Updated:** 2026-04-13
