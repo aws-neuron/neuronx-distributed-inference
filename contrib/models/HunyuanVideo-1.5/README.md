@@ -161,15 +161,22 @@ Patches 1-4 are applied automatically by setting `HUNYUAN_ATTN_MODE=torch`. Patc
 ```bash
 # Set environment variables (see Usage section above)
 
-# Run integration tests
-pytest test/integration/test_model.py -v --capture=tee-sys
+# Run component accuracy tests (byT5 + VAE):
+pytest test/integration/test_model.py -k "ByT5 or VAE" -v --capture=tee-sys
+
+# Run E2E pipeline tests (separately, to avoid NeuronCore contention):
+pytest test/integration/test_model.py -k "E2E" -v --capture=tee-sys
 ```
 
+**Note:** Run component and E2E tests separately. In-process Neuron model loads
+(byT5/VAE) claim NeuronCores, which prevents E2E subprocess tests from
+initializing their own Neuron runtime.
+
 The test suite includes:
-- **byT5 accuracy**: Cosine similarity >= 0.999 vs CPU reference
-- **VAE tile accuracy**: Output finiteness and shape validation
-- **E2E generation**: Produces 5 frames at correct resolution
-- **E2E performance**: 50-step generation completes within 60s (no CFG)
+- **byT5 accuracy**: Cosine similarity >= 0.999 vs CPU reference (encoder + mapper)
+- **VAE tile accuracy**: Output finiteness, shape validation, and spatial upsampling (16x)
+- **E2E generation**: Produces 5 frames at 480x848 resolution (2-step quick test)
+- **E2E performance**: 50-step generation completes within 120s wall-clock (no CFG, includes model loading)
 
 ## File Structure
 
