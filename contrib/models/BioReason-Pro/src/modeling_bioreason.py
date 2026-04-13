@@ -44,7 +44,7 @@ import sys
 import time
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -85,6 +85,55 @@ UNIPROT_SUFFIX = " Summarize in UniProt format."
 # ---------------------------------------------------------------------------
 
 
+def _patch_esm3_tokenizer():
+    """Fix ESM3 sequence tokenizer mask_token incompatibility.
+
+    In ESM3 >= 3.0.4 with transformers >= 4.47, EsmSequenceTokenizer.mask_token
+    returns None despite '<mask>' being in the vocabulary. This causes
+    encoding.tokenize_sequence to fail with:
+        TypeError: replace() argument 2 must be str, not None
+
+    This patch makes tokenize_sequence and get_default_sequence_tokens robust
+    to a None mask_token by skipping the mask-replacement step (protein
+    sequences never contain the mask character '_') and falling back to a
+    vocab lookup for the mask token ID.
+    """
+    import esm.utils.encoding as _enc
+
+    # Only patch once
+    if getattr(_enc, "_bioreason_patched", False):
+        return
+    _enc._bioreason_patched = True
+
+    from esm.utils.constants import esm3 as _C
+
+    def _safe_tokenize_sequence(sequence, sequence_tokenizer, add_special_tokens=True):
+        mask_token = sequence_tokenizer.mask_token
+        if mask_token is not None:
+            sequence = sequence.replace(_C.MASK_STR_SHORT, mask_token)
+        # else: skip replace — protein sequences don't contain mask chars
+        tokens = sequence_tokenizer.encode(
+            sequence, add_special_tokens=add_special_tokens
+        )
+        return torch.tensor(tokens, dtype=torch.int64)
+
+    _enc.tokenize_sequence = _safe_tokenize_sequence
+
+    _orig_get_default = _enc.get_default_sequence_tokens
+
+    def _safe_get_default_sequence_tokens(sequence_length, sequence_tokenizer=None):
+        if sequence_tokenizer is not None:
+            mask_id = sequence_tokenizer.mask_token_id
+            if mask_id is None:
+                vocab = sequence_tokenizer.get_vocab()
+                mask_id = vocab.get("<mask>", sequence_tokenizer.pad_token_id)
+            return torch.full((sequence_length,), mask_id, dtype=torch.int64)
+        return _orig_get_default(sequence_length, sequence_tokenizer)
+
+    _enc.get_default_sequence_tokens = _safe_get_default_sequence_tokens
+    log.info("Applied ESM3 tokenizer compatibility patch")
+
+
 class ESM3Encoder:
     """ESM3-small encoder on CPU for protein sequence embedding."""
 
@@ -96,6 +145,8 @@ class ESM3Encoder:
     ):
         from esm.models.esm3 import ESM3
         from esm.sdk.api import ESMProtein, SamplingConfig
+
+        _patch_esm3_tokenizer()
 
         log.info(f"Loading ESM3 '{model_name}' on {device}...")
         t0 = time.time()
@@ -582,6 +633,101 @@ class BioReasonPipeline:
             "total_time_s": total_time,
             "tok_per_s": num_tokens / gen_time if gen_time > 0 else 0,
         }
+
+    def predict_batch(
+        self,
+        proteins: List[Dict[str, str]],
+        max_new_tokens: Optional[int] = None,
+    ) -> List[Dict[str, object]]:
+        """Run BioReason-Pro inference for a batch of proteins.
+
+        Each protein dict should have keys: sequence, organism, interpro (optional),
+        gogpt (optional). The batch is padded to the compiled batch_size.
+
+        Args:
+            proteins: List of protein dicts
+            max_new_tokens: Override max generation length (optional)
+
+        Returns:
+            List of result dicts, one per input protein
+        """
+        t_start = time.time()
+        max_tokens = max_new_tokens or self.max_new_tokens
+
+        # Build inputs_embeds for each protein individually
+        embeds_list = []
+        embed_times = []
+        for p in proteins:
+            t_emb = time.time()
+            seq = clean_sequence(p["sequence"])
+            embeds = self._build_inputs_embeds(
+                seq, p["organism"], p.get("interpro", ""), p.get("gogpt", "")
+            )
+            embeds_list.append(embeds)
+            embed_times.append(time.time() - t_emb)
+
+        # Pad all embeds to the same sequence length and stack
+        max_seq_len = max(e.shape[1] for e in embeds_list)
+        # Clamp to compiled max_context_length
+        max_seq_len = min(max_seq_len, self.max_context_length)
+
+        padded = []
+        for e in embeds_list:
+            seq_len = min(e.shape[1], max_seq_len)
+            if seq_len < max_seq_len:
+                pad = torch.zeros(
+                    1,
+                    max_seq_len - seq_len,
+                    self.hidden_size,
+                    dtype=torch.bfloat16,
+                )
+                padded.append(torch.cat([e[:, :seq_len], pad], dim=1))
+            else:
+                padded.append(e[:, :max_seq_len])
+
+        # Stack into batch, padding to compiled batch_size if needed
+        batch = torch.cat(padded, dim=0)  # (N, max_seq_len, hidden)
+        actual_batch = batch.shape[0]
+
+        # Pad to compiled batch_size with zeros if needed
+        compiled_bs = self.neuron_model.neuron_config.batch_size
+        if actual_batch < compiled_bs:
+            pad_batch = torch.zeros(
+                compiled_bs - actual_batch,
+                max_seq_len,
+                self.hidden_size,
+                dtype=torch.bfloat16,
+            )
+            batch = torch.cat([batch, pad_batch], dim=0)
+
+        # Generate
+        t_gen = time.time()
+        with torch.no_grad():
+            output_ids = self.hf_adapter.generate(
+                inputs_embeds=batch,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+            )
+        gen_time = time.time() - t_gen
+        total_time = time.time() - t_start
+
+        # Decode results for actual proteins only (not padding)
+        results = []
+        for i in range(actual_batch):
+            text = self.tokenizer.decode(output_ids[i], skip_special_tokens=True)
+            num_tokens = len(output_ids[i])
+            results.append(
+                {
+                    "text": text,
+                    "num_tokens": num_tokens,
+                    "gen_time_s": gen_time,
+                    "total_time_s": total_time,
+                    "embed_time_s": embed_times[i],
+                    "tok_per_s": num_tokens / gen_time if gen_time > 0 else 0,
+                }
+            )
+
+        return results
 
     def generate_with_scores(
         self,

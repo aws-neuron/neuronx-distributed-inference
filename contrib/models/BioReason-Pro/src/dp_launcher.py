@@ -94,35 +94,68 @@ def _worker_fn(
 
     # Process proteins from the task queue until sentinel (None)
     while True:
-        item = task_queue.get()
-        if item is None:
+        # Collect a batch of items from the queue
+        batch_items = []
+        while len(batch_items) < batch_size:
+            item = task_queue.get()
+            if item is None:
+                break
+            batch_items.append(item)
+
+        if not batch_items:
             break
 
-        idx, protein = item
-        try:
-            result = pipeline.predict(
-                sequence=protein["sequence"],
-                organism=protein["organism"],
-                interpro=protein.get("interpro", ""),
-                gogpt=protein.get("gogpt", ""),
-                max_new_tokens=protein.get("max_new_tokens"),
-            )
-            result["worker_id"] = worker_id
-            result["core_id"] = core_id
-            result["protein_idx"] = idx
-            result_queue.put((idx, result))
-        except Exception as e:
-            result_queue.put(
-                (
-                    idx,
-                    {
-                        "error": str(e),
-                        "worker_id": worker_id,
-                        "core_id": core_id,
-                        "protein_idx": idx,
-                    },
+        if batch_size > 1:
+            # Batched processing
+            indices = [idx for idx, _ in batch_items]
+            proteins_batch = [p for _, p in batch_items]
+            try:
+                results = pipeline.predict_batch(proteins_batch)
+                for i, result in enumerate(results):
+                    result["worker_id"] = worker_id
+                    result["core_id"] = core_id
+                    result["protein_idx"] = indices[i]
+                    result_queue.put((indices[i], result))
+            except Exception as e:
+                for idx, _ in batch_items:
+                    result_queue.put(
+                        (
+                            idx,
+                            {
+                                "error": str(e),
+                                "worker_id": worker_id,
+                                "core_id": core_id,
+                                "protein_idx": idx,
+                            },
+                        )
+                    )
+        else:
+            # Single-item processing (BS=1)
+            idx, protein = batch_items[0]
+            try:
+                result = pipeline.predict(
+                    sequence=protein["sequence"],
+                    organism=protein["organism"],
+                    interpro=protein.get("interpro", ""),
+                    gogpt=protein.get("gogpt", ""),
+                    max_new_tokens=protein.get("max_new_tokens"),
                 )
-            )
+                result["worker_id"] = worker_id
+                result["core_id"] = core_id
+                result["protein_idx"] = idx
+                result_queue.put((idx, result))
+            except Exception as e:
+                result_queue.put(
+                    (
+                        idx,
+                        {
+                            "error": str(e),
+                            "worker_id": worker_id,
+                            "core_id": core_id,
+                            "protein_idx": idx,
+                        },
+                    )
+                )
 
     log.info(f"Worker {worker_id}: shutting down")
 

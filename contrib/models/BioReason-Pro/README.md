@@ -102,13 +102,24 @@ BioReason-Pro uses TP=1, so all NeuronCores on a trn2.3xlarge can run independen
 | DP=4 (LNC=2) | 4 | 81.8 | 107.5s | 43.7 | 2.75x |
 | DP=8 (LNC=1) | 8 | 53.9 | 163.0s | 36.0 | 1.81x |
 
+**Scaled workload (40 proteins, loading overhead amortized):**
+
+| Config | Workers | Aggregate tok/s | Wall Time (40 proteins) | Per-Worker tok/s |
+|--------|---------|----------------|------------------------|-----------------|
+| DP=4, BS=1 (LNC=2) | 4 | 129.8 | 271.0s | 43.7 |
+| DP=4, BS=4 (LNC=2) | 4 | 299.9 | 215.3s | 32.8* |
+
+\* Per-worker tok/s for BS=4 reflects batch-averaged throughput (each generate call processes 4 proteins simultaneously). The aggregate throughput is 2.1x the GPU A10G peak (142.3 tok/s).
+
 **Notes:**
 - DP=4 achieves 2.75x speedup (not 4x) because 10 proteins distributed across 4 workers creates load imbalance (some workers process 3, others 2)
 - DP=4 per-worker throughput (43.7 tok/s) matches single-core throughput (44.0 tok/s), confirming zero contention between cores
+- DP=4 BS=4 achieves **299.9 tok/s** aggregate — **2.3x** the DP=4 BS=1 throughput and **2.1x GPU A10G peak**
+- BS=4 batching amortizes ESM3 CPU encoding and KV cache overhead across 4 proteins per generate call
 - DP=8 wall time includes ~30s model loading overhead amortized over only 10 proteins. Per-worker steady-state throughput (36.0 tok/s) matches standalone LNC=1 per-core throughput (37.7 tok/s)
 - DP=8 aggregate tok/s is wall-time-based (total_tokens / wall_time) and includes loading overhead. For larger workloads where loading is amortized, throughput scales with worker count
 - LNC=1 per-worker throughput is 82% of LNC=2 per-worker (36.0 vs 43.7 tok/s), consistent with the single-core LNC comparison above
-- **Recommendation:** DP=4 with LNC=2 is the practical sweet spot for trn2.3xlarge — near-linear per-worker throughput with manageable startup overhead
+- **Recommendation:** DP=4, BS=4 with LNC=2 is the optimal configuration for trn2.3xlarge — 2.1x GPU throughput with zero contention
 
 #### BS=1 Per-Protein Detail (10 diverse proteins, 113-494 AA)
 
@@ -230,6 +241,7 @@ Each worker runs an independent `BioReasonPipeline` pinned to a separate NeuronC
 | trn2.3xlarge (TP=1, LNC=2, BS=1,4,8,16) | VALIDATED | Not tested |
 | trn2.3xlarge (TP=1, LNC=1, BS=1,4) | VALIDATED | Not tested |
 | trn2.3xlarge (TP=1, LNC=2, DP=4) | VALIDATED | Not tested |
+| trn2.3xlarge (TP=1, LNC=2, DP=4, BS=4) | VALIDATED | Not tested |
 | trn2.3xlarge (TP=1, LNC=1, DP=8) | VALIDATED | Not tested |
 | trn2.48xlarge | Not tested | Not tested |
 | inf2.xlarge | Not tested | Not tested |
