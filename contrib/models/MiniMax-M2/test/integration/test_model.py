@@ -20,6 +20,8 @@ def test_required_attributes():
     """Test that required attributes are defined."""
     from modeling_minimax_m2 import MiniMaxM2InferenceConfig
     from neuronx_distributed_inference.models.config import MoENeuronConfig
+    from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+    from transformers import AutoConfig
     import torch
 
     neuron_config = MoENeuronConfig(
@@ -29,7 +31,11 @@ def test_required_attributes():
         torch_dtype=torch.bfloat16,
         on_cpu=True,
     )
-    config = MiniMaxM2InferenceConfig(neuron_config)
+    # Use the bundled config.json to provide model-specific attributes
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent.parent.parent
+    config_path = repo_root / "src" / "neuronx_distributed_inference" / "models" / "minimax_m2"
+    hf_config = AutoConfig.from_pretrained(str(config_path), trust_remote_code=True)
+    config = MiniMaxM2InferenceConfig(neuron_config, load_config=load_pretrained_config(hf_config=hf_config))
     required = config.get_required_attributes()
     assert "hidden_size" in required
     assert "num_local_experts" in required
