@@ -3321,6 +3321,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         return_dict: Optional[bool] = None,
         llava_args: Optional[List] = [],
         input_capture_hook: Optional[Callable] = None,
+        tensor_capture_hook: Optional[Callable] = None,
         slot_mapping: Optional[torch.LongTensor] = None,
         block_table: Optional[torch.LongTensor] = None,
         full_context_lens: Optional[torch.LongTensor] = None,
