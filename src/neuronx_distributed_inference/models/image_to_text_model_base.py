@@ -282,7 +282,7 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
                     sharded_checkpoint_dir=sharded_checkpoint_dir
                 )
 
-    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None, dry_run=False):
+    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None, dry_run=False, disable_fail_fast=False):
         # save config
         self.config.save(compiled_model_path)
 
@@ -293,13 +293,16 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         os.makedirs(vision_compiled_model_path, exist_ok=True)
 
         # Trace text and vision models
-        text_traced_model = self.get_text_builder(debug).trace(initialize_model_weights=False, dry_run=dry_run)
+        trace_kwargs = dict(initialize_model_weights=False, dry_run=dry_run)
+        if disable_fail_fast:
+            trace_kwargs["disable_fail_fast"] = True
+        text_traced_model = self.get_text_builder(debug).trace(**trace_kwargs)
         if not dry_run:
             torch.jit.save(text_traced_model, text_compiled_model_path + COMPILED_MODEL_FILE_NAME)
             del text_traced_model
             logger.info("Finished compiling text model!")
 
-        vision_traced_model = self.get_vision_builder(debug).trace(initialize_model_weights=False, dry_run=dry_run)
+        vision_traced_model = self.get_vision_builder(debug).trace(**trace_kwargs)
         if not dry_run:
             torch.jit.save(vision_traced_model, vision_compiled_model_path + COMPILED_MODEL_FILE_NAME)
             del vision_traced_model

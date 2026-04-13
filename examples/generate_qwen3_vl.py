@@ -7,6 +7,7 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 
 from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLInferenceConfig, Qwen3VLNeuronConfig, NeuronQwen3VLForCausalLM
+from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 
 model_path = "/shared/cache/checkpoints/Qwen3-VL/Qwen3-VL-8B-Thinking/"
 traced_model_path = "./traced_model/"
@@ -15,19 +16,22 @@ torch.manual_seed(0)
 
 DTYPE = torch.bfloat16  # use bf16 to align with HF checkpoint 
 VISION_SEQ_LENGTH = 16 * 1024
-VISION_BUCKETS = [1024, VISION_SEQ_LENGTH]
+VISION_BUCKETS = [1024, 2048, VISION_SEQ_LENGTH]
 
-TEXT_SEQ_LENGTH = 32 * 1024
-TEXT_BUCKETS = [2048, 15360, TEXT_SEQ_LENGTH]
+TEXT_SEQ_LENGTH = 16 * 1024
+TEXT_BUCKETS = [2048, 5120, TEXT_SEQ_LENGTH]
 
 MAX_NEW_TOKENS = 1024
+BATCH_SIZE = 2
 TP_DEGREE = 16
 
 def generate_image_to_text():
     # Initialize configs and tokenizer.
-    text_neuron_config = Qwen3VLNeuronConfig(batch_size=1,
+    text_neuron_config = Qwen3VLNeuronConfig(batch_size=BATCH_SIZE,
                                 seq_len=TEXT_SEQ_LENGTH,
                                 ctx_batch_size=1,
+                                tkg_batch_size=BATCH_SIZE,
+                                is_continuous_batching=True,
                                 tp_degree=TP_DEGREE,
                                 world_size=TP_DEGREE,
                                 torch_dtype=DTYPE,
@@ -35,7 +39,7 @@ def generate_image_to_text():
                                 rpl_reduce_dtype=DTYPE,
                                 cp_degree=1,
                                 save_sharded_checkpoint=True,
-                                sequence_parallel_enabled=False, 
+                                sequence_parallel_enabled=True,
                                 fused_qkv=True,
                                 attn_kernel_enabled=True,
                                 qkv_kernel_enabled=True,
@@ -47,7 +51,7 @@ def generate_image_to_text():
                                 attn_block_tkg_nki_kernel_enabled=False,
                                 attn_block_tkg_nki_kernel_cache_update=False,
                                 on_device_sampling_config=SmplConfig(dynamic=False, top_k=1), 
-                                cc_pipeline_tiling_factor=2,
+                                cc_pipeline_tiling_factor=1,
                                 cast_type="as-declared",
                                 logical_neuron_cores=2,
                                 )
@@ -107,7 +111,7 @@ def generate_image_to_text():
     role='user'
 
     input_ids, attention_mask, _ = NeuronQwen3VLForCausalLM.prepare_input_args(text_prompt, image_path, hf_qwen3_vl_processor, role)
-    sampling_params = prepare_sampling_params(batch_size=1, top_k=[1], top_p=[1.0],  temperature=[1.0])
+    sampling_params = prepare_sampling_params(batch_size=BATCH_SIZE, top_k=[1], top_p=[1.0],  temperature=[1.0])
     outputs = generation_model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -128,7 +132,7 @@ def generate_image_to_text():
         input_ids, attention_mask, vision_inputs = NeuronQwen3VLForCausalLM.prepare_input_args(text_prompt, image_path, hf_qwen3_vl_processor, role)
         pixel_values = vision_inputs["pixel_values"]
         print(f"pixel_values shape: {pixel_values.shape}")
-        sampling_params = prepare_sampling_params(batch_size=1, top_k=[1], top_p=[1.0],  temperature=[1.0])
+        sampling_params = prepare_sampling_params(batch_size=BATCH_SIZE, top_k=[1], top_p=[1.0],  temperature=[1.0])
 
         outputs = generation_model.generate(
             input_ids=input_ids,
@@ -144,6 +148,40 @@ def generate_image_to_text():
         for i, output_token in enumerate(output_tokens):
             print(f"Output {i}: {output_token}")
 
+    # Test BS=2 atomic prefill with different images per batch line.
+    # Each batch line has a different prompt and different number of images,
+    # exercising the VE→CTE atomic execution per batch line.
+    print("\n=== Testing BS=2 atomic prefill with mixed content per batch line ===")
+    batch_prompts = [
+        "How many images do you see? What do you see in these images?",
+        "Describe what is in this image.",
+    ]
+    batch_images = [
+        ["car.jpg", "car.jpg"],  # batch 0: two images
+        ["dog.jpg"],              # batch 1: one image
+    ]
+    input_ids, attention_mask, vision_inputs = NeuronQwen3VLForCausalLM.prepare_input_args(
+        batch_prompts, batch_images, hf_qwen3_vl_processor, role='user'
+    )
+    sampling_params = prepare_sampling_params(batch_size=BATCH_SIZE, top_k=[1], top_p=[1.0], temperature=[1.0])
+    outputs = generation_model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=vision_inputs["pixel_values"],
+        image_grid_thw=vision_inputs["image_grid_thw"],
+        sampling_params=sampling_params,
+        generation_config=generation_config,
+        max_new_tokens=MAX_NEW_TOKENS,
+    )
+    output_tokens = hf_qwen3_vl_processor.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    print(f"Generated outputs shape: {outputs.shape}")
+    for i, output_token in enumerate(output_tokens):
+        print(f"Output {i}: {output_token}")
+
+    print("\nPerformance Benchmarking text+image!")
+    model.neuron_config.max_new_tokens = 10
+    model.neuron_config.batch_size = 2
+    benchmark_sampling(model=model, draft_model=None, generation_config=generation_config, target="all", image=True,benchmark_report_path="benchmark_report_text_and_image.json", num_runs=5)
   
 if __name__ == "__main__":
     generate_image_to_text()

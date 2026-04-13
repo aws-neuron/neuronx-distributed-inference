@@ -21,7 +21,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 import torch_xla.core.xla_model as xm
-from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     OutputChannelParallelConv2d,
@@ -32,25 +31,13 @@ from neuronx_distributed.parallel_layers.mappings import (
     _reduce_scatter_along_dim,
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region_with_dim,
-    reduce_from_tensor_model_parallel_region,
-    reduce_scatter_to_sequence_parallel_region,
     scatter_to_process_group_spmd,
 )
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_data_parallel_group,
     get_tensor_model_parallel_size,
 )
-try:
-    from neuronxcc.nki._pre_prod_kernels import ActFnType
-except ImportError:
-    from neuronxcc.nki._private_kernels import ActFnType
-from neuronxcc.nki._private_kernels.mlp import (
-    mlp_fused_add_isa_kernel,
-    mlp_isa_kernel,
-)
-from neuronxcc.nki.language import nc
 from torch import Tensor, einsum, nn
-from torch_neuronx.xla_impl.ops import nki_jit
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
@@ -208,240 +195,6 @@ class NeuronLlama4ImageAttention(NeuronAttentionBase):
         return attn_output, past_key_value, cos_cache, sin_cache
 
 
-class NeuronLlama4VisionMLP(nn.Module):
-
-    def __init__(self, config, act_layer):
-        super().__init__()
-        self.weight_cache = {}
-        self.config = config
-        self.neuron_config = config.neuron_config
-        self.tp_degree = config.neuron_config.tp_degree
-        self.hidden_size = config.vision_config.hidden_size
-        self.intermediate_size = int(VISION_MLP_RATIO * self.hidden_size)
-        self.act_fn = act_layer
-
-        self.sequence_parallel_enabled = getattr(
-            self.neuron_config, "sequence_parallel_enabled", False
-        )
-        self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
-        self.rms_norm_eps = 1e-6
-        self.rmsnorm_quantize_kernel_enabled = config.neuron_config.rmsnorm_quantize_kernel_enabled
-        self.logical_nc_config = config.neuron_config.logical_nc_config
-        self.activation_quantization_type = config.neuron_config.activation_quantization_type
-        self.mlp_bias = True
-
-        if parallel_state.model_parallel_is_initialized():
-            self.c_fc = ColumnParallelLinear(
-                self.hidden_size,
-                self.intermediate_size,
-                bias=self.mlp_bias,
-                gather_output=False,
-                dtype=config.neuron_config.torch_dtype,
-                pad=True,
-                sequence_parallel_enabled=False,
-                sequence_dimension=None,
-                tensor_model_parallel_group=self.get_tp_group(),
-            )
-            self.c_proj = RowParallelLinear(
-                self.intermediate_size,
-                self.hidden_size,
-                bias=self.mlp_bias,
-                input_is_parallel=True,
-                dtype=config.neuron_config.torch_dtype,
-                pad=True,
-                sequence_parallel_enabled=self.sequence_parallel_enabled,
-                sequence_dimension=self.sequence_dimension,
-                tensor_model_parallel_group=self.get_tp_group(),
-                reduce_dtype=config.neuron_config.rpl_reduce_dtype,
-            )
-            # Transpose the weights to the layout expected by kernels
-            self.c_fc.weight = self.transpose_parallel_linear_layer(self.c_fc.weight)
-            self.c_proj.weight = self.transpose_parallel_linear_layer(self.c_proj.weight)
-
-        else:
-            self.c_fc = nn.Linear(self.hidden_size, self.intermediate_size, bias=self.mlp_bias)
-            self.c_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=self.mlp_bias)
-
-    def get_tp_group(self):
-        return parallel_state.get_tensor_model_parallel_group(as_list=False)
-
-    def transpose_parallel_linear_layer(self, parallel_layer):
-        """
-        This function clones and transposes a ColumnParallelLinear or RowParallelLinear
-        The attributes are also cloned and partition_dim is updated
-        """
-        orig_attrs = vars(parallel_layer)
-        new_layer = torch.nn.Parameter(parallel_layer.clone().T, requires_grad=False)
-        new_layer.__dict__.update(orig_attrs)
-        # flip the partition_dim from 0->1 or 1->0
-        setattr(new_layer, "partition_dim", 1 - getattr(new_layer, "partition_dim"))
-        setattr(new_layer, "get_tensor_from_state_dict", self._get_weight_from_state_dict)
-        setattr(new_layer, "set_tensor_to_state_dict", self._set_weight_to_state_dict)
-        return new_layer
-
-    def _get_weight_from_state_dict(self, prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
-        if prefix in self.weight_cache:
-            return self.weight_cache[prefix]
-
-        if (prefix + "weight") in state_dict:
-            transposed_weight = state_dict[prefix + "weight"].t().contiguous()
-            self.weight_cache[prefix] = transposed_weight
-            return transposed_weight
-
-        else:
-            raise RuntimeError(f"Cannot find {(prefix + 'weight')} in the state_dict")
-
-    def _set_weight_to_state_dict(
-        self, prefix: str, tensor: torch.Tensor, state_dict: Dict[str, Any]
-    ) -> None:
-        if (prefix + "weight") in state_dict:
-            state_dict[prefix + "weight"] = tensor.t()
-        else:
-            raise RuntimeError(f"Cannot find {(prefix + 'weight')} in the state_dict")
-
-    def _kernel_enabled_mlp(self, x, rmsnorm, residual):
-        fused_residual = residual is not None
-        fused_rmsnorm = rmsnorm is not None
-        logger.debug(
-            f"MLP: kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_nc_config={self.logical_nc_config}"
-        )
-
-        # Choose which kernel to call
-        if fused_residual:
-            assert (
-                not self.sequence_parallel_enabled
-            ), "MLP kernel cannot have both fused residual add and sequence parallel RMSnorm!"
-            # Using fused residual add
-            _mlp_fwd_call = nki_jit()(mlp_fused_add_isa_kernel)
-        else:
-            _mlp_fwd_call = nki_jit()(mlp_isa_kernel)
-
-        if self.sequence_parallel_enabled:
-            x = gather_from_sequence_parallel_region(
-                x, self.sequence_dimension, process_group=self.get_tp_group()
-            )
-
-        # Build output tensor
-        output_tensor_seqlen = x.shape[1]
-        if fused_residual:
-            # seqlen dim is doubled to store the residual add output
-            output_tensor_seqlen *= 2
-
-        output_tensor = torch.zeros(
-            size=(
-                x.shape[0],  # batch size
-                output_tensor_seqlen,
-                self.hidden_size,  # hidden size
-            ),
-            dtype=x.dtype,
-            device=x.device,
-        )
-
-        # Grab weights
-        # all weights of the layers are stored in (out, in) shape
-        # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
-        if fused_rmsnorm:
-            ln_w = rmsnorm.weight.unsqueeze(0)
-        else:
-            ln_w = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
-
-        up_w = self.c_fc.weight.data
-        down_w = self.c_proj.weight.data
-        # the kernel requires the shape of bias to be [1, I], here it's [1, 352]
-        up_b = self.c_fc.bias.data.unsqueeze(0)
-        down_b = self.c_proj.bias.data.unsqueeze(0)
-
-        grid = (nc(self.logical_nc_config),)
-
-        if fused_residual:
-            _mlp_fwd_call[grid](
-                x,  # attn_output
-                residual,  # hidden
-                ln_w,  # ln_w
-                up_w,  # gate_w, it will be ignored
-                up_w,  # up_w
-                down_w,  # down_w
-                output_tensor,  # out
-                fused_rmsnorm=fused_rmsnorm,
-                eps=self.rms_norm_eps,
-                kernel_name="MLP",
-                store_add=True,
-                skip_gate=True,
-                act_fn=ActFnType.GELU,
-                up_b=up_b,
-                # skip down project bias inside the kernel,
-                # because all-reduce is done outside the kernel.
-                # bias must be added after the all-reduce to avoid adding it multiple times
-                # same as the impl of NxD RowParallelLinear
-                down_b=None,
-            )
-            original_seqlen = x.shape[1]
-            residual = output_tensor[:, original_seqlen:, :]
-            output_tensor = output_tensor[:, :original_seqlen, :]
-        else:
-            _mlp_fwd_call[grid](
-                x,  # hidden
-                ln_w,
-                up_w,  # gate_w, it will be ignored
-                up_w,
-                down_w,
-                output_tensor,  # out
-                # Run RMSNorm inside the kernel if NOT using SP rmsnorm
-                fused_rmsnorm=fused_rmsnorm,
-                eps=self.rms_norm_eps,
-                kernel_name="MLP",
-                skip_gate=True,
-                act_fn=ActFnType.GELU,
-                up_b=up_b,
-                # skip down project bias inside the kernel,
-                # because all-reduce is done outside the kernel.
-                # bias must be added after the all-reduce to avoid adding it multiple times
-                # same as the impl of NxD RowParallelLinear
-                down_b=None,
-            )
-            residual = None
-
-        # All-reduce or reduce-scatter, depending on whether SP is enabled
-        if self.sequence_parallel_enabled:
-            output_tensor = reduce_scatter_to_sequence_parallel_region(
-                output_tensor, self.sequence_dimension, process_group=self.get_tp_group()
-            )
-        else:
-            output_tensor = reduce_from_tensor_model_parallel_region(
-                output_tensor, process_group=self.get_tp_group()
-            )
-
-        if self.mlp_bias:
-            # add down project bias after all-reduce
-            output_tensor += down_b
-        logger.debug(f"MLP output shape {output_tensor.shape}")
-        return (output_tensor, residual)
-
-    def forward(self, x, rmsnorm=None, residual=None):
-        """
-        If residual is passed in, will fuse its add into the MLP kernel
-        If rmsnorm is passed in, will fuse the rmsnorm into the MLP kernel
-
-        Returns a tuple of (output, residual), where residual is the output of the residual add
-        """
-        sequence_padded = False
-        if x.shape[1] % 2 != 0:
-            logger.debug(
-                "Padding the sequence length to the next even number for using MLP kernel"
-            )
-            # pad the sequence length to the next even number
-            x = torch.nn.functional.pad(x, (0, 0, 0, 1, 0, 0))  # hidden dim  # seq dim  # batch dim
-            sequence_padded = True
-
-        # MLP kernel
-        result = self._kernel_enabled_mlp(x, rmsnorm, residual)
-
-        if sequence_padded:
-            # unpad the sequence length
-            result = (result[0][:, :-1, :], result[1])
-        return result
-
-
 class _TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -460,17 +213,13 @@ class _TransformerBlock(nn.Module):
 
         self.attn = NeuronLlama4ImageAttention(config)
         self.ln_1 = LayerNorm(d_model, dtype=config.neuron_config.torch_dtype)
-        self.mlp = (
-            NeuronLlama4VisionMLP(config, act_layer)
-            if config.neuron_config.mlp_kernel_enabled
-            else ImageFeedForward(
-                dim=d_model,
-                hidden_dim=int(VISION_MLP_RATIO * d_model),
-                dropout=0.0,
-                sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
-                act_layer=act_layer,
-                dtype=config.neuron_config.torch_dtype,
-            )
+        self.mlp = ImageFeedForward(
+            dim=d_model,
+            hidden_dim=int(VISION_MLP_RATIO * d_model),
+            dropout=0.0,
+            sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+            act_layer=act_layer,
+            dtype=config.neuron_config.torch_dtype,
         )
         self.ln_2 = LayerNorm(d_model, dtype=config.neuron_config.torch_dtype)
         self.gated = gated
@@ -500,10 +249,7 @@ class _TransformerBlock(nn.Module):
         _gate_ffn = 1 if not self.gated else self.gate_ffn.tanh()
 
         x = x + _gate_attn * self.attention(self.ln_1(x), freq_cis=freq_cis)
-        if self.config.neuron_config.mlp_kernel_enabled:
-            x = x + _gate_ffn * self.mlp(self.ln_2(x))[0]
-        else:
-            x = x + _gate_ffn * self.mlp(self.ln_2(x))
+        x = x + _gate_ffn * self.mlp(self.ln_2(x))
         return x
 
 

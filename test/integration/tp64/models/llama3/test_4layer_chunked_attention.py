@@ -42,7 +42,7 @@ PERF_CONFIG = NeuronConfig(
 )
 
 @pytest.fixture(scope="module", autouse=True)
-def model_path():
+def model_path(set_module_seed):
     # Load model from config, and save with random weights.
     config_path = os.path.dirname(os.path.abspath(__file__)) + "/config_chunked_attention.json"
     

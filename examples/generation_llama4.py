@@ -66,7 +66,7 @@ def run_llama_generate_image_to_text():
         k_cache_transposed=False,
         blockwise_matmul_config={
             "block_size": 256,
-            "use_block_parallel": True,
+            # NOTE: use_block_parallel removed - beta1 blockwise kernels deprecated
             "block_sharding_strategy": "HI_LO",
             "skip_dma_token": True,
             "skip_dma_weight": True,

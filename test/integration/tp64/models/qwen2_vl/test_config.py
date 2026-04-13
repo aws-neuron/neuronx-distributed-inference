@@ -3,8 +3,8 @@ import os
 
 import torch
 
-from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig as SmplConfig
-from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLInferenceConfig
+from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig as SmplConfig
+from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLInferenceConfig, Qwen2VLNeuronConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 
 logger = logging.getLogger(__name__)
@@ -14,7 +14,7 @@ logger.setLevel(logging.DEBUG)
 def get_qwen2_vl_config(dtype=torch.float32,
                         tkg_batch_size=1,
                         text_tp_degree=4,
-                        vision_tp_degree=4,
+                        vision_tp_degree=1,
                         world_size=4,
                         text_seq_length=2048,
                         vision_seq_len=2048,
@@ -24,9 +24,10 @@ def get_qwen2_vl_config(dtype=torch.float32,
                         flash_decoding_enabled=False,
                         sequence_parallel_enabled=False,
                         use_text_kernels=False,
+                        enable_ve_data_parallel=False,
                         model_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_4layer.json")):
 
-    text_neuron_config = NeuronConfig(
+    text_neuron_config = Qwen2VLNeuronConfig(
         batch_size=tkg_batch_size,
         ctx_batch_size=1,   # CTE and VE alway BS1
         tkg_batch_size=tkg_batch_size,
@@ -56,7 +57,7 @@ def get_qwen2_vl_config(dtype=torch.float32,
         logical_neuron_cores=2,
     )
 
-    vision_neuron_config = NeuronConfig(
+    vision_neuron_config = Qwen2VLNeuronConfig(
         batch_size=1,  # CTE and VE alway BS1
         seq_len=vision_seq_len,
         torch_dtype=dtype,
@@ -76,6 +77,7 @@ def get_qwen2_vl_config(dtype=torch.float32,
         rpl_reduce_dtype=dtype,
         cast_type="as-declared",
         logical_neuron_cores=2,
+        enable_ve_data_parallel=enable_ve_data_parallel,
     )
 
     config = Qwen2VLInferenceConfig(

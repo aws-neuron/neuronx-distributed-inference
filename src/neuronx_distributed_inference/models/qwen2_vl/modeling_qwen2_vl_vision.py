@@ -1,3 +1,23 @@
+# Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch Qwen2-VL vision model for NxD Inference."""
+
 import os
 
 import torch
@@ -9,7 +29,12 @@ from transformers.activations import ACT2FN
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers.models.qwen2_vl.modeling_qwen2_vl import VisionRotaryEmbedding, PatchEmbed
 
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear, SPMDRank
+from neuronx_distributed.parallel_layers.mappings import (
+    scatter_to_process_group_spmd,
+    gather_from_tensor_model_parallel_region_with_dim,
+)
+from neuronx_distributed.parallel_layers.parallel_state import get_data_parallel_group
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
 from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.models.model_wrapper import EncoderModelInstance, ModelWrapper
@@ -24,6 +49,7 @@ from neuronx_distributed_inference.models.qwen2_vl.utils.vision_utils import (
     calculate_max_grid_size, get_image_dimensions
 )
 from neuronx_distributed_inference.models.qwen2_vl.utils.input_processor import prepare_generation_inputs_hf
+from neuronx_distributed_inference.utils.distributed import get_dp_rank_spmd
 
 import logging
 
@@ -179,6 +205,28 @@ class NeuronQwen2VisionModel(nn.Module):
             'rotary_pos_emb_cache',
             self.precomputed_rotary_pos_emb, persistent=False)
 
+        # Data parallelism setup
+        self.neuron_config = config.vision_config.neuron_config
+        self.global_rank = SPMDRank(world_size=self.neuron_config.world_size)
+        assert (
+            self.neuron_config.world_size % self.neuron_config.tp_degree == 0
+        ), "Invalid parallel config. world_size should be a multiple of tp_degree"
+        self.dp_degree = self.neuron_config.world_size // self.neuron_config.tp_degree
+        self.data_parallel_enabled = self.neuron_config.enable_ve_data_parallel
+        if self.data_parallel_enabled:
+            assert self.dp_degree > 1, (
+                "enable_ve_data_parallel is True but dp_degree is 1. "
+                "world_size must be greater than tp_degree to enable vision encoder data parallel."
+            )
+            non_dp_buckets = [b for b in self.neuron_config.buckets if b % self.dp_degree != 0]
+            if non_dp_buckets:
+                logger.warning(
+                    f"enable_ve_data_parallel is True but buckets {non_dp_buckets} are not divisible "
+                    f"by dp_degree={self.dp_degree}. These buckets will be compiled without "
+                    f"vision encoder data parallel."
+                )
+        self.data_parallel_group = get_data_parallel_group()
+
     def rot_pos_ids(self, grid_thw):
         pos_ids = []
         for t, h, w in grid_thw:
@@ -228,16 +276,41 @@ class NeuronQwen2VisionModel(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         cos_emb = emb.cos()
         sin_emb = emb.sin()
-        cos_emb = cos_emb.reshape(grid_thw.shape[0], -1, cos_emb.shape[-1])
-        sin_emb = sin_emb.reshape(grid_thw.shape[0], -1, sin_emb.shape[-1])
+
+        # Reshape to [N, seq_per_image, dim] for proper scattering along image (batch) dim
+        num_images = grid_thw.shape[0]
+        cos_emb = cos_emb.reshape(num_images, -1, cos_emb.shape[-1])
+        sin_emb = sin_emb.reshape(num_images, -1, sin_emb.shape[-1])
+        hidden_states = hidden_states.reshape(num_images, -1, hidden_states.shape[-1])
+
+        # DP scatter hidden_states and position embeddings
+        # num_images is concrete at trace time, so per-bucket NEFFs will include/exclude
+        # scatter/gather based on whether the bucket size is divisible by dp_degree
+        if self.data_parallel_enabled and num_images % self.dp_degree == 0:
+            dp_rank = get_dp_rank_spmd(self.global_rank.get_rank(), self.neuron_config.tp_degree)
+            hidden_states = scatter_to_process_group_spmd(
+                hidden_states, partition_dim=0, rank=dp_rank, process_group=self.data_parallel_group
+            )
+            cos_emb = scatter_to_process_group_spmd(
+                cos_emb, partition_dim=0, rank=dp_rank, process_group=self.data_parallel_group
+            )
+            sin_emb = scatter_to_process_group_spmd(
+                sin_emb, partition_dim=0, rank=dp_rank, process_group=self.data_parallel_group
+            )
+
         position_embeddings = (cos_emb, sin_emb)
 
-        hidden_states = hidden_states.reshape(grid_thw.shape[0], -1, hidden_states.shape[-1])
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
                 position_embeddings)
         hidden_states_merger = self.merger(hidden_states)
+
+        if self.data_parallel_enabled and num_images % self.dp_degree == 0:
+            hidden_states_merger = gather_from_tensor_model_parallel_region_with_dim(
+                hidden_states_merger, gather_dim=0, process_group=self.data_parallel_group
+            )
+
         return self.pad_to_text_seq_len(hidden_states_merger)
 
 
@@ -398,6 +471,10 @@ class NeuronQwen2VLForImageEncoding(NeuronApplicationBase):
                 .detach()
                 .contiguous()
                 .to(inference_config.vision_config.neuron_config.torch_dtype))
+
+        new_state_dict["global_rank.rank"] = torch.arange(
+            0, inference_config.vision_config.neuron_config.world_size, dtype=torch.int32
+        )
 
         del state_dict
         return new_state_dict

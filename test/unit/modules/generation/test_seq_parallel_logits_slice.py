@@ -13,10 +13,10 @@ from neuronx_distributed.parallel_layers.mappings import _reduce_scatter_along_d
 
 
 """
-The follwoing is the testing methodology for a sequence parallel function that processes hidden states (B,S,H) and position_ids (B,S), slicing the last token along the sequence dimension.
+The following is the testing methodology for a sequence parallel function that processes hidden states (B,S,H) and position_ids (B,S), slicing the last token along the sequence dimension.
 
 Test Configurations
-    1. Without tile_cc
+    1. Standard sequence parallel
         In this configuration, hidden states are randomly generated with shape (B,S,H) and then split along the sequence dimension during the forward pass.
 
         Example:
@@ -27,24 +27,8 @@ Test Configurations
                 Core 0: [0,1,2,3,4,5]
                 Core 1: [6,7,8,9,10,11]
 
-    2. With tile_cc
-        In this configuration, hidden states are first tiled and then sharded based on the tensor parallelism degree.
-
-        Example:
-
-            Original hidden states: [0,1,2,3,4,5,6,7,8,9,10,11]
-            Tensor Parallelism (TP) = 2
-            Tiling factor = 3
-            After tiling:
-                Tile 0: [0,1,2,3]
-                Tile 1: [4,5,6,7]
-                Tile 2: [8,9,10,11]
-            After sharding:
-                Core 0: [0,1,4,5,8,9]
-                Core 1: [2,3,6,7,10,11]
-
-    3. With chunked prefill
-        In this configuration, the hidden states remain same as above both cases but we pass num_queries arg to the sequence
+    2. With chunked prefill
+        In this configuration, the hidden states remain same as above but we pass num_queries arg to the sequence
         parallel optimization function which handles the chunked prefill case.
 
 Position IDs
@@ -74,23 +58,6 @@ class SequenceParallelTestModule(torch.nn.Module):
         self.config = config
 
     def forward(self, hidden_states, position_ids):
-        if self.neuron_config.tile_cc:
-            input_ids_tiled = hidden_states.reshape(self.batch_size, 
-                                                    self.neuron_config.cc_pipeline_tiling_factor, 
-                                                    self.sequence_length//self.neuron_config.cc_pipeline_tiling_factor, 
-                                                    self.hidden_size)
-            input_ids_tiled = input_ids_tiled.reshape(self.batch_size, 
-                                                      self.neuron_config.cc_pipeline_tiling_factor, 
-                                                      self.tp_degree, 
-                                                      self.sequence_length//self.neuron_config.cc_pipeline_tiling_factor//self.tp_degree, 
-                                                      self.hidden_size)
-            input_ids_tiled = input_ids_tiled.permute(0,2,1,3,4)
-            input_ids_distributed = input_ids_tiled.reshape(self.batch_size, 
-                                                           self.tp_degree, 
-                                                           self.sequence_length//self.tp_degree,
-                                                           self.hidden_size)
-            hidden_states = input_ids_distributed.reshape(self.batch_size, self.sequence_length, self.hidden_size)
-        
         if self.neuron_config.is_chunked_prefill:
             self.num_queries = self.num_queries.to("xla")
 
@@ -141,17 +108,15 @@ def random_position_ids(batch_size, seq_length):
 
 
 @pytest.mark.parametrize(
-    "batch_size, sequence_length, hidden_size, tp_degree, tile_cc, cc_pipeline_tiling_factor, chunked_prefill, num_queries",
+    "batch_size, sequence_length, hidden_size, tp_degree, chunked_prefill, num_queries",
     [
-        (1, 1024, 256, 2, False, -1, False, -1),
-        (4, 1024, 128, 2, False, -1, False, -1),
-        (1, 1024, 256, 2, True, 2, False, -1),
-        (4, 1024, 256, 2, True, 4, False, -1),
-        (1, 1024, 256, 2, False, -1, True, 1),
-        (4, 1024, 256, 2, False, -1, True, 4),
+        (1, 1024, 256, 2, False, -1),
+        (4, 1024, 128, 2, False, -1),
+        (1, 1024, 256, 2, True, 1),
+        (4, 1024, 256, 2, True, 4),
     ],
 )
-def test_seq_parallel_slice(batch_size, sequence_length, hidden_size, tp_degree, tile_cc, cc_pipeline_tiling_factor, chunked_prefill, num_queries):
+def test_seq_parallel_slice(batch_size, sequence_length, hidden_size, tp_degree, chunked_prefill, num_queries):
     hardware = get_platform_target()
     if hardware == "trn1" and tp_degree == 64:
         pytest.skip("Not supported in trn1")
@@ -164,13 +129,9 @@ def test_seq_parallel_slice(batch_size, sequence_length, hidden_size, tp_degree,
         "torch_dtype": torch.float32,
         "batch_size": batch_size,
         "sequence_parallel_enabled": True,
-        "tile_cc": False
     }
     neuron_config = NeuronConfig(**config_dict)
-    neuron_config.tile_cc = tile_cc
     neuron_config.is_chunked_prefill = chunked_prefill
-    if tile_cc:
-        neuron_config.cc_pipeline_tiling_factor = cc_pipeline_tiling_factor
     config = InferenceConfig(neuron_config=neuron_config, **config_dict)
 
     input_shape = (batch_size, sequence_length, hidden_size)

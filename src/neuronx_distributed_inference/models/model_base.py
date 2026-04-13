@@ -17,11 +17,8 @@ from neuronx_distributed.parallel_layers.mappings import (
     _gather_along_dim,
     _reduce_scatter_along_dim,
     gather_from_sequence_parallel_region,
-    _traced_spmd_tiled_rs,
-    _traced_tiled_rs,
 )
 from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_group
-from neuronxcc.nki.compiler.backends.neuron.dimensions import CCPipeline   # noqa: N813
 from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -67,16 +64,6 @@ from neuronx_distributed_inference.utils.distributed import get_tp_group
 from neuronx_distributed_inference.utils.random import set_random_seed
 from neuronx_distributed_inference.modules.attention.utils import get_kernel_cache_size_bucket, stride_tensor, chunk_and_reorder_tensor
 from neuronx_distributed_inference.modules.attention.attention_process_groups import get_flattened_inverted_tp_cp_group_mesh
-from neuronxcc.nki.language import nc
-try:
-    from neuronxcc.nki._pre_prod_kernels.attention_token_gen import (
-        gen_cache_mask_for_attention_tkg_kernel,
-    )
-except ImportError:
-    logging.warning(
-        "Use a more recent neuron compiler version to enable gen_cache_mask_for_attention_tkg_kernel"
-    )
-    gen_cache_mask_for_attention_tkg_kernel = None
 
 
 class NeuronBaseModel(nn.Module):
@@ -383,34 +370,6 @@ class NeuronBaseModel(nn.Module):
                 return self._create_windowed_attn_mask_spec_decode(self.sliding_window, position_ids)
             else:
                 return self._create_windowed_attn_mask_tkg(attention_mask, self.sliding_window, position_ids)
-
-        if self.neuron_config.attn_block_tkg_nki_kernel_enabled and self.is_prefix_caching:
-            assert not is_for_context_encoding
-            assert position_ids is not None, (
-                "position_ids is required by gen_cache_mask_for_attention_tkg_kernel "
-                "to infer current cache length."
-            )
-            grid = (nc(self.neuron_config.logical_nc_config),)
-            cache_len = position_ids
-            # Eagle draft's context/cache length is 1 shorter than target,
-            # we have already deducted the position_ids for draft at this point.
-            # But for Block KV, the first token of the first cache block is dummy for Eagle draft,
-            # so the cache length is still the same between draft and target.  So add back 1 here.
-            if self.neuron_config.is_block_kv_layout and self.neuron_config.is_eagle_draft:
-                cache_len += 1
-            tkg_kernel_mask = gen_cache_mask_for_attention_tkg_kernel[grid](
-                cache_len=cache_len,
-                num_heads=(self.num_attention_heads + self.tp_degree - 1) // self.tp_degree,
-                S_tkg=self.speculation_length if is_for_speculation else 1,
-                S_ctx=self.n_positions,
-                blk_len=(
-                    self.neuron_config.pa_block_size if self.neuron_config.is_block_kv_layout else 0
-                ),
-            )
-            if self.neuron_config.is_eagle_draft:
-                # First eagle head position masked out.
-                tkg_kernel_mask[:, :, :, 0] = False
-            return tkg_kernel_mask
         if is_for_speculation:
             return self._create_spec_attn_mask(attention_mask)
         return self._create_simple_attn_mask(attention_mask)
@@ -1403,13 +1362,19 @@ class NeuronBaseModel(nn.Module):
             )
 
             hidden_states = layer_outputs[0]
-
             # Add visual features to the hidden states of first several layers
             if is_for_context_encoding and deepstack_vision_embeds is not None and idx in range(len(deepstack_vision_embeds)):
+                # Slice deepstack_vision_embeds to match text input hidden_states's sequence length
+                target_seq_len = hidden_states.shape[1]
+                if self.sequence_parallel_enabled:
+                    # Multiply target_seq_len by TP to slice the full sequence
+                    target_seq_len *= self.neuron_config.tp_degree
+
+                sliced_deepstack_vision_embeds = deepstack_vision_embeds[idx][:, :target_seq_len, :]
                 logging.debug(f"\n in Neuron layer idx {idx} performing deepstack_process_xla {deepstack_vision_embeds[idx].shape}")
                 hidden_states = self.deepstack_process_xla(
                     hidden_states,
-                    deepstack_vision_embeds[idx],
+                    sliced_deepstack_vision_embeds,
                     vision_mask,
                 )
 
@@ -1525,36 +1490,20 @@ class NeuronBaseModel(nn.Module):
             - Handles both vocab_parallel and non-vocab_parallel cases
         """
         if self.sequence_parallel_enabled:
-            if self.neuron_config.tile_cc:
-                tp_size = self.neuron_config.tp_degree
-                shape = list(inputs_embeds.shape)
-                partition_dim = self.sequence_dimension
-                assert shape[partition_dim] % tp_size == 0
-                shape[partition_dim] //= tp_size
-                if self.neuron_config.vocab_parallel:
-                    tiled_cc_op, compute_op, cc_factor = (_traced_tiled_rs, xm.REDUCE_SUM, 1)
-                else:
-                    tiled_cc_op, compute_op, cc_factor = (_traced_spmd_tiled_rs, xm.REDUCE_MAX, self.neuron_config.cc_pipeline_tiling_factor)
-                # Create in the shape used by consumer QKV/MLP kernel.
-                hidden_states = torch.empty(shape, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-                tiled_cc_op[(CCPipeline(cc_factor),)](
-                    inputs_embeds, hidden_states, cc_dim=partition_dim,
-                    tp_rank=tp_size, op=compute_op)
+            shift_target_hidden = self.is_prefix_caching and len(active_block_table.shape) > 1
+            if self.neuron_config.is_eagle_draft and (
+                seq_length < self.neuron_config.weight_gather_seq_len_threshold
+                or shift_target_hidden
+            ):
+                hidden_states = inputs_embeds
             else:
-                shift_target_hidden = self.is_prefix_caching and len(active_block_table.shape) > 1
-                if self.neuron_config.is_eagle_draft and (
-                    seq_length < self.neuron_config.weight_gather_seq_len_threshold
-                    or shift_target_hidden
-                ):
-                    hidden_states = inputs_embeds
-                else:
-                    # TODO: Replace this with rankid + scatter call once supported
-                    hidden_states = _reduce_scatter_along_dim(
-                        inputs_embeds,
-                        self.sequence_dimension,
-                        xm.REDUCE_SUM if self.neuron_config.vocab_parallel else xm.REDUCE_MAX,
-                        process_group=get_tp_group(self.config),
-                    )
+                # TODO: Replace this with rankid + scatter call once supported
+                hidden_states = _reduce_scatter_along_dim(
+                    inputs_embeds,
+                    self.sequence_dimension,
+                    xm.REDUCE_SUM if self.neuron_config.vocab_parallel else xm.REDUCE_MAX,
+                    process_group=get_tp_group(self.config),
+                )
         else:
             hidden_states = inputs_embeds
         return hidden_states
@@ -1666,6 +1615,7 @@ class NeuronFusedSpecModel(nn.Module):
 
         config.fused_spec_config.draft_config.neuron_config.use_draft_group = True
         config.fused_spec_config.draft_config.neuron_config.quantized_mlp_kernel_enabled = False
+
         if self.draft_model_cls:
             self.draft_model = self.draft_model_cls._model_cls(config.fused_spec_config.draft_config)
         else:

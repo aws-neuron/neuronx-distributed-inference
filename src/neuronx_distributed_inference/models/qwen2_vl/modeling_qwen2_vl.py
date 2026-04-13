@@ -1,3 +1,23 @@
+# Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch Qwen2-VL model for NxD Inference."""
+
 import logging
 import torch
 import copy
@@ -15,8 +35,9 @@ from neuronx_distributed_inference.models.llama4.utils.encoder_utils import (
     pad_positions,
 )
 from neuronx_distributed_inference.models.qwen2_vl.utils.constants import (
-    DEFAULT_PIXELS_PER_IMAGE
+    DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT
 )
+from neuronx_distributed_inference.models.qwen2_vl.utils.vision_utils import calculate_pixels_per_image
 
 logger = logging.getLogger("Neuron")
 
@@ -44,6 +65,13 @@ QWEN2_VL_TEXT_CONFIG_KEYS = [
     "vision_start_token_id",
     "vision_end_token_id",
 ]
+
+
+class Qwen2VLNeuronConfig(NeuronConfig):
+    def __init__(self, **kwargs) -> None:
+        self.default_image_width = kwargs.pop("default_image_width", DEFAULT_IMAGE_WIDTH)
+        self.default_image_height = kwargs.pop("default_image_height", DEFAULT_IMAGE_HEIGHT)
+        super().__init__(**kwargs)
 
 
 class Qwen2VLInferenceConfig(ImageToTextInferenceConfig):
@@ -106,7 +134,8 @@ class Qwen2VLInferenceConfig(ImageToTextInferenceConfig):
         # assertions
         # make sure max vision pixels no greater than text bucket
         if self.vision_config.neuron_config.buckets and self.text_config.neuron_config.buckets:
-            assert (self.vision_config.neuron_config.buckets[-1] * DEFAULT_PIXELS_PER_IMAGE // 4) <= self.text_config.neuron_config.buckets[-1]
+            pixels_per_image = calculate_pixels_per_image(self.vision_config.neuron_config.default_image_width, self.vision_config.neuron_config.default_image_height)
+            assert (self.vision_config.neuron_config.buckets[-1] * pixels_per_image // 4) <= self.text_config.neuron_config.buckets[-1]
         assert self.vision_config.neuron_config.fused_qkv is True
 
     def add_special_config(self):
@@ -152,7 +181,7 @@ class Qwen2VLInferenceConfig(ImageToTextInferenceConfig):
 
     @classmethod
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
-        return NeuronConfig
+        return Qwen2VLNeuronConfig
 
 
 class NeuronQwen2VLForCausalLM(NeuronBaseForImageToText):

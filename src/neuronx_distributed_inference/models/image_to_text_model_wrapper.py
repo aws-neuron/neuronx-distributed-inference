@@ -147,6 +147,7 @@ class ImageToTextModelWrapper(ModelWrapper):
         │    21 │ rotary_position_ids   │
         │    22 │ vision_embeddings     │
         │    23 │ vision_mask           │
+        │    24 │deepstack_vision_embeds│
         └───────┴───────────────────────┘
         """
 
@@ -200,8 +201,8 @@ class ImageToTextModelWrapper(ModelWrapper):
             batch_sort_indices=indices if not self.is_prefix_caching else None,
         )
         padded_args.append(padded_sampling_params)
-        # add args prev_hidden --> vision_mask without padding
-        for i, arg in enumerate(args[5:24]):
+        # add args prev_hidden --> deepstack_vision_embeds without padding
+        for i, arg in enumerate(args[5:25]):
             padded_args.append(arg)
 
         outputs = self._forward(*padded_args)

@@ -30,12 +30,15 @@ from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E4
 from neuronx_distributed.utils import cpu_mode
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
-from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaMLP
+from neuronx_distributed_inference.models.llama.modeling_llama import (
+    NeuronLlamaMLP,
+    convert_state_dict_to_fused_qkv,
+)
 from neuronx_distributed_inference.models.model_base import (  # noqa: E402
     NeuronBaseForCausalLM,
     NeuronBaseModel,
 )
-from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase, QKNormPlacement
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 
@@ -96,6 +99,9 @@ class NeuronQwen3Attention(NeuronAttentionBase):
             num_key_value_heads=config.num_key_value_heads,
             head_dim=head_dim,
             rotary_emb=rotary_emb,
+            num_cores_per_group=config.num_cores_per_group,
+            rms_norm_eps=config.rms_norm_eps,
+            qk_norm_placement=QKNormPlacement.PRE_ROPE,  # Qwen3 applies QK norm before RoPE
             q_layernorm=get_rmsnorm_cls()(hidden_size=head_dim, eps=config.rms_norm_eps),
             k_layernorm=get_rmsnorm_cls()(hidden_size=head_dim, eps=config.rms_norm_eps),
         )
@@ -103,11 +109,14 @@ class NeuronQwen3Attention(NeuronAttentionBase):
 
 class NeuronQwen3DecoderLayer(nn.Module):
     """
-    Just replace the attention with the NXD version, and MLP with the NXD version
+    Just replace the attention with the NXD version, and MLP with the NXD version.
+    Supports kernel fusion for QKV and MLP.
     """
 
     def __init__(self, config: Qwen3InferenceConfig):
         super().__init__()
+        self.config = config
+        self.neuron_config = config.neuron_config
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronQwen3Attention(config)
         self.mlp = NeuronLlamaMLP(config)  # can reuse LlamaMLP module
@@ -120,6 +129,17 @@ class NeuronQwen3DecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
         )
 
+        # Kernel enablement flags
+        self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
+        self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
+        self.quantized_mlp_kernel_enabled = config.neuron_config.quantized_mlp_kernel_enabled
+        self.rmsnorm_quantize_kernel_enabled = config.neuron_config.rmsnorm_quantize_kernel_enabled
+        self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+
+        # Fused rmsnorm is only supported when sequence parallelism is disabled
+        self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
+        self.mlp_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -130,25 +150,49 @@ class NeuronQwen3DecoderLayer(nn.Module):
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+
+        qkv_fused_rmsnorm = None
+
+        # Handle QKV kernel fusion with RMSNorm
+        if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
+            qkv_fused_rmsnorm = self.input_layernorm
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+        attn_output = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             adapter_ids=adapter_ids,
+            rmsnorm=qkv_fused_rmsnorm,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
 
+        hidden_states = attn_output.hidden_states
+
+        # First residual connection (after attention)
+        hidden_states = residual + hidden_states
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, adapter_ids=adapter_ids)[0]
+
+        # Handle MLP kernel fusion with RMSNorm
+        if self.mlp_kernel_enabled and self.mlp_kernel_fused_rmsnorm:
+            mlp_fused_rmsnorm = self.post_attention_layernorm
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            mlp_fused_rmsnorm = None
+
+        hidden_states, _ = self.mlp(
+            hidden_states,
+            rmsnorm=mlp_fused_rmsnorm,
+            adapter_ids=adapter_ids,
+        )
+
+        # Second residual connection (after MLP)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
+        outputs = (hidden_states, attn_output.present_key_value, attn_output.cos_cache, attn_output.sin_cache, None)
 
         return outputs
 
@@ -215,6 +259,11 @@ class NeuronQwen3ForCausalLM(NeuronBaseForCausalLM):
 
         num_layers = config.num_hidden_layers
         tp_degree = neuron_config.tp_degree
+
+        # Fuse Q, K, V weights into Wqkv if fused_qkv is enabled (required for QKV kernel)
+        if neuron_config.fused_qkv:
+            state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
+
         for i in range(num_layers):
             # To facilitate rank usage in attention
             state_dict[f"layers.{i}.self_attn.rank_util.rank"] = torch.arange(

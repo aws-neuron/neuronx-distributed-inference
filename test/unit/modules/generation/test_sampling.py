@@ -1,4 +1,5 @@
 # Standard Library
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -10,6 +11,7 @@ import torch_neuronx
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.trace import parallel_model_trace
+from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.modules.generation.sampling import (
@@ -19,6 +21,10 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     prepare_sampling_params,
     validate_sampling_params
 )
+
+# Setup platform target for NKI kernels
+if not os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
 
 
 class TestSampling(unittest.TestCase):

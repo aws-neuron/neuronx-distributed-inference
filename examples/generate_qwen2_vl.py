@@ -4,11 +4,10 @@ import numpy as np
 
 from transformers import AutoProcessor, GenerationConfig
 from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig as SmplConfig
-from neuronx_distributed_inference.models.config import NeuronConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 
-from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl import NeuronQwen2VLForCausalLM, Qwen2VLInferenceConfig
+from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl import NeuronQwen2VLForCausalLM, Qwen2VLInferenceConfig, Qwen2VLNeuronConfig
 from neuronx_distributed_inference.models.qwen2_vl.utils.input_processor import prepare_generation_inputs_hf
 from neuronx_distributed_inference.utils.benchmark import LatencyCollector
 
@@ -21,12 +20,12 @@ NUM_OF_IMAGES = 128
 TEXT_SEQ_LENGTH = 32768
 VISION_SEQ_LENGTH = 1012*NUM_OF_IMAGES
 TEXT_BUCKETS = [2048, 15360, 32768]
-VISION_BUCKETS = [1, 50, 128]
+VISION_BUCKETS = [128]
 
 
 def generate_image_to_text():
     # Initialize configs and tokenizer.
-    text_neuron_config = NeuronConfig(batch_size=1,
+    text_neuron_config = Qwen2VLNeuronConfig(batch_size=1,
                                 seq_len=TEXT_SEQ_LENGTH,
                                 ctx_batch_size=1,
                                 tp_degree=4,
@@ -52,9 +51,9 @@ def generate_image_to_text():
                                 logical_neuron_cores=2,
                                 )
 
-    vision_neuron_config = NeuronConfig(batch_size=1,
+    vision_neuron_config = Qwen2VLNeuronConfig(batch_size=1,
                                 seq_len=VISION_SEQ_LENGTH,
-                                tp_degree=4,
+                                tp_degree=1,
                                 world_size=4,
                                 enable_bucketing=True,
                                 save_sharded_checkpoint=True,
@@ -67,6 +66,9 @@ def generate_image_to_text():
                                 mlp_kernel_enabled=True,
                                 cast_type="as-declared",
                                 logical_neuron_cores=2,
+                                enable_ve_data_parallel=True,
+                                default_image_width=640,
+                                default_image_height=320,
                                 )
 
     config = Qwen2VLInferenceConfig(

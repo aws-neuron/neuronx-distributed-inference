@@ -38,8 +38,6 @@ class TestKVCacheQuantization(unittest.TestCase):
                         "k_cache_transposed": False,
                         "apply_seq_ids_mask": False,
                         "is_prefill_stage": True,
-                        "attn_tkg_builtin_kernel_enabled": False,
-                        "attn_tkg_nki_kernel_enabled": False,
                         "attn_block_tkg_nki_kernel_enabled": False,
                         "kv_cache_update_with_kernel": False,
                         "logical_nc_config": 1,

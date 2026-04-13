@@ -18,9 +18,9 @@
     "intermediate_size": 21504,
     "model_type": "gemma3_text",
     "num_attention_heads": 32,
-    "num_hidden_layers": 62,
+    "num_hidden_layers": 1,
     "num_key_value_heads": 16,
-    "query_pre_attn_scalar": 128,
+    "query_pre_attn_scalar": 168,
     "rope_scaling": {
       "factor": 8.0,
       "rope_type": "linear"

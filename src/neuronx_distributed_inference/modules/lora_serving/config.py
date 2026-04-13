@@ -25,6 +25,7 @@ class LoraServingConfig:
         eviction_policy: str = "lru",
         lfu_decay_period: int = 128,
         base_model_quantized: bool = False,
+        enable_base_model_only: bool = False
     ):
         # The maximum number of concurrent LoRA adapters in device memory
         self.max_loras = max_loras
@@ -41,6 +42,11 @@ class LoraServingConfig:
         self.dynamic_multi_lora = dynamic_multi_lora
         self.eviction_policy = eviction_policy
         self.lfu_decay_period = lfu_decay_period
+        # Add a dummy LoRA adapter to support base model only serving
+        self.enable_base_model_only = enable_base_model_only
+        if self.enable_base_model_only:
+            self.max_loras += 1
+            self.max_cpu_loras += 1
         # Checkpoint paths for LoRA adapters
         self.lora_ckpt_json = lora_ckpt_json
         self.lora_ckpt_paths = self.convert_ckpt_paths_to_dict(lora_ckpt_paths)
@@ -144,17 +150,17 @@ class LoraServingConfig:
         return ckpt_path_dict
 
     def _check_ckpt_config(self):
-        num_ckpts = len(self.lora_ckpt_paths)
-        num_ckpts_cpu = len(self.lora_ckpt_paths_cpu)
+        num_ckpts = len(self.lora_ckpt_paths) + self.enable_base_model_only
+        num_ckpts_cpu = len(self.lora_ckpt_paths_cpu) + self.enable_base_model_only
 
         # adjust number of loras based on number of checkpoints
         if self.max_loras < num_ckpts:
-            logging.warning(f"Setting the number of LoRA adapters in HBM to {num_ckpts}.")
+            logging.warning(f"Setting the number of LoRA adapters in HBM to {len(self.lora_ckpt_paths)}.")
             self.max_loras = num_ckpts
 
         if self.dynamic_multi_lora and num_ckpts_cpu > self.max_cpu_loras:
             raise ValueError(
-                f"The total number of LoRA checkpoints specified in {self.lora_ckpt_json} is {num_ckpts_cpu}, "
+                f"The total number of LoRA checkpoints specified in {self.lora_ckpt_json} is {len(self.lora_ckpt_paths_cpu)}, "
                 f"but the maximum number of adapters that can be hosted on CPU is {self.max_cpu_loras}."
             )
 

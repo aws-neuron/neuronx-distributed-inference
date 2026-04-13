@@ -265,6 +265,7 @@ class TestMoE:
 
         return neuron_model_TP, neuron_model_EP, sample_inputs
 
+    @pytest.mark.skip(reason="Test uses beta1 blockwise_mm_baseline_shard_hidden kernel which is deprecated")
     @pytest.mark.parametrize("model_params", [
         {"hidden_size": 5120, "intermediate_size": 8192, "n_routed_experts": 128, "seq_len": 256, "num_experts_per_tok": 1},
         {"hidden_size": 7168, "intermediate_size": 2048, "n_routed_experts": 64, "seq_len": 256, "num_experts_per_tok": 4},
@@ -293,6 +294,7 @@ class TestMoE:
 
         torch_neuronx.testing.assert_close(neuron_output_TP, neuron_output_EP)
 
+    @pytest.mark.skip(reason="Test uses beta1 blockwise_mm_baseline_shard_hidden kernel which is deprecated")
     @pytest.mark.parametrize("model_params", [
         {"hidden_size": 5120, "intermediate_size": 8192, "n_routed_experts": 128, "seq_len": 256, "num_experts_per_tok": 1},
         {"hidden_size": 7168, "intermediate_size": 2048, "n_routed_experts": 64, "seq_len": 256, "num_experts_per_tok": 4},

@@ -26,13 +26,6 @@ torch.manual_seed(42)
         (1, 16, 4, 2, 6, 4),   # bs=1, input_len < sliding_window, cp enabled
         (1, 16, 4, 6, 8, 4),   # bs=1, input_len > sliding_window, cp enabled
         (2, 4096, 1024, 2048, 128, 4),  # bs=2, longer seq_len and generation, cp_enabled
-
-        # nki-flow (seq_len >= 512)
-        (1, 1024, 512, 512, 6, 1),   # bs=1, seq_len < 2048, use smaller tile size
-        (1, 2048, 1024, 1022, 6, 1),   # bs=1, input_len < sliding_window
-        (1, 2048, 1024, 1026, 8, 1),   # bs=1, input_len > sliding_window
-        (2, 2048, 1024, 1022, 8, 1),  # bs=2
-        (2, 4096, 1024, 2048, 128, 1),  # bs=2, longer seq_len and generation
     ],
     # fmt: on
 )

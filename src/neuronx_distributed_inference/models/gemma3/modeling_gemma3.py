@@ -39,13 +39,14 @@ from neuronx_distributed_inference.models.model_base import (  # noqa: E402
 )
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
 
 
 class NeuronGemma3RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=torch.bfloat16))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -54,15 +55,15 @@ class NeuronGemma3RMSNorm(nn.Module):
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
-        output = output * (1.0 + self.weight.float())
+        output = output * self.weight.float()
         return output.type_as(x)
 
 
-def get_rmsnorm_cls():
+def get_rmsnorm_cls(offset : bool = False):
     # Initialize to the appropriate implementation of RMSNorm
     # If infer on NXD -> CustomRMSNorm
     # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
-    return Gemma3RMSNorm if cpu_mode() else NeuronGemma3RMSNorm
+    return Gemma3RMSNorm if (cpu_mode() and offset) else NeuronGemma3RMSNorm
 
 
 def get_updated_configs(config: InferenceConfig):
@@ -107,6 +108,7 @@ class Gemma3InferenceConfig(InferenceConfig):
             "num_attention_heads",
             "num_hidden_layers",
             "num_key_value_heads",
+            "query_pre_attn_scalar",
             "sliding_window",
         ]
 
@@ -180,9 +182,7 @@ class NeuronGemma3Attention(NeuronAttentionBase):
             use_qk_norm=False,
             use_scaled_rope=None,
             sliding_window=config.sliding_window,
-            post_transpose_layernorm=True,
-            # TODO: Enable this
-            # query_pre_attn_scalar=config.query_pre_attn_scalar**(.5) # QK/sqrt(head_dim) is replaced with QK/sqrt(query_pre_attn_scalar) in Gemma3
+            softmax_scale=(config.query_pre_attn_scalar**(.5))  # QK/sqrt(head_dim) is replaced with QK/sqrt(query_pre_attn_scalar) in Gemma3
         )
 
         self.q_layernorm = get_rmsnorm_cls()(hidden_size=head_dim, eps=config.rms_norm_eps)
@@ -241,6 +241,11 @@ class NeuronGemma3DecoderLayer(nn.Module):
             hidden_states = hidden_states * (self.hidden_size**0.5)
 
         residual = hidden_states
+
+        # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
+        # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
+        # hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -261,6 +266,8 @@ class NeuronGemma3DecoderLayer(nn.Module):
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
+        # # End module marker
+        # hidden_states = ModuleMarkerEndWrapper()(hidden_states)
         outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
 
         return outputs
@@ -312,14 +319,47 @@ class NeuronGemma3ForCausalLM(NeuronBaseForCausalLM):
     """
 
     _model_cls = NeuronGemma3TextModel
+    _STATE_DICT_MODEL_PREFIX = "language_model.model."
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
         return Gemma3ForCausalLM.from_pretrained(model_path, **kwargs)
 
+    # Wraps NeuronBaseForCausalLM.enable_context_encoding() to add compile_tag.
+    def enable_context_encoding(self):
+        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
+        super().enable_context_encoding()
+
+    # Wraps NeuronBaseForCausalLM.enable_token_generation() to add compile_tag.
+    def enable_token_generation(self):
+        self.compile_tag = TOKEN_GENERATION_MODEL_TAG
+        super().enable_token_generation()
+
+    def get_compiler_args(self):
+        # Set compiler optimization level based on model tag
+        if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
+            optimization_level = "-O1"
+        elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
+            # Disable Modular flow for TKG graph with EP enabled as it causes perf degradation
+            optimization_level = "-O1"
+
+        compiler_args = f"--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer {optimization_level}"
+        # Add flags for cc-overlap
+        compiler_args += (
+            " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
+        )
+        compiler_args += " --auto-cast=none"
+        # Enable vector-offset DGE
+        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
+        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
+
+        return compiler_args
+
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
         """This function should be over-ridden in child classes as needed"""
+        if "model.norm.weight" in state_dict.keys():
+            state_dict = {k.removeprefix("model."): v for k, v in state_dict.items()}
         neuron_config = config.neuron_config
 
         if neuron_config.vocab_parallel:
@@ -330,6 +370,8 @@ class NeuronGemma3ForCausalLM(NeuronBaseForCausalLM):
 
         num_layers = config.num_hidden_layers
         tp_degree = neuron_config.tp_degree
+
+        state_dict["norm.weight"] += 1.0
 
         for i in range(num_layers):
             # To facilitate rank usage in attention
@@ -347,6 +389,27 @@ class NeuronGemma3ForCausalLM(NeuronBaseForCausalLM):
                 state_dict[f"layers.{i}.self_attn.k_norm.weight"].detach().clone()
             )
             del state_dict[f"layers.{i}.self_attn.k_norm.weight"]
+
+            state_dict[f"layers.{i}.self_attn.k_layernorm.weight"] += 1.0
+            state_dict[f"layers.{i}.self_attn.q_layernorm.weight"] += 1.0
+            state_dict[f"layers.{i}.input_layernorm.weight"] += 1.0
+            state_dict[f"layers.{i}.post_attention_layernorm.weight"] += 1.0
+            state_dict[f"layers.{i}.post_feedforward_layernorm.weight"] += 1.0
+            state_dict[f"layers.{i}.pre_feedforward_layernorm.weight"] += 1.0
+
+            if config.neuron_config.fused_qkv:
+                attr = "weight"  # Will have to set this to "scale" if we pursue quantized weights
+
+                state_dict[f"layers.{i}.self_attn.Wqkv.{attr}"] = torch.cat(
+                    [
+                        state_dict[f"layers.{i}.self_attn.q_proj.{attr}"],
+                        state_dict[f"layers.{i}.self_attn.k_proj.{attr}"],
+                        state_dict[f"layers.{i}.self_attn.v_proj.{attr}"],
+                    ],
+                )
+                del state_dict[f"layers.{i}.self_attn.q_proj.{attr}"]
+                del state_dict[f"layers.{i}.self_attn.k_proj.{attr}"]
+                del state_dict[f"layers.{i}.self_attn.v_proj.{attr}"]
 
         # To facilitate rank usage in base model
         state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)

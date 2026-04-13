@@ -15,8 +15,6 @@ from neuronx_distributed_inference.modules.attention.utils import get_kernel_cac
 from neuronx_distributed_inference.modules.attention.attention_process_groups import get_tp_cp_group_mesh
 from neuronx_distributed_inference.utils.distributed import split_along_dim, get_dp_rank
 
-from neuronxcc.nki.language import nc
-
 
 def _slice_kv_cacheline(padding_side: str, seq_len: int, cache: Tensor, transposed: bool):
     seqlen_dim = 3 if transposed else 2
@@ -162,11 +160,7 @@ class GptOssKVCacheManager(nn.Module):
             k_cache = k_cache[: -1]  # remove garbage position
             v_cache = v_cache[: -1]
 
-        attn_kernel_enabled = (
-            self.neuron_config.attn_tkg_builtin_kernel_enabled
-            or self.neuron_config.attn_tkg_nki_kernel_enabled
-            or self.neuron_config.attn_block_tkg_nki_kernel_enabled
-        )
+        attn_kernel_enabled = self.neuron_config.attn_block_tkg_nki_kernel_enabled
 
         if attn_kernel_enabled:  # Attention TKG Kernels do not need slicing.
             skip_slice = True
@@ -317,8 +311,7 @@ class GptOssKVCacheManager(nn.Module):
                 elif self.neuron_config.kv_cache_update_with_kernel:
                     cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids, dp_degree)
                     # For trn2+ we use the dma_skipping KV update kernel for better performance
-                    grid = (nc(self.neuron_config.logical_nc_config),)
-                    k_cache, v_cache = write_kv_cache_at_batch_kernel[grid](latest_k, latest_v, k_cache, v_cache, cache_idx)
+                    k_cache, v_cache = write_kv_cache_at_batch_kernel[self.neuron_config.logical_nc_config](latest_k, latest_v, k_cache.data, v_cache.data, cache_idx)
                 else:
                     cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids, dp_degree)
                     indices = [cache_idx] + [torch.zeros(1, device=seq_ids.device) for _ in range(k_cache.dim() - 1)]

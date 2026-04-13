@@ -108,10 +108,7 @@ class ModelWrapper(torch.nn.Module):
             if self.neuron_config.scratchpad_page_size:
                 self.compiler_args += f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size} "
 
-            if self.is_block_kv_layout and (
-                self.neuron_config.attn_block_tkg_nki_kernel_enabled
-                or self.neuron_config.attn_tkg_nki_kernel_enabled
-            ):
+            if self.is_block_kv_layout and self.neuron_config.attn_block_tkg_nki_kernel_enabled:
                 # Remove once NCC-6661 is resolved.
                 self.compiler_args += " --internal-backend-options='--enable-verifier=false' "
 
@@ -495,16 +492,21 @@ class ModelWrapper(torch.nn.Module):
         for arg in args[len(padded_args):empty_tensor_count]:
             padded_args.append(arg)
 
-        # Tensors for replacement
+        # Tensors for replacement - don't pad 2D tensors (tensor replacement args)
         tf_tensors_start = len(args) - 2 * tf_arg_count
         tf_tensors_end = len(args) - tf_arg_count
         for arg in args[tf_tensors_start:tf_tensors_end]:
-            padded_arg = pad_helper(
-                arg,
-                pad_type="repeat_first_batchline",
-                batch_sort_indices=indices,
-            )
-            padded_args.append(padded_arg)
+            # Don't pad 2D tensors (tensor replacement arguments like router outputs)
+            if arg.dim() == 2:
+                padded_args.append(arg)
+            else:
+                # Pad 3D+ tensors normally
+                padded_arg = pad_helper(
+                    arg,
+                    pad_type="repeat_first_batchline",
+                    batch_sort_indices=indices,
+                )
+                padded_args.append(padded_arg)
 
         # Masks for replacement that don't need to be padded up to batch dim
         for arg in args[-tf_arg_count:]:
@@ -1127,14 +1129,10 @@ class ModelWrapper(torch.nn.Module):
                 return tuple(args)
         else:
             padded_attn_mask = F.pad(args[1], (0, prefix_bucket - args[1].shape[1]), "constant", 0)
-            attn_tkg_nki_kernel_enabled = (
-                self.neuron_config.attn_block_tkg_nki_kernel_enabled
-                or self.neuron_config.attn_tkg_nki_kernel_enabled
-            )
             block_table_arg_idx = 8 if self.neuron_config.enable_fused_speculation else 12
             block_table = args[block_table_arg_idx]
             pad_right = (prefix_bucket // self.neuron_config.pa_block_size) - block_table.shape[1]
-            block_table_padding = -1 if attn_tkg_nki_kernel_enabled else 0
+            block_table_padding = -1 if self.neuron_config.attn_block_tkg_nki_kernel_enabled else 0
             padded_block_table = F.pad(block_table, (0, pad_right), "constant", block_table_padding)
             new_args = list(args)
             new_args[1] = padded_attn_mask

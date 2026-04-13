@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from neuronx_distributed_inference.utils.testing import build_function
+from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl_text import NeuronQwen3VLTextModel
 from neuronx_distributed_inference.models.llama4.utils.encoder_utils import (
     generate_positions_from_mask,
@@ -11,6 +12,17 @@ from neuronx_distributed_inference.models.llama4.utils.encoder_utils import (
 import os
 os.environ["BASE_COMPILE_WORK_DIR"] = "./compiler_workdir"
 
+from unittest.mock import patch, MagicMock
+
+@pytest.fixture
+def model_instance():
+    with patch.object(NeuronQwen3VLTextModel, '__init__', lambda self: None):
+        instance = NeuronQwen3VLTextModel()
+        instance.sequence_parallel_enabled = False
+        instance.sequence_dimension = 1
+        instance.config = MagicMock()
+        return instance
+        
 def hf_reference_impl(
             hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
     ):
@@ -27,7 +39,7 @@ torch.manual_seed(0)
     (4096, 2765, 2752, 13),
     (4096, 5120, 5100, 10),
 ])
-def test_original_vs_neuron(hidden_dim, seq_length, num_vision_tokens, vision_start_idx):
+def test_original_vs_neuron(model_instance, hidden_dim, seq_length, num_vision_tokens, vision_start_idx):
     
     assert seq_length >= (num_vision_tokens + vision_start_idx), "seq_length must be >= num_vision_tokens + vision_start_idx"
 
@@ -49,8 +61,7 @@ def test_original_vs_neuron(hidden_dim, seq_length, num_vision_tokens, vision_st
     vision_mask_positions = pad_positions(vision_mask_positions, pad_limit, pad_value)
     visual_embeds_padded = pad_vision_embeddings(visual_embeds.unsqueeze(0), pad_limit)
 
-    # Run on CP
-    cp_func = NeuronQwen3VLTextModel.deepstack_process_xla(hidden_states, visual_embeds_padded, vision_mask_positions)
+    cp_func = model_instance.deepstack_process_xla(hidden_states, visual_embeds_padded, vision_mask_positions)
     torch.testing.assert_close(hf_output_ref, cp_func, rtol=1e-2, atol=1e-2), "cp_func output does not match HF reference"
     print("cp_func vs hf_output_ref passed!")
 
@@ -60,7 +71,7 @@ def test_original_vs_neuron(hidden_dim, seq_length, num_vision_tokens, vision_st
 
     # Run on Neuron device
     neuron_func = build_function(
-        func=NeuronQwen3VLTextModel.deepstack_process_xla,
+        func=model_instance.deepstack_process_xla,
         example_inputs=[(hidden_states_all_zeros, visual_embeds_all_zeros, vision_mask_positions_all_zeros)],
         tp_degree=2)
     
