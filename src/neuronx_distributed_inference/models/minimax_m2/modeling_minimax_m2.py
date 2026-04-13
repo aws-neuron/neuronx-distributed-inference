@@ -884,9 +884,8 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
         partial RoPE support (rotary_dim < head_dim).
 
         Uses the nki-library kernel instead of the compiler's private kernel.
-        QK norm is NOT fused into this kernel — MiniMax-M2's flat QK norm is
-        architecturally incompatible with the kernel's per-head norm. This matches
-        the base class behavior which also skips QK norm (use_qk_norm=False).
+        QK norm is fused into the kernel via the flat QK RMSNorm feature, which
+        normalizes across all Q (or K) heads concatenated before head splitting.
         """
         assert _HAS_NKILIB_ATTN_BLOCK, (
             "nki-library attention_block_tkg not available. "
@@ -1002,6 +1001,36 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
 
         grid = self.logical_nc_config
 
+        # Prepare flat QK norm weights (per-rank slice via SPMD rank selection)
+        # The kernel expects [1, per_rank_width] weights for each of Q and K.
+        flat_qk_norm_enabled = self.use_minimax_qk_norm
+        flat_qk_W_Q = None
+        flat_qk_W_K = None
+        if flat_qk_norm_enabled:
+            # Q norm: select per-rank slice from padded weight
+            q_norm_weight = self.q_norm.weight.data  # [padded_q_hidden_size]
+            q_per_rank = self.q_norm.hidden_size
+            if self.q_norm.tp_degree > 1:
+                q_w_reshaped = q_norm_weight.view(self.q_norm.tp_degree, q_per_rank)
+                rank_index = self.rank_util.rank[:1]
+                flat_qk_W_Q = torch.index_select(
+                    q_w_reshaped, 0, rank_index
+                )  # [1, q_per_rank]
+            else:
+                flat_qk_W_Q = q_norm_weight[:q_per_rank].unsqueeze(0)  # [1, q_per_rank]
+
+            # K norm: select per-rank slice from padded weight
+            k_norm_weight = self.k_norm.weight.data  # [padded_k_hidden_size]
+            k_per_rank = self.k_norm.hidden_size
+            if self.k_norm.tp_degree > 1:
+                k_w_reshaped = k_norm_weight.view(self.k_norm.tp_degree, k_per_rank)
+                rank_index = self.rank_util.rank[:1]
+                flat_qk_W_K = torch.index_select(
+                    k_w_reshaped, 0, rank_index
+                )  # [1, k_per_rank]
+            else:
+                flat_qk_W_K = k_norm_weight[:k_per_rank].unsqueeze(0)  # [1, k_per_rank]
+
         attn_output, K, V = attention_block_tkg[grid](
             # -- input
             X=hidden_states,
@@ -1016,8 +1045,12 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
             quantization_type_qkv=NkilibQuantizationType.NONE,
             weight_dequant_scale_qkv=None,
             input_dequant_scale_qkv=None,
-            # -- Q/K processing: pre-RoPE RMSNorm (disabled — MiniMax QK norm is
-            #    flat, not per-head, and cannot be expressed by the kernel)
+            # -- Q/K processing: flat QK RMSNorm (before head split)
+            rmsnorm_QK_flat_enabled=flat_qk_norm_enabled,
+            rmsnorm_QK_flat_eps=self.rms_norm_eps if flat_qk_norm_enabled else 0.0,
+            rmsnorm_QK_flat_W_Q=flat_qk_W_Q,
+            rmsnorm_QK_flat_W_K=flat_qk_W_K,
+            # -- Q/K processing: per-head pre-RoPE RMSNorm (disabled)
             rmsnorm_QK_pre_rope_enabled=False,
             rmsnorm_QK_pre_rope_eps=0.0,
             rmsnorm_QK_pre_rope_W_Q=None,
