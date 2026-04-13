@@ -113,8 +113,12 @@ def get_modules_to_not_convert(neuron_config: MoENeuronConfig):
 def _helper_concat_and_delete_qkv(
     state_dict: Dict[str, Any], layer_num: int, attr: str
 ):
-    """Concatenate Q/K/V into fused Wqkv for a single attribute (weight or scale)."""
-    state_dict[f"layers.{layer_num}.self_attn.Wqkv.{attr}"] = torch.cat(
+    """Concatenate Q/K/V into fused Wqkv for a single attribute (weight or scale).
+
+    The fused key uses the ``qkv_proj.Wqkv`` path because the NxDI model nests
+    the Wqkv linear layer under ``self_attn.qkv_proj`` (a GroupQueryAttention_QKV module).
+    """
+    state_dict[f"layers.{layer_num}.self_attn.qkv_proj.Wqkv.{attr}"] = torch.cat(
         [
             state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"],
             state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"],
