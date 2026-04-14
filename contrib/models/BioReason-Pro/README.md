@@ -58,7 +58,9 @@ Throughput scales steadily with batch size. Compiled separately per batch size u
 | 8          | 128.8             | 124.3s                   | |
 | 16         | 134.7             | 78.8s                    | 10 proteins padded to 16 (62.5% utilization) |
 
-#### GPU Comparison (g5.2xlarge, A10G 24 GB, vLLM 0.10.1.1)
+#### GPU Comparison
+
+**A10G (g5.2xlarge, vLLM 0.10.1.1, gpu_memory_utilization=0.5):**
 
 | Batch Size | GPU tok/s | Neuron tok/s | Neuron/GPU |
 |------------|-----------|--------------|------------|
@@ -66,7 +68,20 @@ Throughput scales steadily with batch size. Compiled separately per batch size u
 | 8          | 132.7     | 128.8        | 0.97x      |
 | 16         | 137.8     | 134.7        | 0.98x      |
 
-GPU peaks at BS=4 then declines due to KV cache preemption at 0.5 `gpu_memory_utilization` (required because ESM3 shares GPU VRAM). Neuron continues scaling through BS=16, not yet plateaued. At BS=8+, GPU and Neuron converge to within 3%.
+A10G peaks at BS=4 then declines due to KV cache preemption at 0.5 `gpu_memory_utilization` (required because ESM3 shares GPU VRAM).
+
+**H100 (p5.48xlarge, single GPU, vLLM 0.19, FlashAttention 3, gpu_memory_utilization=0.85, ESM3 on CPU):**
+
+| BS | H100 tok/s | Neuron DP=4 tok/s | Neuron/H100 |
+|----|-----------|-------------------|-------------|
+| 4  | 348.2     | 270.9             | 0.78x       |
+| 8  | 411.3     | 494.9             | **1.20x**   |
+| 16 | 507.0     | 537.3             | **1.06x**   |
+| 32 | 522.6     | --                | --          |
+
+**Best vs best: Neuron 537.3 tok/s (DP=4, BS=16) vs H100 522.6 tok/s (BS=32) = 1.03x Neuron.**
+
+At BS=8+, Neuron DP=4 surpasses the H100 due to 4 NeuronCores processing batches in parallel. The H100 has the advantage at low batch sizes (vLLM continuous batching, FlashAttention 3), but Neuron's data parallelism gives it the edge at higher batch sizes where static batching overhead is amortized.
 
 #### LNC Configuration Comparison (trn2.3xlarge)
 
@@ -77,7 +92,7 @@ LNC=1 splits the chip into 8 logical cores (12 GB HBM each) vs LNC=2's 4 cores (
 | 1  | 44.0        | 37.7        | 85.7%        |
 | 4  | 98.6        | 73.2        | 74.3%        |
 
-LNC=1 retains 74-86% of LNC=2 per-core throughput. With 8 independent cores available for data parallelism (vs 4 on LNC=2), LNC=1 is the optimal configuration for batch protein processing workloads on trn2.3xlarge.
+LNC=1 retains 74-86% of LNC=2 per-core throughput. However, measured DP results show LNC=2 DP=4 outperforms LNC=1 DP=8 at all batch sizes: 270.9 vs 178.6 tok/s at BS=4 (1.52x), 494.9 vs 375.7 at BS=8 (1.32x). The wider LNC=2 cores provide better aggregate throughput despite having fewer DP workers.
 
 #### Long Sequence Validation (max_context=4096, max_new=4096, total=8192)
 
@@ -102,24 +117,27 @@ BioReason-Pro uses TP=1, so all NeuronCores on a trn2.3xlarge can run independen
 | DP=4 (LNC=2) | 4 | 81.8 | 107.5s | 43.7 | 2.75x |
 | DP=8 (LNC=1) | 8 | 53.9 | 163.0s | 36.0 | 1.81x |
 
-**Scaled workload (40 proteins, loading overhead amortized):**
+**Scaled workload (40+ proteins, loading overhead amortized):**
 
-| Config | Workers | Aggregate tok/s | Wall Time (40 proteins) | Per-Worker tok/s |
-|--------|---------|----------------|------------------------|-----------------|
-| DP=4, BS=1 (LNC=2) | 4 | 129.8 | 271.0s | 43.7 |
-| DP=4, BS=4 (LNC=2) | 4 | 299.9 | 215.3s | 32.8* |
+| Config | Workers | Aggregate tok/s | Wall Time | Per-Worker tok/s |
+|--------|---------|----------------|-----------|-----------------|
+| DP=4, BS=1 (LNC=2) | 4 | 129.8 | 271.0s (40 proteins) | 43.7 |
+| DP=4, BS=4 (LNC=2) | 4 | 270.9 | 243.9s (48 proteins) | 32.5-32.8 |
+| DP=4, BS=8 (LNC=2) | 4 | 494.9 | 346.4s (96 proteins) | 32.0-32.6 |
+| **DP=4, BS=16 (LNC=2)** | **4** | **537.3** | **731.8s (192 proteins)** | **15.1-22.7** |
+| DP=8, BS=1 (LNC=1) | 8 | 140.0 | 274.1s (40 proteins) | 34.8-37.8 |
+| DP=8, BS=4 (LNC=1) | 8 | 178.6 | 637.6s (96 proteins) | 21.2-22.0 |
+| DP=8, BS=8 (LNC=1) | 8 | 375.7 | 844.9s (192 proteins) | 24.3-24.5 |
 
-\* Per-worker tok/s for BS=4 reflects batch-averaged throughput (each generate call processes 4 proteins simultaneously). The aggregate throughput is 2.1x the GPU A10G peak (142.3 tok/s).
+**Peak throughput: 537.3 tok/s** at DP=4, BS=16, LNC=2.
 
 **Notes:**
 - DP=4 achieves 2.75x speedup (not 4x) because 10 proteins distributed across 4 workers creates load imbalance (some workers process 3, others 2)
-- DP=4 per-worker throughput (43.7 tok/s) matches single-core throughput (44.0 tok/s), confirming zero contention between cores
-- DP=4 BS=4 achieves **299.9 tok/s** aggregate — **2.3x** the DP=4 BS=1 throughput and **2.1x GPU A10G peak**
-- BS=4 batching amortizes ESM3 CPU encoding and KV cache overhead across 4 proteins per generate call
-- DP=8 wall time includes ~30s model loading overhead amortized over only 10 proteins. Per-worker steady-state throughput (36.0 tok/s) matches standalone LNC=1 per-core throughput (37.7 tok/s)
-- DP=8 aggregate tok/s is wall-time-based (total_tokens / wall_time) and includes loading overhead. For larger workloads where loading is amortized, throughput scales with worker count
-- LNC=1 per-worker throughput is 82% of LNC=2 per-worker (36.0 vs 43.7 tok/s), consistent with the single-core LNC comparison above
-- **Recommendation:** DP=4, BS=4 with LNC=2 is the optimal configuration for trn2.3xlarge — 2.1x GPU throughput with zero contention
+- DP=4 per-worker throughput (43.7 tok/s at BS=1) matches single-core throughput (44.0 tok/s), confirming zero contention between cores
+- Per-worker throughput degrades at BS=16 (22.7 vs 32.7 at BS=4), suggesting HBM bandwidth saturation
+- LNC=2 DP=4 is **1.52x faster** than LNC=1 DP=8 at BS=4 (270.9 vs 178.6 tok/s), confirming wider LNC=2 cores are optimal for small models
+- LNC=1 per-worker throughput is 82% of LNC=2 per-worker (36.0 vs 43.7 tok/s at BS=1), consistent with the single-core LNC comparison above
+- **Recommendation:** DP=4, BS=16 with LNC=2 is the optimal configuration for maximum throughput on trn2.3xlarge
 
 #### BS=1 Per-Protein Detail (10 diverse proteins, 113-494 AA)
 
@@ -239,10 +257,9 @@ Each worker runs an independent `BioReasonPipeline` pinned to a separate NeuronC
 | Instance | SDK 2.28 | SDK 2.27 |
 |----------|----------|----------|
 | trn2.3xlarge (TP=1, LNC=2, BS=1,4,8,16) | VALIDATED | Not tested |
-| trn2.3xlarge (TP=1, LNC=1, BS=1,4) | VALIDATED | Not tested |
-| trn2.3xlarge (TP=1, LNC=2, DP=4) | VALIDATED | Not tested |
-| trn2.3xlarge (TP=1, LNC=2, DP=4, BS=4) | VALIDATED | Not tested |
-| trn2.3xlarge (TP=1, LNC=1, DP=8) | VALIDATED | Not tested |
+| trn2.3xlarge (TP=1, LNC=1, BS=1,4,8) | VALIDATED | Not tested |
+| trn2.3xlarge (TP=1, LNC=2, DP=4, BS=1,4,8,16) | VALIDATED | Not tested |
+| trn2.3xlarge (TP=1, LNC=1, DP=8, BS=1,4,8) | VALIDATED | Not tested |
 | trn2.48xlarge | Not tested | Not tested |
 | inf2.xlarge | Not tested | Not tested |
 
