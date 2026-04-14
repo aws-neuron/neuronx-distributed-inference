@@ -188,6 +188,7 @@ HunyuanVideo-1.5/
 │   ├── dit_tp_wrapper.py          # DiT TP=4 with NKI flash attention (699 LOC)
 │   ├── dit_wrapper.py             # CPU preprocessor for tracing (366 LOC)
 │   ├── e2e_pipeline.py            # Full E2E T2V pipeline (908 LOC)
+│   ├── nki_rope.py                # Optional NKI fused RoPE kernel (HUNYUAN_NKI_ROPE=1)
 │   ├── compile_vae_neuron.py      # VAE compilation with monkey-patches
 │   ├── tiled_vae_decode.py        # Tiled VAE decode runtime
 │   ├── trace_byt5.py              # byT5 encoder tracing
@@ -225,6 +226,23 @@ Uses `attention_isa_kernel` from `neuronxcc.nki._private_kernels.attention` for 
 ### CFG (Classifier-Free Guidance)
 
 The 480p_t2v model uses traditional CFG with `guidance_scale=6.0`. Two sequential B=1 forward passes per step (unconditional + conditional). Pre-caching the negative (empty string) embeddings saves ~14s per run.
+
+### NKI RoPE Kernel (Optional)
+
+An NKI fused RoPE kernel is included in `src/nki_rope.py` as an optional optimization. Enable it by setting:
+
+```bash
+export HUNYUAN_NKI_ROPE=1
+```
+
+**Benchmark result:** ~3% faster per DiT step (250ms vs 257ms). The gain is modest because:
+- The torch-side data reshaping (permute, cat, contiguous) before/after the NKI kernel adds overhead that offsets most of the kernel-level fusion benefit
+- The Neuron compiler already optimizes the baseline PyTorch ops (`mul`, `rotate_half`) well
+- RoPE is a lightweight element-wise operation, not compute-bound
+
+The kernel is mathematically exact (cos_sim = 1.0 vs baseline in isolated tests) and produces visually identical output. It is disabled by default because the complexity-to-gain ratio is unfavorable. The kernel source is included for reference and for users who want to experiment with NKI custom kernels on their own models.
+
+**Note:** When `HUNYUAN_NKI_ROPE=1` is set, the DiT must be recompiled since the traced graph changes.
 
 ### Compiler Flags
 

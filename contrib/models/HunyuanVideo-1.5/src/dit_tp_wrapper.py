@@ -55,6 +55,12 @@ from torch_neuronx.xla_impl.ops import nki_jit
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
+# NKI RoPE kernel (optional, ~3% faster per step but adds code complexity)
+# Enable with: export HUNYUAN_NKI_ROPE=1
+USE_NKI_ROPE = os.environ.get("HUNYUAN_NKI_ROPE", "0") == "1"
+if USE_NKI_ROPE:
+    from nki_rope import nki_rope_apply
+
 # NKI alignment constants
 NKI_SEQ_TILE = 128
 NKI_SEQ_TILE_SHARDED = 2048  # Required for LNC=2 (vc_size=2) on trn2
@@ -408,7 +414,12 @@ class TPMMDoubleStreamBlock(nn.Module):
         img_k = self.img_attn_k_norm(img_k)
 
         # RoPE (only on image tokens)
-        img_q, img_k = apply_rotary_emb_traceable(img_q, img_k, freqs_cos, freqs_sin)
+        if USE_NKI_ROPE:
+            img_q, img_k = nki_rope_apply(img_q, img_k, freqs_cos, freqs_sin)
+        else:
+            img_q, img_k = apply_rotary_emb_traceable(
+                img_q, img_k, freqs_cos, freqs_sin
+            )
 
         # --- Text QKV ---
         txt_modulated = modulate(
