@@ -290,10 +290,31 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             batch_size, max_codec_len, max_mel_len,
         )
 
-        # Trace the DiT model
-        dit.eval()
+        # Wrap the DiT to fix keyword arguments for tracing.
+        # torch_neuronx.trace only supports positional args, and the DiT's
+        # forward has boolean kwargs (apply_cfg, drop_code, etc.) that create
+        # branching. We trace with apply_cfg=False (single forward) and
+        # handle CFG in the ODE solver loop on CPU.
+        class _DiTTraceWrapper(torch.nn.Module):
+            def __init__(self, dit_module):
+                super().__init__()
+                self.dit = dit_module
+
+            def forward(self, hidden_states, condition_vector,
+                        speaker_embedding, quantized_code, time_step):
+                return self.dit(
+                    hidden_states, condition_vector, speaker_embedding,
+                    quantized_code, time_step,
+                    drop_audio_conditioning=False,
+                    drop_code=False,
+                    apply_cfg=False,
+                )
+
+        wrapper = _DiTTraceWrapper(dit)
+        wrapper.eval()
+
         compiled_dit = torch_neuronx.trace(
-            dit,
+            wrapper,
             example_inputs,
             compiler_args=[
                 "--auto-cast=none",
@@ -327,54 +348,66 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
     def _get_dit_module(self):
         """Extract the DiT sub-module from the HF Token2Wav model.
 
-        The HF Qwen2_5OmniToken2WavModel typically has:
-          - self.dit or self.flow_model: The DiT transformer
-          - self.vocoder or self.bigvgan: The BigVGAN vocoder
-          - self.speaker_encoder: ECAPA-TDNN
+        HF Qwen2_5OmniToken2WavModel has:
+          - self.code2wav_dit_model: Qwen2_5OmniToken2WavDiTModel
+          - self.code2wav_bigvgan_model: Qwen2_5OmniToken2WavBigVGANModel
 
         Returns:
             The DiT nn.Module, or None if not found
         """
-        # Try common attribute names
-        for attr_name in ["dit", "flow_model", "transformer", "dit_model"]:
+        for attr_name in [
+            "code2wav_dit_model", "dit", "flow_model", "transformer", "dit_model",
+        ]:
             if hasattr(self.model, attr_name):
                 return getattr(self.model, attr_name)
-        # Search one level deeper
         for name, module in self.model.named_children():
-            if "dit" in name.lower() or "flow" in name.lower() or "transformer" in name.lower():
+            if "dit" in name.lower() or "flow" in name.lower():
                 return module
         return None
 
     def _create_dit_example_inputs(self, batch_size, max_codec_len, max_mel_len):
-        """Create example inputs for DiT tracing.
+        """Create example inputs for Qwen2_5OmniToken2WavDiTModel.forward().
 
-        The exact input signature depends on the HF DiT implementation.
-        Common DiT forward signatures:
-          dit(x, t, cond)  — x: noisy mel, t: timestep, cond: conditioning
-          dit(x, timesteps, encoder_hidden_states)
+        Actual HF signature:
+          forward(hidden_states, condition_vector, speaker_embedding,
+                  quantized_code, time_step,
+                  drop_audio_conditioning=False, drop_code=False,
+                  apply_cfg=True)
 
-        This method creates dummy tensors matching the expected signature.
-        Override this method if the DiT has a different input format.
+        We trace with apply_cfg=False to get a single forward pass.
+        CFG (running the model twice) is handled in the ODE solver loop.
 
         Returns:
             Tuple of example input tensors
         """
-        # Standard DiT inputs (adjust based on actual HF implementation)
         dit = self._get_dit_module()
-        dit_dim = 1024  # DiT hidden dimension
 
-        # Try to infer dim from model params
+        # Infer dimensions from config or model
+        dit_dim = 1024  # hidden dimension
+        emb_dim = 512   # speaker embedding dim
+        mel_dim = 80    # mel spectrogram channels
+
         if dit is not None:
-            for name, param in dit.named_parameters():
-                if "embed" in name and param.dim() == 2:
-                    dit_dim = param.shape[-1]
-                    break
+            dit_cfg = getattr(dit, "config", None)
+            if dit_cfg is not None:
+                dit_dim = getattr(dit_cfg, "dim", dit_dim)
+                emb_dim = getattr(dit_cfg, "emb_dim", emb_dim)
+                mel_dim = getattr(dit_cfg, "mel_dim", mel_dim)
 
-        x = torch.randn(batch_size, max_mel_len, dit_dim, dtype=torch.float32)
-        t = torch.tensor([0.5], dtype=torch.float32).expand(batch_size)
-        codec_emb = torch.randn(batch_size, max_codec_len, dit_dim, dtype=torch.float32)
+        # hidden_states: (batch, mel_len, dim) — noisy mel in latent space
+        hidden_states = torch.randn(batch_size, max_mel_len, dit_dim, dtype=torch.float32)
+        # condition_vector: (batch, cond_len, mel_dim) — raw mel spectrogram for speaker conditioning
+        # The DiT's input_embed passes this through ECAPA-TDNN Conv1d(mel_dim, ...)
+        condition_vector = torch.randn(batch_size, max_mel_len, mel_dim, dtype=torch.float32)
+        # speaker_embedding: (batch, emb_dim) — speaker embedding
+        speaker_embedding = torch.randn(batch_size, emb_dim, dtype=torch.float32)
+        # quantized_code: (batch, code_len) — codec token IDs
+        quantized_code = torch.randint(0, 8193, (batch_size, max_codec_len), dtype=torch.long)
+        # time_step: (batch,) — ODE timestep
+        time_step = torch.tensor([0.5], dtype=torch.float32).expand(batch_size)
 
-        return (x, t, codec_emb)
+        return (hidden_states, condition_vector, speaker_embedding,
+                quantized_code, time_step)
 
     @torch.no_grad()
     def __call__(

@@ -354,18 +354,16 @@ class TalkerRotaryEmbedding(nn.Module):
         return 1.0 / (self.base ** (freq_indices / self.dim))
 
     def forward(self, x, position_ids):
-        if position_ids.dim() == 3:
-            # 3D mRoPE: position_ids shape (3, batch, seq)
-            inv_freq_expanded = self.inv_freq[None, None, :, None].expand(
-                3, position_ids.shape[1], -1, 1
-            )
-            position_ids_expanded = position_ids[:, :, None, :].float()
-        else:
-            # 2D standard RoPE: position_ids shape (batch, seq)
-            inv_freq_expanded = self.inv_freq[None, :, None].expand(
-                position_ids.shape[0], -1, 1
-            )
-            position_ids_expanded = position_ids[:, None, :].float()
+        if position_ids.ndim == 2:
+            # Expand 2D (batch, seq) → 3D (3, batch, seq) for mRoPE
+            # Same approach as Qwen3-VL: replicate across temporal/height/width
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        # 3D mRoPE: position_ids shape (3, batch, seq)
+        inv_freq_expanded = self.inv_freq[None, None, :, None].expand(
+            3, position_ids.shape[1], -1, 1
+        )
+        position_ids_expanded = position_ids[:, :, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
@@ -596,6 +594,99 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
     @classmethod
     def get_config_cls(cls):
         return TalkerInferenceConfig
+
+    def set_vision_embeddings(self, vision_embeddings, vision_mask):
+        """Store vision embeddings for the next generate() call.
+
+        During context encoding, projected thinker states (896-dim) are
+        injected as vision_embeddings. Call this before generate().
+
+        Args:
+            vision_embeddings: (batch, seq, 896) projected thinker states
+            vision_mask: (batch, seq, 1) int32 mask (all positions active)
+        """
+        self._vision_embeddings = vision_embeddings
+        self._vision_mask = vision_mask
+
+    def _get_model_outputs(
+        self, input_ids, attention_mask, position_ids, seq_ids,
+        sampling_params, prev_hidden, adapter_ids,
+        medusa_args=None, llava_args=None, **kwargs
+    ):
+        """Override to pass vision_embeddings to ImageToTextModelWrapper.
+
+        ImageToTextModelWrapper traces with 24 positional args:
+          0-4: input_ids, attention_mask, position_ids, seq_ids, sampling_params
+          5-20: empty placeholders (prev_hidden, adapter_ids, medusa/block args)
+          21: rotary_position_ids
+          22: vision_embeddings
+          23: vision_mask
+        """
+        vision_embeddings = getattr(self, '_vision_embeddings', torch.empty(0))
+        vision_mask = getattr(self, '_vision_mask', torch.empty(0))
+
+        if self._is_prefill(position_ids):
+            outputs = self.context_encoding_model(
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                torch.empty(0),  # prev_hidden
+                torch.empty(0),  # adapter_ids
+                torch.empty(0),  # accepted_indices
+                torch.empty(0),  # current_length
+                torch.empty(0),  # medusa_mask
+                torch.empty(0),  # scatter_index
+                torch.empty(0),  # slot_mapping
+                torch.empty(0),  # active_block_table
+                torch.empty(0),  # num_queries
+                torch.empty(0),  # computed_context_lens
+                torch.empty(0),  # tile_q_indices
+                torch.empty(0),  # tile_block_tables
+                torch.empty(0),  # tile_masks
+                torch.empty(0),  # inputs_embeds
+                torch.empty(0),  # kv_cache
+                torch.empty(0),  # active_mask
+                torch.empty(0),  # rotary_position_ids
+                vision_embeddings,
+                vision_mask,
+            )
+            self.kv_cache_populated = True
+            # Clear after context encoding (not needed for token generation)
+            self._vision_embeddings = torch.empty(0)
+            self._vision_mask = torch.empty(0)
+            is_run_on_neuron = self.context_encoding_model.is_neuron()
+        else:
+            outputs = self.token_generation_model(
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                torch.empty(0),  # prev_hidden
+                torch.empty(0),  # adapter_ids
+                torch.empty(0),  # accepted_indices
+                torch.empty(0),  # current_length
+                torch.empty(0),  # medusa_mask
+                torch.empty(0),  # scatter_index
+                torch.empty(0),  # slot_mapping
+                torch.empty(0),  # active_block_table
+                torch.empty(0),  # num_queries
+                torch.empty(0),  # computed_context_lens
+                torch.empty(0),  # tile_q_indices
+                torch.empty(0),  # tile_block_tables
+                torch.empty(0),  # tile_masks
+                torch.empty(0),  # inputs_embeds
+                torch.empty(0),  # kv_cache
+                torch.empty(0),  # active_mask
+                torch.empty(0),  # rotary_position_ids
+                torch.empty(0),  # vision_embeddings (empty for token gen)
+                torch.empty(0),  # vision_mask
+            )
+            is_run_on_neuron = self.token_generation_model.is_neuron()
+
+        return outputs, is_run_on_neuron
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):

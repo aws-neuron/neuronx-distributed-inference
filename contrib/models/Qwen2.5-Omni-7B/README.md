@@ -16,7 +16,7 @@ NeuronX Distributed Inference implementation of [Qwen/Qwen2.5-Omni-7B](https://h
 | Thinker (text) | Neuron | 4 | hidden=3584, heads=28, kv_heads=4, layers=28 |
 | Vision encoder | Neuron | 4 | embed=1280, heads=16, depth=32, SwiGLU MLP |
 | Audio encoder | CPU+Neuron | 4 | d_model=1280, heads=20, layers=32, chunked attention |
-| Talker | CPU | N/A | hidden=896, heads=12, kv_heads=4, layers=24, vocab=8448 |
+| Talker | Neuron | 4 | hidden=896, heads=12, kv_heads=4, head_dim=128, layers=24, vocab=8448 |
 | Token2Wav | CPU (fp32) | N/A | DiT: dim=1024, 22 blocks; BigVGAN: 6 upsample stages |
 
 **Total state dict keys:** 2448 (Text: 339, Vision: 518, Audio: 489, Talker: 293, Token2Wav: 809)
@@ -25,7 +25,7 @@ Key features:
 - **Thinker**: Architecturally identical to Qwen2.5-7B; reuses `NeuronQwen2ForCausalLM` with state-dict prefix remapping (28 heads / 4 TP = 7 per rank, 4 kv_heads / 4 TP = 1 per rank)
 - **Vision encoder**: SwiGLU MLP, RMSNorm, separate QKV projections, PatchMerger (16 heads / 4 TP = 4 per rank)
 - **Audio encoder**: Whisper-style with chunked attention. Hybrid CPU+Neuron: Conv1d frontend + chunking on CPU, 32 transformer layers on Neuron (20 heads / 4 TP = 5 per rank), AvgPool + LayerNorm + projection on CPU
-- **Talker**: Wraps HF's `Qwen2_5OmniTalkerForConditionalGeneration` on CPU. Stays on CPU because: non-standard head_dim (128 != 896/12), 3D mRoPE with per-step thinker-state injection, only ~690M params
+- **Talker**: Neuron-compiled with fused embedding (8448→3584→896 collapsed), explicit head_dim=128, 3D mRoPE, thinker state injection via ImageToTextModelWrapper (12 heads / 4 TP = 3 per rank, 4 kv_heads / 4 TP = 1 per rank)
 - **Token2Wav**: DiT + BigVGAN vocoder with ODE sampling (Runge-Kutta 4), requires float32
 
 ## Prerequisites
@@ -189,12 +189,20 @@ Per-component measured breakdown for text-to-speech (14.1s audio output):
 | Token2Wav (DiT+BigVGAN) | 117.9s | 47% | 8.4x | 22 DiT blocks × 10 ODE steps × 2 (CFG) = 440 forward passes |
 | **Total** | **252.1s** | **100%** | **17.9x** | Generating 14.1s audio takes 252.1s on CPU |
 
-Key observations:
-- Talker and Token2Wav are roughly equal bottlenecks (~41% vs ~47%)
-- Thinker has ~100s JIT warmup overhead on first call (134s → 31s on second call)
-- Total real-time factor: 17.9x (far from real-time on CPU)
+### Speech Pipeline: Neuron vs CPU (trn2.48xlarge, TP=4, BF16)
 
-> **Note**: These are CPU inference times. With Neuron-compiled Talker (TP=4) and Token2Wav DiT (torch_neuronx.trace), speech generation latency should decrease significantly — targeting <2x real-time.
+| Component | CPU Time | Neuron Time | Speedup | TPOT |
+|-----------|----------|-------------|---------|------|
+| Thinker (7B) | 30.4s | 0.47s | **64.7x** | 10.2ms |
+| Talker (690M) | 98.1s | 2.0s (500 tokens) | **49.1x** | 4.0ms |
+| Token2Wav (DiT+BigVGAN) | 139.3s | 139.3s (CPU) | 1x | — |
+| **Total** | **267.9s** | **141.8s** (projected) | **1.9x** | — |
+
+Key observations:
+- Thinker and Talker achieve **49-65x speedup** on Neuron
+- Token2Wav is now the sole bottleneck (98% of projected Neuron pipeline time)
+- Projected RTF: 9.1x (vs CPU 17.2x) for 15.6s audio output
+- Token2Wav DiT compilation is blocked by XLA tracing limitations (complex `input_embed` preprocessing); stays on CPU for now
 
 ## Compatibility Matrix
 
