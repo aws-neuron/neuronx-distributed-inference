@@ -471,11 +471,39 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         return NeuronQwen25OmniTalker
 
     @staticmethod
+    def _get_neuron_talker_cls():
+        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
+            NeuronQwen25OmniTalkerForCausalLM,
+        )
+        return NeuronQwen25OmniTalkerForCausalLM
+
+    @staticmethod
+    def _get_talker_config_cls():
+        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
+            TalkerInferenceConfig,
+        )
+        return TalkerInferenceConfig
+
+    @staticmethod
+    def _get_thinker_projection_cls():
+        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
+            ThinkerToTalkerProjection,
+        )
+        return ThinkerToTalkerProjection
+
+    @staticmethod
     def _get_token2wav_cls():
         from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_token2wav import (
             NeuronQwen25OmniToken2Wav,
         )
         return NeuronQwen25OmniToken2Wav
+
+    @staticmethod
+    def _get_neuron_token2wav_cls():
+        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_token2wav import (
+            NeuronQwen25OmniToken2WavWithNeuronDiT,
+        )
+        return NeuronQwen25OmniToken2WavWithNeuronDiT
 
     def __init__(self, *args, **kwargs):
         super().__init__(
@@ -637,20 +665,19 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         self.audio_encoder.transformer = audio_app.model
         logger.info("Audio encoder transformer loaded from %s", compiled_model_path)
 
-    def enable_talker(self, state_dict=None):
-        """Initialize the Talker model (runs on CPU).
+    def enable_talker(self, state_dict=None, use_neuron=False):
+        """Initialize the Talker model.
 
         The Talker converts Thinker hidden states into codec tokens for
-        speech synthesis. It uses HF's autoregressive generation with
-        KV cache. Stays on CPU because:
-          - Non-standard head_dim (128 != 896/12) incompatible with NeuronAttentionBase
-          - 3D mRoPE with per-step position recomputation from Thinker output
-          - Custom input pipeline (embed + thinker_state + project) at every step
-          - Only ~690M params — not a bottleneck vs. the 7B Thinker on Neuron
+        speech synthesis.
 
         Args:
             state_dict: Converted state dict containing talker keys.
                 If None, the Talker is created with random weights.
+            use_neuron: If True, use the Neuron-compiled Talker
+                (NeuronQwen25OmniTalkerForCausalLM). Requires separate
+                compilation with compile_talker() / load_talker().
+                If False (default), use the CPU-based HF wrapper.
         """
         talker_config = getattr(self.config, "talker_config", None)
         if talker_config is None:
@@ -660,20 +687,95 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
             )
             return
 
-        TalkerCls = self._get_talker_cls()
-        dtype = torch.bfloat16
-
-        if state_dict is not None:
-            self.talker = TalkerCls.from_pretrained_state_dict(
-                talker_config, state_dict, dtype=dtype
+        if use_neuron:
+            # Neuron Talker — just mark for later compile/load
+            logger.info(
+                "Neuron Talker mode enabled. Call compile_talker() or "
+                "load_talker() to activate."
             )
+            self._talker_use_neuron = True
+            self._talker_state_dict = state_dict
+            # Initialize CPU projection for thinker states
+            if state_dict is not None:
+                ProjCls = self._get_thinker_projection_cls()
+                self.thinker_to_talker_proj = ProjCls.from_state_dict(state_dict)
+                logger.info("Thinker→Talker CPU projection initialized")
         else:
-            self.talker = TalkerCls(talker_config, dtype=dtype)
+            # CPU Talker (default)
+            TalkerCls = self._get_talker_cls()
+            dtype = torch.bfloat16
 
-        logger.info("Talker initialized on CPU")
+            if state_dict is not None:
+                self.talker = TalkerCls.from_pretrained_state_dict(
+                    talker_config, state_dict, dtype=dtype
+                )
+            else:
+                self.talker = TalkerCls(talker_config, dtype=dtype)
 
-    def enable_token2wav(self, state_dict=None, speaker_dict_path=None):
-        """Initialize the Token2Wav vocoder (runs on CPU in float32).
+            logger.info("Talker initialized on CPU")
+
+    def compile_talker(self, compiled_model_path, talker_neuron_config=None):
+        """Compile the Talker on Neuron.
+
+        Creates a NeuronQwen25OmniTalkerForCausalLM, converts the state
+        dict (fusing embedding + projection), and compiles.
+
+        Recommended neuron_config:
+          - tp_degree=4 (12 Q heads / 4 = 3 per rank)
+          - batch_size=1
+          - seq_len=4096 (max codec tokens)
+
+        Args:
+            compiled_model_path: Path to save compiled model
+            talker_neuron_config: NeuronConfig for Talker compilation.
+                If None, creates a default config with TP=4.
+        """
+        talker_config = getattr(self.config, "talker_config", None)
+        if talker_config is None:
+            raise RuntimeError("No talker_config in model config")
+
+        NeuronTalkerCls = self._get_neuron_talker_cls()
+        TalkerConfigCls = self._get_talker_config_cls()
+
+        if talker_neuron_config is None:
+            from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
+                TalkerNeuronConfig,
+            )
+            talker_neuron_config = TalkerNeuronConfig(
+                tp_degree=4,
+                batch_size=1,
+                seq_len=4096,
+                torch_dtype=torch.bfloat16,
+            )
+
+        from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+        inference_config = TalkerConfigCls(
+            neuron_config=talker_neuron_config,
+            load_config=load_pretrained_config(hf_config=talker_config),
+        )
+
+        app = NeuronTalkerCls(self.model_path, config=inference_config)
+        app.compile(compiled_model_path)
+        logger.info("Talker compiled to %s", compiled_model_path)
+
+    def load_talker(self, compiled_model_path, talker_app=None):
+        """Load a compiled Talker from disk.
+
+        Args:
+            compiled_model_path: Path to compiled model artifacts.
+            talker_app: Optional pre-compiled NeuronQwen25OmniTalkerForCausalLM.
+        """
+        if talker_app is None:
+            NeuronTalkerCls = self._get_neuron_talker_cls()
+            talker_app = NeuronTalkerCls.load(compiled_model_path)
+
+        self.talker = talker_app
+        logger.info("Neuron Talker loaded from %s", compiled_model_path)
+
+    def enable_token2wav(
+        self, state_dict=None, speaker_dict_path=None, use_neuron_dit=False
+    ):
+        """Initialize the Token2Wav vocoder.
 
         Token2Wav converts codec tokens from the Talker into audio
         waveforms using DiT + BigVGAN.
@@ -683,6 +785,9 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
                 If None, Token2Wav is created with random weights.
             speaker_dict_path: Path to spk_dict.pt for speaker conditioning.
                 If provided, loads the speaker map for audio generation.
+            use_neuron_dit: If True, use the Neuron-accelerated version
+                (DiT on Neuron, ODE loop + BigVGAN on CPU).
+                Call compile_token2wav_dit() / load_token2wav_dit() to compile.
         """
         token2wav_config = getattr(self.config, "token2wav_config", None)
         if token2wav_config is None:
@@ -692,7 +797,10 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
             )
             return
 
-        Token2WavCls = self._get_token2wav_cls()
+        if use_neuron_dit:
+            Token2WavCls = self._get_neuron_token2wav_cls()
+        else:
+            Token2WavCls = self._get_token2wav_cls()
 
         if state_dict is not None:
             self.token2wav = Token2WavCls.from_pretrained_state_dict(
@@ -709,7 +817,44 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
                 list(self.speaker_map.keys()),
             )
 
-        logger.info("Token2Wav initialized on CPU (float32)")
+        mode = "CPU (Neuron DiT capable)" if use_neuron_dit else "CPU"
+        logger.info("Token2Wav initialized on %s (float32)", mode)
+
+    def compile_token2wav_dit(self, compiled_path, **kwargs):
+        """Compile the Token2Wav DiT on Neuron.
+
+        Requires enable_token2wav(use_neuron_dit=True) to be called first.
+
+        Args:
+            compiled_path: Directory to save compiled DiT
+            **kwargs: Additional args passed to compile_dit()
+                (max_codec_len, max_mel_len, batch_size)
+        """
+        if self.token2wav is None:
+            raise RuntimeError("Call enable_token2wav(use_neuron_dit=True) first")
+        if not hasattr(self.token2wav, "compile_dit"):
+            raise RuntimeError(
+                "Token2Wav is not Neuron DiT capable. "
+                "Call enable_token2wav(use_neuron_dit=True)"
+            )
+        self.token2wav.compile_dit(compiled_path, **kwargs)
+        logger.info("Token2Wav DiT compiled to %s", compiled_path)
+
+    def load_token2wav_dit(self, compiled_path):
+        """Load a compiled Token2Wav DiT.
+
+        Args:
+            compiled_path: Directory containing compiled DiT
+        """
+        if self.token2wav is None:
+            raise RuntimeError("Call enable_token2wav(use_neuron_dit=True) first")
+        if not hasattr(self.token2wav, "load_dit"):
+            raise RuntimeError(
+                "Token2Wav is not Neuron DiT capable. "
+                "Call enable_token2wav(use_neuron_dit=True)"
+            )
+        self.token2wav.load_dit(compiled_path)
+        logger.info("Token2Wav DiT loaded from %s", compiled_path)
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
