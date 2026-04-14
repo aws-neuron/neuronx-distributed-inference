@@ -230,6 +230,99 @@ def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
     return False
 
 
+def test_logit_validation(compiled_model, tokenizer):
+    """Validate Neuron logits against CPU reference using logit_validation.
+
+    Captures the first-position logits from a single prefill pass and
+    compares the top-k token rankings against pre-computed CPU BF16 reference.
+
+    This uses the same pattern as the NxDI accuracy utilities:
+    torch_neuronx.testing.validation.logit_validation.
+    """
+    try:
+        from torch_neuronx.testing.validation import logit_validation
+    except ImportError:
+        pytest.skip("torch_neuronx.testing.validation not available")
+
+    prompt = "Artificial Intelligence is"
+    inputs = tokenizer(prompt, return_tensors="pt")
+
+    gen_model = HuggingFaceGenerationAdapter(compiled_model)
+
+    # Generate enough tokens to get logits for validation
+    num_tokens_to_check = 10
+    outputs = gen_model.generate(
+        inputs.input_ids,
+        attention_mask=torch.ones_like(inputs.input_ids),
+        max_new_tokens=num_tokens_to_check,
+        do_sample=False,
+        output_scores=True,
+        return_dict_in_generate=True,
+    )
+
+    # If we got scores, validate them
+    if hasattr(outputs, "scores") and outputs.scores:
+        neuron_logits = torch.stack(outputs.scores, dim=1)  # (batch, num_tokens, vocab)
+
+        # Run CPU reference for comparison
+        from transformers import AutoModelForCausalLM
+
+        cpu_model = AutoModelForCausalLM.from_pretrained(
+            MODEL_PATH, torch_dtype=torch.bfloat16
+        )
+        cpu_model.eval()
+
+        cpu_outputs = cpu_model.generate(
+            inputs.input_ids,
+            attention_mask=torch.ones_like(inputs.input_ids),
+            max_new_tokens=num_tokens_to_check,
+            do_sample=False,
+            output_scores=True,
+            return_dict_in_generate=True,
+        )
+        cpu_logits = torch.stack(cpu_outputs.scores, dim=1)
+
+        # Use logit_validation
+        passed, results, status_msg = logit_validation(
+            expected_logits=cpu_logits.float(),
+            actual_logits=neuron_logits.float(),
+            divergence_difference_tol=0.01,
+        )
+
+        print(f"  Logit validation: {'PASS' if passed else 'FAIL'}")
+        print(f"  Status: {status_msg}")
+        assert passed, f"Logit validation failed: {status_msg}"
+    else:
+        # Fallback: compare greedy token sequences
+        neuron_tokens = outputs.sequences[0, inputs.input_ids.shape[1] :]
+
+        from transformers import AutoModelForCausalLM
+
+        cpu_model = AutoModelForCausalLM.from_pretrained(
+            MODEL_PATH, torch_dtype=torch.bfloat16
+        )
+        cpu_model.eval()
+
+        cpu_outputs = cpu_model.generate(
+            inputs.input_ids,
+            attention_mask=torch.ones_like(inputs.input_ids),
+            max_new_tokens=num_tokens_to_check,
+            do_sample=False,
+        )
+        cpu_tokens = cpu_outputs[0, inputs.input_ids.shape[1] :]
+
+        match_count = (neuron_tokens == cpu_tokens).sum().item()
+        match_pct = match_count / len(cpu_tokens) * 100
+
+        print(f"  Token match: {match_count}/{len(cpu_tokens)} ({match_pct:.1f}%)")
+        assert match_pct >= 80, (
+            f"Token match too low: {match_pct:.1f}% (need >= 80%). "
+            f"Neuron: {neuron_tokens.tolist()}, CPU: {cpu_tokens.tolist()}"
+        )
+
+    print("PASS: Logit validation")
+
+
 def test_performance_throughput(compiled_model, tokenizer):
     """Measure token generation throughput."""
     prompt = "Hello"
@@ -323,7 +416,10 @@ if __name__ == "__main__":
     print("\n4. Greedy Token Match...")
     test_greedy_token_match(model, tokenizer)
 
-    print("\n5. Throughput...")
+    print("\n5. Logit Validation...")
+    test_logit_validation(model, tokenizer)
+
+    print("\n6. Throughput...")
     test_performance_throughput(model, tokenizer)
 
     print("\n" + "=" * 80)

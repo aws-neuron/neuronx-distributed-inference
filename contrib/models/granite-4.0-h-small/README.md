@@ -289,4 +289,6 @@ python test/unit/test_nki_selective_scan.py
 
 ## Maintainer
 
+Jim Burtoft (jimburtoft)
+
 **Last Updated:** 2026-03-10
