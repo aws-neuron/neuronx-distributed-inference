@@ -166,12 +166,20 @@ def test_ocr_accuracy(llm, processor, test_image):
     )
     print(f"  Score: {matches}/5 keywords found")
 
-    # Require at least 2 of the 5 keywords to be recognized
-    assert matches >= 2, (
+    # Check for complete phrases (stricter than individual keywords)
+    found_hello_world = "hello world" in text
+    found_neuron_ocr = "neuron ocr" in text
+
+    # Require at least 4 of 5 keywords AND at least one complete phrase
+    assert matches >= 4, (
         f"OCR accuracy too low: only {matches}/5 keywords found in output. "
+        f"Expected at least 4. Output: {result['text'][:200]}"
+    )
+    assert found_hello_world or found_neuron_ocr, (
+        f"No complete phrase found. Expected 'hello world' or 'neuron ocr' in output. "
         f"Output: {result['text'][:200]}"
     )
-    print(f"PASS: OCR accuracy ({matches}/5 keywords)")
+    print(f"PASS: OCR accuracy ({matches}/5 keywords, phrase match OK)")
 
 
 def test_throughput(llm, processor, test_image):
