@@ -31,6 +31,7 @@
 
 """Qwen2.5-Omni Token2Wav model for NXD inference."""
 
+import json
 import logging
 import os
 from typing import Optional
@@ -200,163 +201,169 @@ class NeuronQwen25OmniToken2Wav:
 # =============================================================================
 
 
+def _monkeypatch_dit_attention_for_neuron(dit_module):
+    """Replace DiTAttention.forward with XLA-traceable version.
+
+    Fixes two XLA-incompatible operations in DiTAttention:
+    1. In-place slice assignment: query[:, :1], key[:, :1] = ...
+       → replaced with torch.cat-based reassembly
+    2. ALL_ATTENTION_FUNCTIONS dispatch → explicit matmul attention
+
+    Args:
+        dit_module: Qwen2_5OmniToken2WavDiTModel instance
+    """
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+        apply_rotary_pos_emb,
+    )
+
+    for block in dit_module.transformer_blocks:
+        attn = block.attn
+
+        def _make_patched(a):
+            def forward(hidden_states, position_embeddings=None, attention_mask=None):
+                batch_size = hidden_states.shape[0]
+                query = a.to_q(hidden_states)
+                key = a.to_k(hidden_states)
+                value = a.to_v(hidden_states)
+
+                inner_dim = key.shape[-1]
+                head_dim = inner_dim // a.heads
+                query = query.view(batch_size, -1, a.heads, head_dim).transpose(1, 2)
+                key = key.view(batch_size, -1, a.heads, head_dim).transpose(1, 2)
+                value = value.view(batch_size, -1, a.heads, head_dim).transpose(1, 2)
+
+                # Apply RoPE to first head only (matches HF behavior)
+                # FIX: use torch.cat instead of in-place slice assignment
+                cos, sin = position_embeddings
+                q_rope, k_rope = apply_rotary_pos_emb(
+                    query[:, :1], key[:, :1], cos, sin
+                )
+                query = torch.cat([q_rope, query[:, 1:]], dim=1)
+                key = torch.cat([k_rope, key[:, 1:]], dim=1)
+
+                # Explicit matmul attention (XLA-safe, no SDPA dispatch)
+                scale = head_dim ** -0.5
+                attn_weights = torch.matmul(
+                    query, key.transpose(-2, -1)
+                ) * scale
+                if attention_mask is not None:
+                    attn_weights = attn_weights + attention_mask
+                attn_weights = torch.nn.functional.softmax(
+                    attn_weights, dim=-1
+                )
+                attn_output = torch.matmul(attn_weights, value)
+
+                attn_output = attn_output.transpose(1, 2).contiguous()
+                attn_output = attn_output.reshape(
+                    batch_size, -1, a.heads * head_dim
+                )
+                attn_output = attn_output.to(query.dtype)
+
+                attn_output = a.to_out[0](attn_output)
+                attn_output = a.to_out[1](attn_output)
+
+                return attn_output
+
+            return forward
+
+        attn.forward = _make_patched(attn)
+
+
+class _NeuronDiTCore(torch.nn.Module):
+    """Traced wrapper for DiT transformer blocks + norm_out + proj_out.
+
+    Only the compute-heavy transformer core is compiled on Neuron.
+    All preprocessing (time_embed, text_embed, input_embed with ECAPA-TDNN,
+    rotary_embed, block_diff) stays on CPU to avoid XLA tracing issues with:
+    - ECAPA-TDNN Conv1d(padding="same", padding_mode="reflect")
+    - AttentiveStatisticsPooling (dynamic masks, masked_fill(-inf))
+    - DiTCodecEmbedding (torch.repeat_interleave)
+    - DiTInputEmbedding (2D/3D tensor cat mismatch)
+    - Rotary embedding (torch.autocast context manager)
+
+    The attention mask is pre-computed on CPU as a float additive mask
+    (0.0 for attend, -1e4 for don't attend) to avoid boolean mask issues.
+    """
+
+    def __init__(self, dit_module):
+        super().__init__()
+        self.transformer_blocks = dit_module.transformer_blocks
+        self.norm_out = dit_module.norm_out
+        self.proj_out = dit_module.proj_out
+
+    def forward(self, hidden_states, time_embedding, cos, sin, attention_mask):
+        """
+        Args:
+            hidden_states: (batch, seq_len, dim) from input_embed
+            time_embedding: (time_batch, dim) from time_embed (broadcasts)
+            cos: (batch, seq_len, head_dim) from rotary_embed
+            sin: (batch, seq_len, head_dim) from rotary_embed
+            attention_mask: (1, 1, seq_len, seq_len) float additive mask
+        """
+        position_embeddings = (cos, sin)
+
+        for block in self.transformer_blocks:
+            # Inline DiTDecoderLayer.forward with pre-computed attention_mask
+            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(
+                hidden_states, emb=time_embedding
+            )
+            attn_output = block.attn(
+                hidden_states=norm,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+            )
+            hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
+            norm = (
+                block.ff_norm(hidden_states) * (1 + scale_mlp[:, None])
+                + shift_mlp[:, None]
+            )
+            ff_output = block.ff(norm)
+            hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
+
+        hidden_states = self.norm_out(hidden_states, time_embedding)
+        output = self.proj_out(hidden_states)
+        return output
+
+
 class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
-    """Token2Wav with DiT (Diffusion Transformer) compiled on Neuron.
+    """Token2Wav with DiT transformer core compiled on Neuron.
 
     The DiT is the compute bottleneck in Token2Wav:
       - 22 transformer blocks × 10 ODE steps = 220 forward passes per generation
-      - Each block: self-attention (dim=1024, 16 heads) + cross-attention + FFN
+      - Each block: self-attention (dim=1024, 16 heads) + FFN
       - Total ~85M params
 
-    By compiling the DiT on Neuron, the 220 forward passes are accelerated
-    while the ODE solver orchestration stays on CPU.
+    Split architecture (CPU preprocessing + Neuron transformer core):
+      CPU: time_embed(time_step) → time embedding
+      CPU: text_embed(quantized_code) → codec features
+      CPU: input_embed(hidden_states, speaker_embedding, condition_vector, code_embed)
+           → includes ECAPA-TDNN speaker encoder, CFG batch doubling
+      CPU: rotary_embed(hidden_states) → cos, sin
+      CPU: _create_block_diff(hidden_states) → attention mask
+      Neuron: 22 transformer blocks + norm_out + proj_out (the compute hotspot)
+      CPU: ODE solver loop (Runge-Kutta 4, 10 steps)
+      CPU: BigVGAN vocoder → waveform
 
     Usage:
-      # 1. Create with HF config
       t2w = NeuronQwen25OmniToken2WavWithNeuronDiT(token2wav_config)
-
-      # 2. Load weights
       t2w.load_state_dict(state_dict)
-
-      # 3. Compile DiT on Neuron
-      t2w.compile_dit("compiled_dit/", max_codec_len=2048, max_mel_len=4096)
-
-      # 4. Load compiled DiT (in subsequent runs)
+      t2w.compile_dit("compiled_dit/", max_mel_len=2048)
+      # Subsequent runs:
       t2w.load_dit("compiled_dit/")
-
-      # 5. Generate (ODE loop on CPU, DiT on Neuron)
       waveform = t2w(code, conditioning, reference_mel)
-
-    Architecture:
-      CPU: ECAPA-TDNN speaker encoder → speaker embedding
-      CPU: Codec embedding → codec features
-      CPU: ODE solver loop (10 steps):
-        ├── Neuron: DiT forward (22 blocks) × 2 (CFG) = 44 Neuron calls/step
-        └── CPU: Euler/RK4 integration
-      CPU: BigVGAN vocoder → waveform
     """
 
     def __init__(self, token2wav_config):
         super().__init__(token2wav_config)
-        self._neuron_dit = None
+        self._neuron_dit_core = None
         self._dit_compiled_path = None
-
-    def compile_dit(
-        self,
-        compiled_path,
-        max_codec_len=2048,
-        max_mel_len=4096,
-        batch_size=1,
-    ):
-        """Compile the DiT model on Neuron using torch_neuronx.trace().
-
-        The DiT's forward method is traced with example inputs of the
-        specified shapes. The compiled model handles fixed-size inputs;
-        actual inputs are padded/truncated to match.
-
-        Args:
-            compiled_path: Directory to save compiled model
-            max_codec_len: Maximum codec sequence length
-            max_mel_len: Maximum mel spectrogram length
-            batch_size: Batch size for compilation (typically 1)
-        """
-        try:
-            import torch_neuronx
-        except ImportError:
-            logger.error(
-                "torch_neuronx not available. DiT compilation requires "
-                "running on a Neuron instance (trn1/trn2/inf2)."
-            )
-            raise
-
-        os.makedirs(compiled_path, exist_ok=True)
-
-        # Extract the DiT sub-module from the HF model
-        dit = self._get_dit_module()
-        if dit is None:
-            raise RuntimeError(
-                "Could not extract DiT module from Token2Wav model. "
-                "Check that the model is properly initialized."
-            )
-
-        # Create example inputs for tracing
-        # The exact input signature depends on the HF DiT implementation
-        example_inputs = self._create_dit_example_inputs(
-            batch_size, max_codec_len, max_mel_len
-        )
-
-        logger.info(
-            "Compiling DiT on Neuron: batch=%d, codec_len=%d, mel_len=%d",
-            batch_size, max_codec_len, max_mel_len,
-        )
-
-        # Wrap the DiT to fix keyword arguments for tracing.
-        # torch_neuronx.trace only supports positional args, and the DiT's
-        # forward has boolean kwargs (apply_cfg, drop_code, etc.) that create
-        # branching. We trace with apply_cfg=False (single forward) and
-        # handle CFG in the ODE solver loop on CPU.
-        class _DiTTraceWrapper(torch.nn.Module):
-            def __init__(self, dit_module):
-                super().__init__()
-                self.dit = dit_module
-
-            def forward(self, hidden_states, condition_vector,
-                        speaker_embedding, quantized_code, time_step):
-                return self.dit(
-                    hidden_states, condition_vector, speaker_embedding,
-                    quantized_code, time_step,
-                    drop_audio_conditioning=False,
-                    drop_code=False,
-                    apply_cfg=False,
-                )
-
-        wrapper = _DiTTraceWrapper(dit)
-        wrapper.eval()
-
-        compiled_dit = torch_neuronx.trace(
-            wrapper,
-            example_inputs,
-            compiler_args=[
-                "--auto-cast=none",
-                "--model-type=transformer",
-                "-O1",
-            ],
-        )
-
-        # Save compiled model
-        save_path = os.path.join(compiled_path, "dit_neuron.pt")
-        torch.jit.save(compiled_dit, save_path)
-        logger.info("Compiled DiT saved to %s", save_path)
-
-        self._neuron_dit = compiled_dit
-        self._dit_compiled_path = compiled_path
-
-    def load_dit(self, compiled_path):
-        """Load a previously compiled DiT model.
-
-        Args:
-            compiled_path: Directory containing compiled model
-        """
-        save_path = os.path.join(compiled_path, "dit_neuron.pt")
-        if not os.path.exists(save_path):
-            raise FileNotFoundError(f"Compiled DiT not found at {save_path}")
-
-        self._neuron_dit = torch.jit.load(save_path)
-        self._dit_compiled_path = compiled_path
-        logger.info("Loaded compiled DiT from %s", save_path)
+        self._dit_max_mel_len = None
+        self._dit_batch_size = None
 
     def _get_dit_module(self):
-        """Extract the DiT sub-module from the HF Token2Wav model.
-
-        HF Qwen2_5OmniToken2WavModel has:
-          - self.code2wav_dit_model: Qwen2_5OmniToken2WavDiTModel
-          - self.code2wav_bigvgan_model: Qwen2_5OmniToken2WavBigVGANModel
-
-        Returns:
-            The DiT nn.Module, or None if not found
-        """
+        """Extract the DiT sub-module from the HF Token2Wav model."""
         for attr_name in [
-            "code2wav_dit_model", "dit", "flow_model", "transformer", "dit_model",
+            "code2wav_dit_model", "dit", "flow_model", "transformer",
         ]:
             if hasattr(self.model, attr_name):
                 return getattr(self.model, attr_name)
@@ -365,49 +372,167 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 return module
         return None
 
-    def _create_dit_example_inputs(self, batch_size, max_codec_len, max_mel_len):
-        """Create example inputs for Qwen2_5OmniToken2WavDiTModel.forward().
+    def compile_dit(
+        self,
+        compiled_path,
+        max_mel_len=2048,
+        batch_size=2,
+    ):
+        """Compile the DiT transformer core on Neuron.
 
-        Actual HF signature:
-          forward(hidden_states, condition_vector, speaker_embedding,
-                  quantized_code, time_step,
-                  drop_audio_conditioning=False, drop_code=False,
-                  apply_cfg=True)
+        Only the 22 transformer blocks + norm_out + proj_out are compiled.
+        Preprocessing (ECAPA-TDNN, codec embedding, input embedding, rotary)
+        stays on CPU to avoid XLA tracing issues.
 
-        We trace with apply_cfg=False to get a single forward pass.
-        CFG (running the model twice) is handled in the ODE solver loop.
+        Args:
+            compiled_path: Directory to save compiled model
+            max_mel_len: Maximum mel spectrogram length (covers ~24s audio).
+                Shorter inputs are padded; longer inputs fall back to CPU.
+            batch_size: Batch size for compilation. Use 2 for standard
+                inference with classifier-free guidance (CFG doubles batch).
+        """
+        try:
+            import torch_neuronx
+        except ImportError:
+            raise ImportError(
+                "torch_neuronx required for DiT compilation. "
+                "Run on a Neuron instance (trn1/trn2/inf2)."
+            )
+
+        os.makedirs(compiled_path, exist_ok=True)
+
+        dit = self._get_dit_module()
+        if dit is None:
+            raise RuntimeError("Could not extract DiT module from Token2Wav.")
+
+        # Get model dimensions
+        dit_cfg = getattr(dit, "config", None)
+        dim = getattr(dit_cfg, "dim", 1024)
+        num_heads = getattr(dit_cfg, "num_attention_heads", 16)
+        head_dim = dim // num_heads
+
+        logger.info(
+            "Compiling DiT core: batch=%d, mel_len=%d, dim=%d, heads=%d",
+            batch_size, max_mel_len, dim, num_heads,
+        )
+
+        # Monkeypatch DiTAttention to fix in-place slice assignment
+        _monkeypatch_dit_attention_for_neuron(dit)
+
+        # Create wrapper for transformer core only
+        core = _NeuronDiTCore(dit)
+        core.float()
+        core.eval()
+
+        # Create example inputs
+        # time_embedding uses batch=1 (broadcasts to hidden_states batch)
+        hidden_states = torch.randn(
+            batch_size, max_mel_len, dim, dtype=torch.float32
+        )
+        time_embedding = torch.randn(1, dim, dtype=torch.float32)
+        cos = torch.randn(
+            batch_size, max_mel_len, head_dim, dtype=torch.float32
+        )
+        sin = torch.randn(
+            batch_size, max_mel_len, head_dim, dtype=torch.float32
+        )
+        attention_mask = torch.zeros(
+            1, 1, max_mel_len, max_mel_len, dtype=torch.float32
+        )
+
+        compiled = torch_neuronx.trace(
+            core,
+            (hidden_states, time_embedding, cos, sin, attention_mask),
+            compiler_args=[
+                "--auto-cast=none",
+                "--model-type=transformer",
+                "-O1",
+            ],
+        )
+
+        save_path = os.path.join(compiled_path, "dit_core_neuron.pt")
+        torch.jit.save(compiled, save_path)
+
+        # Save metadata for load
+        meta = {
+            "max_mel_len": max_mel_len,
+            "batch_size": batch_size,
+            "dim": dim,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+        }
+        with open(os.path.join(compiled_path, "dit_core_meta.json"), "w") as f:
+            json.dump(meta, f)
+
+        logger.info("Compiled DiT core saved to %s", save_path)
+
+        self._neuron_dit_core = compiled
+        self._dit_compiled_path = compiled_path
+        self._dit_max_mel_len = max_mel_len
+        self._dit_batch_size = batch_size
+
+    def load_dit(self, compiled_path):
+        """Load a previously compiled DiT core model.
+
+        Args:
+            compiled_path: Directory containing compiled model
+        """
+        save_path = os.path.join(compiled_path, "dit_core_neuron.pt")
+        meta_path = os.path.join(compiled_path, "dit_core_meta.json")
+
+        if not os.path.exists(save_path):
+            raise FileNotFoundError(
+                f"Compiled DiT core not found at {save_path}"
+            )
+
+        self._neuron_dit_core = torch.jit.load(save_path)
+        self._dit_compiled_path = compiled_path
+
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            self._dit_max_mel_len = meta["max_mel_len"]
+            self._dit_batch_size = meta["batch_size"]
+
+        logger.info("Loaded compiled DiT core from %s", save_path)
+
+    def _build_attention_mask(self, block_diff, actual_mel_len, max_mel_len):
+        """Build float additive attention mask with padding.
+
+        Combines the blockwise attention pattern from block_diff with
+        padding masking for positions beyond actual_mel_len.
+
+        Args:
+            block_diff: (batch, heads, actual_mel_len, actual_mel_len)
+                from _create_block_diff
+            actual_mel_len: Actual sequence length before padding
+            max_mel_len: Padded sequence length (compiled size)
 
         Returns:
-            Tuple of example input tensors
+            (1, 1, max_mel_len, max_mel_len) float32 tensor.
+            0.0 for attend, -1e4 for don't attend.
         """
         dit = self._get_dit_module()
+        look_backward = dit.transformer_blocks[0].look_backward_block
+        look_ahead = dit.transformer_blocks[0].look_ahead_block
 
-        # Infer dimensions from config or model
-        dit_dim = 1024  # hidden dimension
-        emb_dim = 512   # speaker embedding dim
-        mel_dim = 80    # mel spectrogram channels
+        # Compute boolean mask from block_diff (use first batch/head slice)
+        bd = block_diff[0, 0]  # (actual_mel_len, actual_mel_len)
+        bool_mask = (bd >= -float(look_backward)) & (
+            bd <= float(look_ahead)
+        )
 
-        if dit is not None:
-            dit_cfg = getattr(dit, "config", None)
-            if dit_cfg is not None:
-                dit_dim = getattr(dit_cfg, "dim", dit_dim)
-                emb_dim = getattr(dit_cfg, "emb_dim", emb_dim)
-                mel_dim = getattr(dit_cfg, "mel_dim", mel_dim)
-
-        # hidden_states: (batch, mel_len, dim) — noisy mel in latent space
-        hidden_states = torch.randn(batch_size, max_mel_len, dit_dim, dtype=torch.float32)
-        # condition_vector: (batch, cond_len, mel_dim) — raw mel spectrogram for speaker conditioning
-        # The DiT's input_embed passes this through ECAPA-TDNN Conv1d(mel_dim, ...)
-        condition_vector = torch.randn(batch_size, max_mel_len, mel_dim, dtype=torch.float32)
-        # speaker_embedding: (batch, emb_dim) — speaker embedding
-        speaker_embedding = torch.randn(batch_size, emb_dim, dtype=torch.float32)
-        # quantized_code: (batch, code_len) — codec token IDs
-        quantized_code = torch.randint(0, 8193, (batch_size, max_codec_len), dtype=torch.long)
-        # time_step: (batch,) — ODE timestep
-        time_step = torch.tensor([0.5], dtype=torch.float32).expand(batch_size)
-
-        return (hidden_states, condition_vector, speaker_embedding,
-                quantized_code, time_step)
+        # Create padded float mask (all masked by default)
+        mask = torch.full(
+            (1, 1, max_mel_len, max_mel_len), -1e4, dtype=torch.float32
+        )
+        # Fill valid region
+        mask[0, 0, :actual_mel_len, :actual_mel_len] = torch.where(
+            bool_mask,
+            torch.tensor(0.0, dtype=torch.float32),
+            torch.tensor(-1e4, dtype=torch.float32),
+        )
+        return mask
 
     @torch.no_grad()
     def __call__(
@@ -420,40 +545,124 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         sway_coefficient=-1.0,
         **kwargs,
     ):
-        """Generate waveform. DiT runs on Neuron if compiled, else CPU.
+        """Generate waveform. DiT core runs on Neuron if compiled, else CPU.
 
-        This method delegates to the HF model's forward which handles the
-        ODE solver loop internally. When the DiT is compiled on Neuron,
-        the HF model's internal DiT calls are intercepted and redirected
-        to the Neuron-compiled version.
-
-        Args:
-            code: (batch, seq_len) codec token IDs from the Talker
-            conditioning: (batch, mel_len, enc_dim) speaker conditioning
-            reference_mel: (batch, mel_len, mel_dim) reference mel spectrogram
-            num_steps: Number of ODE solver steps (default 10)
-            guidance_scale: Classifier-free guidance scale (default 0.5)
-            sway_coefficient: Time schedule sway (default -1.0)
-
-        Returns:
-            waveform: (samples,) audio waveform tensor on CPU
+        Monkeypatches dit.forward to split execution:
+        - CPU: preprocessing (time/text/input embed, rotary, block_diff)
+        - Neuron: 22 transformer blocks + norm + proj
+        - CPU: ODE solver, BigVGAN vocoder
         """
-        if self._neuron_dit is not None:
-            # Redirect DiT calls to Neuron
-            original_dit = self._get_dit_module()
-            original_forward = original_dit.forward
+        if self._neuron_dit_core is not None:
+            dit = self._get_dit_module()
+            original_forward = dit.forward
+            neuron_core = self._neuron_dit_core
+            max_mel_len = self._dit_max_mel_len
+            expected_batch = self._dit_batch_size
+            build_mask = self._build_attention_mask
 
-            def neuron_dit_forward(*args, **fwd_kwargs):
-                # Move inputs to CPU (Neuron handles device transfer)
-                cpu_args = tuple(
-                    a.cpu().float() if isinstance(a, torch.Tensor) else a
-                    for a in args
+            def neuron_dit_forward(
+                hidden_states,
+                condition_vector,
+                speaker_embedding,
+                quantized_code,
+                time_step,
+                drop_audio_conditioning=False,
+                drop_code=False,
+                apply_cfg=True,
+            ):
+                """DiT forward with Neuron-accelerated transformer core."""
+                batch_size = hidden_states.shape[0]
+                if time_step.ndim == 0:
+                    time_step = time_step.repeat(batch_size)
+
+                # CPU: compute embeddings (same as HF original)
+                time_embedding = dit.time_embed(time_step)
+                text_embedding = dit.text_embed(
+                    quantized_code,
+                    drop_code=False if apply_cfg else drop_code,
                 )
-                result = self._neuron_dit(*cpu_args)
-                return result
+                text_embedding_uncond = (
+                    dit.text_embed(quantized_code, drop_code=True)
+                    if apply_cfg
+                    else None
+                )
 
-            # Monkeypatch the DiT forward for this call
-            original_dit.forward = neuron_dit_forward
+                # CPU: input embedding (ECAPA-TDNN, CFG batch doubling)
+                hidden_states = dit.input_embed(
+                    hidden_states,
+                    speaker_embedding,
+                    condition_vector,
+                    text_embedding,
+                    drop_audio_cond=drop_audio_conditioning,
+                    code_embed_uncond=text_embedding_uncond,
+                    apply_cfg=apply_cfg,
+                )
+
+                # CPU: positional encodings
+                cos, sin = dit.rotary_embed(hidden_states)
+                block_diff = dit._create_block_diff(hidden_states)
+
+                actual_mel_len = hidden_states.shape[1]
+                actual_batch = hidden_states.shape[0]
+
+                # Fall back to CPU for oversized inputs
+                if actual_mel_len > max_mel_len:
+                    logger.warning(
+                        "mel_len %d > max %d, falling back to CPU",
+                        actual_mel_len,
+                        max_mel_len,
+                    )
+                    return original_forward(
+                        hidden_states,
+                        condition_vector,
+                        speaker_embedding,
+                        quantized_code,
+                        time_step,
+                        drop_audio_conditioning=drop_audio_conditioning,
+                        drop_code=drop_code,
+                        apply_cfg=apply_cfg,
+                    )
+
+                # Build attention mask with padding
+                attention_mask = build_mask(
+                    block_diff, actual_mel_len, max_mel_len
+                )
+
+                # Pad to compiled shapes
+                pad_mel = max_mel_len - actual_mel_len
+                if pad_mel > 0:
+                    hidden_states = torch.nn.functional.pad(
+                        hidden_states, (0, 0, 0, pad_mel)
+                    )
+                    cos = torch.nn.functional.pad(cos, (0, 0, 0, pad_mel))
+                    sin = torch.nn.functional.pad(sin, (0, 0, 0, pad_mel))
+
+                pad_batch = expected_batch - actual_batch
+                if pad_batch > 0:
+                    hidden_states = torch.nn.functional.pad(
+                        hidden_states, (0, 0, 0, 0, 0, pad_batch)
+                    )
+                    cos = torch.nn.functional.pad(
+                        cos, (0, 0, 0, 0, 0, pad_batch)
+                    )
+                    sin = torch.nn.functional.pad(
+                        sin, (0, 0, 0, 0, 0, pad_batch)
+                    )
+
+                # Run transformer core on Neuron
+                output = neuron_core(
+                    hidden_states.float(),
+                    time_embedding.float(),
+                    cos.float(),
+                    sin.float(),
+                    attention_mask.float(),
+                )
+
+                # Unpad to actual sizes
+                output = output[:actual_batch, :actual_mel_len]
+                return output
+
+            dit.forward = neuron_dit_forward
             try:
                 result = self.model(
                     code=code,
@@ -465,11 +674,9 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                     **kwargs,
                 )
             finally:
-                # Restore original forward
-                original_dit.forward = original_forward
+                dit.forward = original_forward
             return result
         else:
-            # Fallback to CPU
             return self.model(
                 code=code,
                 conditioning=conditioning,
@@ -482,10 +689,7 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
 
     @classmethod
     def from_pretrained_state_dict(cls, token2wav_config, state_dict):
-        """Create Token2Wav with Neuron DiT support.
-
-        Same as base class but returns the Neuron-capable subclass.
-        """
+        """Create Token2Wav with Neuron DiT support."""
         token2wav = cls(token2wav_config)
 
         t2w_keys = {}
@@ -505,6 +709,9 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             logger.warning("Token2Wav missing keys: %s", missing[:10])
         if unexpected:
             logger.warning("Token2Wav unexpected keys: %s", unexpected[:10])
-        logger.info("Loaded %d weights into Token2Wav (Neuron DiT capable)", len(t2w_keys))
+        logger.info(
+            "Loaded %d weights into Token2Wav (Neuron DiT capable)",
+            len(t2w_keys),
+        )
 
         return token2wav
