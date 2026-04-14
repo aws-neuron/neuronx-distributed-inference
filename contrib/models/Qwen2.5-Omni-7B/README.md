@@ -169,6 +169,33 @@ Audio encoder performance (CPU frontend + CPU postprocessor, no Neuron transform
 | 10s | ~1000 | ~33ms | included |
 | 30s | ~3000 | ~34ms | included |
 
+### End-to-End Multimodal (CPU inference, trn2.48xlarge)
+
+| Test | Input | Output | Time |
+|------|-------|--------|------|
+| Text → Text | "What is the capital of France?" | Correct answer (Paris) | 15.1s |
+| Image + Text → Text | Synthetic image (shapes) + description prompt | Correctly identified red square, blue circle, yellow circle, green triangle | 59.5s |
+| Audio + Text → Text | 440Hz sine wave + "What do you hear?" | Text response generated | 12.1s |
+| Text → Speech | "Say hello and tell me the weather" | Text + audio waveform (14.2s audio) | 197.2s |
+
+### Speech Pipeline Profiling (CPU inference, trn2.48xlarge)
+
+Per-component measured breakdown for text-to-speech (14.1s audio output):
+
+| Component | Time | % of Total | RTF | Notes |
+|-----------|------|------------|-----|-------|
+| Thinker (7B) | 31.0s | 12% | — | 59 text tokens, ~1.9 tok/s on CPU |
+| Talker (690M) | 103.3s | 41% | 7.3x | Autoregressive codec token generation, 24 layers |
+| Token2Wav (DiT+BigVGAN) | 117.9s | 47% | 8.4x | 22 DiT blocks × 10 ODE steps × 2 (CFG) = 440 forward passes |
+| **Total** | **252.1s** | **100%** | **17.9x** | Generating 14.1s audio takes 252.1s on CPU |
+
+Key observations:
+- Talker and Token2Wav are roughly equal bottlenecks (~41% vs ~47%)
+- Thinker has ~100s JIT warmup overhead on first call (134s → 31s on second call)
+- Total real-time factor: 17.9x (far from real-time on CPU)
+
+> **Note**: These are CPU inference times. With Neuron-compiled Talker (TP=4) and Token2Wav DiT (torch_neuronx.trace), speech generation latency should decrease significantly — targeting <2x real-time.
+
 ## Compatibility Matrix
 
 | Instance/Version | 2.23+ (PyTorch 2.9) | 2.22 and earlier |
@@ -211,4 +238,4 @@ python /tmp/test_qwen25_omni_tp4.py
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-10
+**Last Updated:** 2026-04-14
