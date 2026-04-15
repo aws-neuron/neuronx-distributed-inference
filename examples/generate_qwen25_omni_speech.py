@@ -4,8 +4,9 @@ End-to-end speech synthesis for Qwen2.5-Omni-7B on NeuronX (TP=4).
 
 Full pipeline: Thinker (text) -> Talker (codec tokens) -> Token2Wav (audio)
 
-All three Neuron components are compiled automatically on first run.
-Subsequent runs load from cache (~15s).
+Two-step workflow:
+  Step 1: Compile all Neuron components (one-time, ~30 min)
+  Step 2: Run inference (loads compiled artifacts, ~15s per utterance)
 
 Prerequisites:
   - Trn2 instance (trn2.48xlarge or trn2.xlarge, 4+ NeuronCores)
@@ -16,17 +17,13 @@ Usage:
   source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
   cd neuronx-distributed-inference
 
-  # First run compiles all 3 components (~30 min total):
+  # Step 1: Compile (one-time, ~30 min)
+  python examples/generate_qwen25_omni_speech.py --compile
+
+  # Step 2: Run inference
   python examples/generate_qwen25_omni_speech.py
-
-  # Subsequent runs load from cache:
   python examples/generate_qwen25_omni_speech.py --prompt "Tell me about the weather"
-
-  # Custom model/output paths:
-  python examples/generate_qwen25_omni_speech.py \
-    --model-path /path/to/Qwen2.5-Omni-7B \
-    --compiled-path /tmp/compiled \
-    --output speech.wav
+  python examples/generate_qwen25_omni_speech.py --speaker Chelsie --output hello.wav
 
 Pipeline timing (trn2.48xlarge, TP=4, from compiled cache):
   Thinker:  ~0.3s  (text generation)
@@ -131,12 +128,164 @@ def _run_subprocess(script_code, label, temp_dir):
     return True
 
 
-# ---------------------------------------------------------------------------
-# Phase 1: Thinker (Neuron, subprocess)
-# ---------------------------------------------------------------------------
+# ==========================================================================
+# Compilation (--compile)
+# ==========================================================================
+
+def compile_all(model_path, compiled_path):
+    """Compile all three Neuron components: Thinker, Talker, DiT.
+
+    Each component is compiled in a separate subprocess for Neuron process
+    isolation. Compiled artifacts are saved to compiled_path/{component}/.
+    """
+    print("=" * 60)
+    print("Compiling Qwen2.5-Omni Speech Components")
+    print("=" * 60)
+    print(f"  Model:    {model_path}")
+    print(f"  Output:   {compiled_path}")
+    print(f"  TP:       {TP_DEGREE}")
+    t_total = time.time()
+
+    temp_dir = os.path.join(compiled_path, "_tmp")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # --- 1. Compile Thinker ---
+    print("\n--- [1/3] Compiling Thinker ---")
+    thinker_compiled = os.path.join(compiled_path, "thinker_tp4")
+    if os.path.exists(os.path.join(thinker_compiled, "neuron_config.json")):
+        print("  Already compiled, skipping.")
+    else:
+        script = f'''
+import torch, os
+MODEL_PATH = "{model_path}"
+COMPILED = "{thinker_compiled}"
+
+from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
+    NeuronQwen25OmniForCausalLM, Qwen25OmniInferenceConfig,
+)
+
+nc = NeuronConfig(
+    tp_degree={TP_DEGREE}, batch_size=1, seq_len=2048, max_context_length=2048,
+    torch_dtype=torch.bfloat16,
+    on_device_sampling_config=OnDeviceSamplingConfig(
+        do_sample=True, temperature=0.7, top_k=20, top_p=0.8
+    ),
+)
+cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(MODEL_PATH))
+model = NeuronQwen25OmniForCausalLM(MODEL_PATH, cfg)
+model.compile(COMPILED)
+print("Thinker compiled successfully")
+'''
+        ok = _run_subprocess(script, "compile_thinker", temp_dir)
+        if not ok:
+            print("FATAL: Thinker compilation failed.")
+            return False
+
+    # --- 2. Compile Talker ---
+    print("\n--- [2/3] Compiling Talker ---")
+    talker_compiled = os.path.join(compiled_path, "talker_tp4")
+    if os.path.exists(os.path.join(talker_compiled, "neuron_config.json")):
+        print("  Already compiled, skipping.")
+    else:
+        script = f'''
+import torch, os
+MODEL_PATH = "{model_path}"
+COMPILED = "{talker_compiled}"
+
+from transformers import AutoConfig
+from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
+    NeuronQwen25OmniTalkerForCausalLM, TalkerInferenceConfig, TalkerNeuronConfig,
+)
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+
+hf = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
+tc = hf.talker_config
+
+tnc = TalkerNeuronConfig(
+    tp_degree={TP_DEGREE}, batch_size=1, seq_len=2048, max_context_length=2048,
+    torch_dtype=torch.bfloat16,
+)
+tic = TalkerInferenceConfig(neuron_config=tnc, load_config=load_pretrained_config(hf_config=tc))
+talker = NeuronQwen25OmniTalkerForCausalLM(MODEL_PATH, config=tic)
+talker.compile(COMPILED)
+print("Talker compiled successfully")
+'''
+        ok = _run_subprocess(script, "compile_talker", temp_dir)
+        if not ok:
+            print("FATAL: Talker compilation failed.")
+            return False
+
+    # --- 3. Compile DiT ---
+    print("\n--- [3/3] Compiling Token2Wav DiT ---")
+    dit_compiled = os.path.join(compiled_path, "dit_core")
+    if os.path.exists(os.path.join(dit_compiled, "dit_core_neuron.pt")):
+        print("  Already compiled, skipping.")
+    else:
+        script = f'''
+import torch, os
+MODEL_PATH = "{model_path}"
+COMPILED = "{dit_compiled}"
+
+from transformers import AutoConfig
+from safetensors.torch import load_file
+from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_token2wav import (
+    NeuronQwen25OmniToken2WavWithNeuronDiT,
+)
+
+hf_config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
+t2w = NeuronQwen25OmniToken2WavWithNeuronDiT(hf_config.token2wav_config)
+
+state_dict = {{}}
+for fn in sorted(os.listdir(MODEL_PATH)):
+    if fn.endswith(".safetensors"):
+        sd = load_file(os.path.join(MODEL_PATH, fn))
+        for k, v in sd.items():
+            if k.startswith("token2wav."):
+                state_dict[k[len("token2wav."):]] = v
+t2w.load_state_dict(state_dict, strict=False)
+
+t2w.compile_dit(COMPILED, max_mel_len=2048, batch_size=2)
+print("DiT compiled successfully")
+'''
+        ok = _run_subprocess(script, "compile_dit", temp_dir)
+        if not ok:
+            print("FATAL: DiT compilation failed.")
+            return False
+
+    total = time.time() - t_total
+    print(f"\nAll components compiled in {total:.0f}s")
+    print(f"Artifacts saved to: {compiled_path}/")
+    print(f"  thinker_tp4/    - Thinker (7B text model)")
+    print(f"  talker_tp4/     - Talker (690M codec model)")
+    print(f"  dit_core/       - Token2Wav DiT (85M transformer)")
+    return True
+
+
+# ==========================================================================
+# Inference
+# ==========================================================================
+
+def _check_compiled(compiled_path):
+    """Verify all compiled artifacts exist."""
+    checks = [
+        (os.path.join(compiled_path, "thinker_tp4", "neuron_config.json"), "Thinker"),
+        (os.path.join(compiled_path, "talker_tp4", "neuron_config.json"), "Talker"),
+        (os.path.join(compiled_path, "dit_core", "dit_core_neuron.pt"), "DiT"),
+    ]
+    missing = [name for path, name in checks if not os.path.exists(path)]
+    if missing:
+        print(f"ERROR: Missing compiled artifacts for: {', '.join(missing)}")
+        print(f"Run with --compile first:")
+        print(f"  python {sys.argv[0]} --compile")
+        return False
+    return True
+
+
 def run_thinker(model_path, compiled_path, prompt, system_prompt, temp_dir):
-    """Generate text using the Neuron Thinker model."""
-    print("\n--- Phase 1: Neuron Thinker (TP=4) ---")
+    """Phase 1: Generate text using the Neuron Thinker model."""
+    print("\n--- Phase 1: Thinker (text generation) ---")
 
     thinker_compiled = os.path.join(compiled_path, "thinker_tp4")
     output_file = os.path.join(temp_dir, "thinker_output.json")
@@ -163,11 +312,6 @@ nc = NeuronConfig(
 )
 cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(MODEL_PATH))
 model = NeuronQwen25OmniForCausalLM(MODEL_PATH, cfg)
-
-# Compile if needed
-if not os.path.exists(os.path.join(COMPILED, "neuron_config.json")):
-    print("Compiling Thinker (first run, ~10 min)...")
-    model.compile(COMPILED)
 model.load(COMPILED)
 
 tok = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
@@ -216,12 +360,9 @@ print(f"OK: {{len(gen_ids)}} tokens in {{gen_time:.2f}}s: {{text[:100]}}")
         return json.load(f)
 
 
-# ---------------------------------------------------------------------------
-# Phase 2: CPU hidden state extraction
-# ---------------------------------------------------------------------------
 def extract_hidden_states(model_path, thinker_result):
-    """Extract thinker hidden states via CPU forward pass."""
-    print("\n--- Phase 2: CPU hidden state extraction ---")
+    """Phase 2: Extract thinker hidden states via CPU forward pass."""
+    print("\n--- Phase 2: Hidden state extraction (CPU) ---")
     from transformers import Qwen2_5OmniForConditionalGeneration
 
     with Timer("Load HF model"):
@@ -243,12 +384,9 @@ def extract_hidden_states(model_path, thinker_result):
     return hf_model, outputs, full_ids, prompt_len
 
 
-# ---------------------------------------------------------------------------
-# Phase 3: Prepare Talker input
-# ---------------------------------------------------------------------------
 def prepare_talker_input(model_path, hf_model, outputs, full_ids, prompt_len, speaker, temp_dir):
-    """Build projected thinker states for the Talker."""
-    print("\n--- Phase 3: Prepare Talker input ---")
+    """Phase 3: Build projected thinker states for the Talker."""
+    print("\n--- Phase 3: Talker input preparation ---")
     from transformers import AutoConfig
     from safetensors.torch import load_file
     from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
@@ -364,12 +502,9 @@ def prepare_talker_input(model_path, hf_model, outputs, full_ids, prompt_len, sp
     return context_len
 
 
-# ---------------------------------------------------------------------------
-# Phase 4: Talker (Neuron, subprocess)
-# ---------------------------------------------------------------------------
 def run_talker(model_path, compiled_path, context_len, temp_dir):
-    """Generate codec tokens using the Neuron Talker model."""
-    print("\n--- Phase 4: Neuron Talker (TP=4) ---")
+    """Phase 4: Generate codec tokens using the Neuron Talker model."""
+    print("\n--- Phase 4: Talker (codec token generation) ---")
 
     talker_compiled = os.path.join(compiled_path, "talker_tp4")
     output_file = os.path.join(temp_dir, "talker_output.json")
@@ -395,11 +530,6 @@ tnc = TalkerNeuronConfig(
 )
 tic = TalkerInferenceConfig(neuron_config=tnc, load_config=load_pretrained_config(hf_config=tc))
 talker = NeuronQwen25OmniTalkerForCausalLM(MODEL_PATH, config=tic)
-
-# Compile if needed
-if not os.path.exists(os.path.join(COMPILED, "neuron_config.json")):
-    print("Compiling Talker (first run, ~10 min)...")
-    talker.compile(COMPILED)
 talker.load(COMPILED)
 
 adp = HuggingFaceGenerationAdapter(talker)
@@ -465,12 +595,9 @@ with open(os.path.join(TEMP_DIR, "talker_output.json"), "w") as f:
         return json.load(f)
 
 
-# ---------------------------------------------------------------------------
-# Phase 5: Token2Wav (Neuron DiT + CPU BigVGAN)
-# ---------------------------------------------------------------------------
 def run_token2wav(model_path, compiled_path, codec_codes, temp_dir, output_wav):
-    """Convert codec tokens to waveform using Neuron DiT + CPU BigVGAN."""
-    print("\n--- Phase 5: Token2Wav (Neuron DiT + CPU BigVGAN) ---")
+    """Phase 5: Convert codec tokens to waveform using Neuron DiT + CPU BigVGAN."""
+    print("\n--- Phase 5: Token2Wav (waveform synthesis) ---")
 
     from transformers import AutoConfig
     from safetensors.torch import load_file
@@ -493,14 +620,10 @@ def run_token2wav(model_path, compiled_path, codec_codes, temp_dir, output_wav):
                     state_dict[k[len("token2wav."):]] = v
     t2w.load_state_dict(state_dict, strict=False)
 
-    # Compile or load DiT
+    # Load compiled DiT
     dit_compiled = os.path.join(compiled_path, "dit_core")
-    if not os.path.exists(os.path.join(dit_compiled, "dit_core_neuron.pt")):
-        with Timer("Compile DiT (first run, ~5 min)"):
-            t2w.compile_dit(dit_compiled, max_mel_len=2048, batch_size=2)
-    else:
-        with Timer("Load compiled DiT"):
-            t2w.load_dit(dit_compiled)
+    with Timer("Load compiled DiT"):
+        t2w.load_dit(dit_compiled)
     _restore_embedding()
 
     # Prepare inputs
@@ -532,12 +655,17 @@ def run_token2wav(model_path, compiled_path, codec_codes, temp_dir, output_wav):
         return 0
 
 
-# ---------------------------------------------------------------------------
+# ==========================================================================
 # Main
-# ---------------------------------------------------------------------------
+# ==========================================================================
+
 def main():
     parser = argparse.ArgumentParser(
         description="Qwen2.5-Omni-7B speech synthesis on Neuron"
+    )
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Compile all Neuron components (one-time, ~30 min)",
     )
     parser.add_argument(
         "--prompt", default=DEFAULT_PROMPT,
@@ -567,6 +695,16 @@ def main():
 
     model_path = _resolve_model_path(args.model_path)
     compiled_path = args.compiled_path
+
+    # --- Compile mode ---
+    if args.compile:
+        ok = compile_all(model_path, compiled_path)
+        sys.exit(0 if ok else 1)
+
+    # --- Inference mode ---
+    if not _check_compiled(compiled_path):
+        sys.exit(1)
+
     temp_dir = os.path.join(compiled_path, "_tmp")
     os.makedirs(temp_dir, exist_ok=True)
 
