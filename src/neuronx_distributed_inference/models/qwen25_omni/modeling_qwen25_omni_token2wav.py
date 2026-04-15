@@ -291,8 +291,11 @@ class _NeuronDiTCore(torch.nn.Module):
     - DiTInputEmbedding (2D/3D tensor cat mismatch)
     - Rotary embedding (torch.autocast context manager)
 
-    The attention mask is pre-computed on CPU as a float additive mask
-    (0.0 for attend, -1e4 for don't attend) to avoid boolean mask issues.
+    Each block may have a different attention pattern (look_backward/look_ahead).
+    Three per-block masks are pre-computed on CPU:
+    - mask_local: look_backward=0, look_ahead=0 (most blocks)
+    - mask_backward: look_backward=1, look_ahead=0 (blocks 0, 20)
+    - mask_ahead: look_backward=0, look_ahead=1 (block 10)
     """
 
     def __init__(self, dit_module):
@@ -300,20 +303,38 @@ class _NeuronDiTCore(torch.nn.Module):
         self.transformer_blocks = dit_module.transformer_blocks
         self.norm_out = dit_module.norm_out
         self.proj_out = dit_module.proj_out
+        # Build per-block mask selection (Python list for static trace)
+        # 0 = mask_local (0,0), 1 = mask_backward (1,0), 2 = mask_ahead (0,1)
+        self._block_mask_idx = []
+        for block in dit_module.transformer_blocks:
+            lb = block.look_backward_block
+            la = block.look_ahead_block
+            if lb == 0 and la == 0:
+                self._block_mask_idx.append(0)
+            elif lb >= 1 and la == 0:
+                self._block_mask_idx.append(1)
+            else:  # la >= 1
+                self._block_mask_idx.append(2)
 
-    def forward(self, hidden_states, time_embedding, cos, sin, attention_mask):
+    def forward(self, hidden_states, time_embedding, cos, sin,
+                mask_local, mask_backward, mask_ahead):
         """
         Args:
             hidden_states: (batch, seq_len, dim) from input_embed
             time_embedding: (time_batch, dim) from time_embed (broadcasts)
             cos: (batch, seq_len, head_dim) from rotary_embed
             sin: (batch, seq_len, head_dim) from rotary_embed
-            attention_mask: (1, 1, seq_len, seq_len) float additive mask
+            mask_local: (batch, 1, seq_len, seq_len) float mask (0,0)
+            mask_backward: (batch, 1, seq_len, seq_len) float mask (1,0)
+            mask_ahead: (batch, 1, seq_len, seq_len) float mask (0,1)
         """
         position_embeddings = (cos, sin)
+        masks = [mask_local, mask_backward, mask_ahead]
 
-        for block in self.transformer_blocks:
-            # Inline DiTDecoderLayer.forward with pre-computed attention_mask
+        for i, block in enumerate(self.transformer_blocks):
+            # Select per-block mask (static Python int index → traced as constant)
+            attention_mask = masks[self._block_mask_idx[i]]
+
             norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(
                 hidden_states, emb=time_embedding
             )
@@ -446,13 +467,21 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         sin = torch.randn(
             batch_size, max_mel_len, head_dim, dtype=torch.float32
         )
-        attention_mask = torch.zeros(
+        # Three per-block attention masks (local, backward, ahead)
+        mask_local = torch.zeros(
+            batch_size, 1, max_mel_len, max_mel_len, dtype=torch.float32
+        )
+        mask_backward = torch.zeros(
+            batch_size, 1, max_mel_len, max_mel_len, dtype=torch.float32
+        )
+        mask_ahead = torch.zeros(
             batch_size, 1, max_mel_len, max_mel_len, dtype=torch.float32
         )
 
         compiled = torch_neuronx.trace(
             core,
-            (hidden_states, time_embedding, cos, sin, attention_mask),
+            (hidden_states, time_embedding, cos, sin,
+             mask_local, mask_backward, mask_ahead),
             compiler_args=[
                 "--auto-cast=none",
                 "--model-type=transformer",
@@ -506,47 +535,47 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
 
         logger.info("Loaded compiled DiT core from %s", save_path)
 
-    def _build_attention_mask(self, block_diff, actual_mel_len, max_mel_len):
-        """Build float additive attention mask with padding.
+    def _build_attention_masks(self, block_diff, actual_mel_len, max_mel_len):
+        """Build three per-block float additive attention masks with padding.
 
-        Combines the blockwise attention pattern from block_diff with
-        padding masking for positions beyond actual_mel_len.
+        DiT blocks have three distinct attention patterns based on their
+        look_backward_block/look_ahead_block attributes:
+          - mask_local (0,0): most blocks — attend only within same block
+          - mask_backward (1,0): blocks 0,20 — attend current + previous block
+          - mask_ahead (0,1): block 10 — attend current + next block
 
         Args:
             block_diff: (batch, heads, actual_mel_len, actual_mel_len)
-                from _create_block_diff
+                from _create_block_diff. Values are block index differences.
             actual_mel_len: Actual sequence length before padding
             max_mel_len: Padded sequence length (compiled size)
 
         Returns:
-            (1, 1, max_mel_len, max_mel_len) float32 tensor.
+            Tuple of 3 masks, each (batch, 1, max_mel_len, max_mel_len) float32.
             0.0 for attend, -1e4 for don't attend.
         """
-        dit = self._get_dit_module()
-        look_backward = dit.transformer_blocks[0].look_backward_block
-        look_ahead = dit.transformer_blocks[0].look_ahead_block
-
-        # Compute boolean mask from block_diff (use first batch/head slice)
-        bd = block_diff[0, 0]  # (actual_mel_len, actual_mel_len)
-        bool_mask = (bd >= -float(look_backward)) & (
-            bd <= float(look_ahead)
-        )
-
-        # Create padded float mask (all masked by default)
-        # Use batch dimension from _dit_batch_size to match compiled shape
         mask_batch = self._dit_batch_size or 1
-        mask = torch.full(
-            (mask_batch, 1, max_mel_len, max_mel_len), -1e4, dtype=torch.float32
-        )
-        # Fill valid region (same pattern for all batch elements)
-        valid = torch.where(
-            bool_mask,
-            torch.tensor(0.0, dtype=torch.float32),
-            torch.tensor(-1e4, dtype=torch.float32),
-        )
-        for b in range(mask_batch):
-            mask[b, 0, :actual_mel_len, :actual_mel_len] = valid
-        return mask
+        bd = block_diff[0, 0]  # (actual_mel_len, actual_mel_len)
+
+        # Three patterns: (look_backward, look_ahead)
+        patterns = [(0, 0), (1, 0), (0, 1)]
+        masks = []
+        for lb, la in patterns:
+            bool_mask = (bd >= -float(lb)) & (bd <= float(la))
+            valid = torch.where(
+                bool_mask,
+                torch.tensor(0.0, dtype=torch.float32),
+                torch.tensor(-1e4, dtype=torch.float32),
+            )
+            mask = torch.full(
+                (mask_batch, 1, max_mel_len, max_mel_len),
+                -1e4, dtype=torch.float32,
+            )
+            for b in range(mask_batch):
+                mask[b, 0, :actual_mel_len, :actual_mel_len] = valid
+            masks.append(mask)
+
+        return masks[0], masks[1], masks[2]
 
     @torch.no_grad()
     def __call__(
@@ -572,7 +601,7 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             neuron_core = self._neuron_dit_core
             max_mel_len = self._dit_max_mel_len
             expected_batch = self._dit_batch_size
-            build_mask = self._build_attention_mask
+            build_masks = self._build_attention_masks
 
             def neuron_dit_forward(
                 hidden_states,
@@ -640,8 +669,8 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 actual_mel_len = hidden_states.shape[1]
                 actual_batch = hidden_states.shape[0]
 
-                # Build attention mask with padding
-                attention_mask = build_mask(
+                # Build three per-block attention masks
+                mask_local, mask_backward, mask_ahead = build_masks(
                     block_diff, actual_mel_len, max_mel_len
                 )
 
@@ -666,13 +695,15 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                         sin, (0, 0, 0, 0, 0, pad_batch)
                     )
 
-                # Run transformer core on Neuron
+                # Run transformer core on Neuron (3 per-block masks)
                 output = neuron_core(
                     hidden_states.float(),
                     time_embedding.float(),
                     cos.float(),
                     sin.float(),
-                    attention_mask.float(),
+                    mask_local.float(),
+                    mask_backward.float(),
+                    mask_ahead.float(),
                 )
 
                 # Unpad to actual sizes
