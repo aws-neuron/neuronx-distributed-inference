@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+"""
+End-to-end speech synthesis for Qwen2.5-Omni-7B on NeuronX (TP=4).
+
+Full pipeline: Thinker (text) -> Talker (codec tokens) -> Token2Wav (audio)
+
+All three Neuron components are compiled automatically on first run.
+Subsequent runs load from cache (~15s).
+
+Prerequisites:
+  - Trn2 instance (trn2.48xlarge or trn2.xlarge, 4+ NeuronCores)
+  - Neuron SDK 2.23+ with PyTorch 2.9
+  - Model weights: huggingface-cli download Qwen/Qwen2.5-Omni-7B
+
+Usage:
+  source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+  cd neuronx-distributed-inference
+
+  # First run compiles all 3 components (~30 min total):
+  python examples/generate_qwen25_omni_speech.py
+
+  # Subsequent runs load from cache:
+  python examples/generate_qwen25_omni_speech.py --prompt "Tell me about the weather"
+
+  # Custom model/output paths:
+  python examples/generate_qwen25_omni_speech.py \
+    --model-path /path/to/Qwen2.5-Omni-7B \
+    --compiled-path /tmp/compiled \
+    --output speech.wav
+
+Pipeline timing (trn2.48xlarge, TP=4, from compiled cache):
+  Thinker:  ~0.3s  (text generation)
+  Talker:   ~2-3s  (codec token generation)
+  Token2Wav: ~10s  (mel spectrogram + vocoder)
+  Total:    ~15s   for ~10s of audio (RTF ~1.5x)
+"""
+
+import argparse
+import gc
+import json
+import os
+import subprocess
+import sys
+import time
+
+import torch
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+MODEL_PATH = os.environ.get(
+    "QWEN25_OMNI_MODEL_PATH",
+    os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen2.5-Omni-7B/snapshots/"),
+)
+COMPILED_PATH = os.environ.get(
+    "QWEN25_OMNI_COMPILED_PATH", "/tmp/qwen25_omni_compiled"
+)
+TP_DEGREE = int(os.environ.get("QWEN25_OMNI_TP_DEGREE", "4"))
+
+DEFAULT_PROMPT = "Say hello and briefly introduce yourself in two sentences."
+DEFAULT_SYSTEM = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating "
+    "text and speech."
+)
+DEFAULT_SPEAKER = "Ethan"
+
+# Save original embedding forward (Neuron model loading may monkeypatch it)
+_ORIG_EMBEDDING_FORWARD = torch.nn.Embedding.forward
+
+
+def _resolve_model_path(path):
+    """Resolve model path, handling HF cache snapshot directories."""
+    if os.path.isdir(path) and not os.path.exists(os.path.join(path, "config.json")):
+        snaps = [d for d in os.listdir(path) if not d.startswith(".")]
+        if snaps:
+            path = os.path.join(path, snaps[0])
+    return path
+
+
+def _restore_embedding():
+    """Restore original Embedding.forward if Neuron loading changed it."""
+    if torch.nn.Embedding.forward is not _ORIG_EMBEDDING_FORWARD:
+        torch.nn.Embedding.forward = _ORIG_EMBEDDING_FORWARD
+
+
+class Timer:
+    def __init__(self, label):
+        self.label = label
+        self.elapsed = 0
+
+    def __enter__(self):
+        self.start = time.time()
+        return self
+
+    def __exit__(self, *args):
+        self.elapsed = time.time() - self.start
+        print(f"  [{self.label}] {self.elapsed:.2f}s")
+
+
+# ---------------------------------------------------------------------------
+# Subprocess runner (Thinker and Talker need separate processes for Neuron)
+# ---------------------------------------------------------------------------
+def _run_subprocess(script_code, label, temp_dir):
+    """Run Python code as a subprocess (required for Neuron process isolation)."""
+    script_path = os.path.join(temp_dir, f"{label}.py")
+    with open(script_path, "w") as f:
+        f.write(script_code)
+    t0 = time.time()
+    result = subprocess.run(
+        [sys.executable, script_path],
+        capture_output=True, text=True, timeout=600,
+    )
+    elapsed = time.time() - t0
+    if result.returncode != 0:
+        print(f"  [{label}] FAILED ({elapsed:.1f}s)")
+        # Filter noise from stderr
+        for line in result.stderr.strip().split("\n")[-15:]:
+            if line.strip() and not any(
+                x in line for x in ["WARN", "TDRV", "NMGR", "NRT", "nccl", "blockwise"]
+            ):
+                print(f"    {line}")
+        for line in result.stdout.strip().split("\n")[-5:]:
+            if line.strip():
+                print(f"    {line}")
+        return False
+    print(f"  [{label}] OK ({elapsed:.1f}s)")
+    for line in result.stdout.strip().split("\n"):
+        if line.strip():
+            print(f"    {line}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Thinker (Neuron, subprocess)
+# ---------------------------------------------------------------------------
+def run_thinker(model_path, compiled_path, prompt, system_prompt, temp_dir):
+    """Generate text using the Neuron Thinker model."""
+    print("\n--- Phase 1: Neuron Thinker (TP=4) ---")
+
+    thinker_compiled = os.path.join(compiled_path, "thinker_tp4")
+    output_file = os.path.join(temp_dir, "thinker_output.json")
+
+    script = f'''
+import torch, os, json, time
+MODEL_PATH = "{model_path}"
+COMPILED = "{thinker_compiled}"
+OUTPUT = "{output_file}"
+
+from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
+from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
+    NeuronQwen25OmniForCausalLM, Qwen25OmniInferenceConfig,
+)
+from transformers import AutoTokenizer
+
+nc = NeuronConfig(
+    tp_degree={TP_DEGREE}, batch_size=1, seq_len=2048, max_context_length=2048,
+    torch_dtype=torch.bfloat16,
+    on_device_sampling_config=OnDeviceSamplingConfig(
+        do_sample=True, temperature=0.7, top_k=20, top_p=0.8
+    ),
+)
+cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(MODEL_PATH))
+model = NeuronQwen25OmniForCausalLM(MODEL_PATH, cfg)
+
+# Compile if needed
+if not os.path.exists(os.path.join(COMPILED, "neuron_config.json")):
+    print("Compiling Thinker (first run, ~10 min)...")
+    model.compile(COMPILED)
+model.load(COMPILED)
+
+tok = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+adp = HuggingFaceGenerationAdapter(model)
+
+# Warmup
+enc = tok(tok.apply_chat_template(
+    [{{"role":"user","content":"Hi"}}], tokenize=False, add_generation_prompt=True
+), return_tensors="pt")
+_ = adp.generate(
+    input_ids=enc["input_ids"], attention_mask=enc["attention_mask"],
+    max_new_tokens=5, eos_token_id=[tok.eos_token_id, 151645],
+)
+
+# Generate
+chat = [
+    {{"role":"system","content":"{system_prompt}"}},
+    {{"role":"user","content":"{prompt}"}},
+]
+enc = tok(tok.apply_chat_template(chat, tokenize=False, add_generation_prompt=True), return_tensors="pt")
+t0 = time.time()
+out = adp.generate(
+    input_ids=enc["input_ids"], attention_mask=enc["attention_mask"],
+    max_new_tokens=200, eos_token_id=[tok.eos_token_id, 151645],
+)
+gen_time = time.time() - t0
+
+prompt_len = enc["input_ids"].shape[1]
+all_ids = out[0].tolist()
+gen_ids = all_ids[prompt_len:]
+text = tok.decode(gen_ids, skip_special_tokens=True)
+
+result = {{"all_ids": all_ids, "prompt_len": prompt_len, "gen_text": text,
+           "gen_time": gen_time, "n_tokens": len(gen_ids)}}
+with open(OUTPUT, "w") as f:
+    json.dump(result, f)
+print(f"OK: {{len(gen_ids)}} tokens in {{gen_time:.2f}}s: {{text[:100]}}")
+'''
+    ok = _run_subprocess(script, "thinker", temp_dir)
+    if not ok:
+        return None
+
+    with open(output_file) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: CPU hidden state extraction
+# ---------------------------------------------------------------------------
+def extract_hidden_states(model_path, thinker_result):
+    """Extract thinker hidden states via CPU forward pass."""
+    print("\n--- Phase 2: CPU hidden state extraction ---")
+    from transformers import Qwen2_5OmniForConditionalGeneration
+
+    with Timer("Load HF model"):
+        hf_model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+            model_path, torch_dtype=torch.float32, trust_remote_code=True,
+        )
+        hf_model.eval()
+    _restore_embedding()
+
+    full_ids = torch.tensor([thinker_result["all_ids"]], dtype=torch.long)
+    prompt_len = thinker_result["prompt_len"]
+
+    with Timer("Forward pass"):
+        with torch.no_grad():
+            outputs = hf_model.thinker(
+                input_ids=full_ids, output_hidden_states=True, return_dict=True,
+            )
+
+    return hf_model, outputs, full_ids, prompt_len
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Prepare Talker input
+# ---------------------------------------------------------------------------
+def prepare_talker_input(model_path, hf_model, outputs, full_ids, prompt_len, speaker, temp_dir):
+    """Build projected thinker states for the Talker."""
+    print("\n--- Phase 3: Prepare Talker input ---")
+    from transformers import AutoConfig
+    from safetensors.torch import load_file
+    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
+        ThinkerToTalkerProjection,
+    )
+
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    talker_cfg = hf_config.talker_config
+
+    # Speaker conditioning
+    spk_dict = torch.load(os.path.join(model_path, "spk_dict.pt"), weights_only=True)
+    sp = spk_dict[speaker]
+    conditioning = sp["cond"].unsqueeze(0).float() if sp["cond"].dim() == 1 else sp["cond"].float()
+    if conditioning.dim() == 1:
+        conditioning = conditioning.unsqueeze(0)
+    reference_mel = sp["ref_mel"].unsqueeze(0).float() if sp["ref_mel"].dim() == 2 else sp["ref_mel"].float()
+    if reference_mel.dim() == 2:
+        reference_mel = reference_mel.unsqueeze(0)
+    bos_token = sp["bos_token"]
+    if isinstance(bos_token, torch.Tensor):
+        bos_token = bos_token.item()
+
+    # Build per-position hidden states
+    embedding_output = outputs.hidden_states[0]
+    last_hidden = outputs.hidden_states[-1]
+    total_len = full_ids.shape[1]
+
+    context_embed = embedding_output[:, :prompt_len, :]
+    context_hidden = last_hidden[:, :prompt_len, :]
+    reply_embeds = [embedding_output[:, i:i+1, :] for i in range(prompt_len, total_len)]
+    reply_hiddens = [last_hidden[:, i:i+1, :] for i in range(prompt_len, total_len)]
+
+    thinker_token_embeds = [context_embed] + reply_embeds
+    thinker_hidden_states_list = [context_hidden] + reply_hiddens
+
+    thinker_reply_part = (
+        torch.cat(thinker_hidden_states_list[1:], dim=1)
+        + torch.cat(thinker_token_embeds[1:], dim=1)
+    )
+    talker_inputs_embeds = thinker_hidden_states_list[0] + thinker_token_embeds[0]
+
+    thinker_embed_tokens = hf_model.thinker.get_input_embeddings()
+    bos_embed = thinker_embed_tokens(torch.tensor([[bos_token]], dtype=torch.long))
+    talker_inputs_embeds = torch.cat([
+        talker_inputs_embeds, bos_embed, thinker_reply_part[:, :1, :],
+    ], dim=1)
+
+    # Add Talker's own codec token embeddings to last 2 positions
+    talker_embed_weight = None
+    for fn in sorted(os.listdir(model_path)):
+        if fn.endswith(".safetensors"):
+            sd = load_file(os.path.join(model_path, fn))
+            if "talker.model.embed_tokens.weight" in sd:
+                talker_embed_weight = sd["talker.model.embed_tokens.weight"]
+                break
+    if talker_embed_weight is not None:
+        talker_embed_layer = torch.nn.Embedding(
+            talker_embed_weight.shape[0], talker_embed_weight.shape[1]
+        )
+        talker_embed_layer.weight.data = talker_embed_weight.float()
+        codec_bos_embed = talker_embed_layer(
+            torch.tensor([talker_cfg.tts_codec_start_token_id])
+        )
+        codec_pad_embed = talker_embed_layer(
+            torch.tensor([talker_cfg.tts_codec_pad_token_id])
+        )
+        talker_inputs_embeds[:, -1, :] += codec_bos_embed
+        talker_inputs_embeds[:, -2, :] += codec_pad_embed
+
+    # Reply part for per-step injection
+    eos_embed = thinker_embed_tokens(
+        torch.tensor([[talker_cfg.tts_text_end_token_id]], dtype=torch.long)
+    )
+    pad_embed = thinker_embed_tokens(
+        torch.tensor([[talker_cfg.tts_text_pad_token_id]], dtype=torch.long)
+    )
+    thinker_reply_part = torch.cat([thinker_reply_part[:, 1:, :], eos_embed, pad_embed], dim=1)
+
+    context_len = talker_inputs_embeds.shape[1]
+    n_reply = thinker_reply_part.shape[1]
+    print(f"  Context: {context_len} tokens, Reply: {n_reply} tokens")
+
+    # Project thinker states (3584 -> 896)
+    proj_weight = proj_bias = None
+    for k, v in hf_model.state_dict().items():
+        if "thinker_to_talker_proj.weight" in k:
+            proj_weight = v
+        if "thinker_to_talker_proj.bias" in k:
+            proj_bias = v
+
+    proj = ThinkerToTalkerProjection(proj_weight.shape[1], proj_weight.shape[0])
+    proj.proj.weight.data = proj_weight
+    if proj_bias is not None:
+        proj.proj.bias.data = proj_bias
+
+    projected_context = proj(talker_inputs_embeds)
+    projected_reply = proj(thinker_reply_part)
+
+    # Save and clean up
+    talker_input = {
+        "projected_context": projected_context,
+        "projected_reply": projected_reply,
+        "context_len": context_len,
+        "n_reply": n_reply,
+        "prompt_len": prompt_len,
+        "conditioning": conditioning,
+        "reference_mel": reference_mel,
+    }
+    torch.save(talker_input, os.path.join(temp_dir, "talker_input.pt"))
+
+    del hf_model, outputs
+    gc.collect()
+    return context_len
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Talker (Neuron, subprocess)
+# ---------------------------------------------------------------------------
+def run_talker(model_path, compiled_path, context_len, temp_dir):
+    """Generate codec tokens using the Neuron Talker model."""
+    print("\n--- Phase 4: Neuron Talker (TP=4) ---")
+
+    talker_compiled = os.path.join(compiled_path, "talker_tp4")
+    output_file = os.path.join(temp_dir, "talker_output.json")
+
+    script = f'''
+import torch, os, json, time
+MODEL_PATH = "{model_path}"
+COMPILED = "{talker_compiled}"
+TEMP_DIR = "{temp_dir}"
+
+from transformers import AutoConfig
+from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
+    NeuronQwen25OmniTalkerForCausalLM, TalkerInferenceConfig, TalkerNeuronConfig,
+)
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
+
+hf = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
+tc = hf.talker_config
+
+tnc = TalkerNeuronConfig(
+    tp_degree={TP_DEGREE}, batch_size=1, seq_len=2048, max_context_length=2048,
+    torch_dtype=torch.bfloat16,
+)
+tic = TalkerInferenceConfig(neuron_config=tnc, load_config=load_pretrained_config(hf_config=tc))
+talker = NeuronQwen25OmniTalkerForCausalLM(MODEL_PATH, config=tic)
+
+# Compile if needed
+if not os.path.exists(os.path.join(COMPILED, "neuron_config.json")):
+    print("Compiling Talker (first run, ~10 min)...")
+    talker.compile(COMPILED)
+talker.load(COMPILED)
+
+adp = HuggingFaceGenerationAdapter(talker)
+
+# Load prepared input
+inp = torch.load(os.path.join(TEMP_DIR, "talker_input.pt"), weights_only=False)
+projected_context = inp["projected_context"]
+projected_reply = inp["projected_reply"]
+context_len = inp["context_len"]
+
+codec_bos = tc.tts_codec_start_token_id
+codec_eos = tc.tts_codec_end_token_id
+codec_pad = tc.tts_codec_pad_token_id
+codec_mask = tc.tts_codec_mask_token_id
+
+# Build input_ids: [mask * (context-2), pad, bos]
+talker_input_ids = torch.cat([
+    torch.full((1, context_len - 2), codec_mask, dtype=torch.long),
+    torch.tensor([[codec_pad]], dtype=torch.long),
+    torch.tensor([[codec_bos]], dtype=torch.long),
+], dim=1)
+talker_attention_mask = torch.ones_like(talker_input_ids, dtype=torch.long)
+
+# Set vision embeddings with per-step thinker reply states
+ve = projected_context.to(torch.bfloat16)
+vm = torch.ones(1, context_len, 1, dtype=torch.int32)
+reply = projected_reply.to(torch.bfloat16)
+talker.set_vision_embeddings(ve, vm, thinker_reply_embeds=reply)
+
+max_gen = min(600, 2048 - context_len - 10)
+print(f"Input: {{talker_input_ids.shape}}, max_gen={{max_gen}}")
+
+t0 = time.time()
+out = adp.generate(
+    input_ids=talker_input_ids,
+    attention_mask=talker_attention_mask,
+    max_new_tokens=max_gen,
+    eos_token_id=[codec_eos, codec_pad],
+    suppress_tokens=[codec_bos],
+    do_sample=True, temperature=0.9, top_k=40, top_p=0.8,
+    repetition_penalty=1.05,
+)
+gen_time = time.time() - t0
+
+gen_tokens = out[0, context_len:].tolist()
+while gen_tokens and gen_tokens[-1] == codec_eos:
+    gen_tokens.pop()
+
+if gen_tokens:
+    print(f"Generated {{len(gen_tokens)}} codec tokens in {{gen_time:.2f}}s")
+else:
+    print(f"No codec tokens generated")
+
+result = {{"codes": gen_tokens, "gen_time": gen_time}}
+with open(os.path.join(TEMP_DIR, "talker_output.json"), "w") as f:
+    json.dump(result, f)
+'''
+    ok = _run_subprocess(script, "talker", temp_dir)
+    if not ok:
+        return None
+
+    with open(output_file) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Token2Wav (Neuron DiT + CPU BigVGAN)
+# ---------------------------------------------------------------------------
+def run_token2wav(model_path, compiled_path, codec_codes, temp_dir, output_wav):
+    """Convert codec tokens to waveform using Neuron DiT + CPU BigVGAN."""
+    print("\n--- Phase 5: Token2Wav (Neuron DiT + CPU BigVGAN) ---")
+
+    from transformers import AutoConfig
+    from safetensors.torch import load_file
+    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_token2wav import (
+        NeuronQwen25OmniToken2WavWithNeuronDiT,
+    )
+
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    t2w_cfg = hf_config.token2wav_config
+
+    t2w = NeuronQwen25OmniToken2WavWithNeuronDiT(t2w_cfg)
+
+    # Load weights
+    state_dict = {}
+    for fn in sorted(os.listdir(model_path)):
+        if fn.endswith(".safetensors"):
+            sd = load_file(os.path.join(model_path, fn))
+            for k, v in sd.items():
+                if k.startswith("token2wav."):
+                    state_dict[k[len("token2wav."):]] = v
+    t2w.load_state_dict(state_dict, strict=False)
+
+    # Compile or load DiT
+    dit_compiled = os.path.join(compiled_path, "dit_core")
+    if not os.path.exists(os.path.join(dit_compiled, "dit_core_neuron.pt")):
+        with Timer("Compile DiT (first run, ~5 min)"):
+            t2w.compile_dit(dit_compiled, max_mel_len=2048, batch_size=2)
+    else:
+        with Timer("Load compiled DiT"):
+            t2w.load_dit(dit_compiled)
+    _restore_embedding()
+
+    # Prepare inputs
+    code_tensor = torch.tensor([codec_codes], dtype=torch.long)
+    num_embeds = getattr(t2w_cfg.dit_config, "num_embeds", 8193)
+    if code_tensor.max() >= num_embeds:
+        code_tensor = code_tensor.clamp(0, num_embeds)
+
+    inp = torch.load(os.path.join(temp_dir, "talker_input.pt"), weights_only=False)
+
+    with Timer("Generate waveform"):
+        wav = t2w(
+            code=code_tensor,
+            conditioning=inp["conditioning"],
+            reference_mel=inp["reference_mel"],
+            num_steps=10,
+            guidance_scale=0.5,
+        )
+
+    if wav is not None and isinstance(wav, torch.Tensor) and wav.numel() > 0:
+        import soundfile as sf
+        wav_np = wav.detach().cpu().float().numpy().flatten()
+        sf.write(output_wav, wav_np, 24000)
+        audio_duration = len(wav_np) / 24000
+        print(f"  Audio: {audio_duration:.1f}s saved to {output_wav}")
+        return audio_duration
+    else:
+        print("  No audio generated")
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Qwen2.5-Omni-7B speech synthesis on Neuron"
+    )
+    parser.add_argument(
+        "--prompt", default=DEFAULT_PROMPT,
+        help="Text prompt for speech generation",
+    )
+    parser.add_argument(
+        "--system-prompt", default=DEFAULT_SYSTEM,
+        help="System prompt",
+    )
+    parser.add_argument(
+        "--speaker", default=DEFAULT_SPEAKER, choices=["Ethan", "Chelsie"],
+        help="Speaker voice (default: Ethan)",
+    )
+    parser.add_argument(
+        "--model-path", default=MODEL_PATH,
+        help=f"Model path (default: {MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--compiled-path", default=COMPILED_PATH,
+        help=f"Compiled artifacts path (default: {COMPILED_PATH})",
+    )
+    parser.add_argument(
+        "--output", default="speech_output.wav",
+        help="Output WAV file path (default: speech_output.wav)",
+    )
+    args = parser.parse_args()
+
+    model_path = _resolve_model_path(args.model_path)
+    compiled_path = args.compiled_path
+    temp_dir = os.path.join(compiled_path, "_tmp")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    print("=" * 60)
+    print("Qwen2.5-Omni Speech Pipeline (Neuron, TP=4)")
+    print("=" * 60)
+    print(f"  Model:    {model_path}")
+    print(f"  Compiled: {compiled_path}")
+    print(f"  Speaker:  {args.speaker}")
+    print(f"  Prompt:   {args.prompt}")
+    print(f"  Output:   {args.output}")
+    t_total = time.time()
+
+    # Phase 1: Thinker
+    thinker_result = run_thinker(
+        model_path, compiled_path, args.prompt, args.system_prompt, temp_dir
+    )
+    if not thinker_result:
+        print("Thinker failed, aborting.")
+        return
+    print(f"  Text: {thinker_result['gen_text'][:200]}")
+
+    # Phase 2: Hidden states
+    hf_model, outputs, full_ids, prompt_len = extract_hidden_states(
+        model_path, thinker_result
+    )
+
+    # Phase 3: Talker input prep
+    context_len = prepare_talker_input(
+        model_path, hf_model, outputs, full_ids, prompt_len,
+        args.speaker, temp_dir,
+    )
+
+    # Phase 4: Talker
+    talker_result = run_talker(model_path, compiled_path, context_len, temp_dir)
+    if not talker_result or not talker_result["codes"]:
+        print("Talker failed or produced no tokens, aborting.")
+        return
+    print(f"  {len(talker_result['codes'])} codec tokens in {talker_result['gen_time']:.1f}s")
+
+    # Phase 5: Token2Wav
+    audio_duration = run_token2wav(
+        model_path, compiled_path, talker_result["codes"], temp_dir, args.output
+    )
+
+    # Summary
+    total_time = time.time() - t_total
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"  Text:     {thinker_result['gen_text'][:200]}")
+    print(f"  Thinker:  {thinker_result['gen_time']:.1f}s ({thinker_result['n_tokens']} tokens)")
+    print(f"  Talker:   {talker_result['gen_time']:.1f}s ({len(talker_result['codes'])} codec tokens)")
+    if audio_duration > 0:
+        print(f"  Audio:    {audio_duration:.1f}s")
+        print(f"  Total:    {total_time:.1f}s (RTF: {total_time/audio_duration:.1f}x)")
+    print(f"\n  Output: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
