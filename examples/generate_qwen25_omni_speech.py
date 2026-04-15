@@ -25,6 +25,9 @@ Usage:
   python examples/generate_qwen25_omni_speech.py --prompt "Tell me about the weather"
   python examples/generate_qwen25_omni_speech.py --speaker Chelsie --output hello.wav
 
+  # Benchmark: run N times, report average latency per component
+  python examples/generate_qwen25_omni_speech.py --num-runs 5
+
 Pipeline timing (trn2.48xlarge, TP=4, from compiled cache):
   Thinker:  ~0.3s  (text generation)
   Talker:   ~2-3s  (codec token generation)
@@ -111,7 +114,6 @@ def _run_subprocess(script_code, label, temp_dir):
     elapsed = time.time() - t0
     if result.returncode != 0:
         print(f"  [{label}] FAILED ({elapsed:.1f}s)")
-        # Filter noise from stderr
         for line in result.stderr.strip().split("\n")[-15:]:
             if line.strip() and not any(
                 x in line for x in ["WARN", "TDRV", "NMGR", "NRT", "nccl", "blockwise"]
@@ -133,11 +135,7 @@ def _run_subprocess(script_code, label, temp_dir):
 # ==========================================================================
 
 def compile_all(model_path, compiled_path):
-    """Compile all three Neuron components: Thinker, Talker, DiT.
-
-    Each component is compiled in a separate subprocess for Neuron process
-    isolation. Compiled artifacts are saved to compiled_path/{component}/.
-    """
+    """Compile all three Neuron components: Thinker, Talker, DiT."""
     print("=" * 60)
     print("Compiling Qwen2.5-Omni Speech Components")
     print("=" * 60)
@@ -283,9 +281,9 @@ def _check_compiled(compiled_path):
     return True
 
 
-def run_thinker(model_path, compiled_path, prompt, system_prompt, temp_dir):
-    """Phase 1: Generate text using the Neuron Thinker model."""
-    print("\n--- Phase 1: Thinker (text generation) ---")
+def run_thinker(model_path, compiled_path, prompt, system_prompt, num_runs, temp_dir):
+    """Phase 1: Load Thinker once, generate num_runs times, return first result + avg time."""
+    print(f"\n--- Phase 1: Thinker (text generation, {num_runs} runs) ---")
 
     thinker_compiled = os.path.join(compiled_path, "thinker_tp4")
     output_file = os.path.join(temp_dir, "thinker_output.json")
@@ -295,6 +293,7 @@ import torch, os, json, time
 MODEL_PATH = "{model_path}"
 COMPILED = "{thinker_compiled}"
 OUTPUT = "{output_file}"
+NUM_RUNS = {num_runs}
 
 from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
@@ -328,29 +327,41 @@ _ = adp.generate(
     max_new_tokens=5, eos_token_id=[tok.eos_token_id, 151645],
 )
 
-# Generate
 chat = [
     {{"role":"system","content":"{system_prompt}"}},
     {{"role":"user","content":"{prompt}"}},
 ]
 enc = tok(tok.apply_chat_template(chat, tokenize=False, add_generation_prompt=True), return_tensors="pt")
-t0 = time.time()
-out = adp.generate(
-    input_ids=enc["input_ids"], attention_mask=enc["attention_mask"],
-    max_new_tokens=200, eos_token_id=[tok.eos_token_id, 151645],
-)
-gen_time = time.time() - t0
 
-prompt_len = enc["input_ids"].shape[1]
-all_ids = out[0].tolist()
-gen_ids = all_ids[prompt_len:]
-text = tok.decode(gen_ids, skip_special_tokens=True)
+first_result = None
+times = []
+for i in range(NUM_RUNS):
+    t0 = time.time()
+    out = adp.generate(
+        input_ids=enc["input_ids"], attention_mask=enc["attention_mask"],
+        max_new_tokens=200, eos_token_id=[tok.eos_token_id, 151645],
+    )
+    elapsed = time.time() - t0
+    times.append(elapsed)
 
-result = {{"all_ids": all_ids, "prompt_len": prompt_len, "gen_text": text,
-           "gen_time": gen_time, "n_tokens": len(gen_ids)}}
+    prompt_len = enc["input_ids"].shape[1]
+    all_ids = out[0].tolist()
+    gen_ids = all_ids[prompt_len:]
+    text = tok.decode(gen_ids, skip_special_tokens=True)
+    n_tokens = len(gen_ids)
+    print(f"  Run {{i+1}}/{{NUM_RUNS}}: {{n_tokens}} tokens in {{elapsed:.3f}}s - {{text[:80]}}")
+
+    if first_result is None:
+        first_result = {{"all_ids": all_ids, "prompt_len": prompt_len,
+                        "gen_text": text, "n_tokens": n_tokens}}
+
+avg_time = sum(times) / len(times)
+first_result["gen_time"] = avg_time
+first_result["all_times"] = times
+print(f"  Avg: {{avg_time:.3f}}s over {{NUM_RUNS}} runs")
+
 with open(OUTPUT, "w") as f:
-    json.dump(result, f)
-print(f"OK: {{len(gen_ids)}} tokens in {{gen_time:.2f}}s: {{text[:100]}}")
+    json.dump(first_result, f)
 '''
     ok = _run_subprocess(script, "thinker", temp_dir)
     if not ok:
@@ -502,9 +513,9 @@ def prepare_talker_input(model_path, hf_model, outputs, full_ids, prompt_len, sp
     return context_len
 
 
-def run_talker(model_path, compiled_path, context_len, temp_dir):
-    """Phase 4: Generate codec tokens using the Neuron Talker model."""
-    print("\n--- Phase 4: Talker (codec token generation) ---")
+def run_talker(model_path, compiled_path, context_len, num_runs, temp_dir):
+    """Phase 4: Load Talker once, generate num_runs times, return first result + avg time."""
+    print(f"\n--- Phase 4: Talker (codec token generation, {num_runs} runs) ---")
 
     talker_compiled = os.path.join(compiled_path, "talker_tp4")
     output_file = os.path.join(temp_dir, "talker_output.json")
@@ -514,6 +525,7 @@ import torch, os, json, time
 MODEL_PATH = "{model_path}"
 COMPILED = "{talker_compiled}"
 TEMP_DIR = "{temp_dir}"
+NUM_RUNS = {num_runs}
 
 from transformers import AutoConfig
 from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
@@ -545,7 +557,6 @@ codec_eos = tc.tts_codec_end_token_id
 codec_pad = tc.tts_codec_pad_token_id
 codec_mask = tc.tts_codec_mask_token_id
 
-# Build input_ids: [mask * (context-2), pad, bos]
 talker_input_ids = torch.cat([
     torch.full((1, context_len - 2), codec_mask, dtype=torch.long),
     torch.tensor([[codec_pad]], dtype=torch.long),
@@ -553,37 +564,42 @@ talker_input_ids = torch.cat([
 ], dim=1)
 talker_attention_mask = torch.ones_like(talker_input_ids, dtype=torch.long)
 
-# Set vision embeddings with per-step thinker reply states
-ve = projected_context.to(torch.bfloat16)
-vm = torch.ones(1, context_len, 1, dtype=torch.int32)
-reply = projected_reply.to(torch.bfloat16)
-talker.set_vision_embeddings(ve, vm, thinker_reply_embeds=reply)
-
 max_gen = min(600, 2048 - context_len - 10)
-print(f"Input: {{talker_input_ids.shape}}, max_gen={{max_gen}}")
 
-t0 = time.time()
-out = adp.generate(
-    input_ids=talker_input_ids,
-    attention_mask=talker_attention_mask,
-    max_new_tokens=max_gen,
-    eos_token_id=[codec_eos, codec_pad],
-    suppress_tokens=[codec_bos],
-    do_sample=True, temperature=0.9, top_k=40, top_p=0.8,
-    repetition_penalty=1.05,
-)
-gen_time = time.time() - t0
+first_codes = None
+times = []
+for i in range(NUM_RUNS):
+    # Reset vision embeddings each run (KV cache is cleared between generates)
+    ve = projected_context.to(torch.bfloat16)
+    vm = torch.ones(1, context_len, 1, dtype=torch.int32)
+    reply = projected_reply.to(torch.bfloat16)
+    talker.set_vision_embeddings(ve, vm, thinker_reply_embeds=reply)
 
-gen_tokens = out[0, context_len:].tolist()
-while gen_tokens and gen_tokens[-1] == codec_eos:
-    gen_tokens.pop()
+    t0 = time.time()
+    out = adp.generate(
+        input_ids=talker_input_ids,
+        attention_mask=talker_attention_mask,
+        max_new_tokens=max_gen,
+        eos_token_id=[codec_eos, codec_pad],
+        suppress_tokens=[codec_bos],
+        do_sample=True, temperature=0.9, top_k=40, top_p=0.8,
+        repetition_penalty=1.05,
+    )
+    elapsed = time.time() - t0
+    times.append(elapsed)
 
-if gen_tokens:
-    print(f"Generated {{len(gen_tokens)}} codec tokens in {{gen_time:.2f}}s")
-else:
-    print(f"No codec tokens generated")
+    gen_tokens = out[0, context_len:].tolist()
+    while gen_tokens and gen_tokens[-1] == codec_eos:
+        gen_tokens.pop()
+    print(f"  Run {{i+1}}/{{NUM_RUNS}}: {{len(gen_tokens)}} codec tokens in {{elapsed:.3f}}s")
 
-result = {{"codes": gen_tokens, "gen_time": gen_time}}
+    if first_codes is None:
+        first_codes = gen_tokens
+
+avg_time = sum(times) / len(times)
+print(f"  Avg: {{avg_time:.3f}}s over {{NUM_RUNS}} runs")
+
+result = {{"codes": first_codes, "gen_time": avg_time, "all_times": times}}
 with open(os.path.join(TEMP_DIR, "talker_output.json"), "w") as f:
     json.dump(result, f)
 '''
@@ -595,9 +611,9 @@ with open(os.path.join(TEMP_DIR, "talker_output.json"), "w") as f:
         return json.load(f)
 
 
-def run_token2wav(model_path, compiled_path, codec_codes, temp_dir, output_wav):
-    """Phase 5: Convert codec tokens to waveform using Neuron DiT + CPU BigVGAN."""
-    print("\n--- Phase 5: Token2Wav (waveform synthesis) ---")
+def run_token2wav(model_path, compiled_path, codec_codes, num_runs, temp_dir, output_wav):
+    """Phase 5: Load DiT once, run num_runs times, save first result, report avg time."""
+    print(f"\n--- Phase 5: Token2Wav (waveform synthesis, {num_runs} runs) ---")
 
     from transformers import AutoConfig
     from safetensors.torch import load_file
@@ -633,26 +649,40 @@ def run_token2wav(model_path, compiled_path, codec_codes, temp_dir, output_wav):
         code_tensor = code_tensor.clamp(0, num_embeds)
 
     inp = torch.load(os.path.join(temp_dir, "talker_input.pt"), weights_only=False)
+    conditioning = inp["conditioning"]
+    reference_mel = inp["reference_mel"]
 
-    with Timer("Generate waveform"):
+    # Run num_runs times, save first result
+    first_wav = None
+    times = []
+    for i in range(num_runs):
+        t0 = time.time()
         wav = t2w(
             code=code_tensor,
-            conditioning=inp["conditioning"],
-            reference_mel=inp["reference_mel"],
+            conditioning=conditioning,
+            reference_mel=reference_mel,
             num_steps=10,
             guidance_scale=0.5,
         )
+        elapsed = time.time() - t0
+        times.append(elapsed)
+        print(f"  Run {i+1}/{num_runs}: {elapsed:.2f}s")
 
-    if wav is not None and isinstance(wav, torch.Tensor) and wav.numel() > 0:
+        if first_wav is None:
+            first_wav = wav
+
+    avg_time = sum(times) / len(times)
+    print(f"  Avg: {avg_time:.2f}s over {num_runs} runs")
+
+    audio_duration = 0
+    if first_wav is not None and isinstance(first_wav, torch.Tensor) and first_wav.numel() > 0:
         import soundfile as sf
-        wav_np = wav.detach().cpu().float().numpy().flatten()
+        wav_np = first_wav.detach().cpu().float().numpy().flatten()
         sf.write(output_wav, wav_np, 24000)
         audio_duration = len(wav_np) / 24000
         print(f"  Audio: {audio_duration:.1f}s saved to {output_wav}")
-        return audio_duration
-    else:
-        print("  No audio generated")
-        return 0
+
+    return audio_duration, avg_time, times
 
 
 # ==========================================================================
@@ -666,6 +696,10 @@ def main():
     parser.add_argument(
         "--compile", action="store_true",
         help="Compile all Neuron components (one-time, ~30 min)",
+    )
+    parser.add_argument(
+        "--num-runs", type=int, default=1,
+        help="Number of inference runs per component for benchmarking (default: 1)",
     )
     parser.add_argument(
         "--prompt", default=DEFAULT_PROMPT,
@@ -695,6 +729,7 @@ def main():
 
     model_path = _resolve_model_path(args.model_path)
     compiled_path = args.compiled_path
+    num_runs = args.num_runs
 
     # --- Compile mode ---
     if args.compile:
@@ -716,52 +751,68 @@ def main():
     print(f"  Speaker:  {args.speaker}")
     print(f"  Prompt:   {args.prompt}")
     print(f"  Output:   {args.output}")
+    print(f"  Runs:     {num_runs}")
     t_total = time.time()
 
-    # Phase 1: Thinker
+    # Phase 1: Thinker (load once, run N times in subprocess)
     thinker_result = run_thinker(
-        model_path, compiled_path, args.prompt, args.system_prompt, temp_dir
+        model_path, compiled_path, args.prompt, args.system_prompt,
+        num_runs, temp_dir,
     )
     if not thinker_result:
         print("Thinker failed, aborting.")
         return
     print(f"  Text: {thinker_result['gen_text'][:200]}")
 
-    # Phase 2: Hidden states
+    # Phase 2: Hidden states (CPU, run once)
     hf_model, outputs, full_ids, prompt_len = extract_hidden_states(
         model_path, thinker_result
     )
 
-    # Phase 3: Talker input prep
+    # Phase 3: Talker input prep (CPU, run once)
     context_len = prepare_talker_input(
         model_path, hf_model, outputs, full_ids, prompt_len,
         args.speaker, temp_dir,
     )
 
-    # Phase 4: Talker
-    talker_result = run_talker(model_path, compiled_path, context_len, temp_dir)
+    # Phase 4: Talker (load once, run N times in subprocess)
+    talker_result = run_talker(
+        model_path, compiled_path, context_len, num_runs, temp_dir,
+    )
     if not talker_result or not talker_result["codes"]:
         print("Talker failed or produced no tokens, aborting.")
         return
-    print(f"  {len(talker_result['codes'])} codec tokens in {talker_result['gen_time']:.1f}s")
+    print(f"  {len(talker_result['codes'])} codec tokens (avg {talker_result['gen_time']:.2f}s)")
 
-    # Phase 5: Token2Wav
-    audio_duration = run_token2wav(
-        model_path, compiled_path, talker_result["codes"], temp_dir, args.output
+    # Phase 5: Token2Wav (load DiT once, run N times in main process)
+    audio_duration, t2w_avg, t2w_times = run_token2wav(
+        model_path, compiled_path, talker_result["codes"],
+        num_runs, temp_dir, args.output,
     )
 
     # Summary
     total_time = time.time() - t_total
+    thinker_avg = thinker_result["gen_time"]
+    talker_avg = talker_result["gen_time"]
+
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"  Text:     {thinker_result['gen_text'][:200]}")
-    print(f"  Thinker:  {thinker_result['gen_time']:.1f}s ({thinker_result['n_tokens']} tokens)")
-    print(f"  Talker:   {talker_result['gen_time']:.1f}s ({len(talker_result['codes'])} codec tokens)")
+    print(f"  Text:      {thinker_result['gen_text'][:200]}")
+    print(f"  Thinker:   {thinker_avg:.3f}s avg ({thinker_result['n_tokens']} tokens)")
+    print(f"  Talker:    {talker_avg:.3f}s avg ({len(talker_result['codes'])} codec tokens)")
+    print(f"  Token2Wav: {t2w_avg:.2f}s avg")
     if audio_duration > 0:
-        print(f"  Audio:    {audio_duration:.1f}s")
-        print(f"  Total:    {total_time:.1f}s (RTF: {total_time/audio_duration:.1f}x)")
-    print(f"\n  Output: {args.output}")
+        pipeline_avg = thinker_avg + talker_avg + t2w_avg
+        print(f"  Audio:     {audio_duration:.1f}s")
+        print(f"  Pipeline:  {pipeline_avg:.2f}s avg (RTF: {pipeline_avg/audio_duration:.2f}x)")
+    if num_runs > 1:
+        print(f"\n  Per-run details ({num_runs} runs):")
+        print(f"    Thinker:   {thinker_result.get('all_times', [])}")
+        print(f"    Talker:    {talker_result.get('all_times', [])}")
+        print(f"    Token2Wav: {[f'{t:.2f}' for t in t2w_times]}")
+    print(f"\n  Total wall time: {total_time:.1f}s")
+    print(f"  Output: {args.output}")
 
 
 if __name__ == "__main__":
