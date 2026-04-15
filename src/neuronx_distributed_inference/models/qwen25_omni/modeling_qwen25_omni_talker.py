@@ -773,8 +773,12 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
                 step_ve = reply_embeds[:, self._tkg_step:self._tkg_step + 1, :]
                 step_vm = torch.ones(batch_size, 1, 1, dtype=torch.int32)
                 self._tkg_step += 1
+            elif reply_embeds is not None and reply_embeds.shape[1] > 0:
+                # Repeat the last reply state (matches HF behavior where
+                # thinker_reply_part stays at the last element when exhausted)
+                step_ve = reply_embeds[:, -1:, :]
+                step_vm = torch.ones(batch_size, 1, 1, dtype=torch.int32)
             else:
-                # No more reply states — pass zeros (add 0 = no-op)
                 step_ve = torch.zeros(
                     batch_size, 1, hidden_size, dtype=dtype
                 )
