@@ -111,10 +111,11 @@ NeuronX Distributed Inference implementation of Qwen3.5-27B, a 27B parameter den
 ### Text-Only (trn2.3xlarge, TP=4)
 
 ```python
+import json
 import torch
 from transformers import AutoTokenizer, GenerationConfig
 from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
-from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
+from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
 from src.modeling_qwen35 import Qwen35InferenceConfig, NeuronQwen35ForCausalLM
 
@@ -132,14 +133,29 @@ neuron_config = NeuronConfig(
     enable_bucketing=False,
     flash_decoding_enabled=False,
     on_device_sampling_config=OnDeviceSamplingConfig(top_k=1),
+    save_sharded_checkpoint=True,
 )
 
+# Read config.json directly (model_type 'qwen3_5' may not be
+# registered in all transformers versions)
+import os
+with open(os.path.join(model_path, "config.json")) as f:
+    hf_config = json.load(f)
+text_config = hf_config.get("text_config", hf_config)
+config_dict = dict(text_config)
+config_dict["pad_token_id"] = text_config.get("eos_token_id", 248044)
+config_dict.setdefault("tie_word_embeddings", False)
+
 config = Qwen35InferenceConfig(
-    neuron_config, load_config=load_pretrained_config(model_path),
+    neuron_config=neuron_config,
+    **config_dict,
 )
 
 model = NeuronQwen35ForCausalLM(model_path, config)
 model.compile(compiled_path)
+
+# Reload from compiled artifacts
+model = NeuronQwen35ForCausalLM(compiled_path)
 model.load(compiled_path)
 
 tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
@@ -193,7 +209,7 @@ The DeltaNet forward path can be controlled via environment variables:
 
 1. **HBM-limited at TP=4:** The 27B model consumes 23.57 GB of the 24 GB HBM per NeuronCore pair (LNC=2). Context length is limited to ~512 tokens. Batch size > 1 not possible. Use trn2.12xlarge (TP=16) for production workloads.
 
-2. **SDK 2.29+ required:** The NKI DeltaNet kernels require NKI 0.3.0 (SDK 2.29). SDK 2.28 compatibility is provided via fallback imports but has known issues with `tensor_copy` broadcast behavior.
+2. **SDK 2.29+ required:** The NKI DeltaNet kernels require NKI 0.3.0 (SDK 2.29). No library modifications needed — runs on stock SDK 2.29 DLAMI (`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/`).
 
 3. **No mini model test:** Unlike DeepSeek-V3, a mini model cannot be provided because DeltaNet layers require NKI kernels that only execute on Neuron devices. Integration tests require a trn2 instance with the full 27B weights.
 
@@ -239,7 +255,7 @@ For seq_len > 512, use trn2.12xlarge or larger instance with TP > 4.
 
 ```bash
 cd contrib/models/Qwen3.5-27B/
-pip install neuronx-distributed-inference  # CPU-compatible
+# On DLAMI: source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 pytest test/unit/ -v
 ```
 
