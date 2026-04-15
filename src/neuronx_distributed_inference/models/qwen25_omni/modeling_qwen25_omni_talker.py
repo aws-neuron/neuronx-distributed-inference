@@ -867,16 +867,20 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
             new_state_dict[new_key] = value
 
         # Fuse embedding: embed(8448, 3584) @ proj.T(3584, 896) → (8448, 896)
+        # NOTE: projection bias is NOT included in the fused embedding.
+        # During token generation, the bias is already included once in the
+        # projected thinker reply states (proj(reply) = W @ reply + bias).
+        # Including it here would cause double-bias: fused(token) + proj(reply)
+        # = (W @ E + bias) + (W @ reply + bias) = W @ (E+reply) + 2*bias,
+        # whereas HF computes proj(E + reply) = W @ (E+reply) + bias.
         if "embed_tokens.weight" in new_state_dict and proj_weight is not None:
             embed_weight = new_state_dict["embed_tokens.weight"]  # (8448, 3584)
             fused_embed = embed_weight.float() @ proj_weight.float().T  # (8448, 896)
-            if proj_bias is not None:
-                fused_embed = fused_embed + proj_bias.float().unsqueeze(0)
             new_state_dict["embed_tokens.weight"] = fused_embed.to(
                 neuron_config.torch_dtype
             )
             logger.info(
-                "Fused embed_tokens (%s) + proj (%s) → (%s)",
+                "Fused embed_tokens (%s) + proj (%s) → (%s) (bias excluded)",
                 list(embed_weight.shape), list(proj_weight.shape),
                 list(new_state_dict["embed_tokens.weight"].shape),
             )
