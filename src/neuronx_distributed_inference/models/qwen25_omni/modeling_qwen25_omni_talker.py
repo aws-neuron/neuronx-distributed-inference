@@ -486,6 +486,12 @@ class NeuronTalkerModel(NeuronBaseModel):
     via encode_vision_to_input().
     """
 
+    # Enable vision_embeddings usage during token generation (for per-step
+    # thinker state injection). When True, model_base.get_model_output will
+    # call encode_vision_to_input during both context encoding AND token
+    # generation phases.
+    apply_vision_during_token_gen = True
+
     def setup_attr_for_model(self, config: TalkerInferenceConfig):
         self.on_device_sampling = (
             config.neuron_config.on_device_sampling_config is not None
@@ -524,27 +530,82 @@ class NeuronTalkerModel(NeuronBaseModel):
         )
 
     def encode_vision_to_input(self, inputs_embeds, vision_embeddings, vision_mask):
-        """Replace placeholder embeddings with projected thinker states.
+        """Inject projected thinker states into token embeddings.
 
-        During context encoding, the full input is thinker hidden states
-        (projected from 3584 to 896 on CPU). These are passed as
-        vision_embeddings and substituted into all positions.
+        Operates in two modes:
+        - Context encoding (seq > 1): REPLACE placeholder embeddings with
+          projected thinker states. All positions get thinker states.
+        - Token generation (seq == 1): ADD per-step thinker reply state to
+          the codec token embedding. This provides text guidance at each
+          autoregressive step, matching HF's per-step injection behavior.
 
         Args:
-            inputs_embeds: (batch, seq, 896) from embed_tokens (placeholder)
+            inputs_embeds: (batch, seq, 896) from embed_tokens
             vision_embeddings: (batch, seq, 896) projected thinker states
-            vision_mask: (batch, seq, 1) positions to substitute (all True)
+            vision_mask: (batch, seq, 1) int32 mask
 
         Returns:
-            (batch, seq, 896) with thinker states substituted
+            (batch, seq, 896) with thinker states injected
         """
-        # Simple scatter: replace positions where vision_mask is True
-        vision_mask_bool = vision_mask.bool()
-        if vision_mask_bool.dim() == 3:
-            vision_mask_bool = vision_mask_bool.squeeze(-1)
-        # Expand mask for hidden dim
-        mask_expanded = vision_mask_bool.unsqueeze(-1).expand_as(inputs_embeds)
-        return torch.where(mask_expanded, vision_embeddings, inputs_embeds)
+        if inputs_embeds.shape[1] > 1:
+            # Context encoding: REPLACE embeddings with thinker states
+            vision_mask_bool = vision_mask.bool()
+            if vision_mask_bool.dim() == 3:
+                vision_mask_bool = vision_mask_bool.squeeze(-1)
+            mask_expanded = vision_mask_bool.unsqueeze(-1).expand_as(inputs_embeds)
+            return torch.where(mask_expanded, vision_embeddings, inputs_embeds)
+        else:
+            # Token generation: ADD thinker state to codec token embedding
+            # This matches HF's behavior where thinker_reply_part[step] is
+            # added to embed_tokens(codec_token) at each generation step.
+            return inputs_embeds + vision_embeddings
+
+
+# ---------------------------------------------------------------------------
+# Model Wrapper (tracing with per-step vision_embeddings)
+# ---------------------------------------------------------------------------
+
+
+class TalkerModelWrapper:
+    """Mixin that overrides get_dummy_vision_inputs for per-step injection.
+
+    Unlike the default ImageToTextModelWrapper which uses empty
+    vision_embeddings during token generation tracing, this provides
+    (batch, 1, hidden_size) tensors so the compiled NEFF includes the
+    ADD operation for thinker state injection at each generation step.
+    """
+
+    @staticmethod
+    def get_dummy_vision_inputs(config, input_ids, n_active_tokens, fill_value):
+        input_batch_size, input_sequence_len = input_ids.shape[0], input_ids.shape[-1]
+        if input_sequence_len > 1:
+            # Context encoding: full-sequence vision embeddings
+            vision_embeddings = torch.zeros(
+                input_batch_size,
+                n_active_tokens,
+                config.hidden_size,
+                dtype=config.neuron_config.torch_dtype,
+            )
+            vision_mask = torch.full(
+                size=(input_batch_size, n_active_tokens, 1),
+                fill_value=fill_value,
+                dtype=torch.int32,
+            )
+        else:
+            # Token generation: single-step vision embeddings for per-step
+            # thinker state injection (ADD to codec token embedding)
+            vision_embeddings = torch.zeros(
+                input_batch_size,
+                1,
+                config.hidden_size,
+                dtype=config.neuron_config.torch_dtype,
+            )
+            vision_mask = torch.full(
+                size=(input_batch_size, 1, 1),
+                fill_value=fill_value,
+                dtype=torch.int32,
+            )
+        return vision_embeddings, vision_mask
 
 
 # ---------------------------------------------------------------------------
@@ -589,24 +650,61 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
         from neuronx_distributed_inference.models.image_to_text_model_wrapper import (
             ImageToTextModelWrapper,
         )
-        return ImageToTextModelWrapper
+
+        # Dynamically create a wrapper with per-step vision_embeddings support.
+        # staticmethod() preserves the descriptor when assigning to class attr.
+        class _TalkerImageToTextModelWrapper(ImageToTextModelWrapper):
+            get_dummy_vision_inputs = staticmethod(
+                TalkerModelWrapper.get_dummy_vision_inputs
+            )
+
+        return _TalkerImageToTextModelWrapper
 
     @classmethod
     def get_config_cls(cls):
         return TalkerInferenceConfig
 
-    def set_vision_embeddings(self, vision_embeddings, vision_mask):
+    def set_vision_embeddings(self, vision_embeddings, vision_mask,
+                              thinker_reply_embeds=None):
         """Store vision embeddings for the next generate() call.
 
         During context encoding, projected thinker states (896-dim) are
-        injected as vision_embeddings. Call this before generate().
+        injected as vision_embeddings. During token generation, per-step
+        thinker reply states are ADDED to codec token embeddings.
+
+        Vision embeddings are padded to max_context_length to match the
+        compiled bucket shapes (the compiled model expects fixed-size
+        vision_embeddings matching the bucket, while input_ids and
+        attention_mask are padded by preprocess_inputs).
 
         Args:
             vision_embeddings: (batch, seq, 896) projected thinker states
+                for context encoding
             vision_mask: (batch, seq, 1) int32 mask (all positions active)
+            thinker_reply_embeds: (batch, n_reply, 896) optional per-step
+                thinker reply states for token generation. If provided,
+                reply_embeds[:, step, :] is added to the codec token
+                embedding at each generation step.
         """
+        # Pad vision_embeddings and vision_mask to max_context_length so they
+        # match the compiled NEFF bucket shapes.
+        max_ctx = self.neuron_config.max_context_length
+        batch, seq, dim = vision_embeddings.shape
+        if seq < max_ctx:
+            pad_ve = torch.zeros(
+                batch, max_ctx - seq, dim, dtype=vision_embeddings.dtype
+            )
+            vision_embeddings = torch.cat([vision_embeddings, pad_ve], dim=1)
+            pad_vm = torch.zeros(
+                batch, max_ctx - seq, 1, dtype=vision_mask.dtype
+            )
+            vision_mask = torch.cat([vision_mask, pad_vm], dim=1)
+
         self._vision_embeddings = vision_embeddings
         self._vision_mask = vision_mask
+        self._thinker_reply_embeds = thinker_reply_embeds
+        self._vision_dtype = vision_embeddings.dtype
+        self._tkg_step = 0
 
     def _get_model_outputs(
         self, input_ids, attention_mask, position_ids, seq_ids,
@@ -614,6 +712,12 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
         medusa_args=None, llava_args=None, **kwargs
     ):
         """Override to pass vision_embeddings to ImageToTextModelWrapper.
+
+        Context encoding: passes full projected thinker states as
+        vision_embeddings (REPLACE mode in encode_vision_to_input).
+
+        Token generation: passes per-step thinker reply state as
+        vision_embeddings (ADD mode in encode_vision_to_input).
 
         ImageToTextModelWrapper traces with 24 positional args:
           0-4: input_ids, attention_mask, position_ids, seq_ids, sampling_params
@@ -653,11 +757,29 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
                 vision_mask,
             )
             self.kv_cache_populated = True
-            # Clear after context encoding (not needed for token generation)
+            # Clear context vision (no longer needed), keep reply embeds
             self._vision_embeddings = torch.empty(0)
             self._vision_mask = torch.empty(0)
+            self._tkg_step = 0
             is_run_on_neuron = self.context_encoding_model.is_neuron()
         else:
+            # Get per-step thinker reply state for this generation step
+            reply_embeds = getattr(self, '_thinker_reply_embeds', None)
+            dtype = getattr(self, '_vision_dtype', torch.bfloat16)
+            batch_size = input_ids.shape[0]
+            hidden_size = self.config.hidden_size
+
+            if reply_embeds is not None and self._tkg_step < reply_embeds.shape[1]:
+                step_ve = reply_embeds[:, self._tkg_step:self._tkg_step + 1, :]
+                step_vm = torch.ones(batch_size, 1, 1, dtype=torch.int32)
+                self._tkg_step += 1
+            else:
+                # No more reply states — pass zeros (add 0 = no-op)
+                step_ve = torch.zeros(
+                    batch_size, 1, hidden_size, dtype=dtype
+                )
+                step_vm = torch.ones(batch_size, 1, 1, dtype=torch.int32)
+
             outputs = self.token_generation_model(
                 input_ids,
                 attention_mask,
@@ -681,8 +803,8 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
                 torch.empty(0),  # kv_cache
                 torch.empty(0),  # active_mask
                 torch.empty(0),  # rotary_position_ids
-                torch.empty(0),  # vision_embeddings (empty for token gen)
-                torch.empty(0),  # vision_mask
+                step_ve,         # vision_embeddings (per-step thinker state)
+                step_vm,         # vision_mask
             )
             is_run_on_neuron = self.token_generation_model.is_neuron()
 

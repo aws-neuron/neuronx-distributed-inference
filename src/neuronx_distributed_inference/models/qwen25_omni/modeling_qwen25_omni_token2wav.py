@@ -87,6 +87,16 @@ class NeuronQwen25OmniToken2Wav:
         self.model.eval()
         self.config = token2wav_config
 
+    @property
+    def dtype(self):
+        """Return dtype of the underlying HF model (for HF generate compatibility)."""
+        return next(self.model.parameters()).dtype
+
+    def float(self):
+        """Cast underlying model to float32 (for HF generate compatibility)."""
+        self.model.float()
+        return self
+
     def load_state_dict(self, state_dict, strict=True):
         """Load converted state dict into the HF Token2Wav model."""
         return self.model.load_state_dict(state_dict, strict=strict)
@@ -437,7 +447,7 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             batch_size, max_mel_len, head_dim, dtype=torch.float32
         )
         attention_mask = torch.zeros(
-            1, 1, max_mel_len, max_mel_len, dtype=torch.float32
+            batch_size, 1, max_mel_len, max_mel_len, dtype=torch.float32
         )
 
         compiled = torch_neuronx.trace(
@@ -523,15 +533,19 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         )
 
         # Create padded float mask (all masked by default)
+        # Use batch dimension from _dit_batch_size to match compiled shape
+        mask_batch = self._dit_batch_size or 1
         mask = torch.full(
-            (1, 1, max_mel_len, max_mel_len), -1e4, dtype=torch.float32
+            (mask_batch, 1, max_mel_len, max_mel_len), -1e4, dtype=torch.float32
         )
-        # Fill valid region
-        mask[0, 0, :actual_mel_len, :actual_mel_len] = torch.where(
+        # Fill valid region (same pattern for all batch elements)
+        valid = torch.where(
             bool_mask,
             torch.tensor(0.0, dtype=torch.float32),
             torch.tensor(-1e4, dtype=torch.float32),
         )
+        for b in range(mask_batch):
+            mask[b, 0, :actual_mel_len, :actual_mel_len] = valid
         return mask
 
     @torch.no_grad()
@@ -575,6 +589,27 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 if time_step.ndim == 0:
                     time_step = time_step.repeat(batch_size)
 
+                # Estimate mel_len early. input_embed doubles batch for
+                # CFG, so we must fall back BEFORE calling it — otherwise
+                # original_forward would receive already-modified tensors.
+                est_mel_len = hidden_states.shape[1]
+                if est_mel_len > max_mel_len:
+                    logger.warning(
+                        "mel_len %d > max %d, falling back to CPU",
+                        est_mel_len,
+                        max_mel_len,
+                    )
+                    return original_forward(
+                        hidden_states,
+                        condition_vector,
+                        speaker_embedding,
+                        quantized_code,
+                        time_step,
+                        drop_audio_conditioning=drop_audio_conditioning,
+                        drop_code=drop_code,
+                        apply_cfg=apply_cfg,
+                    )
+
                 # CPU: compute embeddings (same as HF original)
                 time_embedding = dit.time_embed(time_step)
                 text_embedding = dit.text_embed(
@@ -604,24 +639,6 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
 
                 actual_mel_len = hidden_states.shape[1]
                 actual_batch = hidden_states.shape[0]
-
-                # Fall back to CPU for oversized inputs
-                if actual_mel_len > max_mel_len:
-                    logger.warning(
-                        "mel_len %d > max %d, falling back to CPU",
-                        actual_mel_len,
-                        max_mel_len,
-                    )
-                    return original_forward(
-                        hidden_states,
-                        condition_vector,
-                        speaker_embedding,
-                        quantized_code,
-                        time_step,
-                        drop_audio_conditioning=drop_audio_conditioning,
-                        drop_code=drop_code,
-                        apply_cfg=apply_cfg,
-                    )
 
                 # Build attention mask with padding
                 attention_mask = build_mask(

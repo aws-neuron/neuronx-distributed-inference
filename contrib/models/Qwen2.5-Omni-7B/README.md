@@ -16,7 +16,7 @@ NeuronX Distributed Inference implementation of [Qwen/Qwen2.5-Omni-7B](https://h
 | Thinker (text) | Neuron | 4 | hidden=3584, heads=28, kv_heads=4, layers=28 |
 | Vision encoder | Neuron | 4 | embed=1280, heads=16, depth=32, SwiGLU MLP |
 | Audio encoder | CPU+Neuron | 4 | d_model=1280, heads=20, layers=32, chunked attention |
-| Talker | Neuron | 4 | hidden=896, heads=12, kv_heads=4, head_dim=128, layers=24, vocab=8448 |
+| Talker | Neuron | 4 | hidden=896, heads=12, kv_heads=4, head_dim=128, layers=24, vocab=8448, fused embed (8448→896) |
 | Token2Wav | CPU+Neuron (fp32) | N/A | DiT: dim=1024, 22 blocks (Neuron); BigVGAN: 6 upsample stages (CPU) |
 
 **Total state dict keys:** 2448 (Text: 339, Vision: 518, Audio: 489, Talker: 293, Token2Wav: 809)
@@ -25,8 +25,8 @@ Key features:
 - **Thinker**: Architecturally identical to Qwen2.5-7B; reuses `NeuronQwen2ForCausalLM` with state-dict prefix remapping (28 heads / 4 TP = 7 per rank, 4 kv_heads / 4 TP = 1 per rank)
 - **Vision encoder**: SwiGLU MLP, RMSNorm, separate QKV projections, PatchMerger (16 heads / 4 TP = 4 per rank)
 - **Audio encoder**: Whisper-style with chunked attention. Hybrid CPU+Neuron: Conv1d frontend + chunking on CPU, 32 transformer layers on Neuron (20 heads / 4 TP = 5 per rank), AvgPool + LayerNorm + projection on CPU
-- **Talker**: Neuron-compiled with fused embedding (8448→3584→896 collapsed), explicit head_dim=128, 3D mRoPE, thinker state injection via ImageToTextModelWrapper (12 heads / 4 TP = 3 per rank, 4 kv_heads / 4 TP = 1 per rank)
-- **Token2Wav**: DiT transformer core (22 blocks) on Neuron + BigVGAN vocoder on CPU, ODE sampling (Runge-Kutta 4, 10 steps), float32. Split architecture: CPU preprocessing (ECAPA-TDNN, codec embed, input embed, rotary) + Neuron transformer core + CPU ODE solver + CPU BigVGAN
+- **Talker**: Neuron-compiled with fused embedding (embed_tokens 8448→3584 + thinker_to_talker_proj 3584→896 collapsed into 8448→896), explicit head_dim=128, 3D mRoPE, per-step thinker state injection via vision_embeddings (12 heads / 4 TP = 3 per rank, 4 kv_heads / 4 TP = 1 per rank). Auto-pads vision_embeddings to max_context_length for compiled bucket compatibility.
+- **Token2Wav**: DiT transformer core (22 blocks) on Neuron + BigVGAN vocoder on CPU, ODE sampling (Runge-Kutta 4, 10 steps), float32. Split architecture: CPU preprocessing (ECAPA-TDNN, codec embed, input embed, rotary) + Neuron transformer core + CPU ODE solver + CPU BigVGAN. Automatic CPU fallback when mel_len exceeds compiled max.
 
 ## Prerequisites
 
@@ -189,7 +189,19 @@ Per-component measured breakdown for text-to-speech (14.1s audio output):
 | Token2Wav (DiT+BigVGAN) | 117.9s | 47% | 8.4x | 22 DiT blocks × 10 ODE steps × 2 (CFG) = 440 forward passes |
 | **Total** | **252.1s** | **100%** | **17.9x** | Generating 14.1s audio takes 252.1s on CPU |
 
-### Speech Pipeline: Neuron vs CPU (trn2.48xlarge, TP=4, BF16)
+### Full Neuron Speech Pipeline (trn2.48xlarge, TP=4, BF16)
+
+End-to-end speech synthesis with all components on Neuron (9.1s audio output):
+
+| Component | Time | Notes |
+|-----------|------|-------|
+| Thinker (7B, Neuron TP=4) | 0.3s | 24 text tokens |
+| CPU hidden state extraction | ~3s | HF model forward for thinker states |
+| Talker (690M, Neuron TP=4) | 2.1s | 454 codec tokens, per-step thinker injection |
+| Token2Wav (Neuron DiT + CPU BigVGAN) | 9.9s | 22 DiT blocks × 10 ODE steps |
+| **Total** | **~15s** | **9.1s audio, RTF ~1.7x** |
+
+### Neuron vs CPU Speedup (trn2.48xlarge, TP=4, BF16)
 
 | Component | CPU Time | Neuron Time | Speedup | Notes |
 |-----------|----------|-------------|---------|-------|
@@ -197,7 +209,7 @@ Per-component measured breakdown for text-to-speech (14.1s audio output):
 | Talker (690M) | 98.1s | 2.0s (500 tokens) | **49.1x** | TPOT 4.0ms |
 | Token2Wav DiT (85M) | 24.1s | 3.8s | **6.3x** | 22 blocks × 10 ODE steps, batch=2 (CFG) |
 | Token2Wav BigVGAN | 2.8s | 2.8s (CPU) | 1x | Stays on CPU |
-| **Total (projected)** | **267.9s** | **~9s** | **~30x** | All Neuron components active |
+| **Total** | **267.9s** | **~15s** | **~18x** | All Neuron components active |
 
 Token2Wav component breakdown (300 codec tokens / 6.0s audio):
 
@@ -208,12 +220,15 @@ Token2Wav component breakdown (300 codec tokens / 6.0s audio):
 | DiT core single forward (batch=2, mel_len=1024) | 592ms | 60ms | 9.8x |
 
 Key observations:
-- **All three Neuron components** (Thinker, Talker, Token2Wav DiT) now compiled and running on Neuron
+- **Full Neuron speech pipeline** verified end-to-end: Thinker → Talker → Token2Wav all on Neuron, producing real human speech
 - Thinker and Talker achieve **49-65x speedup** on Neuron
 - Token2Wav DiT achieves **6.3x speedup** (9.8x for isolated transformer core)
 - BigVGAN vocoder (CPU) is now the remaining bottleneck
+- **Per-step thinker state injection**: Talker v2 adds thinker_reply_part[step] embedding at each autoregressive step, matching HF behavior
+- **Vision embeddings auto-padding**: Compiled Neuron models require fixed bucket shapes; vision_embeddings are auto-padded to max_context_length
 - Split architecture for Token2Wav: CPU preprocessing (ECAPA-TDNN, codec/input embed, rotary, block_diff) + Neuron transformer core (22 blocks + norm + proj)
 - Overcame XLA tracing limitations: in-place slice assignment in DiTAttention (→ torch.cat), SDPA dispatch (→ explicit matmul), ECAPA-TDNN/codec embed issues (→ kept on CPU)
+- Automatic CPU fallback when mel_len exceeds compiled DiT max
 
 ## Compatibility Matrix
 
@@ -244,8 +259,8 @@ python /tmp/test_qwen25_omni_tp4.py
 
 1. **TP=4 for all Neuron components**: Thinker (28 heads/4=7 per rank), Vision (16 heads/4=4), Audio (20 heads/4=5). All heads divisible by 4.
 2. **Audio encoder hybrid architecture**: Conv1d frontend + chunking on CPU, 32 transformer layers on Neuron with TP=4, AvgPool + LayerNorm + projection on CPU. Asymmetric attention bias (q/v have bias, k has none) handled via ColumnParallelLinear.
-3. **Talker on Neuron**: Non-standard head_dim (128 != 896/12), 3D mRoPE with per-step thinker-state injection, ~690M params. Uses ImageToTextModelWrapper with 24 positional args. Fused embedding (8448→3584→896 collapsed). TPOT 4.0ms.
-4. **Token2Wav split architecture**: DiT transformer core (22 blocks) on Neuron via torch_neuronx.trace(). CPU preprocessing: ECAPA-TDNN speaker encoder, codec embedding (repeat_interleave), input embedding, rotary embedding, block_diff mask. CPU postprocessing: ODE solver (RK4, 10 steps), BigVGAN vocoder. Float32 for ODE precision. XLA fixes: DiTAttention in-place slice assignment → torch.cat, SDPA dispatch → explicit matmul attention, float additive attention mask.
+3. **Talker on Neuron**: Non-standard head_dim (128 != 896/12), 3D mRoPE with per-step thinker-state injection, ~690M params. Uses ImageToTextModelWrapper with 24 positional args. Fused embedding (embed_tokens 8448→3584 + proj 3584→896 collapsed into 8448→896). Per-step thinker reply states injected via vision_embeddings during token generation. Vision embeddings auto-padded to max_context_length for compiled bucket compatibility. TPOT 4.0ms.
+4. **Token2Wav split architecture**: DiT transformer core (22 blocks) on Neuron via torch_neuronx.trace(). CPU preprocessing: ECAPA-TDNN speaker encoder, codec embedding (repeat_interleave), input embedding, rotary embedding, block_diff mask. CPU postprocessing: ODE solver (RK4, 10 steps), BigVGAN vocoder. Float32 for ODE precision. XLA fixes: DiTAttention in-place slice assignment → torch.cat, SDPA dispatch → explicit matmul attention, float additive attention mask. Automatic CPU fallback when mel_len exceeds compiled max.
 5. **Speaker support**: `spk_dict.pt` contains per-speaker conditioning (Ethan, Chelsie)
 6. **State dict prefix remapping**: `thinker.model.*` -> `model.*`, `thinker.lm_head.*` -> `lm_head.*`, `thinker.visual.*` -> `visual.*`, `thinker.audio_tower.*` -> `frontend.*`/`transformer.*`/`postprocessor.*`
 

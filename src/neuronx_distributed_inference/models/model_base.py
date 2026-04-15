@@ -1248,7 +1248,7 @@ class NeuronBaseModel(nn.Module):
 
             if vision_embeddings.dtype != self.config.neuron_config.torch_dtype:
                 vision_embeddings = vision_embeddings.to(self.config.neuron_config.torch_dtype)
-            if is_for_context_encoding:
+            if is_for_context_encoding or getattr(self, 'apply_vision_during_token_gen', False):
                 inputs_embeds = self.encode_vision_to_input(inputs_embeds, vision_embeddings, vision_mask)
 
         if position_ids is None:
