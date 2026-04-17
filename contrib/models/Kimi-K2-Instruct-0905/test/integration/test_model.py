@@ -5,8 +5,8 @@ Integration tests for Kimi-K2-Instruct-0905 NeuronX implementation.
 Tests model compilation, loading, and inference on trn2.48xlarge.
 
 Requirements:
-    - trn2.48xlarge with NEURON_LOGICAL_NC_CONFIG=1 (128 logical cores)
-    - LOCAL_WORLD_SIZE=128
+    - trn2.48xlarge with NEURON_LOGICAL_NC_CONFIG=2 (64 logical cores)
+    - LOCAL_WORLD_SIZE=64
     - Model weights at MODEL_PATH
     - Neuron SDK 2.28+ (Deep Learning AMI Neuron Ubuntu 24.04)
     - Selective loading threshold patched to 0.0 in
@@ -14,10 +14,10 @@ Requirements:
 
 Usage:
     # Full test (compile + load + generate):
-    NEURON_LOGICAL_NC_CONFIG=1 LOCAL_WORLD_SIZE=128 pytest test_model.py -v --capture=tee-sys
+    NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 pytest test_model.py -v --capture=tee-sys
 
     # Load-only (skip compile, use existing NEFFs):
-    NEURON_LOGICAL_NC_CONFIG=1 LOCAL_WORLD_SIZE=128 pytest test_model.py -v --capture=tee-sys -k "not compile"
+    NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 pytest test_model.py -v --capture=tee-sys -k "not compile"
 """
 
 import json
@@ -49,9 +49,9 @@ MODEL_PATH = "/home/ubuntu/models/Kimi-K2-Instruct-0905"
 COMPILED_MODEL_PATH = "/home/ubuntu/kimi-k2/neuron-compiled-fp8-bw-no-ods"
 
 # Model configuration
-TP_DEGREE = 64
+TP_DEGREE = 32
 EP_DEGREE = 2
-LNC = 1
+LNC = 2
 BATCH_SIZE = 1
 SEQ_LEN = 1024
 N_ACTIVE_TOKENS = 128
@@ -306,7 +306,7 @@ def test_performance_tpot(compiled_model, tokenizer):
         median_tpot = sorted(tpots)[len(tpots) // 2]
         tok_per_sec = 1000.0 / median_tpot
         print(f"PASS: TPOT = {median_tpot:.1f} ms ({tok_per_sec:.1f} tok/s)")
-        # Kimi-K2 at BS=1: expected ~297 ms/token (3.4 tok/s)
+        # Kimi-K2 at BS=1 LNC=2: expected ~191 ms/token (5.2 tok/s)
         assert median_tpot < 500, f"TPOT {median_tpot:.1f}ms exceeds 500ms threshold"
     else:
         pytest.skip("Could not measure TPOT (no tokens generated)")

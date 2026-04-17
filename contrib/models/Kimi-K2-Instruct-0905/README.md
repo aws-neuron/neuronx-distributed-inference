@@ -59,38 +59,36 @@ NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2-Instruct-0
 
 ## Validation Results
 
-**Validated:** 2026-04-16
-**Configuration:** TP=64, EP=2, LNC=1, batch_size=1, seq_len=1024, blockwise FP8
+**Validated:** 2026-04-17
+**Recommended Configuration:** TP=32, EP=2, LNC=2, batch_size=1, seq_len=1024, blockwise FP8
 
 ### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | PASS | Model compiles and loads on trn2.48xlarge |
-| Generation | PASS | Correct answers for factual questions (10/13 prompts) |
-| Throughput | PASS | 3.4 tok/s at BS=1 |
+| Generation | PASS | Generates coherent text |
+| Throughput | PASS | 5.2 tok/s at BS=1 (LNC=2) |
 
-### Performance Metrics
+### Performance Metrics (Recommended: LNC=2, TP=32)
 
 | Metric | Value |
 |--------|-------|
-| TPOT (per-token latency) | 297.5 ms |
-| Throughput (BS=1) | 3.4 tok/s |
-| TTFT (61 input tokens) | 1,788 ms |
-| Compile time (total) | 73 min (TKG -O3: 49 min, CTE -O1: 24 min) |
-| Model load time | 47 min |
-| HBM utilization | ~78% (1,200 GB / 1,536 GB) |
+| TPOT (per-token latency) | ~191 ms |
+| Throughput (BS=1) | 5.2 tok/s |
+| Compile time (total) | 67 min |
+| Model load time | 30 min |
+| HBM I/O utilization | 17.55 GB / 24 GB |
 
-### Token Generation Sweep (BS=1, seq_len=1024)
+### LNC=2 vs LNC=1 Comparison
 
-| Output Tokens | TTFT P50 (ms) | TPOT P50 (ms) | tok/s | E2E P50 (ms) |
-|---------------|---------------|----------------|-------|---------------|
-| 16 | 1,787.9 | 297.36 | 3.4 | 6,248.3 |
-| 32 | 1,787.9 | 297.37 | 3.4 | 11,006.6 |
-| 64 | 1,788.3 | 297.52 | 3.4 | 20,533.8 |
-| 128 | 1,787.9 | 297.44 | 3.4 | 39,564.4 |
-| 256 | 1,788.4 | 297.61 | 3.4 | 77,681.2 |
-| 512 | 1,795.9 | 297.55 | 3.4 | 153,842.1 |
+LNC=2 (TP=32, EP=2) is **53% faster** than LNC=1 (TP=64, EP=2) because each
+logical core gets 2x HBM bandwidth, and MoE decode is purely bandwidth-bound.
+
+| Config | TP | EP | Cores | TPOT | tok/s | Speedup |
+|--------|----|----|-------|------|-------|---------|
+| LNC=2 (recommended) | 32 | 2 | 64 | ~191 ms | 5.2 | **+53%** |
+| LNC=1 | 64 | 2 | 128 | 297 ms | 3.4 | baseline |
 
 ### Batching Results
 
@@ -101,13 +99,13 @@ same aggregate throughput as BS=1.
 
 ### Performance Bottleneck
 
-TPOT breakdown (estimated per 297.5 ms token):
+TPOT breakdown (estimated per ~191 ms token at LNC=2):
 
-1. **MoE expert MLPs (~250 ms, ~84%):** 192 local experts x 2 matmuls per layer.
+1. **MoE expert MLPs (~160 ms, ~84%):** 192 local experts x 2 matmuls per layer.
    FP8 weights are dequantized to BF16 before the NKI kernel.
-2. **MLA attention (~25 ms, ~8%):** Weight absorption projections + KV cache.
-3. **Router + all-to-all (~15 ms, ~5%):** Router TopK + expert dispatch across EP=2.
-4. **Other (~7.5 ms, ~3%):** RMSNorm, residuals, lm_head.
+2. **MLA attention (~16 ms, ~8%):** Weight absorption projections + KV cache.
+3. **Router + all-to-all (~10 ms, ~5%):** Router TopK + expert dispatch across EP=2.
+4. **Other (~5 ms, ~3%):** RMSNorm, residuals, lm_head.
 
 Primary optimization opportunity: native blockwise FP8 kernel in the nki-lib MoE TKG
 pipeline (currently blocked -- nki-lib requires per-channel FP8 scales).
@@ -130,11 +128,11 @@ compiled_path = "/path/to/compiled"
 with open(os.path.join(model_path, "config.json")) as f:
     hf_config = json.load(f)
 
-# Configure for trn2.48xlarge
+# Configure for trn2.48xlarge (LNC=2, recommended)
 neuron_config = MoENeuronConfig(
-    tp_degree=64,
+    tp_degree=32,
     ep_degree=2,
-    logical_nc_config=1,
+    logical_nc_config=2,
     max_batch_size=1,
     seq_len=1024,
     n_active_tokens=128,
@@ -142,7 +140,7 @@ neuron_config = MoENeuronConfig(
     capacity_factor=1.0,
     glu_mlp=True,
     moe_ep_degree=2,
-    moe_tp_degree=64,
+    moe_tp_degree=32,
     context_encoding_buckets=[128, 1024],
     router_config=RouterConfig(act_fn="sigmoid", dtype="float32"),
     # FP8 quantization
@@ -165,8 +163,8 @@ config = KimiK2InferenceConfig(neuron_config=neuron_config, **hf_kwargs)
 
 # Compile and load
 model = NeuronKimiK2ForCausalLM(model_path, config)
-model.compile(compiled_path)   # ~73 min
-model.load(compiled_path)      # ~47 min
+model.compile(compiled_path)   # ~67 min
+model.load(compiled_path)      # ~30 min
 
 # Generate (CPU greedy sampling, no on-device sampling)
 from transformers import AutoTokenizer
@@ -177,16 +175,17 @@ tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
 **Important:** Run with environment variables:
 ```bash
-NEURON_LOGICAL_NC_CONFIG=1 LOCAL_WORLD_SIZE=128 python your_script.py
+NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 python your_script.py
 ```
 
 ## Compatibility Matrix
 
 | Instance / SDK Version | 2.28+ | 2.27 and earlier |
 |------------------------|-------|------------------|
-| trn2.48xlarge (LNC=1) | Working | Not tested |
-| trn2.3xlarge | Not supported (needs TP=64, EP=2) | Not supported |
-| trn1.32xlarge | Not supported (needs 128 cores) | Not supported |
+| trn2.48xlarge (LNC=2, recommended) | Working (5.2 tok/s) | Not tested |
+| trn2.48xlarge (LNC=1) | Working (3.4 tok/s) | Not tested |
+| trn2.3xlarge | Not supported (needs TP=32, EP=2 = 64 cores) | Not supported |
+| trn1.32xlarge | Not supported (needs 64 cores at LNC=2) | Not supported |
 | inf2 | Not supported | Not supported |
 
 ## Testing
@@ -197,19 +196,19 @@ Run integration tests on a trn2.48xlarge:
 # Activate Neuron venv
 source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
 
-# Run tests
-NEURON_LOGICAL_NC_CONFIG=1 LOCAL_WORLD_SIZE=128 \
+# Run tests (LNC=2, recommended)
+NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
   pytest test/integration/test_model.py -v --capture=tee-sys
 ```
 
 Or run standalone:
 
 ```bash
-NEURON_LOGICAL_NC_CONFIG=1 LOCAL_WORLD_SIZE=128 \
+NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
   python test/integration/test_model.py
 ```
 
-**Note:** Compilation takes ~73 min and loading takes ~47 min. The first run will compile
+**Note:** Compilation takes ~67 min and loading takes ~30 min. The first run will compile
 NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compilation.
 
 ## Prerequisites
@@ -253,4 +252,4 @@ NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compi
 
 Annapurna Labs
 
-**Last Updated:** 2026-04-16
+**Last Updated:** 2026-04-17
