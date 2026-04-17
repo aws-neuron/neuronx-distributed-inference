@@ -68,27 +68,39 @@ NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2-Instruct-0
 |------|--------|--------|
 | Smoke Test | PASS | Model compiles and loads on trn2.48xlarge |
 | Generation | PASS | Generates coherent text |
-| Throughput | PASS | 5.2 tok/s at BS=1 (LNC=2) |
+| Throughput | PASS | 6.0 tok/s at BS=1 (LNC=2) |
 
 ### Performance Metrics (Recommended: LNC=2, TP=32)
 
 | Metric | Value |
 |--------|-------|
-| TPOT (per-token latency) | ~191 ms |
-| Throughput (BS=1) | 5.2 tok/s |
+| TPOT (per-token latency) | 165.5 ms |
+| Throughput (BS=1) | 6.0 tok/s |
+| TTFT (61 input tokens) | 1,420 ms |
 | Compile time (total) | 67 min |
 | Model load time | 30 min |
 | HBM I/O utilization | 17.55 GB / 24 GB |
 
 ### LNC=2 vs LNC=1 Comparison
 
-LNC=2 (TP=32, EP=2) is **53% faster** than LNC=1 (TP=64, EP=2) because each
+LNC=2 (TP=32, EP=2) is **76% faster** than LNC=1 (TP=64, EP=2) because each
 logical core gets 2x HBM bandwidth, and MoE decode is purely bandwidth-bound.
 
 | Config | TP | EP | Cores | TPOT | tok/s | Speedup |
 |--------|----|----|-------|------|-------|---------|
-| LNC=2 (recommended) | 32 | 2 | 64 | ~191 ms | 5.2 | **+53%** |
+| LNC=2 (recommended) | 32 | 2 | 64 | 165.5 ms | 6.0 | **+76%** |
 | LNC=1 | 64 | 2 | 128 | 297 ms | 3.4 | baseline |
+
+### Token Generation Sweep (LNC=2, BS=1, seq_len=1024)
+
+| Output Tokens | TTFT P50 (ms) | TPOT P50 (ms) | tok/s | E2E P50 (ms) |
+|---------------|---------------|----------------|-------|---------------|
+| 16 | 1,420.4 | 166.38 | 6.0 | 3,916.1 |
+| 32 | 1,419.8 | 165.58 | 6.0 | 6,553.0 |
+| 64 | 1,419.7 | 165.56 | 6.0 | 11,849.8 |
+| 128 | 1,419.8 | 165.48 | 6.0 | 22,435.8 |
+| 256 | 1,419.9 | 165.42 | 6.0 | 43,604.1 |
+| 512 | 1,420.0 | 165.47 | 6.0 | 85,974.4 |
 
 ### Batching Results
 
@@ -99,13 +111,13 @@ same aggregate throughput as BS=1.
 
 ### Performance Bottleneck
 
-TPOT breakdown (estimated per ~191 ms token at LNC=2):
+TPOT breakdown (estimated per ~165.5 ms token at LNC=2):
 
-1. **MoE expert MLPs (~160 ms, ~84%):** 192 local experts x 2 matmuls per layer.
+1. **MoE expert MLPs (~139 ms, ~84%):** 192 local experts x 2 matmuls per layer.
    FP8 weights are dequantized to BF16 before the NKI kernel.
-2. **MLA attention (~16 ms, ~8%):** Weight absorption projections + KV cache.
-3. **Router + all-to-all (~10 ms, ~5%):** Router TopK + expert dispatch across EP=2.
-4. **Other (~5 ms, ~3%):** RMSNorm, residuals, lm_head.
+2. **MLA attention (~13 ms, ~8%):** Weight absorption projections + KV cache.
+3. **Router + all-to-all (~8 ms, ~5%):** Router TopK + expert dispatch across EP=2.
+4. **Other (~5.5 ms, ~3%):** RMSNorm, residuals, lm_head.
 
 Primary optimization opportunity: native blockwise FP8 kernel in the nki-lib MoE TKG
 pipeline (currently blocked -- nki-lib requires per-channel FP8 scales).

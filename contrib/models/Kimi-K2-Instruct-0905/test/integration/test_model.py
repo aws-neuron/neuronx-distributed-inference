@@ -306,7 +306,7 @@ def test_performance_tpot(compiled_model, tokenizer):
         median_tpot = sorted(tpots)[len(tpots) // 2]
         tok_per_sec = 1000.0 / median_tpot
         print(f"PASS: TPOT = {median_tpot:.1f} ms ({tok_per_sec:.1f} tok/s)")
-        # Kimi-K2 at BS=1 LNC=2: expected ~191 ms/token (5.2 tok/s)
+        # Kimi-K2 at BS=1 LNC=2: expected ~165 ms/token (6.0 tok/s)
         assert median_tpot < 500, f"TPOT {median_tpot:.1f}ms exceeds 500ms threshold"
     else:
         pytest.skip("Could not measure TPOT (no tokens generated)")
