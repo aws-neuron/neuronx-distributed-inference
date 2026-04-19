@@ -59,7 +59,7 @@ NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2-Instruct-0
 
 ## Validation Results
 
-**Validated:** 2026-04-17
+**Validated:** 2026-04-18 (SDK 2.28 and 2.29)
 **Recommended Configuration:** TP=32, EP=2, LNC=2, batch_size=1, seq_len=1024, blockwise FP8
 
 ### Test Results
@@ -192,21 +192,26 @@ NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 python your_script.py
 
 ## Compatibility Matrix
 
-| Instance / SDK Version | 2.28+ | 2.27 and earlier |
-|------------------------|-------|------------------|
-| trn2.48xlarge (LNC=2, recommended) | Working (5.2 tok/s) | Not tested |
-| trn2.48xlarge (LNC=1) | Working (3.4 tok/s) | Not tested |
-| trn2.3xlarge | Not supported (needs TP=32, EP=2 = 64 cores) | Not supported |
-| trn1.32xlarge | Not supported (needs 64 cores at LNC=2) | Not supported |
-| inf2 | Not supported | Not supported |
+| Instance / SDK Version | 2.29 | 2.28 | 2.27 and earlier |
+|------------------------|------|------|------------------|
+| trn2.48xlarge (LNC=2, recommended) | Working (6.0 tok/s)* | Working (6.0 tok/s) | Not tested |
+| trn2.48xlarge (LNC=1) | Not tested | Working (3.4 tok/s) | Not tested |
+| trn2.3xlarge | Not supported (needs TP=32, EP=2 = 64 cores) | Not supported | Not supported |
+| trn1.32xlarge | Not supported (needs 64 cores at LNC=2) | Not supported | Not supported |
+| inf2 | Not supported | Not supported | Not supported |
+
+\*SDK 2.29 requires a workaround for context encoding (see SDK 2.29 Notes below).
 
 ## Testing
 
 Run integration tests on a trn2.48xlarge:
 
 ```bash
-# Activate Neuron venv
+# Activate Neuron venv (SDK 2.28)
 source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+
+# Or for SDK 2.29 (apply forward_blockwise workaround first, install tiktoken)
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
 # Run tests (LNC=2, recommended)
 NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
@@ -242,6 +247,51 @@ NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compi
 
 * [moonshotai/Kimi-K2-Instruct-0905](https://huggingface.co/moonshotai/Kimi-K2-Instruct-0905)
 
+## SDK 2.29 Notes
+
+SDK 2.29 (NxDI 0.9.17334) introduces a new `forward_blockwise` code path for MoE context
+encoding. The default kernel dispatch (`_call_shard_hidden_kernel`) is a stub that raises
+`NotImplementedError`. While nkilib IS installed in the DLAMI, the available alternative
+kernels (`shard_on_intermediate`, `shard_on_block`) are incompatible with this model's
+dimensions:
+
+- `use_shard_on_intermediate_dynamic_while`: MLIR verification failure due to small per-TP
+  intermediate dimension (64) not matching kernel tile expectations.
+- `use_shard_on_block_dynamic_while` + `PING_PONG`: Compiles but produces incorrect outputs
+  (likely due to blockwise FP8 scale dequantization interaction with the kernel).
+
+**Recommended workaround:** Patch `expert_mlps_v2.py` in the `neuronx_distributed` package
+to use `forward_all_experts_EP` instead of `forward_blockwise` when expert parallelism is
+enabled:
+
+```python
+# In neuronx_distributed/modules/moe/expert_mlps_v2.py, in the forward() method,
+# find the context encoding dispatch (around line 1497):
+#     return self.forward_blockwise(...)
+# Replace with:
+if self.moe_expert_model_parallel_group.size() > 1:
+    return self.forward_all_experts_EP(hidden_states, expert_affinities, expert_index)
+return self.forward_blockwise(hidden_states, expert_affinities, expert_index, ...)
+```
+
+**Impact:** Token generation (TPOT) is unaffected (166.1 ms, identical to SDK 2.28). Context
+encoding (TTFT) is ~7x slower (10,185 ms vs 1,420 ms) because `forward_all_experts_EP` sends
+every token through every local expert rather than using the optimized blockwise dispatch. For
+long-output workloads this is negligible; for TTFT-sensitive workloads, use SDK 2.28.
+
+### SDK 2.29 Benchmark (LNC=2, TP=32, EP=2, BS=1, seq_len=1024)
+
+| Output Tokens | TTFT P50 (ms) | TPOT P50 (ms) | tok/s | E2E P50 (ms) |
+|---------------|---------------|----------------|-------|---------------|
+| 16 | 10,184.9 | 166.27 | 6.0 | 12,678.9 |
+| 32 | 10,185.1 | 166.13 | 6.0 | 15,335.3 |
+| 64 | 10,184.6 | 166.10 | 6.0 | 20,651.2 |
+| 128 | 10,184.7 | 166.15 | 6.0 | 31,286.4 |
+| 256 | 10,184.5 | 166.03 | 6.0 | 52,522.3 |
+| 512 | 10,184.6 | 166.06 | 6.0 | 95,040.9 |
+
+**Additional SDK 2.29 setup:** Install `tiktoken` (`pip install tiktoken`) in the venv.
+
 ## Known Limitations
 
 - **No on-device sampling:** The model uses CPU greedy sampling because the vocabulary
@@ -264,4 +314,4 @@ NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compi
 
 Annapurna Labs
 
-**Last Updated:** 2026-04-17
+**Last Updated:** 2026-04-18
