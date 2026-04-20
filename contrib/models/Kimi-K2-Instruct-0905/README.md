@@ -251,9 +251,9 @@ NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compi
 
 SDK 2.29 (NxDI 0.9.17334) introduces a new `forward_blockwise` code path for MoE context
 encoding. The default kernel dispatch (`_call_shard_hidden_kernel`) is a stub that raises
-`NotImplementedError`. While nkilib IS installed in the DLAMI, the available alternative
-kernels (`shard_on_intermediate`, `shard_on_block`) are incompatible with this model's
-dimensions:
+`NotImplementedError`. While nkilib IS installed in the DLAMI (bundled version matches the
+standalone `nki-library` April 2026 release), the available alternative kernels
+(`shard_on_intermediate`, `shard_on_block`) are incompatible with this model's dimensions:
 
 - `use_shard_on_intermediate_dynamic_while`: MLIR verification failure due to small per-TP
   intermediate dimension (64) not matching kernel tile expectations.
@@ -303,9 +303,12 @@ long-output workloads this is negligible; for TTFT-sensitive workloads, use SDK 
   weights or slight router bias approximation. Mitigated by masking EOS for the first
   few generation tokens (`min_tokens_before_eos=3`).
 
-- **Batching does not improve throughput:** The MoE computation is bandwidth-bound
-  (192 expert weight loads per step), so higher batch sizes increase latency linearly
-  without improving aggregate throughput.
+- **Batching does not improve throughput:** NxDI compiles HLO with per-sequence shapes
+  (`[1, seq_len]` for CTE, `[1, 1]` for TKG) regardless of `max_batch_size`. Multiple
+  sequences in a batch are processed sequentially through the same NEFF. Combined with
+  the bandwidth-bound nature of MoE (192 expert weight loads per decode step), BS>1
+  provides no aggregate throughput benefit. Verified: BS=2 compile produces identical
+  NEFF shapes to BS=1.
 
 - **Compiler flags have no measurable impact:** -O3 with DGE vs -O1 showed 0% difference,
   confirming the bottleneck is weight bandwidth, not compute or scheduling.
@@ -314,4 +317,4 @@ long-output workloads this is negligible; for TTFT-sensitive workloads, use SDK 
 
 Annapurna Labs
 
-**Last Updated:** 2026-04-18
+**Last Updated:** 2026-04-20
