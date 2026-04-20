@@ -309,6 +309,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         medusa_mask = kwargs.get("medusa_mask", None)
         scatter_index = kwargs.get("scatter_index", None)
         position_ids = kwargs.get("position_ids", None)
+        input_capture_hook = kwargs.get("input_capture_hook", None)
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
@@ -349,6 +350,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                     scatter_index,
                 ),
                 "sampling_params": sampling_params,
+                "input_capture_hook": input_capture_hook,
                 "adapter_ids": adapter_ids,
             }
         )
