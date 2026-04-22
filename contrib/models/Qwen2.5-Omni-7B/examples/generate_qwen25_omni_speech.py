@@ -181,16 +181,14 @@ def compile_all(model_path, compiled_path):
     t_total = time.time()
 
     stages = [
-        ("Thinker",  "thinker_tp4", ["neuron_config.json"],                  _compile_thinker),
-        ("Talker",   "talker_tp4",  ["neuron_config.json"],                  _compile_talker),
-        # DiT has two possible artifacts: TP-replicated directory (current)
-        # or the legacy single-file .pt (pre-TP rewrite).
-        ("DiT",      "dit_core",    ["dit_core_parallel", "dit_core_neuron.pt"], _compile_dit),
+        ("Thinker",  "thinker_tp4", "neuron_config.json",   _compile_thinker),
+        ("Talker",   "talker_tp4",  "neuron_config.json",   _compile_talker),
+        ("DiT",      "dit_core",    "dit_core_neuron.pt",   _compile_dit),
     ]
-    for idx, (label, subdir, markers, fn) in enumerate(stages, 1):
+    for idx, (label, subdir, marker, fn) in enumerate(stages, 1):
         print(f"\n--- [{idx}/{len(stages)}] Compiling {label} ---")
         out_path = os.path.join(compiled_path, subdir)
-        if any(os.path.exists(os.path.join(out_path, m)) for m in markers):
+        if os.path.exists(os.path.join(out_path, marker)):
             print("  Already compiled, skipping.")
             continue
         t0 = time.time()
@@ -207,23 +205,12 @@ def compile_all(model_path, compiled_path):
 # ==========================================================================
 
 def _check_compiled(compiled_path):
-    """Confirm that each component has been compiled.
-
-    Accepts both the new TP-replicated DiT artifact (``dit_core_parallel/``)
-    and the legacy single-device one (``dit_core_neuron.pt``).
-    """
     checks = [
-        ([os.path.join(compiled_path, "thinker_tp4", "neuron_config.json")], "Thinker"),
-        ([os.path.join(compiled_path, "talker_tp4",  "neuron_config.json")], "Talker"),
-        (
-            [
-                os.path.join(compiled_path, "dit_core", "dit_core_parallel"),
-                os.path.join(compiled_path, "dit_core", "dit_core_neuron.pt"),
-            ],
-            "DiT",
-        ),
+        (os.path.join(compiled_path, "thinker_tp4", "neuron_config.json"), "Thinker"),
+        (os.path.join(compiled_path, "talker_tp4", "neuron_config.json"), "Talker"),
+        (os.path.join(compiled_path, "dit_core", "dit_core_neuron.pt"), "DiT"),
     ]
-    missing = [name for paths, name in checks if not any(os.path.exists(p) for p in paths)]
+    missing = [name for path, name in checks if not os.path.exists(path)]
     if missing:
         print(f"ERROR: Missing compiled artifacts for: {', '.join(missing)}")
         print(f"Run with --compile first:")
