@@ -44,9 +44,8 @@ import traceback
 import torch
 
 # Default paths - override with environment variables
-MODEL_PATH = os.environ.get(
-    "QWEN25_OMNI_MODEL_PATH", "/opt/dlami/nvme/models/Qwen2.5-Omni-7B"
-)
+from _model_path import resolve_model_path
+MODEL_PATH = resolve_model_path()
 COMPILED_PATH = os.environ.get(
     "QWEN25_OMNI_COMPILED_PATH", "/tmp/qwen25_omni_tp4_compiled"
 )

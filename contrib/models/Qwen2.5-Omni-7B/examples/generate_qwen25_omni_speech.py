@@ -63,10 +63,8 @@ import torch
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-MODEL_PATH = os.environ.get(
-    "QWEN25_OMNI_MODEL_PATH",
-    os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen2.5-Omni-7B/snapshots/"),
-)
+from _model_path import resolve_model_path
+MODEL_PATH = resolve_model_path()
 COMPILED_PATH = os.environ.get(
     "QWEN25_OMNI_COMPILED_PATH", "/tmp/qwen25_omni_compiled"
 )
@@ -81,15 +79,6 @@ DEFAULT_SYSTEM = (
 DEFAULT_SPEAKER = "Ethan"
 
 _ORIG_EMBEDDING_FORWARD = torch.nn.Embedding.forward
-
-
-def _resolve_model_path(path):
-    """Resolve model path, handling HF cache snapshot directories."""
-    if os.path.isdir(path) and not os.path.exists(os.path.join(path, "config.json")):
-        snaps = [d for d in os.listdir(path) if not d.startswith(".")]
-        if snaps:
-            path = os.path.join(path, snaps[0])
-    return path
 
 
 def _restore_embedding():
@@ -750,7 +739,7 @@ def main():
     )
     args = parser.parse_args()
 
-    model_path = _resolve_model_path(args.model_path)
+    model_path = args.model_path
     compiled_path = args.compiled_path
     num_runs = args.num_runs
 
