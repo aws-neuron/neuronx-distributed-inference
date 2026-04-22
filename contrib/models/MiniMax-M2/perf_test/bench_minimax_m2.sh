@@ -4,6 +4,12 @@ set -e
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
 MODEL_PATH="${MINIMAX_M2_PATH:-/opt/dlami/nvme/models/MiniMax-M2-BF16}"
+# The NxDI contrib MiniMax-M2 modeling code is registered into NxDI's
+# MODEL_TYPES by vllm-neuron's register() hook using this env var.
+# Default to this contrib package's own src/ relative to the script.
+: "${NXDI_CONTRIB_MINIMAX_M2_SRC:=$(cd "$(dirname "$0")/.." && pwd)/src}"
+export NXDI_CONTRIB_MINIMAX_M2_SRC
+
 PORT=8000
 RESULTS_DIR="/tmp/bench_results/minimax_m2"
 mkdir -p "$RESULTS_DIR"

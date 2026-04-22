@@ -1,5 +1,11 @@
 #!/bin/bash
 # Setup for MiniMax-M2 vLLM benchmarking on Trn2.
+#
+# Clones upstream vllm-project/vllm-neuron at release-0.5.0 and applies
+# vllm-neuron-patch.patch, which adds a runtime registration hook so the
+# contrib NeuronMiniMaxM2ForCausalLM is plugged into NxDI's MODEL_TYPES
+# at vllm-neuron plugin init time. vLLM's ModelRegistry already recognizes
+# MiniMaxM2ForCausalLM so no vLLM-side registration is needed.
 set -e
 
 echo "=========================================="
@@ -8,13 +14,24 @@ echo "=========================================="
 
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
+PATCH_FILE="$(cd "$(dirname "$0")" && pwd)/vllm-neuron-patch.patch"
+
 echo ""
-echo "[1/2] Installing vllm-neuron with the MiMo/MiniMax patch..."
+echo "[1/2] Installing vllm-neuron (release-0.5.0) with the contrib registration patch..."
 
 if [ ! -d /tmp/vllm-neuron ]; then
-    git clone --branch feature/mimo-support https://github.com/whn09/vllm-neuron.git /tmp/vllm-neuron
+    git clone --branch release-0.5.0 https://github.com/vllm-project/vllm-neuron.git /tmp/vllm-neuron
 fi
+
 cd /tmp/vllm-neuron
+
+if git apply --check "$PATCH_FILE" 2>/dev/null; then
+    git apply "$PATCH_FILE"
+    echo "  Applied $PATCH_FILE"
+else
+    echo "  Patch already applied or conflicts; continuing."
+fi
+
 pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
 pip install s5cmd
 
@@ -33,5 +50,9 @@ else
     echo "  Download complete: $(du -sh $MINIMAX_PATH | cut -f1)"
 fi
 
+CONTRIB_SRC="$(cd "$(dirname "$0")/.." && pwd)/src"
+
 echo ""
-echo "Setup complete. Set MINIMAX_M2_PATH=$MINIMAX_PATH before running the benchmark."
+echo "Setup complete. Before running the benchmark, export:"
+echo "  export MINIMAX_M2_PATH=$MINIMAX_PATH"
+echo "  export NXDI_CONTRIB_MINIMAX_M2_SRC=$CONTRIB_SRC"

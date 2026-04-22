@@ -91,18 +91,34 @@ MiniMax-M2 can be served via [vllm-neuron](https://github.com/aws-neuron/vllm-ne
 ### Setup
 
 ```bash
-# 1. Install vllm-neuron
-pip install vllm-neuron
+# 1. Clone vllm-project/vllm-neuron at release-0.5.0
+git clone --branch release-0.5.0 https://github.com/vllm-project/vllm-neuron.git /tmp/vllm-neuron
 
-# 2. Apply the MiMo/MiniMax patch
-cd /path/to/vllm-neuron
+# 2. Apply the contrib registration patch
+cd /tmp/vllm-neuron
 git apply /path/to/neuronx-distributed-inference/contrib/models/MiniMax-M2/perf_test/vllm-neuron-patch.patch
-pip install -e .
+
+# 3. Install
+pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
 ```
+
+Or let `perf_test/0_setup.sh` do steps 1-3 plus weight download.
+
+The patch is 30 lines and only touches `vllm_neuron/__init__.py`. It adds a
+`_register_contrib_models()` hook that, when `NXDI_CONTRIB_MINIMAX_M2_SRC`
+is set, registers `NeuronMiniMaxM2ForCausalLM` into NxDI's `MODEL_TYPES`
+under the key `minimaxm2` (matching the lowercased architecture name that
+vllm-neuron's `_get_neuron_model_cls` computes). vLLM's `ModelRegistry`
+already recognizes `MiniMaxM2ForCausalLM` so no vLLM-side registration is
+needed. No upstream vLLM or NxDI source is modified.
 
 ### Serving
 
 ```bash
+# The contrib src/ must be reachable so the plugin hook can import it.
+export NXDI_CONTRIB_MINIMAX_M2_SRC=/path/to/neuronx-distributed-inference/contrib/models/MiniMax-M2/src
+export MINIMAX_M2_PATH=/path/to/MiniMax-M2-BF16
+
 python3 -m vllm.entrypoints.openai.api_server \
     --model /path/to/MiniMax-M2-BF16 \
     --tensor-parallel-size 64 \
