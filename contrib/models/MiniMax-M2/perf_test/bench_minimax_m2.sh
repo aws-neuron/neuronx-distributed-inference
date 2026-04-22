@@ -34,17 +34,25 @@ COMMON_MINIMAX_CONFIG='"tp_degree": 64,
 # the practical way to get the bench running on current stacks. Remove
 # this once the NKI kernel is promoted back to the stable path.
 
-# Helper: wait for vLLM server to be ready
+# Helper: wait for vLLM server to be ready. First-time compilation of a
+# 256-expert MoE model takes 30-90 minutes, so we poll for up to 2 hours.
 wait_for_server() {
-    echo "  Waiting for vLLM server to be ready..."
-    for i in $(seq 1 120); do
+    echo "  Waiting for vLLM server to be ready (up to 2h for first compile)..."
+    local interval=10
+    local max_attempts=720  # 720 * 10s = 7200s = 2h
+    local start=$SECONDS
+    for i in $(seq 1 $max_attempts); do
         if curl -s http://localhost:$PORT/health > /dev/null 2>&1; then
-            echo "  Server ready! (${i}s)"
+            echo "  Server ready! (waited $((SECONDS - start))s)"
             return 0
         fi
-        sleep 5
+        # Show a progress blip every minute so the user knows we're alive
+        if [ $((i % 6)) -eq 0 ]; then
+            echo "    ...still waiting ($((SECONDS - start))s elapsed)"
+        fi
+        sleep $interval
     done
-    echo "  ERROR: Server did not start within 600s"
+    echo "  ERROR: Server did not start within $((max_attempts * interval))s"
     return 1
 }
 
