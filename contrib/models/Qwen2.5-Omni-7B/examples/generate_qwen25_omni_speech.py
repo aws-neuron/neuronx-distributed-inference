@@ -396,13 +396,23 @@ with open(OUTPUT, "w") as f:
 
 
 def extract_hidden_states(model_path, thinker_result):
-    """Phase 2: Extract thinker hidden states via CPU forward pass."""
+    """Phase 2: Extract thinker hidden states via CPU forward pass.
+
+    We load the HF model on CPU in bfloat16 (the checkpoint's native dtype) and
+    run one forward pass to capture ``hidden_states[0]`` (token embeddings) and
+    ``hidden_states[-1]`` (final layer output). These are consumed by Phase 3's
+    ``thinker_to_talker_proj`` and ultimately reach the Talker as bfloat16,
+    so float32 here would just burn 2x memory and time with no accuracy win.
+    """
     print("\n--- Phase 2: Hidden state extraction (CPU) ---")
     from transformers import Qwen2_5OmniForConditionalGeneration
 
     with Timer("Load HF model"):
         hf_model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.float32, trust_remote_code=True,
+            model_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
         )
         hf_model.eval()
     _restore_embedding()
@@ -511,6 +521,7 @@ def prepare_talker_input(model_path, hf_model, outputs, full_ids, prompt_len, sp
     proj.proj.weight.data = proj_weight
     if proj_bias is not None:
         proj.proj.bias.data = proj_bias
+    proj.to(proj_weight.dtype)
 
     projected_context = proj(talker_inputs_embeds)
     projected_reply = proj(thinker_reply_part)
