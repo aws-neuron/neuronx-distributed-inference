@@ -1,129 +1,91 @@
-diff --git a/vllm_neuron/worker/neuronx_distributed_model_loader.py b/vllm_neuron/worker/neuronx_distributed_model_loader.py
-index d2099eb..e246249 100644
---- a/vllm_neuron/worker/neuronx_distributed_model_loader.py
-+++ b/vllm_neuron/worker/neuronx_distributed_model_loader.py
-@@ -41,7 +41,7 @@ from neuronx_distributed_inference.models.config import (  # yapf: disable
- from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
- from neuronx_distributed_inference.utils.constants import MODEL_TYPES
- from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
--from transformers import AutoModelForCausalLM, PretrainedConfig
-+from transformers import PretrainedConfig
- from vllm.config import (
-     CacheConfig,
-     ModelConfig,
-@@ -186,8 +186,14 @@ class NeuronModelBase(nn.Module):
-
-         neuron_config = neuronx_model_cls.get_neuron_config_cls()(**neuron_config_dict)
-
-+        # Use pre-loaded hf_config if available (loaded by vLLM with trust_remote_code=True)
-+        hf_config = kwargs.get("hf_config")
-+        if hf_config is not None:
-+            load_config_fn = load_pretrained_config(hf_config=hf_config)
-+        else:
-+            load_config_fn = load_pretrained_config(model_name_or_path)
-         config = kwargs.get("config") or neuronx_model_cls.get_config_cls()(
--            neuron_config, load_config=load_pretrained_config(model_name_or_path)
-+            neuron_config, load_config=load_config_fn
-         )
-
-         # If fused speculation is enabled, attach the draft model config.
-@@ -254,11 +260,10 @@ class NeuronModelBase(nn.Module):
-                 "Using pre-compiled artifacts, override_neuron_config will be ignored"
-             )
-
--    def _save_pretrained_model(self, model_name: str):
--        hf_model = AutoModelForCausalLM.from_pretrained(model_name)
--        saved_path = os.path.join("local-models", model_name)
--        hf_model.save_pretrained(saved_path)
--        return saved_path
-+    def _get_model_path(self, model_name: str):
-+        """Get local path for model, using HuggingFace cache if available."""
-+        from huggingface_hub import snapshot_download
-+        return snapshot_download(repo_id=model_name, trust_remote_code=True)
-
-     def _compile_and_load_model(
-         self, model_path: str, neuronx_model_cls, config, compiled_path: str
-@@ -565,7 +570,7 @@ class NeuronCausalLM(NeuronModelBase):
-
-         if not success:
-             if not os.path.exists(model_name_or_path):
--                model_name_or_path = self._save_pretrained_model(model_name_or_path)
-+                model_name_or_path = self._get_model_path(model_name_or_path)
-             self._compile_and_load_model(
-                 model_name_or_path, neuronx_model_cls, config, compiled_model_path
-             )
-@@ -611,10 +616,15 @@ class NeuronMultiModalCausalLM(NeuronCausalLM):
-             **text_neuron_config
-         )
-
-+        hf_config = kwargs.get("hf_config")
-+        if hf_config is not None:
-+            load_config_fn = load_pretrained_config(hf_config=hf_config)
-+        else:
-+            load_config_fn = load_pretrained_config(model_name_or_path)
-         config = neuronx_model_cls.get_config_cls()(
-             text_neuron_config=text_neuron_config,
-             vision_neuron_config=vision_neuron_config,
--            load_config=load_pretrained_config(model_name_or_path),
-+            load_config=load_config_fn,
-         )
-
-         success, compiled_model_path, _ = self._load_weights_common(
-@@ -623,7 +633,7 @@ class NeuronMultiModalCausalLM(NeuronCausalLM):
-
-         if not success:
-             if not os.path.exists(model_name_or_path):
--                model_name_or_path = self._save_pretrained_model(model_name_or_path)
-+                model_name_or_path = self._get_model_path(model_name_or_path)
-
-             self._compile_and_load_model(
-                 model_name_or_path, neuronx_model_cls, config, compiled_model_path
-@@ -758,14 +768,6 @@ class NeuronPixtralForCausalLM(NeuronMultiModalCausalLM):
-
-
- class NeuronQwen2VLForCausalLM(NeuronMultiModalCausalLM):
--    # overwrite _save_pretrained_model as Qwen2VL is not in AutoModelForCausalLM
--    def _save_pretrained_model(self, model_name: str):
--        from transformers import Qwen2VLForConditionalGeneration
--
--        hf_model = Qwen2VLForConditionalGeneration.from_pretrained(model_name)
--        saved_path = os.path.join("local-models", model_name)
--        hf_model.save_pretrained(saved_path)
--        return saved_path
-
-     def execute_model(self, model_input):
-         """Helper to run model with defaults for missing multimodal inputs."""
-@@ -819,13 +821,7 @@ class NeuronQwen2VLForCausalLM(NeuronMultiModalCausalLM):
-
-
- class NeuronQwen3VLForCausalLM(NeuronQwen2VLForCausalLM):
--    def _save_pretrained_model(self, model_name: str):
--        from transformers import Qwen3VLForConditionalGeneration
--
--        hf_model = Qwen3VLForConditionalGeneration.from_pretrained(model_name)
--        saved_path = os.path.join("local-models", model_name)
--        hf_model.save_pretrained(saved_path)
--        return saved_path
-+    pass
-
-
- class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
-@@ -964,6 +960,10 @@ def _get_neuron_model_cls(architecture: str):
-             if model == "qwen3moe":
-                 model = "qwen3_moe"
-
-+            # MiMo is based on Qwen2 architecture
-+            if model == "mimo":
-+                model = "qwen2"
+diff --git a/vllm_neuron/__init__.py b/vllm_neuron/__init__.py
+index ce4c6d2..f4505ae 100644
+--- a/vllm_neuron/__init__.py
++++ b/vllm_neuron/__init__.py
+@@ -2,6 +2,8 @@
+ """VllmNeuronPlugin module."""
+ 
+ import glob
++import os
++import sys
+ import warnings
+ from vllm_neuron.utils import set_unique_rt_root_comm_id
+ 
+@@ -12,6 +14,69 @@ def _is_neuron_dev() -> bool:
+     return len(neuron_devices) > 0
+ 
+ 
++def _register_contrib_models():
++    """Register NxDI contrib models that aren't in upstream NxDI's MODEL_TYPES.
 +
-             if model == "qwen2vl":
-                 model = "qwen2_vl"
-
-@@ -1050,6 +1050,7 @@ def get_neuron_model(
-         neuron_config=neuron_config,
-         override_neuron_config=override_neuron_config,
-         speculative_config=speculative_config,
-+        hf_config=model_config.hf_config,
-     )
-     model.neuron_config = model.model.config.neuron_config
-     model.architecture = architecture
++    Activated by environment variables:
++      NXDI_CONTRIB_MIMO_V2_FLASH_SRC -> path to contrib/models/MiMo-V2-Flash/src
++
++    Each model is both:
++      - Registered to vLLM's ModelRegistry so vLLM's architecture allowlist passes
++      - Registered to NxDI's MODEL_TYPES so vllm-neuron's _get_neuron_model_cls finds it
++
++    This lets zero-invasion NxDI contrib models be served by vllm-neuron without
++    modifying either NxDI or vllm-neuron's upstream source.
++    """
++    mimo_src = os.environ.get("NXDI_CONTRIB_MIMO_V2_FLASH_SRC")
++    if mimo_src and os.path.isdir(mimo_src):
++        if mimo_src not in sys.path:
++            sys.path.insert(0, mimo_src)
++        # Register into NxDI first (no circular import concerns, NxDI doesn't
++        # touch vllm). Use a try/except so a broken contrib dir doesn't block
++        # vllm-neuron startup.
++        try:
++            from modeling_mimo_v2 import NeuronMiMoV2ForCausalLM
++            from neuronx_distributed_inference.utils.constants import MODEL_TYPES
++            MODEL_TYPES.setdefault(
++                "mimo_v2_flash", {"causal-lm": NeuronMiMoV2ForCausalLM}
++            )
++        except Exception as e:
++            warnings.warn(
++                f"Failed to register MiMo-V2-Flash in NxDI MODEL_TYPES: {e}",
++                category=UserWarning,
++            )
++            return
++        # Register into vLLM's architecture allowlist. Import vLLM lazily
++        # because vllm_neuron.register() is itself called during vLLM's plugin
++        # init — importing `from vllm import ModelRegistry` at that stage
++        # triggers a partially-initialized circular import. Defer to a
++        # runtime hook via vllm.model_executor.models.registry module-level
++        # singleton, which is safe to access after plugin init completes.
++        # The actual vLLM architecture check happens later in ModelConfig
++        # creation, so registering here (even slightly later than NxDI) is
++        # still in time.
++        # Try to register immediately; if vLLM's module graph is still mid-init
++        # (circular import), silently skip — vLLM will re-trigger plugin
++        # registration later and the retry will succeed. We deliberately don't
++        # warn on circular-import failures because they're transient and
++        # expected during plugin init.
++        try:
++            from vllm.model_executor.models.registry import ModelRegistry as _MR
++            if "MiMoV2FlashForCausalLM" not in _MR.get_supported_archs():
++                _MR.register_model(
++                    "MiMoV2FlashForCausalLM", NeuronMiMoV2ForCausalLM
++                )
++        except ImportError:
++            # vLLM still initializing — will be retried on the next plugin
++            # activation pass.
++            pass
++        except Exception as e:
++            warnings.warn(
++                f"Failed to register MiMoV2FlashForCausalLM in vLLM ModelRegistry: {e}",
++                category=UserWarning,
++            )
++
++
+ def register():
+     """Register the Neuron platform if Neuron devices are present, else return None."""
+     if not _is_neuron_dev():
+@@ -20,6 +85,7 @@ def register():
+             category=UserWarning,
+         )
+         return None
++    _register_contrib_models()
+     return "vllm_neuron.platform.NeuronPlatform"
+ 
+ 

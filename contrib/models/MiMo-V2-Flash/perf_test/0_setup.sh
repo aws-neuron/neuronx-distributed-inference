@@ -1,5 +1,11 @@
 #!/bin/bash
 # Setup for MiMo-V2-Flash vLLM benchmarking on Trn2.
+#
+# This clones upstream vllm-project/vllm-neuron at release-0.5.0 (which already
+# has the mimov2flash -> mimo_v2_flash model_type rewrite), then applies
+# vllm-neuron-patch.patch to add a runtime registration hook so the contrib
+# NeuronMiMoV2ForCausalLM is plugged into both NxDI's MODEL_TYPES and vLLM's
+# ModelRegistry at vllm-neuron plugin init time.
 set -e
 
 echo "=========================================="
@@ -8,13 +14,25 @@ echo "=========================================="
 
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
+PATCH_FILE="$(cd "$(dirname "$0")" && pwd)/vllm-neuron-patch.patch"
+
 echo ""
-echo "[1/2] Installing vllm-neuron with the MiMo/MiniMax patch..."
+echo "[1/2] Installing vllm-neuron (release-0.5.0) with the contrib registration patch..."
 
 if [ ! -d /tmp/vllm-neuron ]; then
-    git clone --branch feature/mimo-support https://github.com/whn09/vllm-neuron.git /tmp/vllm-neuron
+    git clone --branch release-0.5.0 https://github.com/vllm-project/vllm-neuron.git /tmp/vllm-neuron
 fi
+
 cd /tmp/vllm-neuron
+
+# Apply patch (idempotent via `git apply --check` first).
+if git apply --check "$PATCH_FILE" 2>/dev/null; then
+    git apply "$PATCH_FILE"
+    echo "  Applied $PATCH_FILE"
+else
+    echo "  Patch already applied or conflicts; continuing."
+fi
+
 pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
 pip install s5cmd
 
@@ -33,5 +51,11 @@ else
     echo "  Download complete: $(du -sh $MIMO_PATH | cut -f1)"
 fi
 
+# Figure out where this contrib package's src/ lives so the registration hook
+# can add it to sys.path inside vllm-neuron.
+CONTRIB_SRC="$(cd "$(dirname "$0")/.." && pwd)/src"
+
 echo ""
-echo "Setup complete. Set MIMO_V2_FLASH_PATH=$MIMO_PATH before running the benchmark."
+echo "Setup complete. Before running the benchmark, export:"
+echo "  export MIMO_V2_FLASH_PATH=$MIMO_PATH"
+echo "  export NXDI_CONTRIB_MIMO_V2_FLASH_SRC=$CONTRIB_SRC"

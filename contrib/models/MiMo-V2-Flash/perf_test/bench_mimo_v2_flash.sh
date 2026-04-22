@@ -4,6 +4,12 @@ set -e
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
 MODEL_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2-Flash-BF16}"
+# The NxDI contrib MiMo-V2-Flash modeling code is registered into vLLM /
+# NxDI lookup tables by vllm-neuron's register() hook using this env var.
+# Default to this contrib package's own src/ relative to the script.
+: "${NXDI_CONTRIB_MIMO_V2_FLASH_SRC:=$(cd "$(dirname "$0")/.." && pwd)/src}"
+export NXDI_CONTRIB_MIMO_V2_FLASH_SRC
+
 PORT=8000
 RESULTS_DIR="/tmp/bench_results/mimo_v2_flash"
 mkdir -p "$RESULTS_DIR"
