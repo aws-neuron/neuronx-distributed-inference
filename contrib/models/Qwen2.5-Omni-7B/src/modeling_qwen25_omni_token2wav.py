@@ -340,7 +340,9 @@ def _build_dit_core_for_trace():
     fresh.eval()
     fresh._block_mask_idx = block_mask_idx
     fresh.load_state_dict(core_state_dict)
-    return fresh
+    # parallel_model_trace's worker expects (model, input_output_alias).
+    # DiT has no input/output weight aliasing, so the alias dict is empty.
+    return fresh, {}
 
 
 class _NeuronDiTCore(torch.nn.Module):
