@@ -279,6 +279,47 @@ def _monkeypatch_dit_attention_for_neuron(dit_module):
         attn.forward = _make_patched(attn)
 
 
+# File path used by the picklable builder `_build_dit_core_for_trace`.
+# parallel_model_trace spawns child processes via torch.multiprocessing (start
+# method = 'spawn'), so the builder must be importable by fully qualified name,
+# and its only dependency — the DiT state dict + original module — has to be
+# recoverable inside the child. We stash it on disk (torch.save) and let the
+# child reload it: the Qwen2.5-Omni-7B repo weights are already on disk anyway,
+# so an extra ~350MB pickle round-trip is acceptable.
+_DIT_BUILDER_STASH_PATH: str = ""
+
+
+def _build_dit_core_for_trace():
+    """Module-level, picklable builder for parallel_model_trace.
+
+    Reads the stashed pickle (see `_DIT_BUILDER_STASH_PATH`) that
+    `NeuronQwen25OmniToken2WavWithNeuronDiT.compile_dit` wrote before invoking
+    parallel_model_trace. The file is a plain ``torch.save`` of
+    ``{"dit_module": ..., "state_dict": ..., "block_mask_idx": ...}``.
+    """
+    import os as _os
+    import torch as _torch
+
+    stash_path = _os.environ.get("_QWEN25_OMNI_DIT_STASH", "")
+    if not stash_path or not _os.path.isfile(stash_path):
+        raise RuntimeError(
+            "Builder stash not found. Expected _QWEN25_OMNI_DIT_STASH env var "
+            "to point at a torch.save()'d dict written by compile_dit()."
+        )
+
+    payload = _torch.load(stash_path, weights_only=False, map_location="cpu")
+    dit = payload["dit_module"]
+    state_dict = payload["state_dict"]
+    block_mask_idx = payload["block_mask_idx"]
+
+    fresh = _NeuronDiTCore(dit)
+    fresh.float()
+    fresh.eval()
+    fresh._block_mask_idx = block_mask_idx
+    fresh.load_state_dict(state_dict)
+    return fresh
+
+
 class _NeuronDiTCore(torch.nn.Module):
     """Traced wrapper for DiT transformer blocks + norm_out + proj_out.
 
@@ -465,21 +506,26 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         # Monkeypatch DiTAttention to fix in-place slice assignment
         _monkeypatch_dit_attention_for_neuron(dit)
 
-        # Capture state dict so parallel_model_trace's builder closure can
+        # Capture state dict so parallel_model_trace's builder can
         # reconstruct _NeuronDiTCore on the XLA device with the right weights.
+        # The builder must be a module-level function (see _build_dit_core_for_trace
+        # above) because parallel_model_trace pickles the builder across spawn'd
+        # processes. Since spawn'd children don't inherit globals, we write the
+        # inputs to a temp file and point the child at it via an env var.
         core_template = _NeuronDiTCore(dit)
         core_template.float()
         core_template.eval()
-        core_state_dict = core_template.state_dict()
-        block_mask_idx = core_template._block_mask_idx
 
-        def build_core():
-            fresh = _NeuronDiTCore(dit)
-            fresh.float()
-            fresh.eval()
-            fresh._block_mask_idx = block_mask_idx
-            fresh.load_state_dict(core_state_dict)
-            return fresh
+        stash_path = os.path.join(compiled_path, "_dit_builder_stash.pt")
+        torch.save(
+            {
+                "dit_module": dit,
+                "state_dict": core_template.state_dict(),
+                "block_mask_idx": core_template._block_mask_idx,
+            },
+            stash_path,
+        )
+        os.environ["_QWEN25_OMNI_DIT_STASH"] = stash_path
 
         # Create example inputs
         # time_embedding uses batch=1 (broadcasts to hidden_states batch)
@@ -504,17 +550,24 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             batch_size, 1, max_mel_len, max_mel_len, dtype=torch.float32
         )
 
-        compiled = parallel_model_trace(
-            build_core,
-            (hidden_states, time_embedding, cos, sin,
-             mask_local, mask_backward, mask_ahead),
-            tp_degree=tp_degree,
-            compiler_args=[
-                "--auto-cast=none",
-                "--model-type=transformer",
-                "-O1",
-            ],
-        )
+        try:
+            compiled = parallel_model_trace(
+                _build_dit_core_for_trace,
+                (hidden_states, time_embedding, cos, sin,
+                 mask_local, mask_backward, mask_ahead),
+                tp_degree=tp_degree,
+                compiler_args=[
+                    "--auto-cast=none",
+                    "--model-type=transformer",
+                    "-O1",
+                ],
+            )
+        finally:
+            os.environ.pop("_QWEN25_OMNI_DIT_STASH", None)
+            try:
+                os.remove(stash_path)
+            except OSError:
+                pass
 
         # parallel_model_trace produces a ParallelModel that serializes as a
         # directory (multiple per-rank artifacts), not a single .pt file.
