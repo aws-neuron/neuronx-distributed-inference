@@ -1,82 +1,58 @@
 # PLAN.md — V-JEPA 2.1 Neuron Port Roadmap
 
-## Current Status: Phase 1 — Initial Port (CPU-only)
+## Phase 1 — Initial Port (CPU-only) ✅ COMPLETE
 
-### Completed
-- [x] Read and analyzed V-JEPA 2.1 source code (encoder, predictor, AC predictor, modules)
-- [x] Read the paper (arxiv 2506.09985)
+- [x] Analyzed V-JEPA 2.1 source code and paper
+- [x] Created self-contained `modeling_jepa21.py` with no upstream imports
+- [x] Created CPU-only unit tests
 - [x] Created project structure following NxDI contrib conventions
-- [x] Created self-contained encoder module (`modeling_jepa21.py`) with no upstream imports
-- [x] Created CPU-only unit tests for encoder forward pass
-- [x] Created README.md, AGENT.md, PLAN.md
+- [ ] Verify CPU forward pass matches upstream vjepa2 repo (numerical equivalence)
 
-### In Progress
-- [ ] Verify CPU forward pass matches upstream vjepa2 repo output (numerical equivalence)
-- [ ] Test all 4 encoder variants (ViT-B, ViT-L, ViT-g, ViT-G)
+## Phase 2 — Neuron Compilation (on Trainium) ✅ COMPLETE
 
-## Phase 2 — Neuron Compilation (on Trainium)
+- [x] Set up trn2.3xlarge instance (sa-east-1, persistent spot)
+- [x] Traced ViT-B (86M) — compiled on first attempt with `use_sdpa=False`
+- [x] Traced ViT-L (300M) — compiled in 18 min
+- [x] Validated both: cosine similarity > 0.999 vs CPU reference
+- [x] Benchmarked: ViT-B 164.5ms, ViT-L 437.4ms (batch=1, BF16, 16 frames)
+- [x] DataParallel: 2x throughput with `torch_neuronx.DataParallel` (zero code changes)
+- [x] Integrated NKI flash attention (`attention_isa_kernel`) — works but slower at 4608 tokens
+- [x] Added modular compilation markers (`ModuleMarkerStartWrapper`/`EndWrapper`)
 
-### Tasks
-- [ ] Set up trn2 instance with Neuron SDK 2.28+
-- [ ] Install dependencies (torch-neuronx, neuronx-distributed-inference)
-- [ ] Trace ViT-B encoder with `torch_neuronx.trace()` at 384×384, 16 frames
-- [ ] Verify SDPA compatibility — if Neuron doesn't support `F.scaled_dot_product_attention`, add manual attention fallback
-- [ ] Verify Conv3d support — if unsupported, decompose to reshape + Conv2d
-- [ ] Handle `torch.arange` in RoPE forward pass (may need to precompute)
-- [ ] Trace ViT-L encoder
-- [ ] Compare traced output vs CPU reference (cosine similarity > 0.99)
-- [ ] Benchmark latency and throughput
+### Key findings
+- Conv3d, `torch.arange`, `repeat_interleave` all compile natively — no workarounds needed
+- Only required change: `use_sdpa=False` to bypass unsupported SDPA
+- BF16 softmax dtype fix: `.to(v.dtype)` after softmax
+- NKI flash attention: higher accuracy but 1.8x slower at 4608 tokens (designed for 16K+)
+- DataParallel: linear throughput scaling, 83ms/clip for ViT-B (2 NeuronCores)
 
-## Phase 3 — Scaling & Optimization
+## Phase 3 — Scaling to ViT-g / ViT-G 🔴 BLOCKED
 
-### Tasks
-- [ ] Test ViT-g (1B params) — may need TP>1 or NKI flash attention for 64-frame clips
-- [ ] Test ViT-G (1.8B params) — likely needs TP≥2
-- [ ] If TP needed: port to NxDI pattern with NKI flash attention
-- [ ] Profile memory usage at different frame counts (16, 32, 64)
-- [ ] Optimize: batch compilation for multiple input shapes (frame count buckets)
+**Blocker**: neuronx-cc compiler OOMs on host (>124GB RAM) when compiling ViT-g (40 layers) as a monolithic graph. The `ModuleMarkerStartWrapper`/`EndWrapper` markers do NOT cause `torch_neuronx.trace()` to split the graph — they are only respected by `parallel_model_trace` from NxD.
 
-## Phase 4 — Downstream Tasks
+### Options (in order of recommendation)
 
-### Tasks
-- [ ] Add attentive pooler for classification inference
-- [ ] Add predictor for action anticipation inference
-- [ ] Test with pretrained checkpoints on downstream benchmarks
-- [ ] Add AC predictor for robotics planning inference (if applicable)
+1. **`parallel_model_trace` from NxD** — Use `neuronx_distributed.trace.parallel_model_trace` instead of `torch_neuronx.trace()`. This is how Flux and other NxDI models compile with modular markers. Requires wrapping the model in a `ModelWrapper`-like class with `input_generator()` and `get_model_instance()`. The markers are already in the model code.
 
-## Phase 5 — Contrib Submission
+2. **Larger instance for compilation** — Compile on trn2.48xlarge (2TB RAM), then load the `.pt` on trn2.3xlarge for inference. Simplest approach, just costs more during compilation.
 
-### Tasks
-- [ ] Run full test suite on Trainium hardware
-- [ ] Measure accuracy with `neuron_allclose()` against CPU reference
-- [ ] Fill in compatibility matrix with actual test results
-- [ ] Fill in benchmark results (throughput, latency)
-- [ ] Ensure all tests pass with `pytest`
-- [ ] Submit PR following NxDI contrib guidelines
+3. **Manual graph splitting** — Trace layers 0-19 and 20-39 as separate models, chain at runtime. Hacky but avoids NxD dependency.
 
-## Key Decisions
+### Tasks remaining
+- [ ] Get ViT-g (1B) compiling via one of the above approaches
+- [ ] Validate and benchmark ViT-g
+- [ ] Compile, validate, and benchmark ViT-G (1.8B)
 
-### Why start with ViT-B/ViT-L?
-- Smaller models compile faster and fit on single NeuronCore
-- Validates the porting approach before scaling up
-- ViT-B (86M params) and ViT-L (300M params) are practical for many downstream tasks
+## Phase 4 — Downstream Tasks (NOT STARTED)
 
-### Why `torch_neuronx.trace()` first?
-- Simpler than full NxDI port
-- Encoder is feedforward (no KV cache, no autoregressive)
-- Can always upgrade to NxDI later if TP is needed for larger models
+- [ ] Attentive pooler for classification
+- [ ] Predictor for action anticipation
+- [ ] Test with pretrained checkpoints
+- [ ] 64-frame inference (NKI flash attention becomes relevant here)
 
-### Why not port the predictor first?
-- Encoder is the primary inference component
-- Predictor is only needed for pretraining and specific tasks (anticipation)
-- Encoder features are sufficient for classification, VQA, and feature extraction
+## Phase 5 — Contrib Submission (NOT STARTED)
 
-## Risk Register
-
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| SDPA not supported on Neuron | Medium | Manual attention fallback already in codebase (`use_sdpa=False`) |
-| Conv3d not supported | Low | Decompose to reshape + Conv2d |
-| 64-frame ViT-G exceeds single-core HBM | High | Start with shorter clips; upgrade to NxDI with TP if needed |
-| RoPE dynamic tensor creation | Medium | Precompute position tensors at trace time |
-| `timm` dependency | Low | Replaced with inline `drop_path` (identity at eval) |
+- [ ] Full test suite on Trainium
+- [ ] `neuron_allclose()` validation
+- [ ] Complete compatibility matrix
+- [ ] Submit PR

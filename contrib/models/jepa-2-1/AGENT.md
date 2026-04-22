@@ -1,105 +1,118 @@
 # AGENT.md — V-JEPA 2.1 Neuron Port Technical Reference
 
-## Source Code Location
+## Source Code
 
-- **Original model code**: `~/dev/vjepa2/`
-  - V-JEPA 2 encoder: `src/models/vision_transformer.py` → `VisionTransformer`
-  - V-JEPA 2 predictor: `src/models/predictor.py` → `VisionTransformerPredictor`
-  - V-JEPA 2 AC predictor: `src/models/ac_predictor.py` → `VisionTransformerPredictorAC`
-  - V-JEPA 2.1 encoder: `app/vjepa_2_1/models/vision_transformer.py` → `VisionTransformer` (extended)
-  - V-JEPA 2.1 predictor: `app/vjepa_2_1/models/predictor.py` → `VisionTransformerPredictor` (extended)
-  - V-JEPA 2.1 modules: `app/vjepa_2_1/models/utils/modules.py` (Block, RoPEAttention, MLP, SwiGLUFFN)
-  - V-JEPA 2.1 patch embed: `app/vjepa_2_1/models/utils/patch_embed.py` (PatchEmbed, PatchEmbed3D)
-  - Hub/loading: `src/hub/backbones.py` (checkpoint loading, arch configs)
-  - Attentive pooler: `src/models/attentive_pooler.py`
+- **Upstream**: `~/dev/vjepa2/` (Meta's vjepa2 repo)
+- **Neuron port**: `src/modeling_jepa21.py` — self-contained, no upstream imports
 
-## Architecture Details
+## Architecture
 
 ### Encoder (VisionTransformer)
 
-The V-JEPA 2.1 encoder is a standard ViT with these key features:
+Standard ViT with 3D-RoPE, bidirectional attention, hierarchical output.
 
-1. **Patch Embedding**: `PatchEmbed3D` with Conv3d kernel (tubelet_size, patch_size, patch_size). For video: stride matches kernel. For images: uses separate `PatchEmbed3D` with `tubelet_size=1` when `img_temporal_dim_size` is set.
+| Arch | Params | embed_dim | depth | num_heads | head_dim | mlp_ratio |
+|------|--------|-----------|-------|-----------|----------|-----------|
+| vit_base | 86M | 768 | 12 | 12 | 64 | 4.0 |
+| vit_large | 300M | 1024 | 24 | 16 | 64 | 4.0 |
+| vit_giant | 1.01B | 1408 | 40 | 22 | 64 | 48/11 |
+| vit_gigantic | 1.8B | 1664 | 48 | 26 | 64 | 64/13 |
 
-2. **3D-RoPE**: Rotary position embeddings applied separately to depth/height/width dimensions. Head dim is split into 3 roughly equal segments:
-   - `d_dim = 2 * ((head_dim // 3) // 2)` — temporal
-   - `h_dim = 2 * ((head_dim // 3) // 2)` — height
-   - `w_dim = 2 * ((head_dim // 3) // 2)` — width
-   - Remaining dims get no rotation
+### Token Counts (384×384, patch_size=16, tubelet_size=2)
 
-3. **RoPE Bug**: The `rotate_queries_or_keys` function in V-JEPA 2 uses `.repeat(1,1,1,2)` instead of `.repeat_interleave(2, dim=-1)`. V-JEPA 2.1 fixes this with `repeat_interleave`. Both are preserved for checkpoint compatibility.
-
-4. **Hierarchical Output**: The encoder outputs features from multiple intermediate layers. For ViT-L (depth=24): layers [5, 11, 17, 23]. During training, these are concatenated along the feature dimension. During inference, only the last layer's normed output is returned (unless `return_hierarchical=True`).
-
-5. **Modality Embeddings**: Separate learned embeddings for image vs video input, added after patch embedding.
-
-6. **interpolate_rope**: V-JEPA 2.1 adds RoPE interpolation for resolution flexibility. Height/width positions are scaled by `(pretrained_grid_size - 1) / (actual_grid_size - 1)`.
-
-### Model Configurations
-
-| Arch | embed_dim | depth | num_heads | mlp_ratio | head_dim | d/h/w_dim |
-|------|-----------|-------|-----------|-----------|----------|-----------|
-| vit_base | 768 | 12 | 12 | 4.0 | 64 | 20, 20, 20 |
-| vit_large | 1024 | 24 | 16 | 4.0 | 64 | 20, 20, 20 |
-| vit_giant_xformers | 1408 | 40 | 22 | 48/11 | 64 | 20, 20, 20 |
-| vit_gigantic_xformers | 1664 | 48 | 26 | 64/13 | 64 | 20, 20, 20 |
-
-### Token Counts
-
-For 384×384 resolution, patch_size=16, tubelet_size=2:
-- Image (1 frame, tubelet_size=1): 1 × 24 × 24 = 576 tokens
-- 16 frames: 8 × 24 × 24 = 4,608 tokens
+- 16 frames: 8 × 24 × 24 = **4,608 tokens**
 - 64 frames: 32 × 24 × 24 = 18,432 tokens
 
-### Attention Pattern
+### Key Features
 
-Standard bidirectional self-attention (no causal mask) for the encoder. The AC predictor uses block-causal attention for autoregressive frame prediction.
+- **PatchEmbed3D**: Conv3d with kernel=stride=(tubelet_size, patch_size, patch_size)
+- **3D-RoPE**: Separate rotations for depth/height/width on head_dim slices (d_dim=h_dim=w_dim=20 for head_dim=64, 4 dims unrotated)
+- **Hierarchical output**: Normed features from intermediate layers (e.g., [5,11,17,23] for depth=24). Inference returns only the last layer's normed output.
+- **Modality embeddings**: Separate learned embeddings for image vs video
+- **interpolate_rope**: Scales RoPE positions for resolution flexibility
 
-## Neuron Porting Considerations
+## Neuron Compilation — Verified Findings
 
-### Compilation Approach: `torch_neuronx.trace()`
+### What works with `torch_neuronx.trace()` (neuronx-cc 2.24.5133)
 
-The encoder is a standard feedforward ViT — no KV cache, no autoregressive generation. `torch_neuronx.trace()` is the right tool.
+- **Conv3d**: Compiles natively. No decomposition needed.
+- **`torch.arange` in RoPE**: Compiles natively for fixed input shapes. No precomputation needed.
+- **`repeat_interleave`**: Compiles natively. No reshape/expand workaround needed.
+- **Manual attention** (`q @ k.T * scale → softmax → @ v`): Works correctly with `use_sdpa=False`.
+- **BF16 inference**: Works with `--auto-cast none`. Cast model to `.bfloat16()` and use BF16 input tensors.
 
-### Potential Issues
+### What does NOT work
 
-1. **`F.scaled_dot_product_attention`**: Neuron compiler may not support all SDPA backends. May need to fall back to manual attention (`q @ k.T * scale → softmax → @ v`). Set `use_sdpa=False` in the model config.
+- **`F.scaled_dot_product_attention`**: Not supported by `torch_neuronx.trace()`. Must use `use_sdpa=False`.
+- **BF16 softmax on CPU**: `softmax()` promotes BF16→FP32, causing dtype mismatch with V tensor. Fixed with `.to(v.dtype)` after softmax.
+- **ViT-g/ViT-G monolithic compilation**: neuronx-cc OOMs on host (>124GB RAM needed for 40+ layer graph). See "Modular Compilation" below.
 
-2. **`timm.models.layers.drop_path`**: External dependency. For inference (eval mode), drop_path is identity. Can be replaced with `nn.Identity()`.
+### NKI Flash Attention (`attention_isa_kernel`)
 
-3. **Dynamic shapes**: The encoder supports variable frame counts and resolutions via RoPE interpolation. For Neuron compilation, fix the input shape at trace time. Compile separate models for different input shapes if needed.
+Integrated the NxDI production NKI flash attention kernel for bidirectional attention.
 
-4. **`torch.arange` in RoPE**: Dynamic tensor creation inside forward pass. Neuron compiler should handle this for fixed input shapes, but verify.
+**Interface** (from `neuronxcc.nki._private_kernels.attention`):
+```python
+from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
+from torch_neuronx.xla_impl.ops import nki_jit
+_flash = nki_jit()(attention_isa_kernel)
 
-5. **Large attention matrices**: At 64 frames × 384px, the attention matrix is 18432×18432. This may exceed single-core HBM. Options:
-   - Use shorter clips (16 frames → 4608 tokens, manageable)
-   - Use TP>1 via NxDI if needed for long clips
-   - Use NKI flash attention kernels
+# q: (B*H, d_head, seqlen), k: (B*H, d_head, seqlen), v: (B*H, seqlen, d_head)
+# out: pre-allocated zeros (B*H, seqlen, d_head)
+_flash(q, k, v, scale, out, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
+```
 
-6. **Conv3d patch embedding**: Verify Neuron compiler support for 3D convolutions. If unsupported, can be decomposed into reshape + Conv2d.
+**Result**: Higher numerical accuracy (cos_sim 0.9999 vs 0.9998) but **slower** at 4608 tokens — 307ms vs 165ms for ViT-B. The kernel overhead (reshape, launch) outweighs the flash attention benefit at this sequence length. The kernel is designed for 16K+ tokens. Use `use_nki_flash=False` for 16-frame inference.
 
-### Weight Loading
+**Important**: The NKI kernel cannot run on CPU. When using `use_nki_flash=True`, build a separate CPU reference model with `use_nki_flash=False` for validation. The kernel only executes during XLA tracing.
 
-Checkpoints are loaded via `torch.hub.load_state_dict_from_url`. The state dict has keys prefixed with `module.` and `backbone.` which are stripped by `_clean_backbone_key()`. For V-JEPA 2.1 distilled models, the encoder key is `ema_encoder` (not `target_encoder`).
+### Modular Compilation (Layer Boundary Markers)
 
-### Inference-Only Simplifications
+Added `ModuleMarkerStartWrapper`/`ModuleMarkerEndWrapper` from NxDI to split the compiler graph into groups of N layers. Controlled by `modular_compilation_group_size` parameter.
 
-For inference, these training-only features can be removed:
-- Mask application (`apply_masks`) — not used during inference
-- Drop path — identity at eval
-- Predictor — only needed for pretraining/anticipation
-- Activation checkpointing — only for training memory savings
+**Status**: Markers are inserted correctly and validated on ViT-B (identical output and latency to baseline). However, **`torch_neuronx.trace()` does not respect the markers for graph splitting** — ViT-g still OOMs with group_size=8. The markers are likely only respected by `neuronx_distributed.trace.parallel_model_trace`.
 
-## Reference Patterns
+**Next step**: Use `parallel_model_trace` from NxD instead of `torch_neuronx.trace()`, or compile on a larger instance (trn2.48xlarge with 2TB RAM).
 
-### NxDI Contrib Structure
-See `~/dev/Neuron-steering-docs/steering/nxdi-contrib.md` for submission requirements.
+### DataParallel Throughput
 
-### Neuron SDK Docs
-See `~/dev/neuron-docs/` for:
-- `neuronx-distributed/` — distributed inference patterns
-- `nki-library/` — NKI kernel examples (flash attention, etc.)
+`torch_neuronx.DataParallel` distributes inference across NeuronCores with zero model changes:
+```python
+model_dp = torch_neuronx.DataParallel(traced_model)
+output = model_dp(batched_input)  # splits batch across cores
+```
+trn2.3xlarge has 2 logical NeuronCores → 2x throughput. Scales linearly with batch size.
 
-### Similar Ports
-- Vision-language models in NxDI (Qwen-VL, MLLama) have image encoder components
-- The Flux diffusion model in NxDI uses TP + NKI attention for large sequence lengths
+## Instance Details
+
+- **Type**: trn2.3xlarge (persistent spot) in sa-east-1
+- **Instance ID**: i-0cae7b2ac61807cf9
+- **SSH**: `ssh -i ~/.ssh/trn2-sa-east-1.pem ubuntu@52.67.239.128`
+- **Hardware**: 1 Neuron device, 2 logical NeuronCores, 96 GB HBM, 124 GB system RAM
+- **Neuron SDK**: torch-neuronx 2.9.0, neuronx-cc 2.24.5133, NxDI 0.9.17334
+- **Venv**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate`
+
+## Workflow
+
+```bash
+# Sync local → trn2
+rsync -avz --exclude='__pycache__' --exclude='._*' \
+  ~/dev/neuron-docs/neuronx-distributed-inference/contrib/models/jepa-2-1/ \
+  -e "ssh -i ~/.ssh/trn2-sa-east-1.pem" ubuntu@52.67.239.128:jepa-2-1/
+
+# Run on trn2
+ssh -i ~/.ssh/trn2-sa-east-1.pem ubuntu@52.67.239.128 \
+  "cd jepa-2-1 && source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && python ..."
+```
+
+## Weight Loading
+
+Checkpoints loaded via `torch.hub.load_state_dict_from_url`. State dict keys prefixed with `module.` and `backbone.` are stripped. Distilled models (ViT-B, ViT-L) use key `ema_encoder`; self-supervised (ViT-g, ViT-G) use `target_encoder`.
+
+## Reference Code in ~/dev/neuron-docs/
+
+- `nki-library/src/.../core/attention/` — NKI flash attention kernels (production)
+- `nki-library/src/.../core/embeddings/rope.py` — NKI RoPE kernel
+- `neuronx-distributed-inference/src/.../models/diffusers/flux/` — Flux model (non-autoregressive, uses NKI attention + modular markers)
+- `neuronx-distributed-inference/src/.../models/mllama/modeling_mllama_vision.py` — MLLama vision encoder (uses NKI attention)
+- `neuronx-distributed-inference/src/.../models/layer_boundary_marker.py` — ModuleMarkerStart/End for modular compilation

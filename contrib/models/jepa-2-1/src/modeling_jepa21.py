@@ -23,6 +23,17 @@ try:
 except ImportError:
     pass
 
+# Modular compilation markers — only available with NxDI
+_ModuleMarkerStart = None
+_ModuleMarkerEnd = None
+try:
+    from neuronx_distributed_inference.models.layer_boundary_marker import (
+        ModuleMarkerStartWrapper as _ModuleMarkerStart,
+        ModuleMarkerEndWrapper as _ModuleMarkerEnd,
+    )
+except ImportError:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Utility: truncated normal init (replaces src.utils.tensors.trunc_normal_)
@@ -470,6 +481,7 @@ class VisionTransformer(nn.Module):
         wide_silu=True,
         use_sdpa=True,
         use_nki_flash=False,
+        modular_compilation_group_size=0,
         use_activation_checkpointing=False,
         is_causal=False,
         use_rope=True,
@@ -498,6 +510,7 @@ class VisionTransformer(nn.Module):
         self.is_video = num_frames > 1
 
         self.use_activation_checkpointing = use_activation_checkpointing
+        self.modular_compilation_group_size = modular_compilation_group_size
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
 
@@ -649,8 +662,12 @@ class VisionTransformer(nn.Module):
             masks = torch.cat(masks, dim=0)
 
         # Forward through blocks
+        gs = self.modular_compilation_group_size
+        use_markers = gs > 0 and _ModuleMarkerStart is not None
         hier = []
         for i, blk in enumerate(self.blocks):
+            if use_markers and i % gs == 0:
+                x = _ModuleMarkerStart()(x)
             x, _attn = blk(
                 x, mask=masks, T=T, H_patches=H_patches, W_patches=W_patches,
                 return_attn=False, mode=mode,
@@ -658,6 +675,8 @@ class VisionTransformer(nn.Module):
             if i in self.out_layers_distillation:
                 out_idx = self.hierarchical_layers.index(i)
                 hier.append(self.norms_block[out_idx](x))
+            if use_markers and (i % gs == gs - 1 or i == len(self.blocks) - 1):
+                x = _ModuleMarkerEnd()(x)
 
         if training or self.return_hierarchical:
             return torch.cat(hier, dim=2)
@@ -843,6 +862,7 @@ def build_vjepa21_encoder(
     tubelet_size: int = 2,
     use_sdpa: bool = True,
     use_nki_flash: bool = False,
+    modular_compilation_group_size: int = 0,
     use_rope: bool = True,
     interpolate_rope: bool = True,
     img_temporal_dim_size: int = 1,
@@ -870,6 +890,7 @@ def build_vjepa21_encoder(
         tubelet_size=tubelet_size,
         use_sdpa=use_sdpa,
         use_nki_flash=use_nki_flash,
+        modular_compilation_group_size=modular_compilation_group_size,
         use_silu=False,
         wide_silu=True,
         uniform_power=False,
