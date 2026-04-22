@@ -408,26 +408,41 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         compiled_path,
         max_mel_len=2048,
         batch_size=2,
+        tp_degree=4,
     ):
-        """Compile the DiT transformer core on Neuron.
+        """Compile the DiT transformer core on Neuron using TP=4.
 
         Only the 22 transformer blocks + norm_out + proj_out are compiled.
         Preprocessing (ECAPA-TDNN, codec embedding, input embedding, rotary)
         stays on CPU to avoid XLA tracing issues.
 
+        Uses ``neuronx_distributed.trace.parallel_model_trace`` (replicated,
+        not sharded) so the DiT lives on the same NeuronCore group (0..tp_degree-1)
+        as the Thinker and Talker. This matters when all three models share one
+        Python process: a single-device ``torch_neuronx.trace`` NEFF gets
+        placed on a separate core group and pays a cross-group scheduling
+        penalty (~4s per DiT forward on trn2.48xlarge). Replicating onto
+        the same TP group makes the NeuronCore runtime treat all three as
+        peers on the same logical device set.
+
+        DiT itself is small (~85M params) so there is no memory win from
+        sharding the linears; the win is purely co-location.
+
         Args:
-            compiled_path: Directory to save compiled model
+            compiled_path: Directory to save compiled model.
             max_mel_len: Maximum mel spectrogram length (covers ~24s audio).
                 Shorter inputs are padded; longer inputs fall back to CPU.
             batch_size: Batch size for compilation. Use 2 for standard
                 inference with classifier-free guidance (CFG doubles batch).
+            tp_degree: Replication degree; should match the Thinker/Talker
+                ``tp_degree`` so all three live on the same NeuronCore group.
         """
         try:
-            import torch_neuronx
+            from neuronx_distributed.trace import parallel_model_trace
         except ImportError:
             raise ImportError(
-                "torch_neuronx required for DiT compilation. "
-                "Run on a Neuron instance (trn1/trn2/inf2)."
+                "neuronx_distributed required for DiT compilation. "
+                "Run on a Neuron instance with the NxDI venv active."
             )
 
         os.makedirs(compiled_path, exist_ok=True)
@@ -443,17 +458,28 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         head_dim = dim // num_heads
 
         logger.info(
-            "Compiling DiT core: batch=%d, mel_len=%d, dim=%d, heads=%d",
-            batch_size, max_mel_len, dim, num_heads,
+            "Compiling DiT core: batch=%d, mel_len=%d, dim=%d, heads=%d, tp=%d",
+            batch_size, max_mel_len, dim, num_heads, tp_degree,
         )
 
         # Monkeypatch DiTAttention to fix in-place slice assignment
         _monkeypatch_dit_attention_for_neuron(dit)
 
-        # Create wrapper for transformer core only
-        core = _NeuronDiTCore(dit)
-        core.float()
-        core.eval()
+        # Capture state dict so parallel_model_trace's builder closure can
+        # reconstruct _NeuronDiTCore on the XLA device with the right weights.
+        core_template = _NeuronDiTCore(dit)
+        core_template.float()
+        core_template.eval()
+        core_state_dict = core_template.state_dict()
+        block_mask_idx = core_template._block_mask_idx
+
+        def build_core():
+            fresh = _NeuronDiTCore(dit)
+            fresh.float()
+            fresh.eval()
+            fresh._block_mask_idx = block_mask_idx
+            fresh.load_state_dict(core_state_dict)
+            return fresh
 
         # Create example inputs
         # time_embedding uses batch=1 (broadcasts to hidden_states batch)
@@ -478,10 +504,11 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             batch_size, 1, max_mel_len, max_mel_len, dtype=torch.float32
         )
 
-        compiled = torch_neuronx.trace(
-            core,
+        compiled = parallel_model_trace(
+            build_core,
             (hidden_states, time_embedding, cos, sin,
              mask_local, mask_backward, mask_ahead),
+            tp_degree=tp_degree,
             compiler_args=[
                 "--auto-cast=none",
                 "--model-type=transformer",
@@ -489,8 +516,12 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             ],
         )
 
-        save_path = os.path.join(compiled_path, "dit_core_neuron.pt")
-        torch.jit.save(compiled, save_path)
+        # parallel_model_trace produces a ParallelModel that serializes as a
+        # directory (multiple per-rank artifacts), not a single .pt file.
+        save_dir = os.path.join(compiled_path, "dit_core_parallel")
+        os.makedirs(save_dir, exist_ok=True)
+        from neuronx_distributed.trace import parallel_model_save
+        parallel_model_save(compiled, save_dir)
 
         # Save metadata for load
         meta = {
@@ -499,11 +530,12 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             "dim": dim,
             "num_heads": num_heads,
             "head_dim": head_dim,
+            "tp_degree": tp_degree,
         }
         with open(os.path.join(compiled_path, "dit_core_meta.json"), "w") as f:
             json.dump(meta, f)
 
-        logger.info("Compiled DiT core saved to %s", save_path)
+        logger.info("Compiled DiT core (TP=%d) saved to %s", tp_degree, save_dir)
 
         self._neuron_dit_core = compiled
         self._dit_compiled_path = compiled_path
@@ -513,18 +545,34 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
     def load_dit(self, compiled_path):
         """Load a previously compiled DiT core model.
 
-        Args:
-            compiled_path: Directory containing compiled model
+        Supports both the old single-device ``torch.jit`` artifact (filename
+        ``dit_core_neuron.pt``) and the new TP-replicated ``parallel_model``
+        artifact (directory ``dit_core_parallel/``). Loading a legacy
+        single-device artifact will work but pays the cross-core-group
+        scheduling penalty described in ``compile_dit``.
         """
-        save_path = os.path.join(compiled_path, "dit_core_neuron.pt")
         meta_path = os.path.join(compiled_path, "dit_core_meta.json")
+        parallel_dir = os.path.join(compiled_path, "dit_core_parallel")
+        legacy_path = os.path.join(compiled_path, "dit_core_neuron.pt")
 
-        if not os.path.exists(save_path):
+        if os.path.isdir(parallel_dir):
+            from neuronx_distributed.trace import parallel_model_load
+            self._neuron_dit_core = parallel_model_load(parallel_dir)
+            logger.info("Loaded TP-replicated DiT core from %s", parallel_dir)
+        elif os.path.exists(legacy_path):
+            self._neuron_dit_core = torch.jit.load(legacy_path)
+            logger.warning(
+                "Loaded legacy single-device DiT core from %s; recompile with "
+                "compile_dit() to get the TP=4 replicated artifact and avoid "
+                "cross-core-group scheduling overhead when running alongside "
+                "the Thinker and Talker.",
+                legacy_path,
+            )
+        else:
             raise FileNotFoundError(
-                f"Compiled DiT core not found at {save_path}"
+                f"Compiled DiT core not found at {parallel_dir} or {legacy_path}"
             )
 
-        self._neuron_dit_core = torch.jit.load(save_path)
         self._dit_compiled_path = compiled_path
 
         if os.path.exists(meta_path):
@@ -532,8 +580,6 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 meta = json.load(f)
             self._dit_max_mel_len = meta["max_mel_len"]
             self._dit_batch_size = meta["batch_size"]
-
-        logger.info("Loaded compiled DiT core from %s", save_path)
 
     def _build_attention_masks(self, block_diff, actual_mel_len, max_mel_len):
         """Build three per-block float additive attention masks with padding.
