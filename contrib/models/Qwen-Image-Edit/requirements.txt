@@ -1,0 +1,6 @@
+diffusers @ git+https://github.com/huggingface/diffusers
+transformers>=4.45.0
+accelerate
+qwen-vl-utils
+torchvision
+pillow
