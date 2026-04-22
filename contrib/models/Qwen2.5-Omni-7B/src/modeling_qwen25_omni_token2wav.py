@@ -279,44 +279,67 @@ def _monkeypatch_dit_attention_for_neuron(dit_module):
         attn.forward = _make_patched(attn)
 
 
-# File path used by the picklable builder `_build_dit_core_for_trace`.
-# parallel_model_trace spawns child processes via torch.multiprocessing (start
-# method = 'spawn'), so the builder must be importable by fully qualified name,
-# and its only dependency — the DiT state dict + original module — has to be
-# recoverable inside the child. We stash it on disk (torch.save) and let the
-# child reload it: the Qwen2.5-Omni-7B repo weights are already on disk anyway,
-# so an extra ~350MB pickle round-trip is acceptable.
-_DIT_BUILDER_STASH_PATH: str = ""
-
-
 def _build_dit_core_for_trace():
     """Module-level, picklable builder for parallel_model_trace.
 
-    Reads the stashed pickle (see `_DIT_BUILDER_STASH_PATH`) that
-    `NeuronQwen25OmniToken2WavWithNeuronDiT.compile_dit` wrote before invoking
-    parallel_model_trace. The file is a plain ``torch.save`` of
-    ``{"dit_module": ..., "state_dict": ..., "block_mask_idx": ...}``.
+    parallel_model_trace spawns child processes via torch.multiprocessing with
+    ``start_method='spawn'``, so:
+
+    - The builder must be importable by fully qualified name (a nested closure
+      can't be pickled).
+    - Spawn'd children don't inherit parent globals, so we can't pass the DiT
+      module via a module-level variable — and ``torch.save``'ing the module
+      tree fails because Neuron SDK patches classes like ``nn.Embedding``,
+      producing "not the same object" pickler errors.
+
+    Solution: the child builds the DiT from the HuggingFace checkpoint itself,
+    using a model path passed via an env var. The child loads only the
+    token2wav weights from the safetensors shards, plus a pre-saved copy of
+    the block-mask-index list and the DiT state dict (both are cheap to pickle
+    since they're just tensors / ints).
     """
     import os as _os
+    import json as _json
     import torch as _torch
 
+    model_path = _os.environ.get("_QWEN25_OMNI_DIT_MODEL_PATH", "")
     stash_path = _os.environ.get("_QWEN25_OMNI_DIT_STASH", "")
-    if not stash_path or not _os.path.isfile(stash_path):
+    if not model_path or not stash_path or not _os.path.isfile(stash_path):
         raise RuntimeError(
-            "Builder stash not found. Expected _QWEN25_OMNI_DIT_STASH env var "
-            "to point at a torch.save()'d dict written by compile_dit()."
+            "DiT builder: expected _QWEN25_OMNI_DIT_MODEL_PATH and "
+            "_QWEN25_OMNI_DIT_STASH env vars to be set by compile_dit()."
         )
 
-    payload = _torch.load(stash_path, weights_only=False, map_location="cpu")
-    dit = payload["dit_module"]
-    state_dict = payload["state_dict"]
+    from transformers import AutoConfig
+    from safetensors.torch import load_file
+
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    t2w = NeuronQwen25OmniToken2WavWithNeuronDiT(hf_config.token2wav_config)
+
+    state_dict = {}
+    for fn in sorted(_os.listdir(model_path)):
+        if fn.endswith(".safetensors"):
+            sd = load_file(_os.path.join(model_path, fn))
+            for k, v in sd.items():
+                if k.startswith("token2wav."):
+                    state_dict[k[len("token2wav."):]] = v
+    t2w.load_state_dict(state_dict, strict=False)
+
+    dit = t2w._get_dit_module()
+    if dit is None:
+        raise RuntimeError("Could not extract DiT module from Token2Wav.")
+
+    _monkeypatch_dit_attention_for_neuron(dit)
+
+    payload = _torch.load(stash_path, weights_only=True, map_location="cpu")
+    core_state_dict = payload["state_dict"]
     block_mask_idx = payload["block_mask_idx"]
 
     fresh = _NeuronDiTCore(dit)
     fresh.float()
     fresh.eval()
     fresh._block_mask_idx = block_mask_idx
-    fresh.load_state_dict(state_dict)
+    fresh.load_state_dict(core_state_dict)
     return fresh
 
 
@@ -450,6 +473,7 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         max_mel_len=2048,
         batch_size=2,
         tp_degree=4,
+        model_path=None,
     ):
         """Compile the DiT transformer core on Neuron using TP=4.
 
@@ -477,6 +501,11 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 inference with classifier-free guidance (CFG doubles batch).
             tp_degree: Replication degree; should match the Thinker/Talker
                 ``tp_degree`` so all three live on the same NeuronCore group.
+            model_path: Path to the HuggingFace Qwen2.5-Omni-7B checkpoint.
+                Required because ``parallel_model_trace`` spawns fresh child
+                processes that each rebuild the DiT from this checkpoint
+                (we can't pickle the in-memory DiT due to Neuron-patched
+                ``nn.Embedding`` class identity).
         """
         try:
             from neuronx_distributed.trace import parallel_model_trace
@@ -484,6 +513,13 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             raise ImportError(
                 "neuronx_distributed required for DiT compilation. "
                 "Run on a Neuron instance with the NxDI venv active."
+            )
+
+        if not model_path:
+            raise ValueError(
+                "compile_dit(model_path=...) is required — the spawn'd "
+                "compilation workers rebuild the DiT from this HuggingFace "
+                "checkpoint path."
             )
 
         os.makedirs(compiled_path, exist_ok=True)
@@ -506,12 +542,13 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         # Monkeypatch DiTAttention to fix in-place slice assignment
         _monkeypatch_dit_attention_for_neuron(dit)
 
-        # Capture state dict so parallel_model_trace's builder can
-        # reconstruct _NeuronDiTCore on the XLA device with the right weights.
-        # The builder must be a module-level function (see _build_dit_core_for_trace
-        # above) because parallel_model_trace pickles the builder across spawn'd
-        # processes. Since spawn'd children don't inherit globals, we write the
-        # inputs to a temp file and point the child at it via an env var.
+        # Serialize just what the spawn'd builder needs: the transformer
+        # core's state_dict (plain tensors) and the per-block mask indices
+        # (plain ints). We deliberately DO NOT pickle the DiT module itself —
+        # Neuron SDK patches torch classes like nn.Embedding, which makes
+        # torch.save trip on "not the same object" identity checks. Each
+        # child rebuilds the DiT from the on-disk HuggingFace checkpoint
+        # using the path we pass via _QWEN25_OMNI_DIT_MODEL_PATH.
         core_template = _NeuronDiTCore(dit)
         core_template.float()
         core_template.eval()
@@ -519,13 +556,25 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         stash_path = os.path.join(compiled_path, "_dit_builder_stash.pt")
         torch.save(
             {
-                "dit_module": dit,
                 "state_dict": core_template.state_dict(),
                 "block_mask_idx": core_template._block_mask_idx,
             },
             stash_path,
         )
         os.environ["_QWEN25_OMNI_DIT_STASH"] = stash_path
+        os.environ["_QWEN25_OMNI_DIT_MODEL_PATH"] = str(model_path)
+
+        # The builder lives in this module, which normally gets found via a
+        # sys.path.insert bootstrap in the caller. Spawn'd children won't have
+        # that, so push this module's directory onto PYTHONPATH for them.
+        _module_dir = os.path.dirname(os.path.abspath(__file__))
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        prior_pythonpath = existing_pythonpath  # restore in finally
+        if _module_dir not in existing_pythonpath.split(os.pathsep):
+            os.environ["PYTHONPATH"] = (
+                f"{_module_dir}{os.pathsep}{existing_pythonpath}"
+                if existing_pythonpath else _module_dir
+            )
 
         # Create example inputs
         # time_embedding uses batch=1 (broadcasts to hidden_states batch)
@@ -564,6 +613,11 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             )
         finally:
             os.environ.pop("_QWEN25_OMNI_DIT_STASH", None)
+            os.environ.pop("_QWEN25_OMNI_DIT_MODEL_PATH", None)
+            if prior_pythonpath:
+                os.environ["PYTHONPATH"] = prior_pythonpath
+            else:
+                os.environ.pop("PYTHONPATH", None)
             try:
                 os.remove(stash_path)
             except OSError:
