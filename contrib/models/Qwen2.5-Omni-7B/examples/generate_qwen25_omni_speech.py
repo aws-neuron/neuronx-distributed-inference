@@ -35,6 +35,15 @@ Usage:
   python examples/generate_qwen25_omni_speech.py --num-runs 5
 """
 
+import os as _os
+
+# Pin all three Neuron-compiled models (Thinker, Talker, DiT) to the same
+# four NeuronCores. Without this, the runtime places the single-device DiT
+# NEFF on a different core group than the TP=4 Thinker/Talker, and the
+# resulting cross-group scheduling makes every DiT forward ~30% slower.
+# Set before any Neuron module is imported so the runtime picks it up.
+_os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0-3")
+
 # --- Qwen2.5-Omni contrib bootstrap ---
 import sys as _sys
 from pathlib import Path as _Path

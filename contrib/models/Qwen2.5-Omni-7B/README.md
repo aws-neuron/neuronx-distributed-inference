@@ -37,6 +37,11 @@ Key features:
   pip install soundfile          # writes WAV output in generate_qwen25_omni_speech.py
   pip install qwen-omni-utils[decord]   # process_mm_info() in generate_qwen25_omni.py for image/audio/video inputs
   ```
+- **Pin all three Neuron models to the same core group**. Set `NEURON_RT_VISIBLE_CORES=0-3` before launching the speech pipeline so the Thinker (TP=4), Talker (TP=4), and the single-device Token2Wav DiT all live on the same four NeuronCores. Without this the Neuron runtime places the DiT NEFF on a different core group and every DiT forward pays a cross-group scheduling penalty (~30% slower). `examples/generate_qwen25_omni_speech.py` already sets this via `os.environ.setdefault` before any Neuron module is imported; if you embed the pipeline in your own entrypoint, do the same.
+  ```bash
+  export NEURON_RT_VISIBLE_CORES=0-3
+  python examples/generate_qwen25_omni_speech.py
+  ```
 
 ## Usage
 
