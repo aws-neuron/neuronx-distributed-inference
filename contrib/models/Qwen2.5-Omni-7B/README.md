@@ -31,7 +31,12 @@ Key features:
 ## Prerequisites
 
 - **Instance**: trn2.48xlarge or trn2.xlarge (4+ NeuronCores sufficient)
-- **Weights**: Download from [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B)
+- **Weights**: Download from [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) — the example scripts auto-download via `huggingface_hub.snapshot_download` on first run.
+- **Python dependencies** (on top of the NxDI venv):
+  ```bash
+  pip install soundfile          # writes WAV output in generate_qwen25_omni_speech.py
+  pip install qwen-omni-utils[decord]   # process_mm_info() in generate_qwen25_omni.py for image/audio/video inputs
+  ```
 
 ## Usage
 

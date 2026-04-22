@@ -60,6 +60,13 @@ import time
 
 import torch
 
+try:
+    import soundfile as sf  # noqa: F401  (used in Phase 5 to write the output WAV)
+except ImportError:
+    sys.exit(
+        "soundfile is required for WAV output. Install with: pip install soundfile"
+    )
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -688,7 +695,6 @@ def run_token2wav(model_path, compiled_path, codec_codes, num_runs, temp_dir, ou
 
     audio_duration = 0
     if first_wav is not None and isinstance(first_wav, torch.Tensor) and first_wav.numel() > 0:
-        import soundfile as sf
         wav_np = first_wav.detach().cpu().float().numpy().flatten()
         sf.write(output_wav, wav_np, 24000)
         audio_duration = len(wav_np) / 24000
