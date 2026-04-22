@@ -1,56 +1,77 @@
-diff --git a/vllm_neuron/__init__.py b/vllm_neuron/__init__.py
-index ce4c6d2..520d599 100644
---- a/vllm_neuron/__init__.py
-+++ b/vllm_neuron/__init__.py
-@@ -2,6 +2,8 @@
- """VllmNeuronPlugin module."""
- 
- import glob
-+import os
-+import sys
- import warnings
- from vllm_neuron.utils import set_unique_rt_root_comm_id
- 
-@@ -12,6 +14,34 @@ def _is_neuron_dev() -> bool:
-     return len(neuron_devices) > 0
+diff --git a/vllm_neuron/worker/neuronx_distributed_model_loader.py b/vllm_neuron/worker/neuronx_distributed_model_loader.py
+index d2099eb..ed6971f 100644
+--- a/vllm_neuron/worker/neuronx_distributed_model_loader.py
++++ b/vllm_neuron/worker/neuronx_distributed_model_loader.py
+@@ -922,6 +922,64 @@ def _camel_to_kebab(name: str) -> str:
+     return re.sub("([a-z0-9])([A-Z])", r"\1-\2", s1).lower()
  
  
++
 +def _register_contrib_models():
-+    """Register NxDI contrib models that aren't in upstream NxDI's MODEL_TYPES.
++    """Lazy-register NxDI contrib models on each process that calls the loader.
 +
-+    Activated by environment variables:
-+      NXDI_CONTRIB_MINIMAX_M2_SRC -> path to contrib/models/MiniMax-M2/src
++    Driven by env vars:
++      NXDI_CONTRIB_MIMO_V2_FLASH_SRC -> path to contrib MiMo-V2-Flash src/
++      NXDI_CONTRIB_MINIMAX_M2_SRC    -> path to contrib MiniMax-M2 src/
 +
-+    Registers NeuronMiniMaxM2ForCausalLM into NxDI's MODEL_TYPES under the key
-+    "minimaxm2" (matching how vllm-neuron's _get_neuron_model_cls lowercases
-+    the HF architecture "MiniMaxM2ForCausalLM"). vLLM's ModelRegistry already
-+    recognizes MiniMaxM2ForCausalLM so no vLLM-side registration is needed.
++    Registers the contrib model class into NxDI's MODEL_TYPES and, where
++    vLLM does not already know the architecture, registers it into vLLM's
++    ModelRegistry. Runs every time _get_neuron_model_cls is called so that
++    vLLM's spawn'd EngineCore workers (which don't inherit the parent's
++    module-level state) pick up the registration too. Registration is
++    idempotent.
 +    """
-+    minimax_src = os.environ.get("NXDI_CONTRIB_MINIMAX_M2_SRC")
-+    if minimax_src and os.path.isdir(minimax_src):
-+        if minimax_src not in sys.path:
-+            sys.path.insert(0, minimax_src)
++    import os as _os
++    import sys as _sys
++    import warnings as _w
++
++    mimo_src = _os.environ.get("NXDI_CONTRIB_MIMO_V2_FLASH_SRC")
++    if mimo_src and _os.path.isdir(mimo_src) and "mimov2flash" not in MODEL_TYPES:
++        if mimo_src not in _sys.path:
++            _sys.path.insert(0, mimo_src)
++        try:
++            from modeling_mimo_v2 import NeuronMiMoV2ForCausalLM
++            MODEL_TYPES.setdefault(
++                "mimov2flash", {"causal-lm": NeuronMiMoV2ForCausalLM}
++            )
++            try:
++                from vllm.model_executor.models.registry import ModelRegistry
++                if "MiMoV2FlashForCausalLM" not in ModelRegistry.get_supported_archs():
++                    ModelRegistry.register_model(
++                        "MiMoV2FlashForCausalLM", NeuronMiMoV2ForCausalLM
++                    )
++            except ImportError:
++                pass
++        except Exception as e:
++            _w.warn(
++                f"Failed to register MiMo-V2-Flash contrib model: {e}",
++                category=UserWarning,
++            )
++
++    minimax_src = _os.environ.get("NXDI_CONTRIB_MINIMAX_M2_SRC")
++    if minimax_src and _os.path.isdir(minimax_src) and "minimaxm2" not in MODEL_TYPES:
++        if minimax_src not in _sys.path:
++            _sys.path.insert(0, minimax_src)
 +        try:
 +            from modeling_minimax_m2 import NeuronMiniMaxM2ForCausalLM
-+            from neuronx_distributed_inference.utils.constants import MODEL_TYPES
 +            MODEL_TYPES.setdefault(
 +                "minimaxm2", {"causal-lm": NeuronMiniMaxM2ForCausalLM}
 +            )
 +        except Exception as e:
-+            warnings.warn(
-+                f"Failed to register MiniMax-M2 in NxDI MODEL_TYPES: {e}",
++            _w.warn(
++                f"Failed to register MiniMax-M2 contrib model: {e}",
 +                category=UserWarning,
 +            )
 +
 +
- def register():
-     """Register the Neuron platform if Neuron devices are present, else return None."""
-     if not _is_neuron_dev():
-@@ -20,6 +50,7 @@ def register():
-             category=UserWarning,
-         )
-         return None
+ def _get_neuron_model_cls(architecture: str):
+     """
+     Get Neuron model class from architecture string.
+@@ -941,6 +999,7 @@ def _get_neuron_model_cls(architecture: str):
+         _get_neuron_model_cls("NeuronLlamaForCausalLM")
+         <class 'NeuronLlamaForCausalLM'>
+     """
 +    _register_contrib_models()
-     return "vllm_neuron.platform.NeuronPlatform"
- 
- 
+     # Handle Neuron class name (starts with "Neuron") - strip prefix
+     if architecture.startswith("Neuron") and "For" in architecture:
+         original_architecture = architecture
