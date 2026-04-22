@@ -25,7 +25,14 @@ COMMON_MINIMAX_CONFIG='"tp_degree": 64,
             "glu_mlp": true,
             "moe_mask_padded_tokens": true,
             "disable_numeric_cc_token": true,
-            "router_config": {"act_fn": "sigmoid", "dtype": "float32"}'
+            "router_config": {"act_fn": "sigmoid", "dtype": "float32"},
+            "blockwise_matmul_config": {"use_torch_block_wise": true}'
+# NOTE: use_torch_block_wise=true forces MoE blockwise to use the PyTorch
+# reference implementation. The NKI kernel path pulls
+# neuronxcc.nki._private.blockwise_mm.blockwise_mm_baseline_shard_hidden
+# which is missing from Neuron SDK 2.29's public path; skipping it here is
+# the practical way to get the bench running on current stacks. Remove
+# this once the NKI kernel is promoted back to the stable path.
 
 # Helper: wait for vLLM server to be ready
 wait_for_server() {
@@ -128,6 +135,7 @@ python3 -m vllm.entrypoints.openai.api_server \
                 "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
             },
             "blockwise_matmul_config": {
+                "use_torch_block_wise": true,
                 "use_shard_on_intermediate_dynamic_while": false,
                 "skip_dma_token": true
             }
@@ -178,6 +186,7 @@ python3 -m vllm.entrypoints.openai.api_server \
             "on_device_sampling_config": null,
             "use_index_calc_kernel": true,
             "blockwise_matmul_config": {
+                "use_torch_block_wise": true,
                 "use_shard_on_intermediate_dynamic_while": true,
                 "skip_dma_token": true
             },
