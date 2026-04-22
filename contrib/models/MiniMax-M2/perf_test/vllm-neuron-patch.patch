@@ -1,11 +1,39 @@
 diff --git a/vllm_neuron/worker/neuronx_distributed_model_loader.py b/vllm_neuron/worker/neuronx_distributed_model_loader.py
-index d2099eb..ed6971f 100644
+index d2099eb..0c162e4 100644
 --- a/vllm_neuron/worker/neuronx_distributed_model_loader.py
 +++ b/vllm_neuron/worker/neuronx_distributed_model_loader.py
-@@ -922,6 +922,64 @@ def _camel_to_kebab(name: str) -> str:
+@@ -922,6 +922,94 @@ def _camel_to_kebab(name: str) -> str:
      return re.sub("([a-z0-9])([A-Z])", r"\1-\2", s1).lower()
  
  
++
++def _patch_autoconfig_trust_remote_code():
++    """Monkey-patch ``AutoConfig.from_pretrained`` to default ``trust_remote_code=True``.
++
++    NxDI's ``hf_adapter.load_config`` calls ``AutoConfig.from_pretrained(path)``
++    without ``trust_remote_code``. Contrib models like MiMo-V2-Flash that
++    ship a ``configuration_*.py`` with the checkpoint require custom code
++    execution, so the default behaviour crashes with ``ValueError: The
++    repository ... contains custom code which must be executed``.
++
++    vLLM's top-level ``--trust-remote-code`` flag only affects vLLM's own
++    config load, not NxDI's. Patching here is cheap and idempotent.
++    """
++    try:
++        from transformers import AutoConfig
++    except ImportError:
++        return
++    if getattr(AutoConfig, "_nxdi_contrib_patched", False):
++        return
++    _orig = AutoConfig.from_pretrained
++
++    def _patched(*args, **kwargs):
++        kwargs.setdefault("trust_remote_code", True)
++        return _orig(*args, **kwargs)
++
++    AutoConfig.from_pretrained = _patched
++    AutoConfig._nxdi_contrib_patched = True
++
 +
 +def _register_contrib_models():
 +    """Lazy-register NxDI contrib models on each process that calls the loader.
@@ -24,6 +52,8 @@ index d2099eb..ed6971f 100644
 +    import os as _os
 +    import sys as _sys
 +    import warnings as _w
++
++    _patch_autoconfig_trust_remote_code()
 +
 +    mimo_src = _os.environ.get("NXDI_CONTRIB_MIMO_V2_FLASH_SRC")
 +    if mimo_src and _os.path.isdir(mimo_src) and "mimov2flash" not in MODEL_TYPES:
@@ -67,7 +97,7 @@ index d2099eb..ed6971f 100644
  def _get_neuron_model_cls(architecture: str):
      """
      Get Neuron model class from architecture string.
-@@ -941,6 +999,7 @@ def _get_neuron_model_cls(architecture: str):
+@@ -941,6 +1029,7 @@ def _get_neuron_model_cls(architecture: str):
          _get_neuron_model_cls("NeuronLlamaForCausalLM")
          <class 'NeuronLlamaForCausalLM'>
      """
