@@ -162,7 +162,7 @@ def _compile_dit(model_path, out_path):
                 if k.startswith("token2wav."):
                     state_dict[k[len("token2wav."):]] = v
     t2w.load_state_dict(state_dict, strict=False)
-    t2w.compile_dit(out_path, max_mel_len=2048, batch_size=2, model_path=model_path)
+    t2w.compile_dit(out_path, max_mel_len=2048, batch_size=2)
 
 
 def compile_all(model_path, compiled_path):
