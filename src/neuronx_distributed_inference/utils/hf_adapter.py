@@ -2,7 +2,9 @@ import copy
 import os
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Union
-from neuronx_distributed_inference.utils.tensor_replacement.registry import TensorReplacementRegister
+from neuronx_distributed_inference.utils.tensor_replacement.registry import (
+    TensorReplacementRegister,
+)
 import torch
 from neuronx_distributed.utils.medusa_utils import (
     evaluate_posterior,
@@ -10,7 +12,13 @@ from neuronx_distributed.utils.medusa_utils import (
     generate_medusa_buffers,
     update_inference_inputs,
 )
-from transformers import AutoConfig, GenerationConfig, GenerationMixin, PretrainedConfig, PreTrainedModel
+from transformers import (
+    AutoConfig,
+    GenerationConfig,
+    GenerationMixin,
+    PretrainedConfig,
+    PreTrainedModel,
+)
 from transformers.generation.streamers import BaseStreamer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.generation import GenerateDecoderOnlyOutput, SampleDecoderOnlyOutput
@@ -43,7 +51,9 @@ def load_pretrained_config(
         if (model_path_or_name is None and hf_config is None) or (
             model_path_or_name is not None and hf_config is not None
         ):
-            raise ValueError('Please provide only one of "model_path_or_name" or "hf_config"')
+            raise ValueError(
+                'Please provide only one of "model_path_or_name" or "hf_config"'
+            )
 
         if model_path_or_name is not None:
             config: PretrainedConfig = AutoConfig.from_pretrained(model_path_or_name)
@@ -58,11 +68,16 @@ def load_pretrained_config(
         # Set torch_dtype in NeuronConfig.
         hf_dtype = config_dict.get("dtype", config_dict.get("torch_dtype", None))
         if hf_dtype is not None:
-            if self.neuron_config is not None and not self.neuron_config.overrides_torch_dtype:
+            if (
+                self.neuron_config is not None
+                and not self.neuron_config.overrides_torch_dtype
+            ):
                 # Update neuron_config's torch_dtype if not overriden by the user.
                 self.neuron_config.torch_dtype = hf_dtype
                 if isinstance(self.neuron_config.torch_dtype, str):
-                    self.neuron_config.torch_dtype = to_torch_dtype(self.neuron_config.torch_dtype)
+                    self.neuron_config.torch_dtype = to_torch_dtype(
+                        self.neuron_config.torch_dtype
+                    )
             config_dict.pop("dtype", None)
             config_dict.pop("torch_dtype", None)
 
@@ -95,14 +110,23 @@ def to_pretrained_config(config: InferenceConfig):
     del config_dict["neuron_config"]
 
     # handle nested configs for multi-modal models
-    config_dict = _convert_modality_config_to_pretrained_config(config_dict, "text_config")
-    config_dict = _convert_modality_config_to_pretrained_config(config_dict, "vision_config")
+    config_dict = _convert_modality_config_to_pretrained_config(
+        config_dict, "text_config"
+    )
+    config_dict = _convert_modality_config_to_pretrained_config(
+        config_dict, "vision_config"
+    )
 
     return PretrainedConfig(**config_dict)
 
 
 class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
-    def __init__(self, model: NeuronApplicationBase, input_start_offsets=None, capture_draft_logits=False):
+    def __init__(
+        self,
+        model: NeuronApplicationBase,
+        input_start_offsets=None,
+        capture_draft_logits=False,
+    ):
         hf_config = to_pretrained_config(model.config)
         super().__init__(hf_config)
         if self.generation_config is not None:
@@ -116,11 +140,15 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             # the v4.50+ behavior to apply even for models defined before v4.50.
             # To mitigate this issue, we fix the transformers version on self.generation_config.
             if hf_config.transformers_version is not None:
-                self.generation_config.transformers_version = hf_config.transformers_version
+                self.generation_config.transformers_version = (
+                    hf_config.transformers_version
+                )
 
         self.neuron_model = model
         self.neuron_config = model.config.neuron_config
-        self.on_device_sampling = self.neuron_config.on_device_sampling_config is not None
+        self.on_device_sampling = (
+            self.neuron_config.on_device_sampling_config is not None
+        )
         self.padding_side = self.neuron_config.padding_side
         self.sampler = None
         self.prev_kv_cache_populated = False
@@ -176,16 +204,18 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         )
         # convert adapter_ids from strings to indices
         if self.neuron_config.lora_config:
-            model_kwargs["adapter_ids"] = self.neuron_model.lora_model_manager.convert_adapter_ids_to_indices(
-                model_kwargs.get("adapter_ids"), unfinished_sequences.numel()
+            model_kwargs["adapter_ids"] = (
+                self.neuron_model.lora_model_manager.convert_adapter_ids_to_indices(
+                    model_kwargs.get("adapter_ids"), unfinished_sequences.numel()
+                )
             )
         this_peer_finished = False
         # auto-regressive generation
         while not this_peer_finished:
             if self.neuron_config.tensor_replacement_config:
-                if hasattr(self, 'generation_step'):
-                    if model_kwargs['divergence_idx']:
-                        self.generation_step = 1 + model_kwargs['divergence_idx']
+                if hasattr(self, "generation_step"):
+                    if model_kwargs["divergence_idx"]:
+                        self.generation_step = 1 + model_kwargs["divergence_idx"]
                     else:
                         self.generation_step += 1
                 else:
@@ -193,7 +223,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
 
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-            model_kwargs['divergence_idx'] = None
+            model_kwargs["divergence_idx"] = None
             model_kwargs["attention_mask"] = model_inputs.get("attention_mask")
 
             # forward pass to get next token
@@ -244,7 +274,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
 
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, None)
+            unfinished_sequences = unfinished_sequences & ~stopping_criteria(
+                input_ids, None
+            )
             this_peer_finished = unfinished_sequences.max() == 0
 
         if return_dict_in_generate:
@@ -284,7 +316,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             position_ids = attention_mask.long().cumsum(-1) - 1
             if self.input_start_offsets:
                 if len(self.input_start_offsets) > 1:
-                    position_ids += torch.tensor(self.input_start_offsets, dtype=position_ids.dtype, device=position_ids.device)[:, None]
+                    position_ids += torch.tensor(
+                        self.input_start_offsets,
+                        dtype=position_ids.dtype,
+                        device=position_ids.device,
+                    )[:, None]
                 else:
                     position_ids += self.input_start_offsets[0]
                 for i, offset in enumerate(self.input_start_offsets):
@@ -307,18 +343,24 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache", False),
                 "attention_mask": attention_mask,
-                "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
+                "medusa_args": (
+                    accepted_indices,
+                    current_length,
+                    medusa_mask,
+                    scatter_index,
+                ),
                 "sampling_params": sampling_params,
                 "input_capture_hook": input_capture_hook,
-                "tensor_capture_hook": tensor_capture_hook,
-                "adapter_ids": adapter_ids
+                "adapter_ids": adapter_ids,
             }
         )
 
         tf_args = []
         if self.neuron_config.tensor_replacement_config:
             reg = TensorReplacementRegister.get_instance()
-            tf , masks = reg.step_args(self.generation_step, divergence_idx=True if divergence_idx else False)
+            tf, masks = reg.step_args(
+                self.generation_step, divergence_idx=True if divergence_idx else False
+            )
             tf_args = tf + masks
 
         # Only add tf_args if not empty
@@ -333,7 +375,12 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         return model_inputs
 
     def prepare_medusa_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
     ):
         if self.neuron_model.kv_cache_populated:
             input_ids = input_ids[:, -self.neuron_config.medusa_speculation_length :]
@@ -391,13 +438,19 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             if is_for_token_generation:
                 if self.padding_side == "left":
                     attention_mask = torch.cat(
-                        [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
+                        [
+                            attention_mask,
+                            attention_mask.new_ones((attention_mask.shape[0], 1)),
+                        ],
                         dim=-1,
                     )
                     attention_mask = attention_mask[:, 1:]
                 else:
                     attention_mask = torch.cat(
-                        [attention_mask.new_ones((attention_mask.shape[0], 1)), attention_mask],
+                        [
+                            attention_mask.new_ones((attention_mask.shape[0], 1)),
+                            attention_mask,
+                        ],
                         dim=-1,
                     )
             model_kwargs["attention_mask"] = attention_mask
@@ -418,7 +471,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 attention_mask = torch.cat(
                     [
                         attention_mask,
-                        attention_mask.new_ones((attention_mask.shape[0], accepted_len)),
+                        attention_mask.new_ones(
+                            (attention_mask.shape[0], accepted_len)
+                        ),
                     ],
                     dim=-1,
                 )
@@ -426,7 +481,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             else:
                 attention_mask = torch.cat(
                     [
-                        attention_mask.new_ones((attention_mask.shape[0], accepted_len)),
+                        attention_mask.new_ones(
+                            (attention_mask.shape[0], accepted_len)
+                        ),
                         attention_mask,
                     ],
                     dim=-1,
@@ -522,7 +579,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         )
         if "sampling_params" not in fused_assistant_kwargs:
             fused_assistant_kwargs["sampling_params"] = sampling_params
-        model_inputs = self.prepare_inputs_for_generation(input_ids, **fused_assistant_kwargs)
+        model_inputs = self.prepare_inputs_for_generation(
+            input_ids, **fused_assistant_kwargs
+        )
 
         # Other auxiliary variables
         bs = input_ids.shape[0]
@@ -552,7 +611,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         if return_dict_in_generate:
             if output_scores:
                 # TODO: Process raw logits with logits processor when needed
-                scores += (outputs.fused_outputs[-2][:, -1, :],) if self.capture_draft_logits else (outputs.fused_outputs[-1][:, -1, :],)
+                scores += (
+                    (outputs.fused_outputs[-2][:, -1, :],)
+                    if self.capture_draft_logits
+                    else (outputs.fused_outputs[-1][:, -1, :],)
+                )
             if output_logits:
                 raw_logits += (outputs.fused_outputs[-1],)
 
@@ -573,7 +636,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             n_matches = torch.ops.aten.Int(n_matches)
             incremental_len = n_matches
             if self.capture_draft_logits:
-                print(f'n matches: {n_matches}')
+                print(f"n matches: {n_matches}")
 
             # 3. retrieve accepted tokens using n_matches
             if len(accepted_tokens_with_padding.shape) == 1:
@@ -586,7 +649,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             for eos_token_id in eos_token_id_list:
                 if eos_token_id in accepted_tokens:
                     # get column indices
-                    eos_pos_cur = (accepted_tokens == eos_token_id).nonzero(as_tuple=True)[1]
+                    eos_pos_cur = (accepted_tokens == eos_token_id).nonzero(
+                        as_tuple=True
+                    )[1]
                     eos_pos = min(torch.min(eos_pos_cur), eos_pos)
             if eos_pos < accepted_tokens.shape[1]:
                 end_for_all = True
@@ -601,7 +666,10 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                         scores += tuple(outputs.fused_outputs[-2][:, :, :])
                     else:
                         # Only add logits for accepted token positions (not including the extra prediction)
-                        scores += tuple(outputs.fused_outputs[-1][:, i, :] for i in range(accepted_tokens.shape[1]))
+                        scores += tuple(
+                            outputs.fused_outputs[-1][:, i, :]
+                            for i in range(accepted_tokens.shape[1])
+                        )
 
                 if output_logits:
                     raw_logits += (outputs.fused_outputs[-1],)
@@ -643,7 +711,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         if hasattr(assistant_model, "num_assistant_tokens"):
             num_assistant_tokens = assistant_model.num_assistant_tokens
         else:
-            num_assistant_tokens = assistant_model.generation_config.num_assistant_tokens
+            num_assistant_tokens = (
+                assistant_model.generation_config.num_assistant_tokens
+            )
 
         # Init values
         if eos_token_id is not None and pad_token_id is None:
@@ -653,7 +723,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
         eos_token_id_tensor = (
-            torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
+            torch.tensor(eos_token_id).to(input_ids.device)
+            if eos_token_id is not None
+            else None
         )
 
         # Prepare assistant model's keys of inputs
@@ -686,11 +758,15 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                     candidate_input_ids,
                     **assistant_kwargs,
                 )
-                is_for_token_generation = assistant_model.neuron_model.kv_cache_populated
+                is_for_token_generation = (
+                    assistant_model.neuron_model.kv_cache_populated
+                )
 
                 # 1.2 Use the assistant model to obtain the next candidate logits
                 assistant_model_outputs = assistant_model(**assistant_inputs)
-                assistant_new_token = assistant_model_outputs.logits[:, 0, :].argmax(dim=-1)
+                assistant_new_token = assistant_model_outputs.logits[:, 0, :].argmax(
+                    dim=-1
+                )
 
                 # 1.3 Update inputs and args for next iteration
                 candidate_input_ids = torch.cat(
@@ -709,7 +785,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                         eos_token_id_tensor.shape[0], 1
                     )
                     last_assistant_token_is_eos = (
-                        ~last_assistant_token_is_eos.ne(eos_token_id_tensor.unsqueeze(1))
+                        ~last_assistant_token_is_eos.ne(
+                            eos_token_id_tensor.unsqueeze(1)
+                        )
                         .prod(dim=0)
                         .bool()
                     )
@@ -723,14 +801,19 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
 
             # 2.1 Prepare the input arguments
-            input_ids = torch.cat((new_token, candidate_input_ids[:, -candidate_length:-1]), dim=-1)
+            input_ids = torch.cat(
+                (new_token, candidate_input_ids[:, -candidate_length:-1]), dim=-1
+            )
             attention_mask = model_inputs["attention_mask"]
             pos = curr_pos + 1
             position_ids = torch.arange(pos, pos + spec_len).expand(1, spec_len)
             # Pad the input_ids if needed
             if input_ids.shape[-1] < spec_len:
                 input_ids = torch.cat(
-                    (input_ids, torch.full((1, spec_len - input_ids.shape[-1]), pad_token_id)),
+                    (
+                        input_ids,
+                        torch.full((1, spec_len - input_ids.shape[-1]), pad_token_id),
+                    ),
                     dim=-1,
                 )
 
@@ -748,7 +831,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             # 3. Compare the argmax from the original model logits with the assistant forecasted tokens. We can keep
             # the assistant forecasted tokens until the first mismatch, or until the max length is reached.
             candidate_new_tokens = candidate_input_ids[:, -candidate_length:-1]
-            n_matches = ((~(candidate_new_tokens == selected_tokens)).cumsum(dim=-1) < 1).sum()
+            n_matches = (
+                (~(candidate_new_tokens == selected_tokens)).cumsum(dim=-1) < 1
+            ).sum()
 
             # 4. Ensure we don't generate beyond max_len or an EOS token
             if last_assistant_token_is_eos and n_matches == candidate_length:
@@ -782,7 +867,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             )
 
             curr_pos = curr_pos + n_matches + 1
-            assistant_kwargs["attention_mask"] = copy.deepcopy(model_inputs["attention_mask"])
+            assistant_kwargs["attention_mask"] = copy.deepcopy(
+                model_inputs["attention_mask"]
+            )
 
             # 7. Update with the generated token length and check for stopping condition.
             cur_len = cur_len + n_matches + 1
@@ -842,7 +929,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 medusa_buffers["tree_indices"],
                 medusa_buffers["retrieve_indices"],
             )
-            position_ids = medusa_buffers["medusa_position_ids"] + input_ids.nonzero().shape[0]
+            position_ids = (
+                medusa_buffers["medusa_position_ids"] + input_ids.nonzero().shape[0]
+            )
 
             medusa_kwargs = self._prepare_medusa_kwargs(
                 position_ids, cur_len, medusa_buffers, select_indices, medusa_kwargs
@@ -858,21 +947,25 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
 
             tree_logits, tree_medusa_logits = self._extract_logits(outputs)
             logits = tree_logits[0, 0, medusa_buffers["retrieve_indices"]]
-            medusa_logits = tree_medusa_logits[:, 0, 0, medusa_buffers["retrieve_indices"]]
+            medusa_logits = tree_medusa_logits[
+                :, 0, 0, medusa_buffers["retrieve_indices"]
+            ]
 
             best_candidate, accept_length = evaluate_posterior(logits, candidates)
             cur_len = torch.tensor([input_ids.nonzero().size(0) - 1], dtype=torch.int32)
 
-            input_ids, logits, medusa_logits, new_token, select_indices = update_inference_inputs(
-                input_ids[:, : (int(cur_len[0] + 1))],
-                candidates,
-                best_candidate,
-                accept_length,
-                medusa_buffers["retrieve_indices"],
-                outputs,
-                logits,
-                medusa_logits,
-                new_token,
+            input_ids, logits, medusa_logits, new_token, select_indices = (
+                update_inference_inputs(
+                    input_ids[:, : (int(cur_len[0] + 1))],
+                    candidates,
+                    best_candidate,
+                    accept_length,
+                    medusa_buffers["retrieve_indices"],
+                    outputs,
+                    logits,
+                    medusa_logits,
+                    new_token,
+                )
             )
 
             medusa_kwargs["attention_mask"] = self._update_attention_mask(
@@ -883,7 +976,10 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             cur_length = accept_length_tree + cur_length
             accept_lengths_tree.append(accept_length_tree)
             final_accept_length += accept_length + 1
-            if eos_token_id in new_token or final_accept_length > self.neuron_config.max_new_tokens:
+            if (
+                eos_token_id in new_token
+                or final_accept_length > self.neuron_config.max_new_tokens
+            ):
                 break
         return input_ids
 
@@ -898,7 +994,9 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         )
         for index, value in enumerate(select_indices):
             medusa_kwargs["accepted_indices"][index] = value
-        medusa_kwargs["accepted_indices"] = medusa_kwargs["accepted_indices"].unsqueeze(0)
+        medusa_kwargs["accepted_indices"] = medusa_kwargs["accepted_indices"].unsqueeze(
+            0
+        )
         medusa_kwargs["current_length"] = torch.arange(
             cur_len[0].item(),
             cur_len[0].item() + self.neuron_config.num_medusa_heads + 1,
@@ -913,14 +1011,20 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         ).unsqueeze(0)
         return medusa_kwargs
 
-    def _update_attention_mask(self, model_inputs, accept_length, cur_len, medusa_kwargs):
+    def _update_attention_mask(
+        self, model_inputs, accept_length, cur_len, medusa_kwargs
+    ):
         accept_length_concat_tensor = torch.zeros(
             1, accept_length + 1, dtype=model_inputs["attention_mask"].dtype
         )
-        attn_mask = torch.cat([model_inputs["attention_mask"], accept_length_concat_tensor], dim=-1)
+        attn_mask = torch.cat(
+            [model_inputs["attention_mask"], accept_length_concat_tensor], dim=-1
+        )
 
         medusa_kwargs["attention_mask"] = attn_mask.index_fill(
-            1, torch.arange(int(cur_len[0]) + 1, int(cur_len[0]) + 1 + accept_length + 1), 1
+            1,
+            torch.arange(int(cur_len[0]) + 1, int(cur_len[0]) + 1 + accept_length + 1),
+            1,
         )
         return medusa_kwargs["attention_mask"]
 
