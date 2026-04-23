@@ -231,8 +231,9 @@ NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compi
 ## Prerequisites
 
 1. **Selective loading threshold patch:** On the target instance, patch
-   `neuronx_distributed/modules/moe/model_utils.py` to set the selective loading
-   threshold to 0.0 (default is too high for 384 experts).
+   `neuronx_distributed/modules/moe/model_utils.py` to set
+   `DEFAULT_SELECTIVE_LOADING_THRESHOLD = 0.0` (default is 0.05 on SDK 2.28 or
+   1.0 on SDK 2.29, both too high for 384 experts).
 
 2. **Model weights:** Download from HuggingFace:
    ```bash
@@ -256,9 +257,14 @@ standalone `nki-library` April 2026 release), the available alternative kernels
 (`shard_on_intermediate`, `shard_on_block`) are incompatible with this model's dimensions:
 
 - `use_shard_on_intermediate_dynamic_while`: MLIR verification failure due to small per-TP
-  intermediate dimension (64) not matching kernel tile expectations.
-- `use_shard_on_block_dynamic_while` + `PING_PONG`: Compiles but produces incorrect outputs
-  (likely due to blockwise FP8 scale dequantization interaction with the kernel).
+  intermediate dimension (2048/32=64, sharded to 32 at LNC=2) being below the kernel's
+  minimum TILE_SIZE of 128 for the `nc_matmul` stationary free dimension.
+- `use_shard_on_block_dynamic_while` + `PING_PONG`: Compiles but produces incorrect outputs.
+- **Zero-padding fix attempted:** Padding `I_TP_sharded` from 32 to 128 in the
+  `shard_on_intermediate` kernel eliminates the MLIR error and compiles successfully, but
+  produces logits ~10 points lower than expected (13.1 vs 23.0). The EP workaround on the
+  same instance produces correct logits (23.0), confirming the issue is in the kernel's
+  handling of padded dimensions. Filed as internal ticket V2185857494.
 
 **Recommended workaround:** Patch `expert_mlps_v2.py` in the `neuronx_distributed` package
 to use `forward_all_experts_EP` instead of `forward_blockwise` when expert parallelism is
@@ -317,4 +323,4 @@ long-output workloads this is negligible; for TTFT-sensitive workloads, use SDK 
 
 Annapurna Labs
 
-**Last Updated:** 2026-04-20
+**Last Updated:** 2026-04-23
