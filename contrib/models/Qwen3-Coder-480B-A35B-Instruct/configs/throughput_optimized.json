@@ -1,0 +1,51 @@
+{
+  "description": "Qwen3-Coder-480B-A35B-Instruct: Throughput-optimized config for trn2.48xlarge",
+  "hardware": "trn2.48xlarge (64 NeuronCores, LNC=2)",
+  "sdk": "2.28+",
+  "vllm_flags": {
+    "tensor_parallel_size": 64,
+    "max_num_seqs": 16,
+    "max_model_len": 8192,
+    "no_enable_chunked_prefill": true,
+    "no_enable_prefix_caching": true
+  },
+  "override_neuron_config": {
+    "async_mode": true,
+    "attn_kernel_enabled": true,
+    "batch_size": 16,
+    "cc_pipeline_tiling_factor": 2,
+    "cp_degree": 1,
+    "ctx_batch_size": 1,
+    "enable_bucketing": true,
+    "flash_decoding_enabled": false,
+    "fused_qkv": true,
+    "is_continuous_batching": true,
+    "logical_nc_config": 2,
+    "max_context_length": 8192,
+    "mode_mask_padded_tokens": true,
+    "moe_ep_degree": 1,
+    "moe_tp_degree": 64,
+    "qkv_cte_nki_kernel_fuse_rope": true,
+    "qkv_kernel_enabled": true,
+    "qkv_nki_kernel_enabled": true,
+    "scratch_pad_size": 1024,
+    "seq_len": 8192,
+    "sequence_parallel_enabled": true,
+    "torch_dtype": "bfloat16",
+    "tp_degree": 64
+  },
+  "notes": {
+    "auto_bucketing": "No explicit bucket lists; enable_bucketing=true auto-generates: 128, 256, 512, 1024, 2048, 4096, 8192",
+    "no_on_device_sampling": "on_device_sampling_config is omitted; vLLM handles sampling on CPU for better throughput",
+    "flash_decoding": "Must be false; kv_shared group assertion fails with 8 KV heads in pure TP=64",
+    "compile_time": "~22 min first compile (7 CTE + 7 TKG buckets), then cached",
+    "weight_load_time": "~10 min"
+  },
+  "benchmark": {
+    "ttft_short_prompt": "0.85s",
+    "decode_throughput": "15.3 tok/s (single request)",
+    "aggregate_tps_1_concurrent": "14.73 tok/s",
+    "aggregate_tps_4_concurrent": "43.42 tok/s",
+    "aggregate_tps_8_concurrent": "73.23 tok/s"
+  }
+}
