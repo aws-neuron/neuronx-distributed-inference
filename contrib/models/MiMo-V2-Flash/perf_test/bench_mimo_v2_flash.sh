@@ -27,8 +27,13 @@ COMMON_MIMO_CONFIG='"tp_degree": 64,
             "strided_context_parallel_kernel_enabled": false,
             "glu_mlp": true,
             "normalize_top_k_affinities": true,
+            "save_sharded_checkpoint": true,
             "router_config": {"act_fn": "sigmoid", "dtype": "float32"},
             "blockwise_matmul_config": {"use_torch_block_wise": true}'
+# save_sharded_checkpoint=true persists per-rank sharded weights to
+# <compiled-path>/weights/tp{N}_sharded_checkpoint.safetensors during compile;
+# load() then reads those directly (~55s) instead of re-sharding the entire
+# checkpoint on every vllm-neuron startup (~10+ min).
 # NOTE: use_torch_block_wise=true forces MoE blockwise to use the PyTorch
 # reference implementation. The NKI kernel path pulls
 # neuronxcc.nki._private.blockwise_mm.blockwise_mm_baseline_shard_hidden
