@@ -40,8 +40,9 @@ Gemma 4 31B has several unique features compared to Gemma 3 and other standard d
 
 ## Validation Results
 
-**Validated:** 2026-04-04
+**Validated:** 2026-04-23
 **Configuration:** TP=4, batch_size=1, bfloat16, trn2.3xlarge (LNC=2)
+**SDK:** 2.29 (NxDI 0.9, neuronx-cc 2.24). Also validated on SDK 2.28.
 
 ### Text-Only Results
 
@@ -94,23 +95,38 @@ Gemma 4 31B has several unique features compared to Gemma 3 and other standard d
 **Configuration:** TP=4, batch_size=1, bfloat16
 **Instance:** trn2.3xlarge (LNC=2, 4 logical cores)
 
-| Metric | Text-Only | Text + NKI Kernel | VLM (with image) |
-|--------|-----------|-------------------|-------------------|
-| TTFT | ~66 ms | ~165 ms | ~180-270 ms |
-| TPOT | ~30.6 ms | ~30.2 ms | ~30 ms |
-| Throughput | ~32.2 tok/s | ~33.1 tok/s | ~33 tok/s |
-| Vision Encoder | N/A | N/A | ~18.5 ms |
-| Compile Time | ~120 s | ~120 s | ~120 s (text) + ~30 s (vision) |
-| Load Time | ~42 s | ~14 s | ~14 s (text) + ~0.3 s (vision) |
+| Metric | Text-Only | VLM (with image) |
+|--------|-----------|-------------------|
+| TTFT | ~65 ms | ~180-270 ms |
+| TPOT | ~31 ms | ~30 ms |
+| Throughput | ~32 tok/s | ~33 tok/s |
+| Vision Encoder | N/A | ~18.5 ms |
+| Compile Time | ~10 min | ~10 min (text) + ~30 s (vision) |
+| Load Time | ~15 s | ~15 s (text) + ~0.3 s (vision) |
 
-**Note:** Text-only TTFT with NKI kernel (165ms) is higher than without (66ms) because the NKI kernel measurements used `seq_len=512` while the non-kernel measurement used `seq_len=256`. At the same sequence length, performance is comparable. The kernel's advantage grows with longer sequences.
+### Sequence Length Support
+
+Tested up to seq_len=8192 on trn2.3xlarge (LNC=2, TP=4, batch=1, BF16, greedy).
+All correctness tests pass at every tested length.
+
+| seq_len | Compile | Load | KV cache/core | TTFT P50 | TPOT P50 | tok/s | Status |
+|---------|---------|------|---------------|----------|----------|-------|--------|
+| 512 | ~10 min | 15s | 0.11 GB | 65 ms | 30.9 ms | 32.4 | PASS |
+| 4096 | ~15 min | 17s | 0.86 GB | 999 ms | 31.3 ms | 32.0 | PASS |
+| 8192 | ~28 min | 72s | 1.72 GB | 17.0 s | 33.5 ms | 29.8 | PASS |
+| 16384 | OOM | - | 3.44 GB (est.) | - | - | - | CTE compiler OOM |
+
+- TPOT is nearly constant across sequence lengths (TKG is independent of context length).
+- 16384 fails during CTE compilation (host RAM OOM on 128 GB system RAM, not HBM).
+- Larger instances (trn2.48xlarge) may support 16384+.
 
 **Status:** VALIDATED
 
 ## Prerequisites
 
-- **Neuron SDK 2.28+** (DLAMI: `Deep Learning AMI Neuron (Ubuntu 24.04) 20260227`)
-- Also works with **NxDI 0.8.0** on SDK 2.28 with transformers 4.57.6 (includes JSON config fallback)
+- **Neuron SDK 2.29** (DLAMI: `Deep Learning AMI Neuron (Ubuntu 24.04) 20260410`)
+  - Also works on SDK 2.28 (DLAMI 20260227) for trn1 compatibility
+- **transformers >= 4.57.0**
 - **transformers/utils/fx.py shim** (only needed if using transformers >= 5.0):
 
 ```python
@@ -141,7 +157,7 @@ neuron_config = Gemma4NeuronConfig(
     tp_degree=4,
     batch_size=1,
     max_batch_size=1,
-    seq_len=256,  # context_len + gen_len
+    seq_len=4096,  # max context length (tested up to 8192)
     on_device_sampling_config=None,
     torch_dtype=torch.bfloat16,
     fused_qkv=False,
@@ -167,9 +183,53 @@ model.compile(compiled_model_path)
 model = NeuronGemma4ForCausalLM(model_path, config)
 model.load(compiled_model_path)
 
-# Generate (see test/integration/test_model.py for full generation loop)
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-# ... pad inputs to seq_len, run prefill + token generation loop
+# Generate
+tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
+prompt = "The capital of France is"
+ids = tokenizer.encode(prompt, add_special_tokens=True)
+prompt_len = len(ids)
+seq_len = 4096  # must match neuron_config.seq_len
+
+input_ids = torch.zeros(1, seq_len, dtype=torch.int32)
+input_ids[0, :prompt_len] = torch.tensor(ids, dtype=torch.int32)
+attention_mask = torch.zeros(1, seq_len, dtype=torch.int32)
+attention_mask[0, :prompt_len] = 1
+
+# IMPORTANT: padding positions must have position_id=0, not sequential values.
+# The base class extracts hidden states at max(position_ids).
+position_ids = torch.zeros(1, seq_len, dtype=torch.long)
+position_ids[0, :prompt_len] = torch.arange(prompt_len, dtype=torch.long)
+
+# Prefill (CTE)
+with torch.no_grad():
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+    )
+
+# Token generation loop
+token_id = outputs.tokens[0].item()
+generated = [token_id]
+cur_pos = prompt_len
+for _ in range(99):
+    tkg_in = torch.tensor([[token_id]], dtype=torch.long)
+    am_len = cur_pos + 1
+    tkg_mask = torch.cat([
+        torch.ones(1, am_len, dtype=torch.long),
+        torch.zeros(1, seq_len - am_len, dtype=torch.long),
+    ], dim=1)
+    out = model(
+        input_ids=tkg_in,
+        attention_mask=tkg_mask,
+        position_ids=torch.tensor([[cur_pos]], dtype=torch.long),
+    )
+    cur_pos += 1
+    token_id = out.tokens[0].item()
+    generated.append(token_id)
+    if token_id == tokenizer.eos_token_id:
+        break
+print(tokenizer.decode(generated, skip_special_tokens=True))
 ```
 
 See `test/integration/test_model.py` for a complete generation example with chat template support.
@@ -314,16 +374,17 @@ with torch.no_grad():
 
 ## Compatibility Matrix
 
-| Instance Type | SDK 2.28+ | SDK 2.27 and earlier |
-|---------------|-----------|----------------------|
-| trn2.3xlarge (TP=4, LNC=2) | VALIDATED (text + VLM) | Not tested |
-| trn2.48xlarge | Not tested | Not tested |
-| Inf2 | N/A | N/A |
+| Instance Type | SDK 2.29 | SDK 2.28 |
+|---------------|----------|----------|
+| trn2.3xlarge (TP=4, LNC=2) | **VALIDATED** (text + VLM, seq_len up to 8192) | VALIDATED (text + VLM, seq_len up to 2048) |
+| trn2.48xlarge | Not tested (may support seq_len=16384+) | Not tested |
+| trn1 | Not tested (SDK 2.28 likely needed) | Not tested |
 
 **Notes:**
 - Requires TP=4 on trn2.3xlarge with LNC=2 (default). Global layers have 4 KV heads, requiring TP <= 4.
 - `fused_qkv=False` required (heterogeneous Q/K/V shapes per layer type).
 - `attn_kernel_enabled=False` in NeuronConfig (the standard NxDI kernel doesn't support head_dim > 128). The custom NKI kernel in `nki_flash_attn_large_d.py` is applied separately via `ndxi_patch.py`.
+- SDK 2.29 NxDI 0.9 moved `create_sampler` to `modules.generation.sampling`; the code handles both paths automatically.
 
 ## Testing
 
@@ -352,11 +413,13 @@ python test/integration/test_model.py
 - **No bidirectional vision attention**: HF Gemma4 uses bidirectional attention for vision tokens in SWA layers (`or_mask`). This implementation uses standard causal masking for all tokens. Vision quality may be slightly degraded but generation is coherent.
 - **Fixed image resolution**: Currently supports 384x384 images (64 vision tokens). Dynamic resolution requires different bucket configurations.
 - **Prompt format required**: VLM inference requires the specific HF Gemma4 chat template format (see Usage: VLM above). Incorrect prompt formatting produces garbage output.
-- **NxDI 0.8.0 monkey-patches**: The VLM requires `ndxi_patch.py` to be applied before model creation due to API changes in NxDI 0.8.0.
-- **NKI kernel CTE-only**: The custom NKI flash attention kernel applies to context encoding (prefill) only. Token generation uses the standard NxDI `compute_for_token_gen` path, which handles all head_dim sizes natively.
+- **VLM monkey-patches**: The VLM requires `ndxi_patch.py` to be applied before model creation due to API differences across NxDI versions.
+- **NKI kernel**: The custom NKI flash attention kernel works on SDK 2.28 (NKI 0.2.x) but produces incorrect output on SDK 2.29 (NKI 0.3.0) due to ISA behavioral changes. Text-only inference works correctly without the kernel on both SDK versions (uses decomposed attention).
+- **seq_len=16384**: CTE compilation runs out of host memory on trn2.3xlarge (128 GB RAM). Max tested: 8192.
+- **Position IDs**: Padding positions must have `position_id=0`. Using sequential IDs for padding tokens causes garbage CTE output (see Usage example above).
 
 ## Maintainer
 
 Community contribution
 
-**Last Updated:** 2026-04-05
+**Last Updated:** 2026-04-23
