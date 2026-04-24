@@ -19,11 +19,11 @@ PATCH_FILE="$(cd "$(dirname "$0")" && pwd)/vllm-neuron-patch.patch"
 echo ""
 echo "[1/2] Installing vllm-neuron (release-0.5.0) with the contrib registration patch..."
 
-if [ ! -d /tmp/vllm-neuron ]; then
-    git clone --branch release-0.5.0 https://github.com/vllm-project/vllm-neuron.git /tmp/vllm-neuron
+if [ ! -d $HOME/vllm-neuron ]; then
+    git clone --branch release-0.5.0 https://github.com/vllm-project/vllm-neuron.git $HOME/vllm-neuron
 fi
 
-cd /tmp/vllm-neuron
+cd $HOME/vllm-neuron
 
 # Apply patch (idempotent via `git apply --check` first).
 if git apply --check "$PATCH_FILE" 2>/dev/null; then
