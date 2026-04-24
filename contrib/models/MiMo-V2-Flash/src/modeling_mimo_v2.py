@@ -289,21 +289,33 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         self.layer_idx = layer_idx
         self.is_sliding_window = is_sliding_window
 
-        # Select parameters based on attention type
+        # Select parameters based on attention type.
+        #
+        # IMPORTANT: we intentionally force attn_v_head_dim == attn_head_dim.
+        # The HF model has asymmetric head_dim (Q/K=192, V=128), but NxDI's
+        # KV cache manager requires K and V to share the same last-dim size.
+        # Runtime-padding V (was the previous approach) introduced subtle
+        # numerical drift under TP=64 + long decode that compounded into
+        # output collapse. Instead, the preprocess script pre-pads V's output
+        # dim with zeros so V is physically [num_kv_heads, head_dim, hidden];
+        # the forward() slices the attention output back to the real
+        # v_head_dim before o_proj. See preprocess_mimo_v2_flash_fp8.py.
         if is_sliding_window:
             self.attn_head_dim = config.swa_head_dim
-            self.attn_v_head_dim = config.swa_v_head_dim
             self.attn_num_heads = config.swa_num_attention_heads
             self.attn_num_kv_heads = config.swa_num_key_value_heads
+            self.attn_real_v_head_dim = config.swa_v_head_dim
             rope_theta = getattr(config, 'swa_rope_theta', 10000.0)
             self.sliding_window_size = config.sliding_window
         else:
             self.attn_head_dim = config.head_dim
-            self.attn_v_head_dim = config.v_head_dim
             self.attn_num_heads = config.num_attention_heads
             self.attn_num_kv_heads = config.num_key_value_heads
+            self.attn_real_v_head_dim = config.v_head_dim
             rope_theta = config.rope_theta
             self.sliding_window_size = None
+        # Padded dim used for projection + KV cache: same as Q/K head_dim.
+        self.attn_v_head_dim = self.attn_head_dim
 
         # Calculate partial rotary dimensions
         self.partial_rotary_factor = config.partial_rotary_factor
@@ -398,11 +410,14 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             k_num_heads = self.attn_num_kv_heads
             v_num_heads = self.attn_num_kv_heads
 
-        # Q/K use head_dim, V uses v_head_dim
+        # Q/K use head_dim. V is pre-padded to head_dim in the preprocess
+        # script so K and V share one KV-cache shape; the attention output is
+        # sliced back to the real v_head_dim before o_proj, so o_proj still
+        # takes real_v_head_dim per head (matches the HF o_proj weight shape).
         q_hidden_size = self.attn_num_heads * self.attn_head_dim
         k_hidden_size = k_num_heads * self.attn_head_dim
         v_hidden_size = v_num_heads * self.attn_v_head_dim
-        o_hidden_size = self.attn_num_heads * self.attn_v_head_dim
+        o_hidden_size = self.attn_num_heads * self.attn_real_v_head_dim
 
         if parallel_state.model_parallel_is_initialized():
             tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -634,18 +649,14 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             key_states_for_cache = key_states
             value_states_for_cache = value_states
 
-        # WORKAROUND 1: Pad V from v_head_dim (128) to head_dim (192) for KV cache compatibility
-        if self.attn_v_head_dim < self.attn_head_dim:
-            pad_size = self.attn_head_dim - self.attn_v_head_dim
-            value_states_for_cache = F.pad(value_states_for_cache, (0, pad_size), value=0.0)
-
-        # WORKAROUND 2: Pad KV heads if layer has fewer than cache expects
-        # Only needed when NOT using CONVERT_TO_MHA (standard GQA mode)
-        if not self.use_gqa_convert_to_mha and self.local_num_kv_heads < self.local_cache_kv_heads:
-            # Pad KV heads by repeating
-            repeat_factor = self.local_cache_kv_heads // self.local_num_kv_heads
-            key_states_for_cache = key_states_for_cache.repeat(1, repeat_factor, 1, 1)
-            value_states_for_cache = value_states_for_cache.repeat(1, repeat_factor, 1, 1)
+        # NOTE: No runtime V pad or KV head pad here. Previously this block
+        # padded V's head_dim from 128 to 192 at runtime so K and V could share
+        # the same KV cache shape, and separately repeated KV heads for layers
+        # that have fewer kv heads than the cache expects. Both are now
+        # handled in the preprocess script (V is physically padded to 192
+        # with zero rows, and CONVERT_TO_MHA at TP=64 makes local_num_kv_heads
+        # == local_cache_kv_heads, so head-pad is a no-op). Runtime pad/slice
+        # on KV cache storage was the source of the long-decode output drift.
 
         # Repeat KV heads for GQA (only needed without CONVERT_TO_MHA)
         # With CONVERT_TO_MHA, K/V already have num_attention_heads
@@ -657,21 +668,9 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         if is_token_gen:
             # Token generation: use decomposed attention with prior (cached) and active (current) KV
             # past_key_value[0] = cached K, shape [bsz, cache_kv_heads, kv_seq_len, head_dim]
-            # past_key_value[1] = cached V, shape [bsz, cache_kv_heads, kv_seq_len, head_dim] (padded)
+            # past_key_value[1] = cached V, shape [bsz, cache_kv_heads, kv_seq_len, head_dim]
             K_prior = past_key_value[0]
             V_prior = past_key_value[1]
-
-            # WORKAROUND 1: Slice KV heads if cache has more than layer needs
-            # Only needed when NOT using CONVERT_TO_MHA (standard GQA mode)
-            # With CONVERT_TO_MHA, cache and layer have same num_kv_heads
-            if not self.use_gqa_convert_to_mha and self.local_num_kv_heads < self.local_cache_kv_heads:
-                # Cache has repeated heads, just take the first local_num_kv_heads
-                K_prior = K_prior[:, :self.local_num_kv_heads, :, :]
-                V_prior = V_prior[:, :self.local_num_kv_heads, :, :]
-
-            # WORKAROUND 2: Slice V_prior back to v_head_dim (128) from head_dim (192)
-            if self.attn_v_head_dim < self.attn_head_dim:
-                V_prior = V_prior[..., :self.attn_v_head_dim]
 
             # Repeat cached KV for GQA (only needed without CONVERT_TO_MHA)
             # With CONVERT_TO_MHA, cached K/V already have num_attention_heads
@@ -796,9 +795,17 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             # Apply attention to values
             attn_output = torch.matmul(attn_weights, value_states)
 
+        # Slice off the padded v_head_dim tail. V was physically padded from
+        # real_v_head_dim (128) to head_dim (192) in the preprocess script so
+        # it can share NxDI's KV cache shape with K; the padded dims hold
+        # zero weights, so the attention output in those dims is always zero
+        # and the slice is numerically exact.
+        if self.attn_real_v_head_dim < self.attn_v_head_dim:
+            attn_output = attn_output[..., :self.attn_real_v_head_dim]
+
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.local_num_heads * self.attn_v_head_dim)
+        attn_output = attn_output.reshape(bsz, q_len, self.local_num_heads * self.attn_real_v_head_dim)
 
         # Context Parallelism: gather output across CP ranks BEFORE o_proj.
         # With SP enabled, o_proj scatters along seq dim. The input must have full S
@@ -1123,18 +1130,21 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
                 )
 
             if v_proj_key in neuron_state_dict:
+                # V is pre-padded to head_dim in the preprocess script so K/V
+                # can share KV cache shape; use head_dim (not v_head_dim) here.
                 neuron_state_dict[v_proj_key] = _replicate_kv_weights_for_convert_to_mha(
                     neuron_state_dict[v_proj_key],
                     src_num_kv_heads,
                     num_attention_heads,
-                    v_head_dim,
+                    head_dim,
                 )
 
             # FP8 path: replicate per-row scales ([src_heads*head_dim, 1]) in
             # lockstep with the weights. Without this the shard_weights step
             # rejects the scale shape mismatch (e.g. [12,1] vs expected [192,1]).
-            # BF16 has no .scale key, so this loop is a no-op there.
-            for proj, hd in (("k_proj", head_dim), ("v_proj", v_head_dim)):
+            # BF16 has no .scale key, so this loop is a no-op there. Both
+            # k_proj and v_proj scales use head_dim since V is pre-padded.
+            for proj, hd in (("k_proj", head_dim), ("v_proj", head_dim)):
                 scale_key = f"layers.{layer_idx}.self_attn.{proj}.scale"
                 if scale_key in neuron_state_dict:
                     neuron_state_dict[scale_key] = _replicate_kv_weights_for_convert_to_mha(
