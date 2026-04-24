@@ -39,6 +39,14 @@ PROMPT = os.environ.get(
 )
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "20"))
 
+# Keep the per-compile BASE_COMPILE_WORK_DIR in sync with
+# smoke_compile_mimo_v2_flash.py so load() under the same COMPILED_PATH
+# doesn't collide with a concurrent compile or reuse a stale workdir.
+os.environ.setdefault(
+    "BASE_COMPILE_WORK_DIR",
+    os.path.join("/tmp/nxd_model", os.path.basename(COMPILED_PATH.rstrip("/"))),
+)
+
 
 def main():
     from transformers import AutoConfig, AutoTokenizer, GenerationConfig

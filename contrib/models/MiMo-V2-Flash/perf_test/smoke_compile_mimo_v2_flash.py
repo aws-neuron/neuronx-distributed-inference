@@ -45,6 +45,17 @@ STAGE = os.environ.get("STAGE", "all").lower()
 
 os.makedirs(COMPILED_PATH, exist_ok=True)
 
+# NxDI's model builder uses a per-process temp workdir for HLO/NEFF staging
+# (BASE_COMPILE_WORK_DIR, default "/tmp/nxd_model/"). If two compiles run in
+# parallel with the same default, they silently overwrite each other's
+# .hlo_module.pb files and one or both compilations crash with
+# "neuronx-cc returned non-zero exit status 70". Pin the workdir to a
+# unique per-COMPILED_PATH subdir to stay safe under any parallel invocation.
+os.environ.setdefault(
+    "BASE_COMPILE_WORK_DIR",
+    os.path.join("/tmp/nxd_model", os.path.basename(COMPILED_PATH.rstrip("/"))),
+)
+
 
 def main():
     from neuronx_distributed_inference.models.config import MoENeuronConfig
