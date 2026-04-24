@@ -1555,8 +1555,28 @@ class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
 
         def _patched_init(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
+            # CRITICAL: dtype + init value both matter for XLA tracing.
+            #
+            # 1) dtype=torch.bfloat16: the NxDI checkpoint loader casts router
+            #    bias from FP32 -> BF16 ("Found torch.float32 weights in
+            #    checkpoint ... Will convert to torch.bfloat16"). If the traced
+            #    NEFF expects FP32 but the checkpoint supplies BF16, the
+            #    LayoutTransformation silently drops the weight and keeps the
+            #    trace-time init values — so the bias at runtime is whatever
+            #    we init here, not the checkpoint values.
+            #
+            # 2) init=arange, NOT zeros: if every entry is identical (all
+            #    zeros), the `+ bias` op does not change the relative ordering
+            #    of topk, so XLA's constant-folding passes can prove the add
+            #    is a no-op and eliminate it entirely — dropping the bias
+            #    parameter from the HLO. At that point checkpoint loading has
+            #    nothing to bind to and the real bias is silently discarded.
+            #    Using arange guarantees distinct per-expert values, forcing
+            #    the compiler to keep the add as a runtime op with a live
+            #    parameter. Source: Jim Burtoft's MiniMax-M2 fix notes
+            #    (jimburtoft/neuronx-distributed-inference@49f8e164).
             self.e_score_correction_bias = nn.Parameter(
-                torch.zeros(self.num_experts, dtype=torch.float32),
+                torch.arange(self.num_experts, dtype=torch.bfloat16),
                 requires_grad=False,
             )
 
@@ -1564,9 +1584,13 @@ class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
             router_logits = self.get_router_logits(hidden_states)
             expert_affinities = self.apply_activation_fn(router_logits)
 
-            selection_scores = expert_affinities.to(torch.float32) + \
-                self.e_score_correction_bias
-            _, expert_index = torch.topk(selection_scores, self.top_k, dim=-1)
+            # MiMo (and MiniMax-M2) uses topk_method='noaux_tc': the bias is
+            # added ONLY for top-k selection, but the unbiased sigmoid scores
+            # remain as the expert-affinity weights passed to the experts.
+            scores_for_choice = (
+                expert_affinities.float() + self.e_score_correction_bias.unsqueeze(0)
+            )
+            _, expert_index = torch.topk(scores_for_choice, self.top_k, dim=-1)
 
             expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
             expert_index = expert_index.detach().to(dtype=torch.long)
