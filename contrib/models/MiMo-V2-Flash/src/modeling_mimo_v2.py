@@ -1352,6 +1352,27 @@ class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
 
     _model_cls = NeuronMiMoV2Model
 
+    def __init__(self, *args, **kwargs):
+        # Install FP8 monkey-patches BEFORE super().__init__ so the patched
+        # RouterTopK.__init__ and quantization layer classes are in effect
+        # when NxDI builds the decoder (and instantiates routers). Harnesses
+        # that drive us via model.compile()/model.load() (e.g. vllm-neuron)
+        # call those methods AFTER construction, so patching from inside
+        # compile()/load() is too late — RouterTopK instances would already
+        # lack our e_score_correction_bias parameter, silently routing tokens
+        # to wrong experts and producing gibberish output.
+        #
+        # _install_fp8_patches() reads self.neuron_config, which needs to
+        # exist; grab it from the args or the config arg the same way the
+        # base class does.
+        ncfg = kwargs.get("config") or (args[1] if len(args) > 1 else None)
+        if ncfg is not None and getattr(getattr(ncfg, "neuron_config", None), "quantized", False):
+            self._apply_ep_scale_fix()
+            self._apply_blockwise_scale_stride_fix()
+            self._apply_2d_per_channel_fix()
+            self._apply_router_noaux_tc_fix()
+        super().__init__(*args, **kwargs)
+
     @staticmethod
     def load_hf_model(model_path: str, **kwargs):
         """Load HuggingFace model.
