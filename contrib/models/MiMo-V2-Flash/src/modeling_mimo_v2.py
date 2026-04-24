@@ -339,11 +339,11 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
 
         # Scaling factor
         self.scaling = self.attn_head_dim ** -0.5
-        # NOTE: The config may have 'attention_value_scale' (e.g., 0.707), but the HF model
-        # (modeling_mimo_v2_flash.py) does NOT use this value. The HF model only uses
-        # head_dim ** -0.5 for attention scaling, which is already applied via self.scaling.
-        # We must NOT apply attention_value_scale here, as it would cause divergence from HF.
-        self.value_scale = 1.0
+        # HF MiMoV2Attention (modeling_mimo_v2_flash.py) multiplies value_states
+        # by config.attention_value_scale (0.707 for Flash) right after the V
+        # projection, before attention softmax*V. Matching that here — applied
+        # to value_states in forward() rather than to attn_output.
+        self.value_scale = float(getattr(config, "attention_value_scale", 1.0))
 
         # Store cache KV heads for cache compatibility
         # With CONVERT_TO_MHA, all layers have num_attention_heads KV heads
@@ -561,6 +561,13 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+
+        # HF MiMoV2Attention scales V by attention_value_scale (0.707 for Flash)
+        # right after v_proj, before the attention softmax*V. Earlier revisions
+        # of this file applied it post-attention or not at all; both produce
+        # gibberish for prompts longer than ~20 tokens.
+        if self.value_scale != 1.0:
+            value_states = value_states * self.value_scale
 
         # Reshape for multi-head attention: [bsz, num_heads, seq_len, head_dim]
         query_states = query_states.view(bsz, q_len, self.local_num_heads, self.attn_head_dim).transpose(1, 2)
@@ -788,10 +795,6 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
 
             # Apply attention to values
             attn_output = torch.matmul(attn_weights, value_states)
-
-        # Apply value scale if specified
-        if self.value_scale != 1.0:
-            attn_output = attn_output * self.value_scale
 
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2).contiguous()
