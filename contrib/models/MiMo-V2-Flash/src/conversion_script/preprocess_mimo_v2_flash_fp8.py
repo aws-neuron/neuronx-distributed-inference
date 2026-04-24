@@ -195,8 +195,8 @@ def process_layer(
             out[f"{out_prefix}{name}.weight"] = t.detach().clone()
 
     # --- Attention: q/k/v/o are stored separately in Flash ---
-    # q/k: rescale to Neuron FP8 per-row.
-    for proj in ("q_proj", "k_proj"):
+    # q/k/v: rescale to Neuron FP8 per-row.
+    for proj in ("q_proj", "k_proj", "v_proj"):
         w = lazy.get(f"{prefix}self_attn.{proj}.weight")
         if w is None:
             continue
@@ -205,56 +205,6 @@ def process_layer(
         out[f"{out_prefix}self_attn.{proj}.weight"] = w2
         if s2 is not None:
             out[f"{out_prefix}self_attn.{proj}.scale"] = s2
-
-    # v_proj: MiMo-V2 has asymmetric head_dim (Q/K=192, V=128). NxDI's KV cache
-    # manager requires K and V to share the same head_dim; rather than pad V at
-    # runtime (every decode step) which is error-prone, we pre-pad V's output
-    # dimension to match head_dim here: each V head goes from 128 rows to 192
-    # rows, with the extra 64 rows zero. Downstream Q @ V yields zeros in the
-    # padded dims, and the forward() slices the attention output back to
-    # v_head_dim=128 before o_proj. This lets the modeling code drop the
-    # `if v_head_dim < head_dim` runtime pad/slice logic entirely.
-    v_w_hf = lazy.get(f"{prefix}self_attn.v_proj.weight")
-    v_s_hf = lazy.get(f"{prefix}self_attn.v_proj.weight_scale_inv")
-    if v_w_hf is not None:
-        # First run the normal FP8-blockwise -> Neuron-per-row rescale on the
-        # native [num_kv_heads*128, hidden] weight.
-        v_w, v_s = _maybe_fp8_to_neuron_per_row(v_w_hf, v_s_hf)
-        # Now pad output dim from (num_kv_heads*128) to (num_kv_heads*192) by
-        # inserting 64 zero rows after every 128 real rows (preserve per-head
-        # head_dim layout).
-        num_kv_heads_swa = config.get("swa_num_key_value_heads", config["num_key_value_heads"])
-        num_kv_heads_full = config["num_key_value_heads"]
-        num_kv_heads = num_kv_heads_swa if is_swa else num_kv_heads_full
-        v_head_dim = config.get("v_head_dim", 128)
-        head_dim = config.get("head_dim", 192)
-        assert v_w.shape[0] == num_kv_heads * v_head_dim, (
-            f"v_proj out-dim {v_w.shape[0]} != num_kv_heads({num_kv_heads}) * "
-            f"v_head_dim({v_head_dim}) = {num_kv_heads * v_head_dim}"
-        )
-        pad_per_head = head_dim - v_head_dim
-        hidden = v_w.shape[1]
-        # Reshape to [num_kv_heads, v_head_dim, hidden], pad to
-        # [num_kv_heads, head_dim, hidden], flatten back.
-        v_w_per_head = v_w.view(num_kv_heads, v_head_dim, hidden)
-        v_w_padded = torch.zeros(
-            num_kv_heads, head_dim, hidden, dtype=v_w_per_head.dtype,
-        )
-        v_w_padded[:, :v_head_dim, :] = v_w_per_head
-        v_w_padded = v_w_padded.reshape(num_kv_heads * head_dim, hidden).contiguous()
-        out[f"{out_prefix}self_attn.v_proj.weight"] = v_w_padded
-        if v_s is not None:
-            # scale is per-row [out_rows, 1]; same pad-per-head rule. The
-            # padded rows have zero weight, so their scale value is irrelevant
-            # — use the min-clamp value (1e-10) to stay numerically neutral.
-            assert v_s.shape == (num_kv_heads * v_head_dim, 1), v_s.shape
-            v_s_per_head = v_s.view(num_kv_heads, v_head_dim, 1)
-            v_s_padded = torch.full(
-                (num_kv_heads, head_dim, 1), 1e-10, dtype=v_s.dtype,
-            )
-            v_s_padded[:, :v_head_dim, :] = v_s_per_head
-            v_s_padded = v_s_padded.reshape(num_kv_heads * head_dim, 1).contiguous()
-            out[f"{out_prefix}self_attn.v_proj.scale"] = v_s_padded
 
     # o_proj is listed in HF quantization_config.ignored_layers and ships as
     # BF16; on Neuron it binds to a plain RowParallelLinear (see
