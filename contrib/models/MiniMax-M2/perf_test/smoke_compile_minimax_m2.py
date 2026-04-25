@@ -135,18 +135,20 @@ def main():
         quantization_block_size=[128, 128],
         modules_to_not_convert=[
             # M2.7 HF quantization_config.modules_to_not_convert lists
-            # {gate, e_score_correction_bias, lm_head}. The NxDI-side
-            # equivalents are:
-            #   gate -> router (MoE router linear_router)
-            #   e_score_correction_bias -> kept on RouterTopKWithBias as nn.Parameter
-            #   lm_head -> lm_head
-            # plus the usual embed_tokens / norm kept as BF16.
-            # NOTE: unlike Flash, M2's o_proj IS FP8 (not in ignored_layers),
-            # so we do NOT add it here.
+            # {gate, e_score_correction_bias, lm_head}. Plus the usual
+            # embed_tokens / norm kept as BF16 on the NxDI side.
             "embed_tokens",
             "lm_head",
             "norm",
             "router",
+            # o_proj on the NxDI side binds to a plain RowParallelLinear
+            # (not the auto-swapped QuantizedRowParallel), so we dequantize
+            # it to BF16 during preprocess AND list it here so NxDI does
+            # not try to swap it to the quantized class at convert() time.
+            # Without this the loader drops o_proj.weight and .scale as
+            # "redundant" during checkpoint sharding and attention output
+            # becomes garbage.
+            "o_proj",
         ],
     )
 

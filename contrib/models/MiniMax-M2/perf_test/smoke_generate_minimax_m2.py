@@ -108,6 +108,7 @@ def main():
             "lm_head",
             "norm",
             "router",
+            "o_proj",  # binds to plain RowParallelLinear; preprocess dequants to BF16.
         ],
     )
 

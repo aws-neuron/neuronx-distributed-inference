@@ -201,7 +201,8 @@ def process_layer(
             out[f"{out_prefix}{name}.weight"] = t.detach().clone()
 
     # --- Attention: q/k/v/o, all FP8 -> Neuron FP8 per-row ---
-    for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+    # q/k/v -> Neuron FP8 per-row (go through QuantizedColumnParallel).
+    for proj in ("q_proj", "k_proj", "v_proj"):
         w = lazy.get(f"{prefix}self_attn.{proj}.weight")
         if w is None:
             continue
@@ -210,6 +211,37 @@ def process_layer(
         out[f"{out_prefix}self_attn.{proj}.weight"] = w2
         if s2 is not None:
             out[f"{out_prefix}self_attn.{proj}.scale"] = s2
+
+    # o_proj -> BF16 (dequantized). On the Neuron side the modeling code
+    # binds self_attn.o_proj to a plain RowParallelLinear, NOT the auto-
+    # swapped QuantizedRowParallel — so the NxDI loader does not expect
+    # .scale or FP8 weight bytes for o_proj and would drop them as
+    # "redundant" during checkpoint sharding, leaving the projection
+    # zero-initialised and producing garbage outputs. Dequantizing here
+    # and emitting only a BF16 .weight matches what the loader expects.
+    # The bench / smoke config must also add "o_proj" to
+    # modules_to_not_convert to keep NxDI from trying to re-swap this
+    # layer to QuantizedRowParallel during convert().
+    o_w = lazy.get(f"{prefix}self_attn.o_proj.weight")
+    o_s = lazy.get(f"{prefix}self_attn.o_proj.weight_scale_inv")
+    if o_w is not None:
+        if o_w.dtype == torch.float8_e4m3fn:
+            assert o_s is not None, "FP8 o_proj requires weight_scale_inv"
+            out_features, in_features = o_w.shape
+            scale_h, scale_w = o_s.shape
+            block_h = (out_features + scale_h - 1) // scale_h
+            block_w = (in_features + scale_w - 1) // scale_w
+            wf = o_w.float()
+            tmp = torch.zeros(out_features, in_features, dtype=torch.float32)
+            for i in range(scale_h):
+                for j in range(scale_w):
+                    h0, h1 = i * block_h, min((i + 1) * block_h, out_features)
+                    w0, w1 = j * block_w, min((j + 1) * block_w, in_features)
+                    tmp[h0:h1, w0:w1] = wf[h0:h1, w0:w1] * o_s[i, j].item()
+            o_bf16 = tmp.to(torch.bfloat16)
+        else:
+            o_bf16 = o_w.to(torch.bfloat16)
+        out[f"{out_prefix}self_attn.o_proj.weight"] = o_bf16.detach().clone()
 
     # --- QK norm (BF16) ---
     for name in ("q_norm", "k_norm"):

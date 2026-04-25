@@ -91,7 +91,8 @@ If you see fluent sentence output on a 50+ token generation, the FP8 path is wor
 
 The HuggingFace checkpoint ships as block-wise OCP FP8 (E4M3, ±448 range), which is not directly compatible with Neuron FP8 (IEEE-754 E4M3, ±240 range). The preprocess script in `src/conversion_script/preprocess_minimax_m2_fp8.py` rescales it:
 
-- **Attention q/k/v/o**: OCP FP8 blockwise → Neuron FP8 per-row. Per-row scales are used because at TP=64 each rank's output dim is <128, which would collapse a blockwise scale to a singleton. A `_apply_2d_per_channel_fix` monkey-patch installed at compile time routes the 2D weights through PER_CHANNEL_SYMMETRIC to match.
+- **Attention q/k/v**: OCP FP8 blockwise → Neuron FP8 per-row. Per-row scales are used because at TP=64 each rank's output dim is <128, which would collapse a blockwise scale to a singleton. A `_apply_2d_per_channel_fix` monkey-patch installed at compile time routes the 2D weights through PER_CHANNEL_SYMMETRIC to match.
+- **Attention o_proj**: OCP FP8 blockwise → **BF16 (dequantized)**. The NxDI modeling code binds `self_attn.o_proj` to a plain `RowParallelLinear` rather than the auto-swapped `QuantizedRowParallel`, so the loader does not expect `.scale` or FP8 bytes for o_proj and would drop them as "redundant". Preprocess dequantizes to BF16, and the smoke/bench configs list `o_proj` in `modules_to_not_convert` to keep NxDI from re-swapping it at `convert()` time.
 - **MoE experts**: w1/w3 fused into packed `gate_up_proj [num_experts, hidden, 2*IM]`, w2 stacked into `down_proj [num_experts, IM, hidden]`. Scales stay blockwise.
 - **Router gate + `e_score_correction_bias`**: renamed into the NxDI router namespace (`block_sparse_moe.router.linear_router.weight` and `...router.e_score_correction_bias`).
 - **Norms + embed_tokens + lm_head**: passed through BF16.
@@ -171,7 +172,7 @@ python3 -m vllm.entrypoints.openai.api_server \
             "quantization_type": "blockwise_symmetric",
             "quantization_block_axis": [1, 2],
             "quantization_block_size": [128, 128],
-            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router"],
+            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj"],
             "blockwise_matmul_config": {"use_shard_on_block_dynamic_while": true, "block_sharding_strategy": "PING_PONG"},
             "moe_tp_degree": 1,
             "moe_ep_degree": 64,

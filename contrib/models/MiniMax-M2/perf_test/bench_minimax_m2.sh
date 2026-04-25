@@ -36,10 +36,15 @@ mkdir -p "$RESULTS_DIR"
 # save_sharded_checkpoint=true persists per-rank sharded weights to
 # <compiled-path>/weights/tp{N}_sharded_checkpoint.safetensors during
 # compile; load() then reads those directly instead of re-sharding.
-# modules_to_not_convert is tight: HF's quantization_config only skips
+# modules_to_not_convert: HF's quantization_config only skips
 # {gate, e_score_correction_bias, lm_head}, and NxDI-side we additionally
-# keep embed_tokens / norm in BF16. Unlike MiMo-V2-Flash, M2's o_proj is
-# part of the native FP8 quantization — don't add it here.
+# keep embed_tokens / norm in BF16. We also list o_proj here — M2's
+# modeling code binds self_attn.o_proj to a plain RowParallelLinear
+# (not auto-swapped to QuantizedRowParallel), so preprocess dequantizes
+# the FP8 o_proj weights to BF16 and this list prevents NxDI from
+# trying to re-swap it at convert() time. Without this, the loader
+# silently drops the o_proj weights as "redundant keys" and attention
+# output is garbage.
 COMMON_MINIMAX_CONFIG='"tp_degree": 64,
             "logical_nc_config": 2,
             "fused_qkv": false,
@@ -55,7 +60,7 @@ COMMON_MINIMAX_CONFIG='"tp_degree": 64,
             "quantization_type": "blockwise_symmetric",
             "quantization_block_axis": [1, 2],
             "quantization_block_size": [128, 128],
-            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router"],
+            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj"],
             "blockwise_matmul_config": {"use_shard_on_block_dynamic_while": true, "block_sharding_strategy": "PING_PONG"}'
 
 # Helper: wait for vLLM server to be ready. First-time compilation of a
