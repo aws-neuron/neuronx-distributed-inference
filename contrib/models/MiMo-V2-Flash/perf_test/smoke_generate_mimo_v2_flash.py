@@ -21,7 +21,7 @@ MODEL_PATH = os.environ.get(
 )
 COMPILED_PATH = os.environ.get(
     "MIMO_V2_FLASH_COMPILED_PATH",
-    "/opt/dlami/nvme/compiled/mimo_v2_flash_tp64_ep1_fp8/",
+    "/opt/dlami/nvme/compiled/mimo_v2_flash_tp64_moetp1_ep64_fp8/",
 )
 
 # Must match smoke_compile_mimo_v2_flash.py exactly, else load() sees a
@@ -30,8 +30,8 @@ TP_DEGREE = int(os.environ.get("TP_DEGREE", "64"))
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "1024"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1"))
 CTX_BATCH_SIZE = int(os.environ.get("CTX_BATCH_SIZE", "1"))
-MOE_TP = int(os.environ.get("MOE_TP", "64"))
-MOE_EP = int(os.environ.get("MOE_EP", "1"))
+MOE_TP = int(os.environ.get("MOE_TP", "1"))
+MOE_EP = int(os.environ.get("MOE_EP", "64"))
 
 PROMPT = os.environ.get(
     "MIMO_V2_FLASH_PROMPT",

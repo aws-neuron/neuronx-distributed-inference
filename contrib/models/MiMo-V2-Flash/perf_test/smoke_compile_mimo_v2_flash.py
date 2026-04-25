@@ -31,15 +31,23 @@ MODEL_PATH = os.environ.get(
 )
 COMPILED_PATH = os.environ.get(
     "MIMO_V2_FLASH_COMPILED_PATH",
-    "/opt/dlami/nvme/compiled/mimo_v2_flash_tp64_ep1_fp8/",
+    "/opt/dlami/nvme/compiled/mimo_v2_flash_tp64_moetp1_ep64_fp8/",
 )
 
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "64"))
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "1024"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1"))
 CTX_BATCH_SIZE = int(os.environ.get("CTX_BATCH_SIZE", "1"))
-MOE_TP = int(os.environ.get("MOE_TP", "64"))
-MOE_EP = int(os.environ.get("MOE_EP", "1"))
+# Default to moe_tp=1 / moe_ep=64. Under FP8 + moe_tp=64 (our old default)
+# each rank's MoE expert intermediate slice is 32 rows (<128, the scale
+# block size), which collapses the per-rank scale to a singleton in
+# NxDI's `_setup_for_scale` — losing per-channel FP8 scale granularity
+# and producing a BF16-accumulator drift that compounds into output
+# collapse after ~30 decode tokens. moe_tp=1/moe_ep=64 keeps every expert
+# on a single rank (4 full experts per rank), so each expert's scale
+# survives intact. Override via MOE_TP / MOE_EP env vars for other recipes.
+MOE_TP = int(os.environ.get("MOE_TP", "1"))
+MOE_EP = int(os.environ.get("MOE_EP", "64"))
 
 STAGE = os.environ.get("STAGE", "all").lower()
 
