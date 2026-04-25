@@ -38,7 +38,65 @@ Key features:
 ## Prerequisites
 
 - **Instance**: trn2.48xlarge (32 NeuronCores, logical_nc_config=2 → 64 logical cores)
-- **Weights**: Neuron FP8 (produced by `conversion_script/preprocess_mimo_v2_flash_fp8.py`) for the recommended FP8 path, or BF16 (produced by `conversion_script/preprocess_mimo_v2_fp8.py`) for a BF16 fallback.
+- **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9)
+- **Venvs**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` (for preprocess + NxDI direct smoke), `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (for vLLM serving). Both ship with the DLAMI.
+- **Disk**: ~700 GB free under `/opt/dlami/nvme` (the HF FP8 checkpoint is ~290 GB, the Neuron-FP8 preprocessed output is ~310 GB, and `save_sharded_checkpoint=true` writes another ~300 GB per compiled config).
+
+## Quick Start (FP8 on Trn2)
+
+End-to-end recipe to go from a fresh trn2.48xlarge to a working vLLM OpenAI server serving Flash FP8. First-time compile takes ~45-60 minutes; subsequent runs hit the neuronx-cc cache and start in a few minutes.
+
+```bash
+# 1. Clone this repo on the Trn2 instance
+cd $HOME
+git clone <your-fork>/neuronx-distributed-inference.git
+cd neuronx-distributed-inference
+git checkout contrib/MiMo-V2-Flash          # the branch this README lives on
+
+# 2. Download the HuggingFace FP8 checkpoint (~290 GB). Any HF-compatible
+#    downloader works; huggingface-cli example:
+huggingface-cli download XiaomiMiMo/MiMo-V2-Flash \
+    --local-dir /opt/dlami/nvme/models/MiMo-V2-Flash
+
+# 3. Preprocess HF FP8 -> Neuron FP8 (~20 min, ~24 GB peak RAM)
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+python contrib/models/MiMo-V2-Flash/src/conversion_script/preprocess_mimo_v2_flash_fp8.py \
+    --hf_model_path /opt/dlami/nvme/models/MiMo-V2-Flash \
+    --save_path     /opt/dlami/nvme/models/MiMo-V2-Flash-Neuron-FP8 \
+    --tp_degree 64
+
+# 4. (Optional) sanity-check the Neuron-FP8 checkpoint without vLLM
+#    ~45 min first compile; subsequent runs ~30s to load the pre-sharded NEFF.
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
+python contrib/models/MiMo-V2-Flash/perf_test/smoke_compile_mimo_v2_flash.py  # compile
+python contrib/models/MiMo-V2-Flash/perf_test/smoke_generate_mimo_v2_flash.py # 20-token generate
+
+# 5. Install vllm-neuron with the contrib registration patch
+bash contrib/models/MiMo-V2-Flash/perf_test/0_setup.sh
+
+# 6. Start vLLM serving Flash FP8 (first compile ~60 min; subsequent ~3 min)
+bash contrib/models/MiMo-V2-Flash/perf_test/bench_mimo_v2_flash.sh
+```
+
+The bench script runs two configurations (BS=32 and BS=128, both
+`moe_tp_degree=1 / moe_ep_degree=64`) and logs results under
+`/tmp/bench_results/mimo_v2_flash/`.
+
+For a quick `curl` sanity check while the server is up:
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model": "/opt/dlami/nvme/models/MiMo-V2-Flash-Neuron-FP8",
+         "messages": [{"role": "user", "content": "Hello! Introduce yourself in one sentence."}],
+         "max_tokens": 64, "temperature": 0.0}' | python3 -m json.tool
+```
+
+If you get fluent sentence-ending output on a 30+ token generation, the
+FP8 path is working correctly. If you see repetition collapse
+("helpful helpful helpful..."), double-check that `moe_tp_degree=1`,
+`moe_ep_degree=64`, `batch_size>=32`, and that you are loading the
+preprocessed Neuron-FP8 checkpoint (not the raw HF FP8 directory).
 
 ## Checkpoint Preparation
 
