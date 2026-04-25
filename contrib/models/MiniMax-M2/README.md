@@ -1,12 +1,15 @@
-# Contrib Model: MiniMax M2
+# Contrib Model: MiniMax-M2 / M2.7
 
-NeuronX Distributed Inference implementation of [MiniMax/MiniMax-M2](https://huggingface.co/MiniMax/MiniMax-M2).
+NeuronX Distributed Inference implementation of the MiniMax-M2 family on Trn2.
+
+- **Reference checkpoint used for validation:** [MiniMaxAI/MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7)
+- Works with any `MiniMaxM2ForCausalLM` variant (M2 / M2.7 / any minor version) — the config schema is stable across M2 / M2.7.
 
 ## Model Information
 
-- **HuggingFace ID:** `MiniMax/MiniMax-M2`
-- **Model Type:** Decoder-only MoE transformer
-- **Architecture:** Custom MoE with sigmoid routing and e_score_correction_bias
+- **HuggingFace ID:** `MiniMaxAI/MiniMax-M2.7` (and compatible M2 siblings)
+- **Model Type:** Decoder-only MoE transformer with uniform GQA attention
+- **Architecture:** Custom MoE with sigmoid routing, `e_score_correction_bias` (noaux_tc), per-layer QK RMSNorm
 - **License:** Check HuggingFace model card
 
 ## Architecture Details
@@ -16,114 +19,138 @@ NeuronX Distributed Inference implementation of [MiniMax/MiniMax-M2](https://hug
 | Hidden Size | 3072 |
 | Layers | 62 |
 | Attention Heads | 48 Q / 8 KV (GQA) |
-| Head Dim | 128 |
+| Head Dim | 128 (Q=K=V; uniform, no asymmetry) |
 | Experts | 256 (top-8 routing) |
 | Expert Intermediate | 1536 |
-| MLP Intermediate | 8192 |
 | Vocab Size | 200,064 |
-| RoPE | Partial (50% of head_dim), theta=5M |
-| Max Position | 196,608 |
+| RoPE | Partial (rotary_dim=64 of head_dim=128), theta=5M |
+| Max Position | 204,800 |
 
 Key features:
-- **QK Norm**: Applied before reshape on full projection output
-- **Partial RoPE**: Only first 64 of 128 dims use rotary encoding
-- **Sigmoid Router**: With learnable e_score_correction_bias for expert selection
-- **fused_qkv**: Supported for efficient Q/K/V projection
+- **Uniform GQA** (no hybrid attention / sliding window / sink bias — M2 is structurally simpler than Flash).
+- **QK RMSNorm**: Per-layer RMSNorm applied on Q and K after projection, before RoPE (uses Neuron-native `RmsNorm.apply` for CE/TKG consistency).
+- **Sigmoid router + noaux_tc**: `e_score_correction_bias` added to the sigmoid scores before top-k selection; unbiased scores become the expert-affinity weights.
+- **FP8-native**: Routed experts ship in blockwise FP8 (128×128 blocks). Per-row FP8 for attention Q/K/V/O after preprocess, which converts the HF OCP FP8 to Neuron FP8.
 
 ## Prerequisites
 
-- **Instance**: trn2.48xlarge (32 NeuronCores, logical_nc_config=2 -> 64 logical cores)
-- **Weights**: BF16 format (convert from FP8 original if needed)
+- **Instance**: trn2.48xlarge (32 NeuronCores, logical_nc_config=2 → 64 logical cores)
+- **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9)
+- **Venvs**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` (for preprocess + direct NxDI smoke), `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (for vLLM serving). Both ship with the DLAMI.
+- **Disk**: ~500 GB free under `/opt/dlami/nvme` (HF FP8 checkpoint ~215 GB, Neuron-FP8 preprocessed output ~230 GB, plus `save_sharded_checkpoint` writes another ~140 GB per compiled config).
 
-## Usage
+## Quick Start (FP8 on Trn2)
 
-```python
-import sys
-from pathlib import Path
+End-to-end recipe. First-time compile is ~25 minutes; subsequent runs hit the neuronx-cc cache and start in a few minutes.
 
-# Make this contrib package's src/ importable (flat, per upstream contrib convention).
-sys.path.insert(0, str(Path("contrib/models/MiniMax-M2/src").resolve()))
+```bash
+# 1. Clone this repo on the Trn2 instance
+cd $HOME
+git clone <your-fork>/neuronx-distributed-inference.git
+cd neuronx-distributed-inference
+git checkout contrib/MiniMax-M2
 
-import torch
-from transformers import AutoTokenizer
-from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
+# 2. Download the HuggingFace FP8 checkpoint (~215 GB)
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+huggingface-cli download MiniMaxAI/MiniMax-M2.7 \
+    --local-dir /opt/dlami/nvme/models/MiniMax-M2.7
 
-from modeling_minimax_m2 import NeuronMiniMaxM2ForCausalLM, MiniMaxM2InferenceConfig
+# 3. Preprocess HF FP8 -> Neuron FP8 (~13 min, ~15 GB peak RAM)
+python contrib/models/MiniMax-M2/src/conversion_script/preprocess_minimax_m2_fp8.py \
+    --hf_model_path /opt/dlami/nvme/models/MiniMax-M2.7 \
+    --save_path     /opt/dlami/nvme/models/MiniMax-M2.7-Neuron-FP8 \
+    --tp_degree 64
 
-model_path = "/path/to/MiniMax-M2-BF16/"
-compiled_path = "/path/to/compiled/"
+# 4. (Optional) sanity-check without vLLM (~25 min first compile, then ~20s to load)
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
+python contrib/models/MiniMax-M2/perf_test/smoke_compile_minimax_m2.py
+python contrib/models/MiniMax-M2/perf_test/smoke_generate_minimax_m2.py
 
-neuron_config = MoENeuronConfig(
-    tp_degree=64,
-    moe_tp_degree=64,
-    moe_ep_degree=1,
-    batch_size=1,
-    seq_len=512,
-    max_context_length=256,
-    torch_dtype=torch.bfloat16,
-    logical_nc_config=2,
-    sequence_parallel_enabled=True,
-    fused_qkv=True,
-    on_device_sampling_config=OnDeviceSamplingConfig(
-        do_sample=True, temperature=0.6, top_k=20, top_p=0.95
-    ),
-    router_config={act_fn: sigmoid},
-)
+# 5. Install vllm-neuron with the contrib registration patch
+bash contrib/models/MiniMax-M2/perf_test/0_setup.sh
 
-config = MiniMaxM2InferenceConfig(
-    neuron_config, load_config=load_pretrained_config(model_path)
-)
-
-model = NeuronMiniMaxM2ForCausalLM(model_path, config)
-model.compile(compiled_path)
-model.load(compiled_path)
-
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-adapter = HuggingFaceGenerationAdapter(model, tokenizer)
-output = adapter.generate("Hello, how are you?", max_new_tokens=128)
+# 6. Start vLLM + bench (BS=32/moe_ep=64, BS=128/moe_ep=64)
+bash contrib/models/MiniMax-M2/perf_test/bench_minimax_m2.sh
 ```
+
+The bench script runs two configurations (BS=32 and BS=128, both `moe_tp_degree=1 / moe_ep_degree=64`) and logs results under `/tmp/bench_results/minimax_m2/`.
+
+Quick `curl` sanity check once the server is up:
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model": "/opt/dlami/nvme/models/MiniMax-M2.7-Neuron-FP8",
+         "messages": [{"role": "user", "content": "Hello! Introduce yourself in one sentence."}],
+         "max_tokens": 64, "temperature": 0.7}' | python3 -m json.tool
+```
+
+If you see fluent sentence output on a 50+ token generation, the FP8 path is working correctly. If you see repetition collapse (single-token loops like "helpful helpful helpful..."), double-check that `moe_tp_degree=1`, `moe_ep_degree=64`, `batch_size>=32`, and that you're loading the preprocessed Neuron-FP8 checkpoint (not the raw HF FP8 directory).
+
+## Checkpoint Preparation
+
+The HuggingFace checkpoint ships as block-wise OCP FP8 (E4M3, ±448 range), which is not directly compatible with Neuron FP8 (IEEE-754 E4M3, ±240 range). The preprocess script in `src/conversion_script/preprocess_minimax_m2_fp8.py` rescales it:
+
+- **Attention q/k/v/o**: OCP FP8 blockwise → Neuron FP8 per-row. Per-row scales are used because at TP=64 each rank's output dim is <128, which would collapse a blockwise scale to a singleton. A `_apply_2d_per_channel_fix` monkey-patch installed at compile time routes the 2D weights through PER_CHANNEL_SYMMETRIC to match.
+- **MoE experts**: w1/w3 fused into packed `gate_up_proj [num_experts, hidden, 2*IM]`, w2 stacked into `down_proj [num_experts, IM, hidden]`. Scales stay blockwise.
+- **Router gate + `e_score_correction_bias`**: renamed into the NxDI router namespace (`block_sparse_moe.router.linear_router.weight` and `...router.e_score_correction_bias`).
+- **Norms + embed_tokens + lm_head**: passed through BF16.
+
+Output layout:
+```
+save_path/
+  config.json, tokenizer.*, chat_template.jinja
+  configuration_minimax_m2.py, modeling_minimax_m2.py  (trust_remote_code)
+  model.safetensors.index.json
+  model_extras.safetensors                              (embed/norm/lm_head)
+  model_layer{N}.safetensors                            (one per decoder layer, N=0..61)
+```
+
+Runtime characteristics: ~15 GB peak RAM, ~13 minutes total on trn2.48xlarge.
+
+## FP8 Configuration Notes
+
+Three non-obvious constraints on Trn2, identical to the Flash FP8 path and for the same underlying reasons:
+
+1. **`moe_tp_degree=1, moe_ep_degree=64` is the only working FP8 ratio.** At `moe_tp=64` each rank's intermediate slice is 24 rows (<128 blockwise block), and NxDI's `_setup_for_scale` collapses the per-rank scale to a singleton — losing per-channel FP8 scale granularity. The resulting drift compounds across M2's 62 MoE layers and manifests as output collapse after ~30 decode tokens. `moe_tp=1, moe_ep=64` keeps each expert's weight + blockwise scale intact on a single rank and produces correct output.
+
+2. **`batch_size >= 32` on the FP8 path.** NxDI's TKG path refuses Expert Parallelism when `batch_size < num_experts / top_k = 256 / 8 = 32`. BS=1 single-stream latency demos on FP8 are not possible.
+
+3. **Keep outer `ep_degree=1`.** `MoENeuronConfig.ep_degree` is the full-model expert-parallel factor and multiplies `world_size` to `tp_degree * ep_degree`. At `world_size > 64` on a 64-NC Trn2, sharded-checkpoint size grows linearly, ranks beyond 63 have no backing hardware, and load fails. MoE EP is controlled exclusively via `moe_ep_degree`.
+
+The bench and smoke scripts have all three pinned correctly; the items above matter only if you're hand-crafting a `MoENeuronConfig`.
 
 ## vLLM Integration
 
-MiniMax-M2 can be served via [vllm-neuron](https://github.com/aws-neuron/vllm-neuron). A patch is required to add MiniMax architecture support.
+MiniMax-M2 can be served via [vllm-neuron](https://github.com/aws-neuron/vllm-neuron). A contrib registration patch (`perf_test/vllm-neuron-patch.patch`) is required to plug the NxDI modeling code into vllm-neuron's lookup tables.
 
 ### Setup
 
 ```bash
-# 1. Clone vllm-project/vllm-neuron at release-0.5.0
-git clone --branch release-0.5.0 https://github.com/vllm-project/vllm-neuron.git /tmp/vllm-neuron
-
-# 2. Apply the contrib registration patch
-cd /tmp/vllm-neuron
-git apply /path/to/neuronx-distributed-inference/contrib/models/MiniMax-M2/perf_test/vllm-neuron-patch.patch
-
-# 3. Install
-pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
+# The setup script clones vllm-project/vllm-neuron at release-0.5.0, applies
+# the contrib registration patch, installs it editable, and fetches the HF
+# FP8 checkpoint (or skips if already present). It also prints the
+# preprocess command if the Neuron-FP8 output dir is empty.
+bash contrib/models/MiniMax-M2/perf_test/0_setup.sh
 ```
 
-Or let `perf_test/0_setup.sh` do steps 1-3 plus weight download.
+### Serving (FP8, recommended)
 
-The patch is 30 lines and only touches `vllm_neuron/__init__.py`. It adds a
-`_register_contrib_models()` hook that, when `NXDI_CONTRIB_MINIMAX_M2_SRC`
-is set, registers `NeuronMiniMaxM2ForCausalLM` into NxDI's `MODEL_TYPES`
-under the key `minimaxm2` (matching the lowercased architecture name that
-vllm-neuron's `_get_neuron_model_cls` computes). vLLM's `ModelRegistry`
-already recognizes `MiniMaxM2ForCausalLM` so no vLLM-side registration is
-needed. No upstream vLLM or NxDI source is modified.
-
-### Serving
+The bench script already starts a vLLM server at port 8000 with the right config; to start one manually:
 
 ```bash
-# The contrib src/ must be reachable so the plugin hook can import it.
 export NXDI_CONTRIB_MINIMAX_M2_SRC=/path/to/neuronx-distributed-inference/contrib/models/MiniMax-M2/src
-export MINIMAX_M2_PATH=/path/to/MiniMax-M2-BF16
+export MINIMAX_M2_PATH=/path/to/MiniMax-M2.7-Neuron-FP8
+export VLLM_ENGINE_READY_TIMEOUT_S=7200
+# Optional: isolate compile cache per config so parallel M2/Flash/Pro compiles
+# don't race on the default /var/tmp/neuron-compile-cache lock files.
+export NEURON_COMPILED_ARTIFACTS=/path/to/compiled/minimax_m2_bs32_moetp1_ep64_fp8
 
 python3 -m vllm.entrypoints.openai.api_server \
-    --model /path/to/MiniMax-M2-BF16 \
+    --model "$MINIMAX_M2_PATH" \
     --tensor-parallel-size 64 \
     --max-model-len 1024 \
-    --max-num-seqs 256 \
+    --max-num-seqs 32 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
     --trust_remote_code \
@@ -131,72 +158,47 @@ python3 -m vllm.entrypoints.openai.api_server \
         "override_neuron_config": {
             "tp_degree": 64,
             "logical_nc_config": 2,
-            "flash_decoding_enabled": false,
-            "sequence_parallel_enabled": true,
+            "fused_qkv": false,
+            "sequence_parallel_enabled": false,
             "glu_mlp": true,
             "moe_mask_padded_tokens": true,
             "disable_numeric_cc_token": true,
+            "save_sharded_checkpoint": true,
             "router_config": {"act_fn": "sigmoid", "dtype": "float32"},
+            "quantized": true,
+            "quantized_checkpoints_path": "/path/to/MiniMax-M2.7-Neuron-FP8",
+            "quantization_dtype": "f8e4m3",
+            "quantization_type": "blockwise_symmetric",
+            "quantization_block_axis": [1, 2],
+            "quantization_block_size": [128, 128],
+            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router"],
+            "blockwise_matmul_config": {"use_shard_on_block_dynamic_while": true, "block_sharding_strategy": "PING_PONG"},
             "moe_tp_degree": 1,
             "moe_ep_degree": 64,
-            "batch_size": 256,
+            "batch_size": 32,
             "ctx_batch_size": 1,
-            "tkg_batch_size": 256,
+            "tkg_batch_size": 32,
             "max_context_length": 1024,
             "seq_len": 1024,
             "is_continuous_batching": true,
-            "fused_qkv": false,
             "enable_bucketing": true,
-            "normalize_top_k_affinities": true,
-            "use_index_calc_kernel": true,
-            "blockwise_matmul_config": {
-                "use_shard_on_intermediate_dynamic_while": true,
-                "skip_dma_token": true
-            },
-            "scratchpad_page_size": 1024
+            "context_encoding_buckets": [1024],
+            "token_generation_buckets": [1024],
+            "async_mode": true,
+            "on_device_sampling_config": {
+                "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
+            }
         }
     }'
 ```
 
-### Key vLLM Patch Changes
+### vllm-neuron patch summary
 
-The patch (`contrib/models/MiniMax-M2/perf_test/vllm-neuron-patch.patch`) modifies vllm-neuron to:
-- Pass `hf_config` from vLLM to NxDI (required for `trust_remote_code` models)
-- Replace `AutoModelForCausalLM.from_pretrained` with `snapshot_download` for model loading
+The patch is applied to vllm-neuron 0.5.0 and:
 
-See `contrib/models/MiniMax-M2/perf_test/bench_minimax_m2.sh` for full benchmark configurations with BS=1/256. Run `contrib/models/MiniMax-M2/perf_test/0_setup.sh` first to install vllm-neuron and fetch weights.
-
-## Performance
-
-### vLLM Serving — Config 1 (trn2.48xlarge, BF16, BS=1, TP=64/EP=1, non-CB)
-
-Input/output: 900/90 tokens (random dataset)
-
-| Concurrency | Throughput (tok/s) | TPOT (ms) | TTFT (ms) |
-|-------------|-------------------|-----------|-----------|
-| 1 | 39.28 | 13.56 | 1088 |
-
-### vLLM Serving — Config 2 (trn2.48xlarge, BF16, BS=256, TP=64/EP=64, CB)
-
-Input/output: 900/90 tokens (random dataset)
-
-| Concurrency | Throughput (tok/s) | TPOT (ms) | TTFT (ms) |
-|-------------|-------------------|-----------|-----------|
-| 1 | 5.76 | 173.83 | 165 |
-| 16 | 54.69 | 287.09 | 513 |
-| 32 | 75.85 | 408.66 | 1066 |
-| 128 | 106.72 | 1158.08 | 3950 |
-| 256 | 128.94 | 1860.69 | 11263 |
-
-> **Note:** Large MoE models like MiniMax-M2 require extended engine startup time. Set `VLLM_ENGINE_READY_TIMEOUT_S=3600` before launching the vLLM server.
-
-## Compatibility Matrix
-
-| Instance/Version | 2.22+ (PyTorch 2.9) | 2.21 and earlier |
-|------------------|---------------------|------------------|
-| Trn2 (trn2.48xlarge) | Tested | Not tested |
-| Trn1 | Not supported (requires 64 cores) | Not supported |
-| Inf2 | Not supported | Not supported |
+- Registers `NeuronMiniMaxM2ForCausalLM` into NxDI's `MODEL_TYPES` under `minimax_m2` when `NXDI_CONTRIB_MINIMAX_M2_SRC` points at this contrib package's `src/`.
+- Passes `hf_config` from vLLM into `load_pretrained_config` so NxDI does not re-load the config without `trust_remote_code=True`.
+- Replaces vllm-neuron's internal `AutoModelForCausalLM.from_pretrained` with `huggingface_hub.snapshot_download`, which is the only path that works for `trust_remote_code=True` models when no GPU is available for HF's CUDA-gated FP8 quantizer.
 
 ## Testing
 
@@ -204,13 +206,34 @@ Input/output: 900/90 tokens (random dataset)
 pytest contrib/models/MiniMax-M2/test/integration/test_model.py -v
 ```
 
+## Key Implementation Notes
+
+1. **QK Norm**: `MiniMaxM2QKNorm` uses Neuron-native `RmsNorm.apply` (not hand-rolled pow/mean/rsqrt). Hand-rolled PyTorch RMSNorm compiles into different HLO in CE vs TG and produces incorrect TG results.
+2. **Router Bias**: `RouterTopKWithBias` stores `e_score_correction_bias` as an `nn.Parameter` initialised to `torch.arange(num_experts, dtype=torch.bfloat16)`. Two non-obvious reasons:
+   - `register_buffer` (zeros) gets constant-folded by XLA and the checkpoint bias never binds at inference time.
+   - `dtype=float32` triggers a silent dtype mismatch in the NxDI loader's `LayoutTransformation`, which then drops the weight.
+3. **CONVERT_TO_MHA**: When `tp_degree > num_kv_heads` (64 > 8), K/V are replicated to `num_attention_heads` (48) during state-dict conversion; on the FP8 path this applies to the per-row `.scale` tensors in lockstep with the weights.
+4. **FP8 Runtime Patches** (installed in `NeuronMiniMaxM2ForCausalLM.__init__` when `quantized=True`, idempotent):
+   - `_apply_ep_scale_fix` — don't EP-shard `[1,1,W]` singleton scales.
+   - `_apply_blockwise_scale_stride_fix` — force `partition_stride=1` for `BLOCKWISE_SYMMETRIC` to avoid strided-split failures when per-rank weight is smaller than a 128-wide scale block.
+   - `_apply_2d_per_channel_fix` — flip q_config from `BLOCKWISE_SYMMETRIC` to `PER_CHANNEL_SYMMETRIC` for 2D attention weights at layer-swap time.
+5. **`save_quantized_state_dict` override**: short-circuits the HF re-quantize path (which requires CUDA and materialises a ~600 GB BF16 copy) when the preprocess-produced Neuron-FP8 index is already on disk.
+
+## Compatibility Matrix
+
+| Instance | Neuron SDK 2.29+ (PyTorch 2.9) | 2.21 and earlier |
+|----------|--------------------------------|------------------|
+| Trn2 (trn2.48xlarge) | Tested | Not tested |
+| Trn1 | Not supported (requires 64 logical cores via logical_nc_config=2) | Not supported |
+| Inf2 | Not supported | Not supported |
+
 ## Example Checkpoints
 
-* [MiniMax/MiniMax-M2](https://huggingface.co/MiniMax/MiniMax-M2)
-* [MiniMax/MiniMax-M2-unquantized](https://huggingface.co/MiniMax/MiniMax-M2-unquantized) (BF16)
+* [MiniMaxAI/MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7)
+* [MiniMaxAI/MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2)  (same config schema, compatible preprocess)
 
 ## Maintainer
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-13
+**Last Updated:** 2026-04-25
