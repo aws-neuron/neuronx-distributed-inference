@@ -129,6 +129,10 @@ def main():
     print(f"[gen] Loaded in {time.time() - t0:.1f}s")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    # M2 tokenizer doesn't ship a pad_token; fall back to eos so batched
+    # `padding=True` works when BATCH_SIZE > 1.
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
     adapter = HuggingFaceGenerationAdapter(model)
 
     inputs = tokenizer([PROMPT] * BATCH_SIZE, return_tensors="pt", padding=True)

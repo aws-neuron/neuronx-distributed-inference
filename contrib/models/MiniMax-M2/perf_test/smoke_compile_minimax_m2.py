@@ -158,10 +158,10 @@ def main():
     )
     print(f"[smoke] config.hidden_size={config.hidden_size}")
     print(f"[smoke] config.num_hidden_layers={config.num_hidden_layers}")
-    print(f"[smoke] config.n_routed_experts={config.n_routed_experts}")
+    print(f"[smoke] config.num_local_experts={config.num_local_experts}")
     print(f"[smoke] config.num_experts_per_tok={config.num_experts_per_tok}")
-    print(f"[smoke] config.layer_uses_moe[:5]={config.layer_uses_moe[:5]}")
-    print(f"[smoke] config.layer_attention_types[:5]={config.layer_attention_types[:5]}")
+    print(f"[smoke] config.num_key_value_heads={config.num_key_value_heads}")
+    print(f"[smoke] config.attn_type_list[:5]={getattr(config, 'attn_type_list', [None]*5)[:5]}")
 
     print("[smoke] Instantiating NeuronMiniMaxM2ForCausalLM (build model-on-cpu)...")
     t0 = time.time()
