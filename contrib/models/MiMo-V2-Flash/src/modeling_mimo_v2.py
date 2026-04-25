@@ -1235,7 +1235,13 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
     # 128-wide block genuinely share that block's scale. No-op when the
     # .scale keys are absent (BF16 path).
     if getattr(config.neuron_config, "quantized", False):
-        tp = config.neuron_config.tp_degree
+        # IMPORTANT: MoE expert weights are sharded by moe_tp_degree (not the
+        # top-level tp_degree — attention uses tp_degree, MoE can use a
+        # different split). At moe_tp=64 the per-rank intermediate is 32 (<128)
+        # so we had to expand the scale to make the shard layout match; at
+        # moe_tp=16 per-rank intermediate is 128 (>=128) and no expansion is
+        # needed.
+        moe_tp = getattr(config.neuron_config, "moe_tp_degree", None) or config.neuron_config.tp_degree
         for layer_idx in range(config.num_hidden_layers):
             if not config.layer_uses_moe[layer_idx]:
                 continue
@@ -1247,14 +1253,14 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
                 i_blocks = s.shape[1]
                 h_blocks = s.shape[2]
                 intermediate = i_blocks * 128
-                i_per_rank = intermediate // tp  # 32 @ TP=64 for IM=2048
+                i_per_rank = intermediate // moe_tp
                 if i_per_rank < 128:
-                    ranks_per_block = 128 // i_per_rank  # 4 @ TP=64
+                    ranks_per_block = 128 // i_per_rank
                     s_exp = s.unsqueeze(2).expand(-1, -1, ranks_per_block, -1)
                     s_exp = s_exp.reshape(s.shape[0], i_blocks * ranks_per_block, h_blocks)
-                    assert s_exp.shape[1] == tp, (
+                    assert s_exp.shape[1] == moe_tp, (
                         f"down_proj.scale expansion produced {s_exp.shape[1]} rows, "
-                        f"expected TP={tp}"
+                        f"expected moe_tp={moe_tp}"
                     )
                     neuron_state_dict[dp_key] = s_exp.contiguous()
 
@@ -1262,10 +1268,10 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
             # along last axis). Scale: [E, H_blocks, 2*I_blocks] stored as
             # [gate_half | up_half]. Module parameter has per-rank last-dim=1
             # (via _apply_blockwise_scale_stride_fix patch forcing
-            # partition_stride=1), so the full scale must have last-dim=tp
-            # with gate entries 0..tp/2 and up entries tp/2..tp. Expand each
-            # half independently to preserve the gate/up boundary when NxD
-            # does `split(per_partition=2*I/tp, dim=-1)`.
+            # partition_stride=1), so the full scale must have last-dim=moe_tp
+            # with gate entries 0..moe_tp/2 and up entries moe_tp/2..moe_tp.
+            # Expand each half independently to preserve the gate/up boundary
+            # when NxD does `split(per_partition=2*I/moe_tp, dim=-1)`.
             gu_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.scale"
             if gu_key in neuron_state_dict:
                 s = neuron_state_dict[gu_key]
@@ -1276,15 +1282,15 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
                 )
                 i_blocks = two_i_blocks // 2
                 intermediate = i_blocks * 128
-                out_per_rank = (2 * intermediate) // tp  # 64 @ TP=64 for IM=2048
+                out_per_rank = (2 * intermediate) // moe_tp
                 if out_per_rank < 128:
-                    assert tp % 2 == 0, f"TP={tp} must be even for gate/up scale split"
-                    ranks_per_half = tp // 2  # 32 @ TP=64
+                    assert moe_tp % 2 == 0, f"moe_tp={moe_tp} must be even for gate/up scale split"
+                    ranks_per_half = moe_tp // 2
                     assert ranks_per_half % i_blocks == 0, (
                         f"ranks_per_half={ranks_per_half} must be divisible by "
                         f"i_blocks={i_blocks}"
                     )
-                    ranks_per_block = ranks_per_half // i_blocks  # 2 @ TP=64 (i_blocks=16)
+                    ranks_per_block = ranks_per_half // i_blocks
                     gate_half = s[..., :i_blocks]   # [E, H_blocks, i_blocks]
                     up_half = s[..., i_blocks:]
                     gate_exp = (
@@ -1298,9 +1304,9 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
                         .reshape(s.shape[0], h_blocks, ranks_per_half)
                     )
                     s_exp = torch.cat([gate_exp, up_exp], dim=-1)
-                    assert s_exp.shape[-1] == tp, (
+                    assert s_exp.shape[-1] == moe_tp, (
                         f"gate_up_proj.scale expansion produced {s_exp.shape[-1]} "
-                        f"entries, expected TP={tp}"
+                        f"entries, expected moe_tp={moe_tp}"
                     )
                     neuron_state_dict[gu_key] = s_exp.contiguous()
 
