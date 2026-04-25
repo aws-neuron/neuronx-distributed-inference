@@ -81,9 +81,18 @@ def main():
     print(f"[smoke] STAGE={STAGE}")
 
     print("[smoke] Building MoENeuronConfig (quantized FP8 MoE, blockwise_symmetric)...")
+    # NOTE: ep_degree at the top level controls the OUTER (full model)
+    # expert-parallel factor, which multiplies world_size to
+    # tp_degree * ep_degree and duplicates non-MoE weights per replica.
+    # At world_size > 64 on a 64-NC Trn2, sharded weights grow accordingly
+    # (e.g. tp=64 + ep=4 -> 256 ranks -> 4x the sharded checkpoint size,
+    # and at runtime the model doesn't fit on the device). For MoE-only
+    # EP we want ep_degree=1 at the outer level and the per-MoE split
+    # controlled solely by moe_ep_degree (which Pro's working benches
+    # also do). Keep ep_degree=1 unconditionally.
     neuron_config = MoENeuronConfig(
         tp_degree=TP_DEGREE,
-        ep_degree=MOE_EP,
+        ep_degree=1,
         logical_nc_config=2,
         batch_size=BATCH_SIZE,
         max_batch_size=BATCH_SIZE,

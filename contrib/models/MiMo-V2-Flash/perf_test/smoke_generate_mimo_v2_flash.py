@@ -73,9 +73,11 @@ def main():
     print(f"[gen] COMPILED_PATH={COMPILED_PATH}")
     print(f"[gen] TP={TP_DEGREE}, SEQ={SEQ_LEN}, BS={BATCH_SIZE}")
 
+    # Outer ep_degree must match the compile-time value (kept at 1 so
+    # world_size = tp_degree; see smoke_compile_mimo_v2_flash.py comment).
     neuron_config = MoENeuronConfig(
         tp_degree=TP_DEGREE,
-        ep_degree=MOE_EP,
+        ep_degree=1,
         logical_nc_config=2,
         batch_size=BATCH_SIZE,
         max_batch_size=BATCH_SIZE,
