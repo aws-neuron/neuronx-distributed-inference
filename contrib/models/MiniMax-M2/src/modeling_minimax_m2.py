@@ -455,8 +455,14 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
         "MiniMax-M2 requires glu_mlp=True (SwiGLU)"
     )
 
-    # Dequantize FP8 weights if present
-    maybe_dequantize_layer(neuron_state_dict, config)
+    # Dequantize FP8 weights to BF16 ONLY if we are NOT running the native
+    # FP8 inference path. When neuron_config.quantized=True and the source
+    # checkpoint was produced by preprocess_minimax_m2_fp8.py, the FP8 bytes
+    # and .scale tensors must be preserved for NxDI's quantized layers to
+    # load them directly; dequantizing here would re-inflate weights to BF16
+    # and lose the FP8 path's ~2x throughput advantage.
+    if not getattr(config.neuron_config, "quantized", False):
+        maybe_dequantize_layer(neuron_state_dict, config)
 
     with torch.no_grad():
         tp_degree = config.neuron_config.tp_degree
@@ -516,11 +522,17 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                     neuron_state_dict[k_norm_key] = k_norm_replicated.reshape(-1)
 
             # --- Router weights ---
+            # Only rename if the HF-format keys are still present. The
+            # preprocess_minimax_m2_fp8.py streaming preprocess already emits
+            # under NxDI names (block_sparse_moe.router.linear_router.weight
+            # and block_sparse_moe.router.e_score_correction_bias), so for
+            # the FP8 path the pop() below would KeyError without this guard.
             gate_key = f"layers.{layer_idx}.block_sparse_moe.gate.weight"
             router_key = (
                 f"layers.{layer_idx}.block_sparse_moe.router.linear_router.weight"
             )
-            neuron_state_dict[router_key] = neuron_state_dict.pop(gate_key)
+            if gate_key in neuron_state_dict:
+                neuron_state_dict[router_key] = neuron_state_dict.pop(gate_key)
 
             # e_score_correction_bias: map to RouterTopKWithBias.e_score_correction_bias
             # This is an nn.Parameter in the router, so it will be separated from the
@@ -535,7 +547,12 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 neuron_state_dict[bias_dst_key] = neuron_state_dict.pop(bias_src_key)
 
             # --- Expert weight stacking ---
+            # Skip entirely when the preprocessed checkpoint already has the
+            # fused layout (preprocess_minimax_m2_fp8.py emits
+            # block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight directly).
             w1_key = f"layers.{layer_idx}.block_sparse_moe.experts.0.w1.weight"
+            if w1_key not in neuron_state_dict:
+                continue
             intermediate_size, hidden_size = neuron_state_dict[w1_key].shape
             device = neuron_state_dict[w1_key].device
             dtype = neuron_state_dict[w1_key].dtype
@@ -628,6 +645,96 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 new_key = f"{prefix}.qkv_proj.{proj}.weight"
                 if old_key in neuron_state_dict:
                     neuron_state_dict[new_key] = neuron_state_dict.pop(old_key)
+                # Same rename for the FP8 .scale tensor (only present on the
+                # quantized path; BF16 path has no .scale).
+                old_scale_key = f"{prefix}.{proj}.scale"
+                new_scale_key = f"{prefix}.qkv_proj.{proj}.scale"
+                if old_scale_key in neuron_state_dict:
+                    neuron_state_dict[new_scale_key] = neuron_state_dict.pop(old_scale_key)
+
+    # --- Expand MoE blockwise scales along the TP-partitioned dim (FP8 only). ---
+    # NxDI's shard_checkpoint splits the scale on its partition dim into
+    # `per_partition_size = dim_size / moe_tp_degree`. When the per-rank
+    # MoE intermediate is smaller than the 128-wide blockwise scale block
+    # (moe_tp=64 on MiniMax-M2 gives per-rank IM=24, well below 128), several
+    # ranks share one scale block — we need to replicate scale entries along
+    # that dim. Adjacent ranks whose weight falls inside the same 128-wide
+    # block genuinely share that block's scale. No-op when the .scale keys
+    # are absent (BF16 path) or moe_tp is large enough (e.g. moe_tp=1).
+    if getattr(config.neuron_config, "quantized", False):
+        moe_tp = (
+            getattr(config.neuron_config, "moe_tp_degree", None)
+            or config.neuron_config.tp_degree
+        )
+        for layer_idx in range(config.num_hidden_layers):
+            # down_proj (RowParallel on intermediate dim). Scale:
+            # [E, I_blocks, H_blocks]
+            dp_key = (
+                f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.scale"
+            )
+            if dp_key in neuron_state_dict:
+                s = neuron_state_dict[dp_key]
+                i_blocks = s.shape[1]
+                h_blocks = s.shape[2]
+                intermediate = i_blocks * 128
+                i_per_rank = intermediate // moe_tp
+                if i_per_rank < 128:
+                    ranks_per_block = 128 // i_per_rank
+                    s_exp = s.unsqueeze(2).expand(-1, -1, ranks_per_block, -1)
+                    s_exp = s_exp.reshape(s.shape[0], i_blocks * ranks_per_block, h_blocks)
+                    assert s_exp.shape[1] == moe_tp, (
+                        f"down_proj.scale expansion produced {s_exp.shape[1]} rows, "
+                        f"expected moe_tp={moe_tp}"
+                    )
+                    neuron_state_dict[dp_key] = s_exp.contiguous()
+
+            # gate_up_proj (ColumnParallel on 2*intermediate dim, gate|up fused
+            # along last axis). Scale: [E, H_blocks, 2*I_blocks] stored as
+            # [gate_half | up_half]. Module parameter has per-rank last-dim=1
+            # (via _apply_blockwise_scale_stride_fix), so the full scale must
+            # have last-dim=moe_tp with gate entries 0..moe_tp/2 and up
+            # entries moe_tp/2..moe_tp. Expand each half independently.
+            gu_key = (
+                f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"
+            )
+            if gu_key in neuron_state_dict:
+                s = neuron_state_dict[gu_key]
+                h_blocks = s.shape[1]
+                two_i_blocks = s.shape[2]
+                assert two_i_blocks % 2 == 0, (
+                    f"gate_up_proj.scale last dim must be 2*i_blocks, got {two_i_blocks}"
+                )
+                i_blocks = two_i_blocks // 2
+                intermediate = i_blocks * 128
+                out_per_rank = (2 * intermediate) // moe_tp
+                if out_per_rank < 128:
+                    assert moe_tp % 2 == 0, (
+                        f"moe_tp={moe_tp} must be even for gate/up scale split"
+                    )
+                    ranks_per_half = moe_tp // 2
+                    assert ranks_per_half % i_blocks == 0, (
+                        f"ranks_per_half={ranks_per_half} must be divisible by "
+                        f"i_blocks={i_blocks}"
+                    )
+                    ranks_per_block = ranks_per_half // i_blocks
+                    gate_half = s[..., :i_blocks]
+                    up_half = s[..., i_blocks:]
+                    gate_exp = (
+                        gate_half.unsqueeze(-1)
+                        .expand(-1, -1, -1, ranks_per_block)
+                        .reshape(s.shape[0], h_blocks, ranks_per_half)
+                    )
+                    up_exp = (
+                        up_half.unsqueeze(-1)
+                        .expand(-1, -1, -1, ranks_per_block)
+                        .reshape(s.shape[0], h_blocks, ranks_per_half)
+                    )
+                    s_exp = torch.cat([gate_exp, up_exp], dim=-1)
+                    assert s_exp.shape[-1] == moe_tp, (
+                        f"gate_up_proj.scale expansion produced {s_exp.shape[-1]} "
+                        f"entries, expected moe_tp={moe_tp}"
+                    )
+                    neuron_state_dict[gu_key] = s_exp.contiguous()
 
     return neuron_state_dict
 
@@ -1268,6 +1375,17 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
 
     _model_cls = NeuronMiniMaxM2Model
 
+    def __init__(self, *args, **kwargs):
+        # Install FP8 monkey-patches BEFORE super().__init__ so the patched
+        # quantization-layer classes are in effect when NxDI builds the
+        # decoder. Gated on quantized=True so the BF16 path is untouched.
+        ncfg = kwargs.get("config") or (args[1] if len(args) > 1 else None)
+        if ncfg is not None and getattr(getattr(ncfg, "neuron_config", None), "quantized", False):
+            self._apply_ep_scale_fix()
+            self._apply_blockwise_scale_stride_fix()
+            self._apply_2d_per_channel_fix()
+        super().__init__(*args, **kwargs)
+
     @staticmethod
     def load_hf_model(model_path, **kwargs):
         return None
@@ -1281,6 +1399,176 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         state_dict: dict, config: MiniMaxM2InferenceConfig
     ) -> dict:
         return convert_minimax_m2_hf_to_neuron_state_dict(state_dict, config)
+
+    # ------------------------------------------------------------------
+    # FP8 quantized-inference monkey-patches (no-op unless quantized=True).
+    #
+    # Reconcile the preprocessed Neuron-FP8 checkpoint (blockwise-MoE +
+    # per-row-attn) with NxDI's global blockwise_symmetric q_config. Ported
+    # from the MiMo-V2-Flash FP8 enablement work (same MoE block-size math,
+    # same Quantized{Column,Row}Parallel issues). All three are gated by
+    # self.neuron_config.quantized so the BF16 path is completely untouched.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_ep_scale_fix():
+        """Skip per-channel `scale` params when marking expert-parallel
+        weights; they have shape [1, 1, W] and cannot be EP-sharded."""
+        from neuronx_distributed.modules.moe.moe_parallel_layers import (
+            ExpertFusedLinear,
+        )
+
+        if getattr(ExpertFusedLinear, "_minimax_m2_ep_scale_patched", False):
+            return
+
+        def _patched_mark(
+            self_inner,
+            iterable=None,
+            expert_parallel_group_size=None,
+            is_prefill=True,
+            expert_distribution=None,
+        ):
+            from neuronx_distributed.parallel_layers.parallel_state import (
+                get_expert_model_parallel_size,
+            )
+
+            if expert_parallel_group_size is None:
+                expert_parallel_group_size = get_expert_model_parallel_size()
+
+            if expert_parallel_group_size > 1:
+                if iterable is None:
+                    params_to_mark = []
+                    for name, p in self_inner.named_parameters():
+                        if name == "scale" and p.shape[0] == 1:
+                            continue
+                        params_to_mark.append(p)
+                    iterable = params_to_mark
+
+                for p in iterable:
+                    p.expert_model_parallel = True
+                    if is_prefill:
+                        p.is_prefill = True
+                    p.expert_distribution = expert_distribution
+
+        ExpertFusedLinear._mark_expert_parallel_weights = _patched_mark
+        ExpertFusedLinear._minimax_m2_ep_scale_patched = True
+
+    @staticmethod
+    def _apply_blockwise_scale_stride_fix():
+        """Force scale.partition_stride=1 for BLOCKWISE_SYMMETRIC quantization
+        — stride>1 causes strided-splitting failures when per-rank weight
+        size is smaller than a block."""
+        from neuronx_distributed.quantization.quantization_config import (
+            QuantizationType,
+        )
+        from neuronx_distributed.quantization.quantization_layers import (
+            BaseQuantizeParallelLinear,
+        )
+
+        if getattr(BaseQuantizeParallelLinear, "_minimax_m2_blockwise_stride_patched", False):
+            return
+
+        _original_setup = BaseQuantizeParallelLinear._setup_for_scale
+
+        def _patched_setup(self_inner, *args, **kwargs):
+            _original_setup(self_inner, *args, **kwargs)
+            if (
+                hasattr(self_inner, "quantization_type")
+                and self_inner.quantization_type == QuantizationType.BLOCKWISE_SYMMETRIC
+                and hasattr(self_inner, "scale")
+                and hasattr(self_inner.scale, "partition_stride")
+                and self_inner.scale.partition_stride > 1
+            ):
+                self_inner.scale.partition_stride = 1
+
+        BaseQuantizeParallelLinear._setup_for_scale = _patched_setup
+        BaseQuantizeParallelLinear._minimax_m2_blockwise_stride_patched = True
+
+    @staticmethod
+    def _apply_2d_per_channel_fix():
+        """Route 2D self_attn swaps through per_channel_symmetric.
+
+        MiniMax-M2's preprocess writes:
+            - MoE experts: 3D weights with (E, out//128, in//128) blockwise scales.
+            - self_attn q/k/v/o: 2D weights with (out, 1) per-row scales
+              (at TP=64 each rank's out-dim is <128, so blockwise scale
+              would collapse to a singleton; per-row avoids that).
+
+        NxDI's q_config is global blockwise_symmetric (for the MoE). Feeding
+        that into the 2D classes triggers `block axis cannot be < 0 or > 2,
+        received 2` in _setup_for_scale (block axes [1, 2] exceed rank-2
+        weight_shape). This wraps the 2D classes' from_float to override
+        q_config on the fly: flip quantization_type to per_channel_symmetric,
+        drop block_axis / block_size, force quantization_per_channel_axis=0.
+        MoE classes are untouched.
+        """
+        from neuronx_distributed.quantization.quantization_config import (
+            QuantizationType,
+        )
+        from neuronx_distributed.quantization.quantization_layers import (
+            QuantizedColumnParallel,
+            QuantizedRowParallel,
+        )
+
+        def _wrap(cls):
+            if getattr(cls, "_minimax_m2_2d_patched", False):
+                return
+            original_from_float = cls.from_float
+
+            def _patched_from_float(klass, mod, q_config=None, _orig=original_from_float):
+                if q_config is not None and q_config.get("quantization_type") == \
+                        QuantizationType.BLOCKWISE_SYMMETRIC:
+                    q_config = dict(q_config)
+                    q_config["quantization_type"] = QuantizationType.PER_CHANNEL_SYMMETRIC
+                    q_config["quantization_per_channel_axis"] = 0
+                    q_config.pop("block_axis", None)
+                    q_config.pop("block_size", None)
+                if q_config is None:
+                    return _orig(mod)
+                return _orig(mod, q_config)
+
+            cls.from_float = classmethod(_patched_from_float)
+            cls._minimax_m2_2d_patched = True
+
+        _wrap(QuantizedColumnParallel)
+        _wrap(QuantizedRowParallel)
+
+    def _install_fp8_patches(self):
+        """Install all FP8-specific runtime patches. No-op for BF16."""
+        if not getattr(self.neuron_config, "quantized", False):
+            return
+        self._apply_ep_scale_fix()
+        self._apply_blockwise_scale_stride_fix()
+        self._apply_2d_per_channel_fix()
+
+    def compile(self, *args, **kwargs):
+        # save_sharded_checkpoint=True serializes shards during compile() and
+        # that code path reads scale.partition_stride — patches must be live.
+        self._install_fp8_patches()
+        return super().compile(*args, **kwargs)
+
+    def load(self, *args, **kwargs):
+        self._install_fp8_patches()
+        return super().load(*args, **kwargs)
+
+    @classmethod
+    def save_quantized_state_dict(cls, model_path, config):
+        """MiniMax-M2 ships pre-quantized FP8 safetensors via our preprocess
+        script. The base implementation calls AutoModelForCausalLM.from_pretrained
+        to re-quantize, which requires a CUDA GPU (HF's finegrained_fp8
+        quantizer is gated on CUDA) and materializes a ~600 GB BF16 copy.
+        Skip if the checkpoint directory already contains a Neuron-FP8
+        index produced by the preprocess script."""
+        import os as _os
+        qpath = (
+            getattr(config.neuron_config, "quantized_checkpoints_path", None)
+            or model_path
+        )
+        if qpath and _os.path.isdir(qpath):
+            index = _os.path.join(qpath, "model.safetensors.index.json")
+            if _os.path.isfile(index):
+                return
+        return super().save_quantized_state_dict(model_path, config)
 
     def enable_context_encoding(self):
         self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
