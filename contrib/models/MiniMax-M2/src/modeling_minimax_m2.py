@@ -634,10 +634,8 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
         #   self_attn.qkv_proj.k_proj.weight  (not self_attn.k_proj.weight)
         #   self_attn.qkv_proj.v_proj.weight  (not self_attn.v_proj.weight)
         #   self_attn.o_proj.o_proj.weight     (not self_attn.o_proj.weight)
-        # The BF16 path relies on RowParallelLinear's preshard hook to rename
-        # o_proj.weight -> o_proj.o_proj.weight, but that hook only fires via
-        # `maybe_dequantize_layer` which we skip on the FP8 path, so the o_proj
-        # rename is done explicitly below.
+        # The preshard hook in RowParallelLinear handles the o_proj rename
+        # (o_proj.weight -> o_proj.o_proj.weight), so we only rename Q/K/V here.
         # When fused_qkv=True, Q/K/V are already merged into Wqkv above.
         for layer_idx in range(config.num_hidden_layers):
             prefix = f"layers.{layer_idx}.self_attn"
@@ -653,19 +651,6 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 new_scale_key = f"{prefix}.qkv_proj.{proj}.scale"
                 if old_scale_key in neuron_state_dict:
                     neuron_state_dict[new_scale_key] = neuron_state_dict.pop(old_scale_key)
-
-            # o_proj rename: traced-model key is self_attn.o_proj.o_proj.weight
-            # (RowParallelLinear wraps the weight in a nested module under the
-            # same name). The preshard hook does this rename for BF16 paths
-            # that went through maybe_dequantize_layer, but on the FP8 path
-            # we skip that helper — so do the rename here explicitly.
-            # Without this, NxDI's shard_checkpoint reports the preprocessed
-            # o_proj.weight as "redundant" and drops it, leaving the
-            # projection effectively zero and attention output as garbage.
-            o_src = f"{prefix}.o_proj.weight"
-            o_dst = f"{prefix}.o_proj.o_proj.weight"
-            if o_src in neuron_state_dict:
-                neuron_state_dict[o_dst] = neuron_state_dict.pop(o_src)
 
     # --- Expand MoE blockwise scales along the TP-partitioned dim (FP8 only). ---
     # NxDI's shard_checkpoint splits the scale on its partition dim into
