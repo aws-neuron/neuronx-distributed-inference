@@ -59,7 +59,7 @@ NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2-Instruct-0
 
 ## Validation Results
 
-**Validated:** 2026-04-18 (SDK 2.28 and 2.29)
+**Validated:** 2026-04-24 (SDK 2.28 and 2.29)
 **Recommended Configuration:** TP=32, EP=2, LNC=2, batch_size=1, seq_len=1024, blockwise FP8
 
 ### Test Results
@@ -194,13 +194,15 @@ NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 python your_script.py
 
 | Instance / SDK Version | 2.29 | 2.28 | 2.27 and earlier |
 |------------------------|------|------|------------------|
-| trn2.48xlarge (LNC=2, recommended) | Working (6.0 tok/s)* | Working (6.0 tok/s) | Not tested |
+| trn2.48xlarge (LNC=2, recommended) | TKG working, CTE requires EP workaround* | **Working (6.0 tok/s)** | Not tested |
 | trn2.48xlarge (LNC=1) | Not tested | Working (3.4 tok/s) | Not tested |
 | trn2.3xlarge | Not supported (needs TP=32, EP=2 = 64 cores) | Not supported | Not supported |
 | trn1.32xlarge | Not supported (needs 64 cores at LNC=2) | Not supported | Not supported |
 | inf2 | Not supported | Not supported | Not supported |
 
-\*SDK 2.29 requires a workaround for context encoding (see SDK 2.29 Notes below).
+\*SDK 2.29 blockwise CTE kernels (shard_on_I, shard_on_block) produce wrong output with EP=2.
+The `forward_all_experts_EP` workaround gives correct output but 7x slower TTFT. See SDK 2.29
+Notes below for root cause analysis and workaround.
 
 ## Testing
 
@@ -250,21 +252,49 @@ NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compi
 
 ## SDK 2.29 Notes
 
-SDK 2.29 (NxDI 0.9.17334) introduces a new `forward_blockwise` code path for MoE context
-encoding. The default kernel dispatch (`_call_shard_hidden_kernel`) is a stub that raises
-`NotImplementedError`. While nkilib IS installed in the DLAMI (bundled version matches the
-standalone `nki-library` April 2026 release), the available alternative kernels
-(`shard_on_intermediate`, `shard_on_block`) are incompatible with this model's dimensions:
+SDK 2.29 (NxDI 0.9.17334) removed the `blockwise_mm_baseline_shard_hidden` NKI kernel that
+was used for MoE context encoding inference on SDK 2.28. The kernel was in
+`neuronxcc.nki._private.blockwise_mm` which no longer exists in SDK 2.29 (the entire
+`_private` blockwise module was removed). The replacement dynamic-while kernels
+(`shard_on_intermediate` from nkilib `bwmm_shard_on_I.py`, and `shard_on_block` from nkilib
+`bwmm_shard_on_block.py`) produce incorrect output for this model's configuration.
 
-- `use_shard_on_intermediate_dynamic_while`: MLIR verification failure due to small per-TP
-  intermediate dimension (2048/32=64, sharded to 32 at LNC=2) being below the kernel's
-  minimum TILE_SIZE of 128 for the `nc_matmul` stationary free dimension.
-- `use_shard_on_block_dynamic_while` + `PING_PONG`: Compiles but produces incorrect outputs.
-- **Zero-padding fix attempted:** Padding `I_TP_sharded` from 32 to 128 in the
-  `shard_on_intermediate` kernel eliminates the MLIR error and compiles successfully, but
-  produces logits ~10 points lower than expected (13.1 vs 23.0). The EP workaround on the
-  same instance produces correct logits (23.0), confirming the issue is in the kernel's
-  handling of padded dimensions. Filed as internal ticket V2185857494.
+### Root Cause
+
+On SDK 2.28, the blockwise CTE dispatch in `blockwise.py` defaulted to
+`_call_shard_hidden_kernel` (a static kernel, no dynamic while loop). This kernel was the
+**only** blockwise CTE kernel validated to work with Kimi-K2's configuration (384 experts,
+EP=2, I_TP=64). In SDK 2.29:
+
+1. `_call_shard_hidden_kernel` now raises `NotImplementedError` (inference path removed)
+2. `blockwise_mm_baseline_shard_hidden` still appears in training kernel imports but fails
+   to load (`No module named 'neuronxcc.nki._private.blockwise_mm'`)
+3. The nkilib replacement kernels (`shard_on_I`, `shard_on_block`) were never ported from
+   the static `shard_hidden` approach — they use fundamentally different algorithms
+
+### Blockwise CTE Investigation Summary
+
+All available blockwise CTE kernel paths were tested exhaustively:
+
+| Kernel Path | Config | Compile | Output | TTFT |
+|------------|--------|---------|--------|------|
+| `shard_hidden` (SDK 2.28 default) | default | N/A | N/A | Raises `NotImplementedError` |
+| `shard_on_intermediate` (non-hybrid) | `use_shard_on_intermediate_dynamic_while=True` | PASS | "Kimi," (wrong) | 2,386 ms |
+| `shard_on_intermediate` (hybrid) | `use_shard_on_intermediate_dynamic_while=True` | PASS | "Moonshot AI." (wrong) | 1,159 ms |
+| `shard_on_block` + PING_PONG | `use_shard_on_block_dynamic_while=True` | PASS | ",,," (wrong) | 1,676 ms |
+| `shard_on_intermediate` (unpatched) | `use_shard_on_intermediate_dynamic_while=True` | FAIL | N/A | MLIR: `I_TP_sharded=32 < 128` |
+| PyTorch fallback | `use_torch_block_wise=True` | FAIL | N/A | `selective loading + EP` error |
+| EP workaround (`forward_all_experts_EP`) | patched dispatch | PASS | **"Paris" (correct)** | 10,185 ms |
+
+Key observations:
+- Wrong outputs are coherent text from the system prompt ("Kimi", "Moonshot AI") suggesting
+  corrupted CTE hidden states cause the model to regurgitate system message content
+- The `shard_on_intermediate` kernel passes standalone tests (5/5 cosine > 0.99998) — the
+  kernel math is correct in isolation
+- **Both** shard_on_I and shard_on_block produce wrong output, confirming the issue is not
+  specific to either kernel but to the dynamic-while blockwise approach with this model's
+  EP=2 / I_TP=64 configuration
+- Filed as internal ticket V2185857494
 
 **Recommended workaround:** Patch `expert_mlps_v2.py` in the `neuronx_distributed` package
 to use `forward_all_experts_EP` instead of `forward_blockwise` when expert parallelism is
@@ -285,6 +315,10 @@ encoding (TTFT) is ~7x slower (10,185 ms vs 1,420 ms) because `forward_all_exper
 every token through every local expert rather than using the optimized blockwise dispatch. For
 long-output workloads this is negligible; for TTFT-sensitive workloads, use SDK 2.28.
 
+**Recommendation:** Use SDK 2.28 for production deployments until the blockwise CTE regression
+is resolved. The `shard_hidden` kernel available in SDK 2.28 provides both correct output and
+optimal TTFT (1,420 ms).
+
 ### SDK 2.29 Benchmark (LNC=2, TP=32, EP=2, BS=1, seq_len=1024)
 
 | Output Tokens | TTFT P50 (ms) | TPOT P50 (ms) | tok/s | E2E P50 (ms) |
@@ -300,9 +334,9 @@ long-output workloads this is negligible; for TTFT-sensitive workloads, use SDK 
 
 ## Known Limitations
 
-- **No on-device sampling:** The model uses CPU greedy sampling because the vocabulary
-  size (163840) is not divisible by common TP degrees, causing shape mismatches in the
-  on-device sampling kernel.
+- **On-device sampling (ODS):** The model supports on-device sampling with `top_k=1`
+  (greedy) for vocabulary size 163840. ODS avoids transferring full logits to CPU, but
+  also means raw logits are not available for analysis during inference.
 
 - **Elevated EOS logit:** The `<|im_end|>` token (ID 163586) has an elevated logit in
   early generation steps, likely due to the FP8->BF16 dequantization of shared expert
@@ -323,4 +357,4 @@ long-output workloads this is negligible; for TTFT-sensitive workloads, use SDK 
 
 Annapurna Labs
 
-**Last Updated:** 2026-04-23
+**Last Updated:** 2026-04-25
