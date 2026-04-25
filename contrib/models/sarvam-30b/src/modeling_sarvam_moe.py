@@ -875,6 +875,8 @@ class SarvamMoEInferenceConfig(InferenceConfig):
         self.neuron_config.disable_numeric_cc_token = True
         # Sigmoid routing: disable NKI router top-k kernel (only supports softmax)
         self.neuron_config.router_topk_nki_kernel_enabled = False
+        # HF checkpoint has fused QKV (query_key_value); tell NxDI GQA to use Wqkv layout
+        self.neuron_config.fused_qkv = True
 
         # Shared expert config — handled as a standalone module on the decoder
         # layer (NeuronSarvamSharedExpert), NOT inside NxDI's MoE module.
@@ -887,6 +889,10 @@ class SarvamMoEInferenceConfig(InferenceConfig):
         self.neuron_config.fused_shared_experts = False
         self.neuron_config.transpose_shared_experts_weights = False
         self.neuron_config.shared_experts_sequence_parallel_enabled = False
+
+        # SDK 2.29: shard_hidden kernel is missing from nkilib.
+        # Force shard_on_intermediate path to avoid NotImplementedError.
+        self.neuron_config.blockwise_matmul_config.use_shard_on_intermediate_dynamic_while = True
 
         self.maybe_pad_intermediate()
         self._enable_fused_moe_tkg()
