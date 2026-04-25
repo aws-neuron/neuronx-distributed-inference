@@ -88,6 +88,7 @@ def create_model_and_load(compiled_path: str, model_path: str):
         qkv_nki_kernel_enabled=False,
         moe_fused_nki_kernel_enabled=True,
         expert_mlp_nki_kernel_enabled=False,
+        mlp_kernel_enabled=True,
         quantized=True,
         quantization_dtype="f8e4m3",
         quantized_checkpoints_path=model_path,

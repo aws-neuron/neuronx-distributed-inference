@@ -39,6 +39,7 @@ Key features:
 - **FP8 expert weights** with per-tensor symmetric quantization (non-expert layers dequantized to BF16)
 - **DSA (DeepSeek Sparse Attention)** indexer: architecture defined but using full-attention fallback
 - **MTP (Multi-Token Prediction)** layer: skipped (training-only)
+- **NKI MLP kernel** for dense layers 0-2 via `mlp_kernel_enabled=True` (uses nkilib SwiGLU kernel for both CTE and TKG)
 
 ## Important: nkilib Override for GLM-5 Routing
 
@@ -112,6 +113,7 @@ neuron_config = MoENeuronConfig(
     qkv_nki_kernel_enabled=False,
     moe_fused_nki_kernel_enabled=True,
     expert_mlp_nki_kernel_enabled=False,
+    mlp_kernel_enabled=True,  # NKI MLP kernel for dense layers 0-2 (+4% throughput)
     quantized=True,
     quantization_dtype="f8e4m3",
     quantized_checkpoints_path=MODEL_PATH,
@@ -189,12 +191,21 @@ The model is compiled as a single-process SPMD model (one process controlling al
 **SDK:** 2.29 (neuronx-cc 2.24.5133.0)
 **Precision:** FP8 experts, BF16 attention/dense layers
 **Routing:** GLM-5 sigmoid routing with selection_bias + routed_scaling_factor=2.5
+**NKI Kernels:** Fused MoE TKG + MLP kernel for dense layers
 
 | Batch Size | CTE seq_len | Total tok/s | Per-req tok/s | Per-token latency | Scaling |
 |-----------|-------------|-------------|---------------|-------------------|---------|
-| 1 | 2048 | 2.1 | 2.1 | 473 ms | 1.0x |
-| 4 | 512 | 12.3 | 3.1 | 326 ms | 5.9x |
-| 8 | 256 | 23.4 | 2.9 | 342 ms | 11.1x |
+| 1 | 2048 | 2.18 | 2.18 | 458 ms | 1.0x |
+| 4 | 512 | 12.3 | 3.1 | 326 ms | 5.6x |
+| 8 | 256 | 23.4 | 2.9 | 342 ms | 10.7x |
+
+**NKI Kernel Impact (BS=1):**
+
+| Config | tok/s | Per-token latency | Change |
+|--------|-------|-------------------|--------|
+| No NKI kernels (compiler only) | ~1.6 | ~625 ms | baseline |
+| Fused MoE TKG kernel | 2.1 | 473 ms | +31% |
+| Fused MoE TKG + MLP kernel | 2.18 | 458 ms | +36% |
 
 **Notes:**
 - CTE (context encoding) compilation is the bottleneck for larger batch sizes due to HBM limits; `seq_len` must be reduced proportionally
@@ -226,4 +237,4 @@ pytest test/integration/test_model.py -v
 
 Agent glm - Annapurna Labs
 
-**Last Updated:** 2026-04-24
+**Last Updated:** 2026-04-25

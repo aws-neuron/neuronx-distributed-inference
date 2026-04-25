@@ -84,6 +84,18 @@ from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.utils import cpu_mode
 
 from neuronx_distributed_inference.utils.distributed import get_tp_group
+from neuronx_distributed_inference.modules.attention.utils import (
+    transpose_parallel_linear_layer,
+)
+
+# NKI MLP kernel (nkilib)
+try:
+    from nkilib.core.mlp.mlp import mlp as nkilib_mlp
+    from nkilib.core.utils.common_types import NormType, QuantizationType, ActFnType
+
+    NKILIB_MLP_AVAILABLE = True
+except ImportError:
+    NKILIB_MLP_AVAILABLE = False
 
 # MoE v2 module (required for MoE layers)
 try:
@@ -1571,12 +1583,21 @@ class GLM5DenseMLP(nn.Module):
     Standard SwiGLU MLP for dense layers (layers 0, 1, 2 in GLM-5).
 
     Uses the dense_intermediate_size (12288), not the MoE intermediate_size (2048).
+    Supports optional NKI MLP kernel acceleration via mlp_kernel_enabled config flag.
     """
 
     def __init__(self, config: GLM5InferenceConfig):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = config.dense_intermediate_size
+
+        self.hidden_size = hidden_size
+        self.mlp_kernel_enabled = (
+            getattr(config.neuron_config, "mlp_kernel_enabled", False)
+            and NKILIB_MLP_AVAILABLE
+        )
+        self.logical_nc_config = getattr(config.neuron_config, "logical_nc_config", 2)
+        self.rms_norm_eps = config.rms_norm_eps
 
         if parallel_state.model_parallel_is_initialized():
             tp_group = get_tp_group(config)
@@ -1604,15 +1625,74 @@ class GLM5DenseMLP(nn.Module):
                 dtype=config.neuron_config.torch_dtype,
                 tensor_model_parallel_group=tp_group,
             )
+
+            if self.mlp_kernel_enabled:
+                # Transpose weights to (in, out) layout expected by NKI kernel
+                self.gate_proj.weight = transpose_parallel_linear_layer(
+                    self.gate_proj.weight
+                )
+                self.up_proj.weight = transpose_parallel_linear_layer(
+                    self.up_proj.weight
+                )
+                self.down_proj.weight = transpose_parallel_linear_layer(
+                    self.down_proj.weight
+                )
+
+            self._tp_group = tp_group
         else:
             self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
             self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
             self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+            self._tp_group = None
 
-    def forward(self, hidden_states):
+    def _nki_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """NKI MLP kernel path (auto-dispatches between TKG and CTE internally)."""
+        gate_w = self.gate_proj.weight.data
+        up_w = self.up_proj.weight.data
+        down_w = self.down_proj.weight.data
+
+        # No fused norm — norm is applied before this call in the decoder layer
+        norm_weights = torch.zeros(
+            size=(1, self.hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        mlp_output = nkilib_mlp[self.logical_nc_config](
+            hidden_tensor=hidden_states,
+            gate_proj_weights_tensor=gate_w,
+            up_proj_weights_tensor=up_w,
+            down_proj_weights_tensor=down_w,
+            normalization_weights_tensor=norm_weights,
+            normalization_type=NormType.NO_NORM,
+            quantization_type=QuantizationType.NONE,
+            gate_w_scale=None,
+            up_w_scale=None,
+            down_w_scale=None,
+            eps=self.rms_norm_eps,
+            activation_fn=ActFnType.SiLU,
+        )
+
+        # All-reduce across TP ranks (down_proj is RowParallel)
+        from neuronx_distributed.parallel_layers.mappings import (
+            reduce_from_tensor_model_parallel_region,
+        )
+
+        output = reduce_from_tensor_model_parallel_region(
+            mlp_output, process_group=self._tp_group
+        )
+        return output
+
+    def _native_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Standard PyTorch path."""
         gate = F.silu(self.gate_proj(hidden_states))
         up = self.up_proj(hidden_states)
         return self.down_proj(gate * up)
+
+    def forward(self, hidden_states):
+        if self.mlp_kernel_enabled:
+            return self._nki_mlp(hidden_states)
+        return self._native_mlp(hidden_states)
 
 
 # ---------------------------------------------------------------------------
