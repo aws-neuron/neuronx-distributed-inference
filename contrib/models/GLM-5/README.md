@@ -205,14 +205,6 @@ The model is compiled and loaded as a single-process SPMD model (one process con
 | 4 | 512 | 12.3 | 3.1 | 326 ms | 5.4x |
 | 8 | 256 | 23.4 | 2.9 | 342 ms | 10.3x |
 
-**NKI Kernel Impact (BS=1):**
-
-| Config | tok/s | Per-token latency | Change |
-|--------|-------|-------------------|--------|
-| No NKI kernels (compiler only) | ~1.6 | ~625 ms | baseline |
-| Fused MoE TKG kernel | 2.1 | 473 ms | +31% |
-| Fused MoE TKG + MLP kernel | 2.27 | 440 ms | +42% |
-
 **Notes:**
 - CTE (context encoding) compilation is the bottleneck for larger batch sizes due to HBM limits; `seq_len` must be reduced proportionally
 - Weight pre-sharding produces 64 rank files totaling ~1044 GB; weight loading takes ~50-57s, warmup ~17s
