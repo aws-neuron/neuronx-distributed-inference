@@ -315,6 +315,43 @@ encoding (TTFT) is ~7x slower (10,185 ms vs 1,420 ms) because `forward_all_exper
 every token through every local expert rather than using the optimized blockwise dispatch. For
 long-output workloads this is negligible; for TTFT-sensitive workloads, use SDK 2.28.
 
+### SDK 2.28 Kernel Porting Attempt
+
+We attempted to extract the `blockwise_mm_baseline_shard_hidden` kernel source from the
+SDK 2.28 DLAMI and port it to run on SDK 2.29 with NKI 0.3.0. The kernel is 2961 lines of
+NKI code with a static unrolled loop (no dynamic while). Three NKI 0.3.0 compatibility
+issues were identified and fixed:
+
+1. **Output parameter immutability:** NKI 0.3.0 treats kernel parameters as immutable.
+   Fixed by removing `output` from the function signature and allocating internally via
+   `nl.ndarray((T, H), dtype=hidden_states.dtype, buffer=nl.shared_hbm)`.
+
+2. **`@nki.jit` mode:** Must use `nki.jit(fn, mode='torchxla')`, not `mode='trace'`.
+   The trace mode creates a `TraceKernel` that cannot handle torch tensors. The torchxla
+   mode creates a `PyTorchXLAKernel` matching how nkilib kernels are imported.
+
+3. **Helper function returning NKI data:** NKI 0.3.0 asserts "function without nki data as
+   input should not return nki data". Inlined the `create_block_hidden_states` helper body
+   directly in the kernel.
+
+After all NKI 0.3.0 fixes, the kernel generates valid HLO and TKG compiles successfully.
+However, **CTE compilation fails** with a BIR verifier assertion failure in neuronx-cc
+2.24.5133:
+
+```
+neuronxcc.driver.Exceptions.CompilerInternalError  (exit code 70)
+Assertion failure: bad_use.empty()  [inst_visitor.cpp:632]
+Dead memory locations in subgraphs nc00/sg01, nc00/sg02
+```
+
+This is a **neuronx-cc compiler regression** — the kernel's static unrolled loop creates
+dead memory allocations that the BIR verifier rejects. Tested with `-O1`, `-O2`, and bare
+minimum compiler flags — all fail identically with the same HLO hash.
+
+**Conclusion:** The shard_hidden kernel cannot be used on SDK 2.29 due to a compiler bug.
+The EP workaround (`forward_all_experts_EP`) is the only viable path until either the
+compiler is fixed or a new blockwise kernel validated for EP=2 is added to nkilib.
+
 **Recommendation:** Use SDK 2.28 for production deployments until the blockwise CTE regression
 is resolved. The `shard_hidden` kernel available in SDK 2.28 provides both correct output and
 optimal TTFT (1,420 ms).
@@ -357,4 +394,4 @@ optimal TTFT (1,420 ms).
 
 Annapurna Labs
 
-**Last Updated:** 2026-04-25
+**Last Updated:** 2026-04-26
