@@ -43,20 +43,22 @@ Key features:
 
 ## Important: nkilib Override for GLM-5 Routing
 
-GLM-5 uses a modified NKI fused MoE kernel that adds `selection_bias` and `routed_scaling_factor` support to the router. This requires the open-source [nkilib](https://github.com/aws-neuron/nki-lib) to be installed in editable mode:
+GLM-5 uses a modified NKI fused MoE kernel that adds `selection_bias` and `routed_scaling_factor` support to the router. This requires the [nki-lib fork](https://github.com/jimburtoft/nki-library) with routing modifications installed in editable mode:
 
 ```bash
-git clone https://github.com/aws-neuron/nki-lib.git
+git clone https://github.com/jimburtoft/nki-library.git nki-lib
 cd nki-lib
+git checkout feature/selection-bias-routing
 pip install -e .
 ```
 
 The modeling code patches the fused TKG kernel at runtime via `_patch_fused_tkg_with_nkilib()` to inject GLM-5's routing parameters into the NKI mega-kernel.
 
-**Modified nkilib files (3 files):**
+**Modified nkilib files (4 files):**
 - `src/nkilib_src/nkilib/core/router_topk/router_topk.py` — NKI kernel with selection_bias + routed_scaling_factor
 - `src/nkilib_src/nkilib/core/router_topk/router_topk_torch.py` — PyTorch reference
 - `src/nkilib_src/nkilib/core/moe_block/moe_block_tkg.py` — Mega-kernel interface
+- `src/nkilib_src/nkilib/core/subkernels/rmsnorm_tkg.py` — NKI 0.3.0 tensor_reduce axis fix
 
 ## Compatibility Matrix
 
@@ -131,10 +133,10 @@ neuron_config = MoENeuronConfig(
 )
 
 config = GLM5InferenceConfig.from_pretrained(MODEL_PATH, neuron_config=neuron_config)
-model = NeuronGLM5ForCausalLM(config)
+model = NeuronGLM5ForCausalLM(MODEL_PATH, config)
 
-# Compile (generates NEFFs for context encoding + token generation)
-# Run with: torchrun --nproc_per_node=64 compile_script.py
+# Compile (single-process SPMD, NOT torchrun)
+# Run with: python3 compile_script.py
 model.compile(COMPILED_MODEL_PATH)
 ```
 
@@ -168,12 +170,16 @@ tokenizer = PreTrainedTokenizerFast(
 )
 
 # Generate
-inputs = tokenizer("The meaning of life is", return_tensors="pt", padding="max_length", max_length=2048)
+# IMPORTANT: Pad prompt to (seq_len - max_new_tokens) to leave room for generation.
+# Total sequence length (prompt + generated) must not exceed seq_len (2048).
+max_new_tokens = 128
+prompt_pad_len = 2048 - max_new_tokens  # 1920
+inputs = tokenizer("The meaning of life is", return_tensors="pt", padding="max_length", max_length=prompt_pad_len)
 with torch.no_grad():
     outputs = wrapped.generate(
         input_ids=inputs.input_ids,
         attention_mask=inputs.attention_mask,
-        max_new_tokens=128,
+        max_new_tokens=max_new_tokens,
         do_sample=True,
         top_p=0.9,
         temperature=0.7,
@@ -181,9 +187,9 @@ with torch.no_grad():
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
-### Important: Single-Process Loading
+### Important: Single-Process SPMD
 
-The model is compiled as a single-process SPMD model (one process controlling all 64 NeuronCores via `local_ranks_size=64`). Loading **must** use a single Python process, NOT `torchrun`. The compilation step uses `torchrun --nproc_per_node=64`, but loading and inference use a single process.
+The model is compiled and loaded as a single-process SPMD model (one process controlling all 64 NeuronCores via `local_ranks_size=64`). Both compilation and inference use a single Python process — do NOT use `torchrun`.
 
 ## Benchmark Results
 
@@ -195,9 +201,9 @@ The model is compiled as a single-process SPMD model (one process controlling al
 
 | Batch Size | CTE seq_len | Total tok/s | Per-req tok/s | Per-token latency | Scaling |
 |-----------|-------------|-------------|---------------|-------------------|---------|
-| 1 | 2048 | 2.18 | 2.18 | 458 ms | 1.0x |
-| 4 | 512 | 12.3 | 3.1 | 326 ms | 5.6x |
-| 8 | 256 | 23.4 | 2.9 | 342 ms | 10.7x |
+| 1 | 2048 | 2.27 | 2.27 | 440 ms | 1.0x |
+| 4 | 512 | 12.3 | 3.1 | 326 ms | 5.4x |
+| 8 | 256 | 23.4 | 2.9 | 342 ms | 10.3x |
 
 **NKI Kernel Impact (BS=1):**
 
@@ -205,7 +211,7 @@ The model is compiled as a single-process SPMD model (one process controlling al
 |--------|-------|-------------------|--------|
 | No NKI kernels (compiler only) | ~1.6 | ~625 ms | baseline |
 | Fused MoE TKG kernel | 2.1 | 473 ms | +31% |
-| Fused MoE TKG + MLP kernel | 2.18 | 458 ms | +36% |
+| Fused MoE TKG + MLP kernel | 2.27 | 440 ms | +42% |
 
 **Notes:**
 - CTE (context encoding) compilation is the bottleneck for larger batch sizes due to HBM limits; `seq_len` must be reduced proportionally
@@ -230,11 +236,20 @@ The model is compiled as a single-process SPMD model (one process controlling al
 
 ```bash
 # Integration test (requires trn2.48xlarge with compiled model)
-pytest test/integration/test_model.py -v
+export COMPILED_MODEL_PATH=/mnt/nvme2/glm5_compiled
+export MODEL_PATH=/mnt/nvme/GLM-5-FP8
+PYTHONPATH=src:$PYTHONPATH pytest test/integration/test_model.py -v
 ```
+
+## Validated On
+
+- **Instance:** trn2.48xlarge (us-east-2b, `Deep Learning AMI Neuron (Ubuntu 24.04) 20260410`)
+- **SDK:** 2.29 (neuronx-cc 2.24.5133.0, NxDI 0.9.17334, NKI 0.3.0)
+- **Date:** 2026-04-26
+- **Results:** Compilation PASS (both CTE and TKG), all 4 pytest tests PASS, 2.27 tok/s at BS=1
 
 ## Maintainer
 
 Agent glm - Annapurna Labs
 
-**Last Updated:** 2026-04-25
+**Last Updated:** 2026-04-26

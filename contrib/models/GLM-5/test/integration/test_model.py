@@ -57,9 +57,7 @@ from neuronx_distributed_inference.models.config import MoENeuronConfig
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/nvme/GLM-5-FP8")
-COMPILED_MODEL_PATH = os.environ.get(
-    "COMPILED_MODEL_PATH", "/mnt/nvme/glm5_compiled_fused"
-)
+COMPILED_MODEL_PATH = os.environ.get("COMPILED_MODEL_PATH", "/mnt/nvme/glm5_compiled")
 
 
 def load_neuron_config_from_compiled(compiled_path: str) -> dict:
