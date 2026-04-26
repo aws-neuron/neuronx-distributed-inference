@@ -18,7 +18,15 @@ TP Strategy (TP=4):
   - MLP fc1: ColumnParallelLinear (gather_output=False)
   - MLP fc2: RowParallelLinear (input_is_parallel=True)
   - ModulateDiT, FinalLayer, QK-norm: Replicated
-  - Attention: NKI flash attention (fused, O(n) memory)
+  - Attention: NKI flash attention (dense) or STA (sparse, for long sequences)
+
+Attention modes:
+  - Dense (default): Full attention using attention_isa_kernel. O(n^2).
+    Suitable for short sequences (e.g., 480p 5-frame: 3,500 tokens).
+  - STA (Sliding Tile Attention): Block-sparse attention using attention_cte.
+    Tokens are tiled in 3D (T,H,W) and each tile attends only to its
+    spatio-temporal neighborhood. Uses group-by-n_allowed architecture.
+    Required for long sequences (e.g., 129-frame: ~52K tokens).
 
 Forward signature for tracing (all tensors, no control flow):
   1. img       [B, L_img, 2048]
@@ -44,7 +52,7 @@ from neuronx_distributed.parallel_layers.layers import (
     RowParallelLinear,
 )
 
-# NKI Flash Attention imports
+# NKI Flash Attention imports (dense attention)
 try:
     from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
 except ImportError:
@@ -54,6 +62,13 @@ from neuronxcc.nki.language import nc
 from torch_neuronx.xla_impl.ops import nki_jit
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
+
+# STA (Sliding Tile Attention) — optional, for block-sparse attention
+try:
+    from sta_attention import STAAttention, create_sta_attention
+except ImportError:
+    STAAttention = None
+    create_sta_attention = None
 
 # NKI RoPE kernel (optional, ~3% faster per step but adds code complexity)
 # Enable with: export HUNYUAN_NKI_ROPE=1
@@ -203,6 +218,10 @@ class TPMMDoubleStreamBlock(nn.Module):
     All O projections are RowParallel (shard input dim, all-reduce output).
     MLP fc1 is ColumnParallel, fc2 is RowParallel.
     ModulateDiT and QK-norms are replicated.
+
+    Attention mode:
+      - If sta_attention is None: use dense NKI flash attention
+      - If sta_attention is an STAAttention module: use block-sparse STA
     """
 
     def __init__(
@@ -212,12 +231,16 @@ class TPMMDoubleStreamBlock(nn.Module):
         mlp_width_ratio: float = 4.0,
         qkv_bias: bool = True,
         dtype: torch.dtype = torch.bfloat16,
+        sta_attention: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.heads_num = heads_num
         self.head_dim = hidden_size // heads_num
         mlp_hidden_dim = int(hidden_size * mlp_width_ratio)
+
+        # Attention mode: STA (block-sparse) or dense (NKI flash)
+        self.sta_attention = sta_attention  # None = dense, STAAttention = sparse
 
         # --- Image stream ---
         # Modulation (replicated -- small, operates on conditioning vec)
@@ -452,7 +475,13 @@ class TPMMDoubleStreamBlock(nn.Module):
         # NKI flash attention with K/V zeroing for padding text tokens.
         # The K/V zeroing above ensures padding positions have near-zero
         # attention scores, and zero V contribution even if attended to.
-        attn_out = nki_flash_attention(q_cat, k_cat, v_cat)
+        if self.sta_attention is not None:
+            # STA: block-sparse sliding tile attention via attention_cte
+            # STAAttention expects [B, H, seq_len, D] and returns [B, H, seq_len, D]
+            attn_out = self.sta_attention(q_cat, k_cat, v_cat)
+        else:
+            # Dense: NKI flash attention
+            attn_out = nki_flash_attention(q_cat, k_cat, v_cat)
         # [B, local_heads, L_total, D]
 
         # Transpose back: [B, L_total, local_heads, D]
@@ -512,6 +541,19 @@ class HunyuanDiTTPWrapper(nn.Module):
     """
     Complete TP-sharded DiT wrapper for tracing.
     54 double-stream blocks + final layer.
+
+    Supports two attention modes:
+      - Dense (default): Full O(n^2) attention using attention_isa_kernel.
+      - STA: Block-sparse sliding tile attention using attention_cte.
+        Enabled by passing sta_config dict with canvas geometry.
+
+    Args:
+        sta_config: Optional dict to enable STA. Keys:
+            canvas_thw: (T, H, W) of the image latent grid (before padding)
+            tile_thw: tile dimensions (default (6,8,8) = 384 tokens)
+            kernel_thw: neighborhood kernel (default (3,3,3) = 27 tiles)
+            text_len: number of text tokens (default 320)
+        When sta_config is None, uses dense attention.
     """
 
     def __init__(
@@ -524,25 +566,54 @@ class HunyuanDiTTPWrapper(nn.Module):
         out_channels: int = 32,
         qkv_bias: bool = True,
         dtype: torch.dtype = torch.bfloat16,
+        sta_config: Optional[dict] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.heads_num = heads_num
         self.head_dim = hidden_size // heads_num
 
+        # Determine attention mode
+        use_sta = sta_config is not None and create_sta_attention is not None
+        if sta_config is not None and create_sta_attention is None:
+            print(
+                "WARNING: sta_config provided but sta_attention module not available. "
+                "Using dense attention."
+            )
+            use_sta = False
+
+        # For STA, compute local heads per TP rank.
+        # At init time we don't know the TP degree yet, but ColumnParallelLinear
+        # will shard heads. We can compute local_heads from the first block
+        # after construction. For now, assume TP=4 as documented.
+        tp_degree = int(os.getenv("NEURON_RT_NUM_CORES", "4"))
+        local_heads = heads_num // tp_degree
+
         # 54 double-stream blocks
-        self.double_blocks = nn.ModuleList(
-            [
+        self.double_blocks = nn.ModuleList()
+        for _ in range(num_blocks):
+            if use_sta:
+                sta_module = create_sta_attention(
+                    canvas_thw=sta_config["canvas_thw"],
+                    tile_thw=sta_config.get("tile_thw", (6, 8, 8)),
+                    kernel_thw=sta_config.get("kernel_thw", (3, 3, 3)),
+                    text_len=sta_config.get("text_len", 320),
+                    num_heads=local_heads,
+                    head_dim=self.head_dim,
+                )
+            else:
+                sta_module = None
+
+            self.double_blocks.append(
                 TPMMDoubleStreamBlock(
                     hidden_size=hidden_size,
                     heads_num=heads_num,
                     mlp_width_ratio=mlp_width_ratio,
                     qkv_bias=qkv_bias,
                     dtype=dtype,
+                    sta_attention=sta_module,
                 )
-                for _ in range(num_blocks)
-            ]
-        )
+            )
 
         # Final layer (replicated -- tiny output dim)
         out_size = patch_size[0] * patch_size[1] * patch_size[2] * out_channels

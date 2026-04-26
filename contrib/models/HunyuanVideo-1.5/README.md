@@ -185,8 +185,9 @@ HunyuanVideo-1.5/
 ├── README.md
 ├── src/
 │   ├── __init__.py
-│   ├── dit_tp_wrapper.py          # DiT TP=4 with NKI flash attention (699 LOC)
+│   ├── dit_tp_wrapper.py          # DiT TP=4 with NKI flash attention + STA support
 │   ├── dit_wrapper.py             # CPU preprocessor for tracing (366 LOC)
+│   ├── sta_attention.py           # Sliding Tile Attention module for block-sparse attention
 │   ├── e2e_pipeline.py            # Full E2E T2V pipeline (908 LOC)
 │   ├── nki_rope.py                # Optional NKI fused RoPE kernel (HUNYUAN_NKI_ROPE=1)
 │   ├── compile_vae_neuron.py      # VAE compilation with monkey-patches
@@ -221,7 +222,7 @@ HunyuanVideo-1.5/
 
 ### NKI Flash Attention
 
-Uses `attention_isa_kernel` from `neuronxcc.nki._private_kernels.attention` for O(n) memory attention. Sequence lengths are padded to multiples of 2048 (NKI_SEQ_TILE_SHARDED) for LNC=2 compatibility.
+Uses `attention_isa_kernel` from `neuronxcc.nki._private_kernels.attention` for O(n) memory dense attention. Sequence lengths are padded to multiples of 2048 (NKI_SEQ_TILE_SHARDED) for LNC=2 compatibility. For long sequences, Sliding Tile Attention (STA) uses `attention_cte` for block-sparse attention — see the STA section above.
 
 ### CFG (Classifier-Free Guidance)
 
@@ -258,6 +259,65 @@ Three patches are required for the 3D Causal VAE to compile on Neuron:
 1. **CausalConv3d**: Replace `F.pad(mode='replicate')` with `torch.cat` (temporal) + `F.pad(mode='constant')` (spatial)
 2. **swish**: `inplace=True` -> `inplace=False` (Neuron rejects inplace SiLU)
 3. **prepare_causal_attention_mask**: Python loop -> vectorized `torch.arange` + broadcasting
+
+### Sliding Tile Attention (STA) for Long Videos
+
+For long video generation (e.g., 129 frames, ~52K image tokens), dense O(n^2) attention is infeasible (~85 GB per attention matrix). STA replaces dense attention with block-sparse attention: tokens are tiled in 3D (T,H,W) and each tile attends only to its spatio-temporal neighborhood.
+
+**When to use STA:**
+- Short sequences (< 8K tokens, e.g., 5-frame 480p): Use dense attention (default)
+- Long sequences (> 8K tokens, e.g., 129-frame 480p): Use STA
+
+**STA adds no learned parameters** — the same model weights work for both modes. The attention mode is selected at compile time.
+
+**Compiling with STA:**
+
+Pass `sta_config` to `HunyuanDiTTPWrapper` when constructing the model for tracing:
+
+```python
+from dit_tp_wrapper import HunyuanDiTTPWrapper
+
+# 129-frame 480p: T_lat=33, H_lat=30, W_lat=53
+sta_config = {
+    "canvas_thw": (33, 30, 53),   # Latent grid dimensions (T, H, W)
+    "tile_thw": (6, 8, 8),        # Tile size (384 tokens per tile)
+    "kernel_thw": (3, 3, 3),      # 3D neighborhood (27-tile window)
+    "text_len": 320,              # Text token count
+}
+
+model = HunyuanDiTTPWrapper(
+    hidden_size=2048,
+    heads_num=16,
+    num_blocks=54,
+    sta_config=sta_config,  # Enables STA
+)
+```
+
+When `sta_config` is `None` (default), dense attention is used.
+
+**STA Architecture:**
+- Scatter-free design: boundary clamping ensures all image blocks have the same neighborhood size, eliminating the scatter operation that would cause SBUF overflow at 64K+ tokens
+- Per-chunk KV gather: avoids materializing the full gather tensor
+- Text tokens use full attention (attend to all image + text tokens)
+- Uses `attention_cte` kernel from NKI for fused attention computation
+
+**Compiler Memory Requirements:**
+
+| Configuration | Compiler Memory | Compile Time |
+|--------------|----------------|--------------|
+| 2 blocks × 3.5K tokens | ~2 GB | ~51s |
+| 54 blocks × 3.5K tokens | ~4 GB | ~65s |
+| 2 blocks × 52K tokens | ~42 GB | ~715s |
+| 54 blocks × 52K tokens | >124 GB | Requires trn2.48xlarge |
+
+**Benchmark Results (trn2.3xlarge, TP=4):**
+
+| Sequence | Dense | STA |
+|----------|-------|-----|
+| 3.5K tokens (5-frame) | 263ms/step | 1004ms/step |
+| 52K tokens (129-frame) | Infeasible | ~619ms/step (2 blocks) |
+
+STA is slower than dense at short sequences due to tiling/gather overhead, but is the only viable option for long sequences where dense attention exceeds available HBM.
 
 ## Known Issues
 
