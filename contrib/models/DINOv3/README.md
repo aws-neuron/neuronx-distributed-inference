@@ -44,17 +44,19 @@ DINOv3 models are compiled using two different approaches depending on model siz
 | ConvNeXt-T | 0.999989 | < 0.001 |
 | ConvNeXt-B | 0.999989 | < 0.001 |
 
-### Benchmark (trn2.3xlarge, LNC=2, DP=4)
+### Benchmark (trn2.3xlarge, LNC=2, SDK 2.29)
 
-| Model | NEFF Size | Compile Time | 1-Core (img/s) | DP=4 Peak (img/s) |
-|-------|----------:|-------------:|----------------:|-------------------:|
-| ViT-S/16 | 68 MB | 84s | 367 | **722.8** |
-| ViT-B/16 | 264 MB | 45s | 222 | **438.7** |
-| ViT-L/16 | 931 MB | 123s | 87.6 | **174.7** |
-| ViT-H+/16 | 2,595 MB | 688s | 5.2 | 10.5 |
-| ViT-7B/16 | TP=4 NEFF | 5.9s | OOM | **38.8** (TP=4) |
-| ConvNeXt-T | 90 MB | 44s | 183 | **363.3** |
-| ConvNeXt-B | 275 MB | 63s | 130 | **257.8** |
+| Model | Compile Time | 1-Core (img/s) | DP=4 Peak (img/s) |
+|-------|-------------:|----------------:|-------------------:|
+| ViT-S/16 | 84s | 367 | **722.8** |
+| ViT-B/16 | 89s | 214.4 | **422.9** |
+| ViT-L/16 | 123s | 87.6 | **174.7** |
+| ViT-H+/16 | 688s | 5.2 | 10.5 |
+| ViT-7B/16 | 5.9s | OOM | **38.8** (TP=4) |
+| ConvNeXt-T | 34s | 264.4 | **522.6** |
+| ConvNeXt-B | 63s | 130 | **257.8** |
+
+*Note: ViT-S/L/H+/7B and ConvNeXt-B numbers from SDK 2.28; ViT-B and ConvNeXt-T validated on SDK 2.29. ConvNeXt-T improved 44% from SDK 2.28 to 2.29.*
 
 ### Key Findings
 
@@ -68,10 +70,10 @@ DINOv3 models are compiled using two different approaches depending on model siz
 
 | Model | Neuron Best (trn2 DP=4) | GPU Best (A10G torch.compile BS=16) | Winner |
 |-------|------------------------:|------------------------------------:|--------|
-| ViT-B/16 | **440.6 img/s** | 380.0 img/s | Neuron 1.16x |
-| ConvNeXt-Tiny | 364.5 img/s | **1,156.2 img/s** | GPU 3.2x |
+| ViT-B/16 | **422.9 img/s** | 380.0 img/s | Neuron 1.11x |
+| ConvNeXt-Tiny | 522.6 img/s | **1,156.2 img/s** | GPU 2.2x |
 
-Neuron excels on ViT (transformer ops), GPU excels on ConvNeXt (conv ops). The hardware advantage depends on model architecture.
+Neuron excels on ViT (transformer ops), GPU excels on ConvNeXt (conv ops). ConvNeXt gap narrowed from 3.2x to 2.2x with SDK 2.29 compiler improvements.
 
 <details>
 <summary>Full GPU results (A10G, PyTorch 2.6)</summary>
@@ -100,13 +102,13 @@ Neuron excels on ViT (transformer ops), GPU excels on ConvNeXt (conv ops). The h
 
 | Component | Version |
 |-----------|---------|
-| **Neuron SDK** | 2.28 |
-| **torch-neuronx** | 2.9.0.2.11 |
-| **neuronx-cc** | 2.22.12471 |
-| **neuronx-distributed** | 0.16.25997 (ViT-7B TP only) |
+| **Neuron SDK** | 2.29 |
+| **torch-neuronx** | 2.9.0.2.13 |
+| **neuronx-cc** | 2.24.5133.0 |
+| **neuronx-distributed** | (for ViT-7B TP only) |
 | **Instance (small/medium)** | inf2.xlarge, trn2.3xlarge |
 | **Instance (ViT-7B)** | trn2.3xlarge (TP=4, LNC=2) |
-| **DLAMI** | Deep Learning AMI Neuron (Ubuntu 24.04) 20260227 |
+| **DLAMI** | Deep Learning AMI Neuron (Ubuntu 24.04) 20260410 |
 
 ## Usage
 
@@ -114,7 +116,7 @@ Neuron excels on ViT (transformer ops), GPU excels on ConvNeXt (conv ops). The h
 
 ```bash
 # Activate Neuron environment
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
 # Clone DINOv3 repository
 git clone https://github.com/facebookresearch/dinov3.git /mnt/models/dinov3
@@ -175,7 +177,7 @@ for bs, r in dp_results.items():
 
 ```bash
 # Activate Neuron environment
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
 # Run integration tests
 python -m pytest contrib/models/DINOv3/test/integration/test_model.py -v
