@@ -126,31 +126,29 @@ class LazyWeightMap:
 
     def __init__(self, model_dir: str, weight_map: Dict[str, str]):
         self.model_dir = model_dir
-        self.weight_map = weight_map
         self._cur_filename: Optional[str] = None
         self._cur_handle = None
-        # MiMo-V2.5's published index.json still references the legacy
-        # `model_N-00001-of-00002.safetensors` names, but the actual shards
-        # on disk are `model_pp0_epN_shardM.safetensors`. Build an alias
-        # table: legacy -> real filename, for all shards present locally.
-        self._filename_alias: Dict[str, str] = {}
-        import re
-        actual_files = os.listdir(model_dir)
-        legacy_re = re.compile(r"model_(\d+)-0000([12])-of-00002\.safetensors")
-        for name in weight_map.values():
-            if name in self._filename_alias or name in actual_files:
-                continue
-            m = legacy_re.match(name)
-            if not m:
-                continue
-            ep_idx, shard_one_based = m.group(1), m.group(2)
-            shard_zero_based = str(int(shard_one_based) - 1)
-            candidate = f"model_pp0_ep{ep_idx}_shard{shard_zero_based}.safetensors"
-            if candidate in actual_files:
-                self._filename_alias[name] = candidate
+        # V2.5's published model.safetensors.index.json references filenames
+        # like `model_N-00001-of-00002.safetensors`, but the shards on disk
+        # are `model_pp0_epN_shardM.safetensors` and the ep/N numbers don't
+        # line up. Rather than try to reverse-engineer the mapping, scan the
+        # on-disk shards and rebuild weight_map by reading each file's
+        # manifest directly. Falls back to the provided weight_map when the
+        # shard files match the names on disk (pre-V2.5 checkpoints).
+        actual_files = sorted(f for f in os.listdir(model_dir) if f.endswith(".safetensors"))
+        names_in_weight_map = set(weight_map.values())
+        if actual_files and not (names_in_weight_map & set(actual_files)):
+            rebuilt: Dict[str, str] = {}
+            for fname in actual_files:
+                path = os.path.join(model_dir, fname)
+                with safe_open(path, framework="pt", device="cpu") as fp:
+                    for k in fp.keys():
+                        rebuilt[k] = fname
+            self.weight_map = rebuilt
+        else:
+            self.weight_map = weight_map
 
     def _open(self, filename: str):
-        filename = self._filename_alias.get(filename, filename)
         if self._cur_filename == filename:
             return self._cur_handle
         if self._cur_handle is not None:
