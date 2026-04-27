@@ -21,7 +21,7 @@ MODEL_PATH = os.environ.get(
 )
 COMPILED_PATH = os.environ.get(
     "MIMO_V25_PRO_COMPILED_PATH",
-    "/opt/dlami/nvme/compiled/mimo_v25_pro_tp64_moetp1_ep64_fp8/",
+    "/opt/dlami/nvme/compiled/mimo_v25_pro_moetp1_ep64_bs48/",
 )
 
 # Must match smoke_compile_mimo_v2.py exactly, else load() sees a
@@ -30,8 +30,8 @@ TP_DEGREE = int(os.environ.get("TP_DEGREE", "64"))
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "1024"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "48"))  # must match smoke_compile
 CTX_BATCH_SIZE = int(os.environ.get("CTX_BATCH_SIZE", "1"))
-MOE_TP = int(os.environ.get("MOE_TP", "16"))
-MOE_EP = int(os.environ.get("MOE_EP", "4"))
+MOE_TP = int(os.environ.get("MOE_TP", "1"))
+MOE_EP = int(os.environ.get("MOE_EP", "64"))
 
 PROMPT = os.environ.get(
     "MIMO_V25_PRO_PROMPT",

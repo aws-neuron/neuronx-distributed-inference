@@ -177,6 +177,14 @@ class MiMoV2InferenceConfig(InferenceConfig):
         self.num_local_experts = self.n_routed_experts
         self.n_shared_experts = 0  # MiMo-V2.5-Pro has no shared experts
 
+        # Stash the HF config's `intermediate_size` (used by the dense MLP
+        # in layer 0) BEFORE we overwrite `self.intermediate_size` with the
+        # MoE value. `MiMoV2MLP` reads `dense_intermediate_size` and falls
+        # back to `config.intermediate_size * 8` if absent, which happens
+        # to equal 16384 for V2.5-Pro (2048 * 8) but is brittle if Xiaomi
+        # ever tweaks the ratio.
+        self.dense_intermediate_size = self.intermediate_size
+
         # Set intermediate_size for MoE layers
         self.intermediate_size = self.moe_intermediate_size
 
@@ -340,7 +348,7 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         # Scaling factor
         self.scaling = self.attn_head_dim ** -0.5
         # HF MiMoV2Attention (modeling_mimo_v2.py) multiplies value_states
-        # by config.attention_value_scale (0.707 for Flash) right after the V
+        # by config.attention_value_scale (0.612 for MiMo-V2.5-Pro) right after the V
         # projection, before attention softmax*V. Matching that here — applied
         # to value_states in forward() rather than to attn_output.
         self.value_scale = float(getattr(config, "attention_value_scale", 1.0))
@@ -562,7 +570,7 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # HF MiMoV2Attention scales V by attention_value_scale (0.707 for Flash)
+        # HF MiMoV2Attention scales V by attention_value_scale (0.612 for MiMo-V2.5-Pro)
         # right after v_proj, before the attention softmax*V. Earlier revisions
         # of this file applied it post-attention or not at all; both produce
         # gibberish for prompts longer than ~20 tokens.
@@ -824,8 +832,10 @@ class MiMoV2MLP(nn.Module):
     def __init__(self, config: MiMoV2InferenceConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Use the dense intermediate size for non-MoE layers
-        self.intermediate_size = getattr(config, 'dense_intermediate_size', config.intermediate_size * 8)
+        # Use the dense intermediate size for non-MoE layers.
+        # `dense_intermediate_size` is stashed in MiMoV2InferenceConfig.__init__
+        # before `self.intermediate_size` is overwritten with the MoE value.
+        self.intermediate_size = config.dense_intermediate_size
 
         dtype = config.neuron_config.torch_dtype
 
@@ -1081,8 +1091,8 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
     num_attention_heads = config.num_attention_heads
 
     # MiMo-V2.5-Pro has different KV heads for full and sliding window attention
-    full_num_kv_heads = config.num_key_value_heads  # 4
-    swa_num_kv_heads = config.swa_num_key_value_heads  # 8
+    full_num_kv_heads = config.num_key_value_heads  # V2.5-Pro: 8
+    swa_num_kv_heads = config.swa_num_key_value_heads  # V2.5-Pro: 8
 
     # Check if we need to replicate K/V weights
     full_use_convert_to_mha = tp_degree > full_num_kv_heads

@@ -10,7 +10,7 @@ at a time and emits per-layer safetensors shards, capping peak RAM at
 
 MiMo-V2.5-Pro checkpoint layout:
   - q_proj, k_proj, v_proj are FUSED into a single `qkv_proj` tensor per
-    layer (num_kv_heads interleaved groups, Pro-specific). We split into
+    layer (num_kv_heads interleaved groups, MiMo-V2.5-Pro-specific). We split into
     three per-row-quantized projections via `split_qkv_fused()`.
   - o_proj is BF16 (listed in quantization_config.ignored_layers); kept
     as BF16 on the Neuron side (RowParallelLinear, not QuantizedRowParallel).
@@ -409,7 +409,7 @@ def process_layer(
         out[f"{out_prefix}mlp.router.linear_router.weight"] = router_w.detach().clone()
     router_bias = lazy.get(f"{prefix}mlp.gate.e_score_correction_bias")
     if router_bias is not None:
-        # Pro-specific: HF bias has mean ~71 with per-expert std ~3e-4. NxDI
+        # V2.5-Pro: HF bias has mean ~71 (same pathology as V2-Pro; measured mean=70.906, std=2.4e-4) with per-expert std ~3e-4. NxDI
         # casts router parameters to bf16 at load time, and bf16 step size at
         # magnitude 71 is ~0.5 — which completely wipes out the per-expert
         # std=3e-4 variation, collapsing all 384 experts to a single bias

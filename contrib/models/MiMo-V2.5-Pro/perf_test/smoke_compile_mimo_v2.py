@@ -2,11 +2,11 @@
 """Minimal compile+load smoke test for MiMo-V2.5-Pro FP8 on Trn2.
 
 Bypasses vLLM entirely so we can iterate on the preprocessed Neuron-FP8
-checkpoint without paying vllm-neuron's startup cost. Builds the Flash BS=1
-recipe (TP=64, EP=1, blockwise FP8 for routed experts), compiles to a temp
-dir, then loads. EP=1 lets the TKG path enter forward_selective_loading
-legally so BS=1 compiles — with EP>1 NxDI raises NotImplementedError and
-forces BS>=num_experts/top_k = 32.
+checkpoint without paying vllm-neuron's startup cost. Compiles the model
+(TP=64, configurable MoE TP/EP, blockwise FP8 for routed experts) to a
+temp dir, then loads. For `moe_ep_degree > 1` the TKG path raises
+`NotImplementedError: Selective Loading with Expert parallelism` unless
+`batch_size * top_k / num_experts >= 1.0` → `batch_size >= 384 / 8 = 48`.
 
 STAGE controls how far we go:
   instantiate | compile | load | all   (default: all)
@@ -31,7 +31,7 @@ MODEL_PATH = os.environ.get(
 )
 COMPILED_PATH = os.environ.get(
     "MIMO_V25_PRO_COMPILED_PATH",
-    "/opt/dlami/nvme/compiled/mimo_v25_pro_moetp16_ep4_bs48/",
+    "/opt/dlami/nvme/compiled/mimo_v25_pro_moetp1_ep64_bs48/",
 )
 
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "64"))
@@ -41,13 +41,14 @@ SEQ_LEN = int(os.environ.get("SEQ_LEN", "1024"))
 # path raises `NotImplementedError: Selective Loading with Expert parallelism`.
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "48"))
 CTX_BATCH_SIZE = int(os.environ.get("CTX_BATCH_SIZE", "1"))
-# moe_tp=16 / moe_ep=4: after moetp1/ep64 (prefill broken, E_local=6) and
-# moetp32/ep2 (HBM OOM by 28MB at load, E_local=192), try the middle ground.
-# E_local=384/4=96. Also intermediate/moe_tp = 2048/16 = 128 which matches
-# the FP8 scale block size exactly — avoids the stride_fix workaround path.
-# world_size = 16*4 = 64 OK.
-MOE_TP = int(os.environ.get("MOE_TP", "16"))
-MOE_EP = int(os.environ.get("MOE_EP", "4"))
+# moe_tp=1 / moe_ep=64: first recipe to try on V2.5-Pro. Lowest compile time
+# (no intra-expert TP split) and output quality should be comparable to
+# Flash, which uses the same recipe. On V2-Pro this produced garbage
+# prefill ("0.0.0.0:8080"), but we're re-testing on V2.5-Pro because the
+# V2-Pro root cause ended up being FP8 expert-MLP precision loss, which
+# V2.5 may or may not inherit.
+MOE_TP = int(os.environ.get("MOE_TP", "1"))
+MOE_EP = int(os.environ.get("MOE_EP", "64"))
 
 STAGE = os.environ.get("STAGE", "all").lower()
 
@@ -96,8 +97,7 @@ def main():
     # (e.g. tp=64 + ep=4 -> 256 ranks -> 4x the sharded checkpoint size,
     # and at runtime the model doesn't fit on the device). For MoE-only
     # EP we want ep_degree=1 at the outer level and the per-MoE split
-    # controlled solely by moe_ep_degree (which Pro's working benches
-    # also do). Keep ep_degree=1 unconditionally.
+    # controlled solely by moe_ep_degree. Keep ep_degree=1 unconditionally.
     neuron_config = MoENeuronConfig(
         tp_degree=TP_DEGREE,
         ep_degree=1,
