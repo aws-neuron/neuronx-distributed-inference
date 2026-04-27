@@ -212,17 +212,71 @@ def process_layer(
         if t is not None:
             out[f"{out_prefix}{name}.weight"] = t.detach().clone()
 
-    # --- Attention: q/k/v/o are stored separately in MiMo-V2.5 ---
-    # q/k/v: rescale to Neuron FP8 per-row.
-    for proj in ("q_proj", "k_proj", "v_proj"):
-        w = lazy.get(f"{prefix}self_attn.{proj}.weight")
-        if w is None:
-            continue
-        s = lazy.get(f"{prefix}self_attn.{proj}.weight_scale_inv")
-        w2, s2 = _maybe_fp8_to_neuron_per_row(w, s)
-        out[f"{out_prefix}self_attn.{proj}.weight"] = w2
-        if s2 is not None:
-            out[f"{out_prefix}self_attn.{proj}.scale"] = s2
+    # --- Attention: q/k/v ---
+    # MiMo-V2.5 ships the QKV projection *fused* into a single
+    # self_attn.qkv_proj.weight (shape [Q_dim+K_dim+V_dim, hidden]) with
+    # blockwise-128 FP8 scaling. The NxDI modeling code hard-codes separate
+    # q_proj / k_proj / v_proj, so slice the fused tensor back into three
+    # per-proj tensors. All per-head dimensions here are multiples of 128,
+    # so the blockwise scale slices cleanly along the fused output dim.
+    qkv_w = lazy.get(f"{prefix}self_attn.qkv_proj.weight")
+    qkv_s = lazy.get(f"{prefix}self_attn.qkv_proj.weight_scale_inv")
+    if qkv_w is not None:
+        num_heads = config["swa_num_attention_heads" if is_swa else "num_attention_heads"]
+        num_kv_heads = config["swa_num_key_value_heads" if is_swa else "num_key_value_heads"]
+        qk_head_dim = config["swa_head_dim" if is_swa else "head_dim"]
+        v_head_dim = config["swa_v_head_dim" if is_swa else "v_head_dim"]
+        q_dim = num_heads * qk_head_dim
+        k_dim = num_kv_heads * qk_head_dim
+        v_dim = num_kv_heads * v_head_dim
+        assert qkv_w.shape[0] == q_dim + k_dim + v_dim, (
+            f"Layer {layer_idx} fused qkv_proj out_dim {qkv_w.shape[0]} != "
+            f"{q_dim}+{k_dim}+{v_dim}={q_dim+k_dim+v_dim} "
+            f"(is_swa={is_swa}, heads={num_heads}, kv_heads={num_kv_heads}, "
+            f"qk_hd={qk_head_dim}, v_hd={v_head_dim})"
+        )
+        for block_size in (128,):
+            for name, dim in (("q_proj", q_dim), ("k_proj", k_dim), ("v_proj", v_dim)):
+                assert dim % block_size == 0, (
+                    f"{name} dim {dim} is not a multiple of {block_size}; "
+                    f"cannot slice fused qkv blockwise scale"
+                )
+        q_w_slice = qkv_w[:q_dim]
+        k_w_slice = qkv_w[q_dim : q_dim + k_dim]
+        v_w_slice = qkv_w[q_dim + k_dim :]
+        if qkv_s is not None:
+            q_blocks = q_dim // 128
+            k_blocks = k_dim // 128
+            q_s_slice = qkv_s[:q_blocks]
+            k_s_slice = qkv_s[q_blocks : q_blocks + k_blocks]
+            v_s_slice = qkv_s[q_blocks + k_blocks :]
+        else:
+            q_s_slice = k_s_slice = v_s_slice = None
+        for name, w, s in (
+            ("q_proj", q_w_slice, q_s_slice),
+            ("k_proj", k_w_slice, k_s_slice),
+            ("v_proj", v_w_slice, v_s_slice),
+        ):
+            # `s` may still reference the parent qkv scale tensor; clone it so
+            # rescale_fp8 sees a contiguous view and can call .view/.contiguous
+            # on a real tensor.
+            s = s.contiguous().clone() if s is not None else None
+            w = w.contiguous().clone()
+            w2, s2 = _maybe_fp8_to_neuron_per_row(w, s)
+            out[f"{out_prefix}self_attn.{name}.weight"] = w2
+            if s2 is not None:
+                out[f"{out_prefix}self_attn.{name}.scale"] = s2
+    else:
+        # Fallback path for checkpoints that ship split q/k/v (pre-V2.5).
+        for proj in ("q_proj", "k_proj", "v_proj"):
+            w = lazy.get(f"{prefix}self_attn.{proj}.weight")
+            if w is None:
+                continue
+            s = lazy.get(f"{prefix}self_attn.{proj}.weight_scale_inv")
+            w2, s2 = _maybe_fp8_to_neuron_per_row(w, s)
+            out[f"{out_prefix}self_attn.{proj}.weight"] = w2
+            if s2 is not None:
+                out[f"{out_prefix}self_attn.{proj}.scale"] = s2
 
     # o_proj is listed in HF quantization_config.ignored_layers and ships as
     # BF16; on Neuron it binds to a plain RowParallelLinear (see
