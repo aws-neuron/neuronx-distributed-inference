@@ -36,7 +36,7 @@ Key features:
 
 ## Prerequisites
 
-- **Instance**: trn2.48xlarge (32 NeuronCores, logical_nc_config=2 → 64 logical cores)
+- **Instance**: trn2.48xlarge (128 NeuronCores, logical_nc_config=2 → 64 logical cores)
 - **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9)
 - **Venv**: `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (ships with the DLAMI; has NxDI, vllm-neuron, and `huggingface_hub`/`s5cmd`).
 - **Disk**: ~900 GB free under `/opt/dlami/nvme` (HF FP8 checkpoint ~295 GB, Neuron-FP8 preprocessed output ~310 GB, and `save_sharded_checkpoint=true` writes another ~300 GB of per-rank sharded weights per compiled config). The DLAMI creates a 6.9 TB RAID0 at `/dev/md0` across the instance-store NVMes but does **not** add it to `/etc/fstab`, so it is not mounted automatically after a reboot. Before running any of the steps below, remount it if needed:
@@ -311,6 +311,32 @@ python3 -m vllm.entrypoints.openai.api_server \
 ```
 
 See `perf_test/bench_mimo_v2_5.sh` for the full benchmark recipe at BS=32 and BS=128.
+
+### Testing the vLLM server
+
+Once `/v1/models` returns 200 (first-compile takes ~30 min; subsequent starts ~3 min), hit `/v1/chat/completions`. MiMo-V2.5's chat template expects the `<|im_start|>...<|im_end|>` ChatML format — vLLM applies it automatically when you use the chat endpoint, so just send a standard messages array:
+
+```bash
+MODEL=/opt/dlami/nvme/models/MiMo-V2.5-Neuron-FP8
+
+# 1. Short sanity — should return a one-line MiMo self-introduction.
+curl -s http://localhost:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL\",
+         \"messages\":[{\"role\":\"user\",\"content\":\"Hello! Introduce yourself in one sentence.\"}],
+         \"max_tokens\":64}" | python3 -m json.tool
+
+# 2. Long output — check for repetition collapse / gibberish on 500+ tokens.
+curl -s http://localhost:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL\",
+         \"messages\":[{\"role\":\"user\",\"content\":\"Explain the B-tree data structure in detail, including how insertions and deletions preserve balance.\"}],
+         \"max_tokens\":800}" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content'])"
+```
+
+If you see a coherent MiMo introduction and a multi-paragraph technical explanation, the FP8 path is working end-to-end. Output collapse ("helpful helpful helpful ...") on either prompt indicates a broken FP8 recipe — re-check that `moe_tp_degree=1`, `moe_ep_degree=64`, `batch_size>=32`, and that the server is pointed at the Neuron-FP8 preprocessed directory (not the raw HF one).
+
+**Note on sampling determinism**: `on_device_sampling_config.do_sample=true` is the recommended setting; request-level `temperature` is ignored (sampling params are baked into the NEFF at compile time).
 
 ### vllm-neuron patch summary
 
