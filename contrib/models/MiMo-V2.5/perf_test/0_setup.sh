@@ -16,7 +16,11 @@ echo "=========================================="
 
 source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 
-PATCH_FILE="$(cd "$(dirname "$0")" && pwd)/vllm-neuron-patch.patch"
+# Resolve repo-relative paths up front — we cd into $HOME/vllm-neuron below,
+# after which $0's relative form would no longer resolve.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PATCH_FILE="$SCRIPT_DIR/vllm-neuron-patch.patch"
+CONTRIB_SRC="$(cd "$SCRIPT_DIR/.." && pwd)/src"
 
 echo ""
 echo "[1/2] Installing vllm-neuron (release-0.5.0) with the contrib registration patch..."
@@ -50,8 +54,6 @@ else
     huggingface-cli download XiaomiMiMo/MiMo-V2.5 --local-dir "$MIMO_PATH" --max-workers 16
     echo "  Download complete: $(du -sh $MIMO_PATH | cut -f1)"
 fi
-
-CONTRIB_SRC="$(cd "$(dirname "$0")/.." && pwd)/src"
 
 echo ""
 echo "Next, preprocess the FP8 checkpoint for Neuron (~15 min, ~15 GB peak RAM):"
