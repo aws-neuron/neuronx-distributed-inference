@@ -11,7 +11,7 @@
 
 set -e
 
-MODEL_PATH="${MIMO_V2_5_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-BF16}"
+MODEL_PATH="${MIMO_V2_5_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Neuron-FP8}"
 PORT="${PORT:-8000}"
 PROMPT="${PROMPT:-What is 1+1? Answer briefly.}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
