@@ -26,16 +26,13 @@ import sys
 import time
 import traceback
 
-# AWS Llama-3.1-405B FP8 tutorial requires these two env vars to correctly
-# handle OCP-derived FP8 checkpoints on Neuron: XLA_HANDLE_SPECIAL_SCALAR=1
-# opts in to XLA emitting the bit-reinterpretation path for fp8_e4m3fn scalars,
-# and UNSAFE_FP8FNCAST=1 mirrors it for torch-side casts. Our preprocess output
-# has 0 bytes in the IEEE-NaN range (verified 2026-04-28), so these flags are
-# theoretically unnecessary, but setting them matches the AWS tutorial
-# surface exactly. Source: trn2-llama3.1-405b-speculative-tutorial.html
-# "Scenario 2, Step 2".
-os.environ.setdefault("XLA_HANDLE_SPECIAL_SCALAR", "1")
-os.environ.setdefault("UNSAFE_FP8FNCAST", "1")
+# NOTE: AWS Llama-3.1-405B FP8 tutorial recommends XLA_HANDLE_SPECIAL_SCALAR=1
+# and UNSAFE_FP8FNCAST=1 for OCP-derived FP8 checkpoints. Setting them at
+# compile time, however, appears to change the HLO that gets emitted (likely
+# because XLA lowering of fp8_e4m3fn special scalars switches paths), which
+# busts the neuronx-cc cache and forces a full recompile (~90 min). If you
+# need these flags, set them ONLY at generate time and rely on the compiled
+# NEFF's built-in `--experimental-unsafe-fp8e4m3fn-as-fp8e4m3` handling.
 
 MODEL_PATH = os.environ.get(
     "MIMO_V25_PRO_MODEL_PATH",
@@ -150,7 +147,7 @@ def main():
             "lm_head",
             "norm",
             "router",
-            "o_proj",
+            "o_proj", "q_proj", "k_proj", "v_proj",
         ],
     )
 

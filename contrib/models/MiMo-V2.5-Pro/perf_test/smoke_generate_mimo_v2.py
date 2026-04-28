@@ -114,7 +114,7 @@ def main():
             "lm_head",
             "norm",
             "router",
-            "o_proj",
+            "o_proj", "q_proj", "k_proj", "v_proj",
         ],
     )
 
