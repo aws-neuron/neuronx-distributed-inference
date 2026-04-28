@@ -392,7 +392,20 @@ The patch is applied to vllm-neuron 0.5.0 and:
 
 ## Performance
 
-> Benchmark numbers will be added once a stable bench run completes on the FP8 recipe. Preliminary single-stream sanity test produces fluent MiMo self-introduction output on the recipe below (`moe_tp=1, moe_ep=64, batch_size=32`).
+### vLLM Serving (trn2.48xlarge, FP8, BS=32, TP=64 / moe_ep=64, CB + bucketing)
+
+Input/output: 900 / 90 tokens (random dataset). Recipe is the one `bench_mimo_v2_5.sh` drives; 16 prompts at c=1 and 128 prompts at c=16/c=32.
+
+| Concurrency | Output throughput (tok/s) | Total throughput (tok/s) | TPOT median (ms) | TTFT median (ms) | TTFT P99 (ms) |
+|---|---|---|---|---|---|
+| 1 | 15.88 | 174.16 | 58.28 | 485 | 485 |
+| 16 | 113.92 | 1251.14 | 130.85 | 863 | 6371 |
+| 32 | 147.39 | 1618.81 | 190.48 | 1798 | 13281 |
+
+Observations:
+- **Median ITL stays at ~58 ms across all three concurrency levels** — that's the cost of one BS=32 TKG NEFF forward, which runs at fixed shape regardless of how many slots are actually occupied.
+- **Peak output throughput at c=32 is 576 tok/s**, close to the theoretical `32 / 0.058 ≈ 552` ceiling.
+- **TPOT and TTFT grow with concurrency** because `enable_chunked_prefill=false`: each new request's context-encoding pass (900 tokens) preempts TKG for a few hundred ms, and the higher the concurrency the more frequently that happens.
 
 > **Compile time:** the first MiMo-V2.5 compile on SDK 2.29 is ~30 minutes (TKG + CE HLO compilation, weight layout optimization, then `shard_checkpoint` for 64 ranks which dominates at ~27 minutes). Subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and the NEFF loads in ~1 minute. `save_sharded_checkpoint=true` persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the `shard_checkpoint` pass entirely.
 
