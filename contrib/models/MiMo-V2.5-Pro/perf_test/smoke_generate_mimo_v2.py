@@ -7,13 +7,17 @@ Flash wrapper, loads with skip_warmup=False, and generates 20 tokens for a
 single prompt via HuggingFaceGenerationAdapter. Purpose: sanity-check that
 the FP8 MoE + preprocessed scales actually produce coherent tokens.
 
-Run under /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16.
+Run under /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference.
 """
 
 import os
 import sys
 import time
 import traceback
+
+# Same env vars as smoke_compile — match AWS Llama-405B FP8 tutorial.
+os.environ.setdefault("XLA_HANDLE_SPECIAL_SCALAR", "1")
+os.environ.setdefault("UNSAFE_FP8FNCAST", "1")
 
 MODEL_PATH = os.environ.get(
     "MIMO_V25_PRO_MODEL_PATH",

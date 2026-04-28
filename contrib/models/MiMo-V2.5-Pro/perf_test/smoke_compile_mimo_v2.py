@@ -16,14 +16,26 @@ check for the preprocessed checkpoint. SKIP_WARMUP=1 on load() skips the
 forward pass that allocates the shared scratchpad — useful when HBM is
 tight.
 
-Run under /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16 (same venv used
-by the bench script).
+Run under /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference (NxDI direct).
+The `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` venv is only
+needed for vllm serving (bench_mimo_v2.sh).
 """
 
 import os
 import sys
 import time
 import traceback
+
+# AWS Llama-3.1-405B FP8 tutorial requires these two env vars to correctly
+# handle OCP-derived FP8 checkpoints on Neuron: XLA_HANDLE_SPECIAL_SCALAR=1
+# opts in to XLA emitting the bit-reinterpretation path for fp8_e4m3fn scalars,
+# and UNSAFE_FP8FNCAST=1 mirrors it for torch-side casts. Our preprocess output
+# has 0 bytes in the IEEE-NaN range (verified 2026-04-28), so these flags are
+# theoretically unnecessary, but setting them matches the AWS tutorial
+# surface exactly. Source: trn2-llama3.1-405b-speculative-tutorial.html
+# "Scenario 2, Step 2".
+os.environ.setdefault("XLA_HANDLE_SPECIAL_SCALAR", "1")
+os.environ.setdefault("UNSAFE_FP8FNCAST", "1")
 
 MODEL_PATH = os.environ.get(
     "MIMO_V25_PRO_MODEL_PATH",
