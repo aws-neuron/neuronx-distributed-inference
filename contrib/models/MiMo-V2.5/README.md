@@ -385,6 +385,6 @@ pytest contrib/models/MiMo-V2.5/test/integration/test_model.py -v
 
 ## Maintainer
 
-Henan Wan (whn09)
+Henan Wang (whn09)
 
 **Last Updated:** 2026-04-28
