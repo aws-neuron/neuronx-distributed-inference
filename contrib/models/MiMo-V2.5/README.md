@@ -87,6 +87,29 @@ The bench script runs two configurations (BS=32 and BS=128, both
 `moe_tp_degree=1 / moe_ep_degree=64`) and logs results under
 `/opt/dlami/nvme/logs/bench_results/mimo_v2_5/`.
 
+### Environment variables
+
+`0_setup.sh` prints these at the end; setting them explicitly makes the
+smoke / bench / manual-launch paths all behave the same. All of them have
+sensible defaults in the scripts — export them only if you want to
+override or if you plan to launch vLLM outside of `bench_mimo_v2_5.sh`.
+
+**Required (at least for manual `vllm api_server` launches):**
+
+| Variable | Purpose |
+|---|---|
+| `NXDI_CONTRIB_MIMO_V2_5_SRC` | Path to `contrib/models/MiMo-V2.5/src/`. `vllm-neuron`'s registration hook reads it to plug `NeuronMiMoV2ForCausalLM` into NxDI's `MODEL_TYPES` table. |
+| `NXDI_CONTRIB_MIMO_V2_FLASH_SRC` | Alias of `NXDI_CONTRIB_MIMO_V2_5_SRC` — same value. vLLM's builtin arch validator only knows `MiMoV2FlashForCausalLM`, so preprocess rewrites the checkpoint's `architectures` to that name and we re-use the Flash registration key (`mimov2flash`) in vllm-neuron's lookup table. |
+| `MIMO_V2_5_PATH` | Preprocessed Neuron-FP8 checkpoint dir (the `--save_path` output from preprocess). |
+
+**Optional (recommended):**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NEURON_COMPILED_ARTIFACTS` | `/opt/dlami/nvme/compiled/mimo_v2_5_bs32_moetp1_ep64_fp8_vllm` | Where vLLM writes the NEFF + per-rank sharded weights. Default points at a persistent path under `/opt/dlami/nvme/compiled/` so multiple configs don't collide and runs after the nightly reboot can reuse the sharded weights. vLLM's fallback is `<checkpoint>/neuron-compiled-artifacts/<hash>/` which buries output inside the checkpoint dir. |
+| `BASE_COMPILE_WORK_DIR` | `/opt/dlami/nvme/tmp/nxd_model/<basename of NEURON_COMPILED_ARTIFACTS>` | NxDI's HLO / NEFF staging workdir. Default is `/tmp/nxd_model/`, which is wiped by the nightly Trn2 reboot and can silently corrupt parallel compiles that share a basename; the pinned value lives on persistent storage and is unique per config. |
+| `VLLM_ENGINE_READY_TIMEOUT_S` | `7200` | First-time compile of V2.5's 256-expert MoE is ~30 min dominated by `shard_checkpoint`, well past vLLM's default. |
+
 For a quick `curl` sanity check while the server is up:
 
 ```bash

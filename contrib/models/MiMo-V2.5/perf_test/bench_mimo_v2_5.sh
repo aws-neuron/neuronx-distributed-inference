@@ -37,6 +37,18 @@ export NXDI_CONTRIB_MIMO_V2_5_SRC
 # and NeuronMiMoV2ForCausalLM class are shared between Flash and V2.5.
 export NXDI_CONTRIB_MIMO_V2_FLASH_SRC="$NXDI_CONTRIB_MIMO_V2_5_SRC"
 
+# vLLM writes the NEFF + sharded weights here. Default under
+# /opt/dlami/nvme/compiled (persistent) so multiple configs don't clobber
+# each other and the NEFF/shards are reusable after a reboot.
+: "${NEURON_COMPILED_ARTIFACTS:=/opt/dlami/nvme/compiled/mimo_v2_5_bs32_moetp1_ep64_fp8_vllm}"
+export NEURON_COMPILED_ARTIFACTS
+# NxDI's HLO/NEFF staging directory (default /tmp/nxd_model/<name>/). Pin
+# to persistent storage so it survives the nightly Trn2 reboot, and to a
+# unique per-config subdir to stay safe under parallel compile invocations.
+: "${BASE_COMPILE_WORK_DIR:=/opt/dlami/nvme/tmp/nxd_model/$(basename "$NEURON_COMPILED_ARTIFACTS")}"
+export BASE_COMPILE_WORK_DIR
+mkdir -p "$BASE_COMPILE_WORK_DIR"
+
 # First-time MiMo-V2.5 FP8 compile takes 30-60 minutes; extend vLLM's ready
 # timeout and the compiler's environment variables for FP8 numerics.
 export VLLM_ENGINE_READY_TIMEOUT_S=7200
