@@ -59,6 +59,25 @@ Known NxDI limits that constrain recipe choice:
 - **Venvs**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` (for preprocess + NxDI direct smoke), `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (for vLLM serving). Both ship with the DLAMI.
 - **Disk**: ~3 TB free under `/opt/dlami/nvme` (the HF FP8 checkpoint is ~962 GB, the Neuron-FP8 preprocessed output is ~1 TB, and `save_sharded_checkpoint=true` writes another ~300-1000 GB per compiled config (varies with recipe)).
 
+### NVMe mount
+
+The Trn2 DLAMI ships with four local NVMe SSDs that are assembled into a
+RAID0 array at `/opt/dlami/nvme`. After a reboot the mount is **NOT**
+reassembled automatically — you must re-mount manually before the paths
+below resolve:
+
+```bash
+lsblk                            # confirm you see nvme0n1..nvme3n1 devices
+sudo mdadm --assemble /dev/md0 /dev/nvme[0-3]n1 2>/dev/null || true
+sudo mount /dev/md0 /opt/dlami/nvme
+df -h /opt/dlami/nvme            # should show ~6.9 TB total
+```
+
+If `mdadm --assemble` says the array is already assembled, the mount
+step alone is enough. If `/dev/md0` doesn't exist, the array was never
+created on this instance — run `/opt/dlami/setup-nvme.sh` (or the
+DLAMI's built-in helper; consult `ls /opt/dlami/*.sh`) before mounting.
+
 ## Quick Start (FP8 on Trn2)
 
 End-to-end recipe to go from a fresh trn2.48xlarge to a working vLLM OpenAI server serving MiMo-V2.5-Pro FP8. First-time compile takes ~45-60 minutes; subsequent runs hit the neuronx-cc cache and start in a few minutes.
