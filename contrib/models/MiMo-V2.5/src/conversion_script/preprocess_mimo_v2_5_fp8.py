@@ -117,6 +117,160 @@ def rescale_fp8_weight_blockwise(
     return rescaled, neuron_scale.to(torch.float32)
 
 
+def _requantize_per_row(dequant: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """BF16/FP32 -> Neuron FP8 per-row."""
+    row_max_abs = dequant.abs().max(dim=1, keepdim=True)[0]
+    scales = row_max_abs / NEURON_FP8_MAX
+    scales = torch.clamp(scales, min=1e-10)
+    quantized = (dequant / scales).to(torch.float8_e4m3fn)
+    return quantized, scales.to(torch.float32)
+
+
+def split_qkv_fused(
+    qkv_weight: torch.Tensor,
+    qkv_scale: Optional[torch.Tensor],
+    num_q_heads: int,
+    num_kv_heads_this_layer: int,
+    num_groups: int,
+    head_dim: int,
+    v_head_dim: int,
+) -> Dict[str, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    """Split V2.5's fused qkv_proj into q/k/v.
+
+    Layout — validated empirically via per-group Q/K/V magnitude probes:
+
+    The weight is NOT `[all_Q | all_K | all_V]`. It is ``num_groups``
+    interleaved groups, each packing ``hpg`` Q heads, ``kpg`` K heads, and
+    ``kpg`` V heads contiguously:
+
+        group g (g = 0 .. num_groups-1):
+            rows [g*R      : g*R + qg]        = Q heads [g*hpg : (g+1)*hpg]
+            rows [g*R + qg : g*R + qg + kg]   = K heads [g*kpg : (g+1)*kpg]
+            rows [g*R + qg + kg : g*R + R]    = V heads [g*kpg : (g+1)*kpg]
+          where
+            hpg = num_q_heads / num_groups
+            kpg = num_kv_heads_this_layer / num_groups
+            qg  = hpg * head_dim
+            kg  = kpg * head_dim
+            vg  = kpg * v_head_dim
+            R   = qg + kg + vg
+
+    ``num_groups`` is a model-level constant (= the full-attention
+    ``num_key_value_heads``, 4 for V2.5). It is the same for full and SWA
+    layers, so a SWA layer with ``num_kv_heads_this_layer=8`` packs
+    ``kpg=2`` K heads + 2 V heads per group.
+
+    Scale layout: each group holds ``q_blk + k_blk + v_blk`` scale rows
+    where ``q_blk = qg // 128`` (exact; qg is always 128-aligned),
+    ``k_blk = ceil(kg / 128)`` (may add 64 rows of "phantom" padding on
+    V2.5 full layers where kg = 192 and the last half-block is unused),
+    ``v_blk = ceil(vg / 128)``. When a phantom half-block appears, the
+    physical weight rows stop before the phantom rows do — we recover the
+    correct dequant by padding each group's weight out to
+    ``per_group_scale * 128`` rows, broadcasting the scale, then stripping
+    the phantom rows.
+    """
+    in_features = qkv_weight.shape[1]
+    assert num_q_heads % num_groups == 0 and num_kv_heads_this_layer % num_groups == 0, (
+        f"num_q_heads={num_q_heads} and num_kv_heads_this_layer="
+        f"{num_kv_heads_this_layer} must both be divisible by "
+        f"num_groups={num_groups}"
+    )
+    hpg = num_q_heads // num_groups
+    kpg = num_kv_heads_this_layer // num_groups
+    qg_rows = hpg * head_dim
+    kg_rows = kpg * head_dim
+    vg_rows = kpg * v_head_dim
+    real_rows_per_group = qg_rows + kg_rows + vg_rows
+    total_real_rows = num_groups * real_rows_per_group
+
+    BLOCK = 128
+    q_scale_rows_per_group = qg_rows // BLOCK  # exact
+    k_scale_rows_per_group = (kg_rows + BLOCK - 1) // BLOCK
+    v_scale_rows_per_group = (vg_rows + BLOCK - 1) // BLOCK
+    scale_rows_per_group = (
+        q_scale_rows_per_group + k_scale_rows_per_group + v_scale_rows_per_group
+    )
+    padded_rows_per_group = scale_rows_per_group * BLOCK
+
+    assert qkv_weight.shape[0] == total_real_rows, (
+        f"qkv_proj.weight row count {qkv_weight.shape[0]} != expected "
+        f"{total_real_rows} (num_groups={num_groups}, hpg={hpg}, kpg={kpg}, "
+        f"R={real_rows_per_group})"
+    )
+
+    if qkv_weight.dtype != torch.float8_e4m3fn or qkv_scale is None:
+        # BF16 path: no scale to worry about.
+        w = qkv_weight.view(num_groups, real_rows_per_group, in_features)
+        q_w = (
+            w[:, :qg_rows, :]
+            .reshape(num_groups * qg_rows, in_features)
+            .contiguous()
+        )
+        k_w = (
+            w[:, qg_rows : qg_rows + kg_rows, :]
+            .reshape(num_groups * kg_rows, in_features)
+            .contiguous()
+        )
+        v_w = (
+            w[:, qg_rows + kg_rows :, :]
+            .reshape(num_groups * vg_rows, in_features)
+            .contiguous()
+        )
+        q_w2, q_s2 = convert_bf16_to_fp8_per_row(q_w)
+        k_w2, k_s2 = convert_bf16_to_fp8_per_row(k_w)
+        v_w2, v_s2 = convert_bf16_to_fp8_per_row(v_w)
+        return {"q_proj": (q_w2, q_s2), "k_proj": (k_w2, k_s2), "v_proj": (v_w2, v_s2)}
+
+    # FP8 + blockwise scale path.
+    expected_scale_rows = num_groups * scale_rows_per_group
+    expected_scale_cols = (in_features + BLOCK - 1) // BLOCK
+    assert qkv_scale.shape == (expected_scale_rows, expected_scale_cols), (
+        f"qkv scale shape {tuple(qkv_scale.shape)} != expected "
+        f"({expected_scale_rows}, {expected_scale_cols}) for "
+        f"num_groups={num_groups}, per_group={scale_rows_per_group}"
+    )
+
+    w = qkv_weight.to(torch.float32).view(
+        num_groups, real_rows_per_group, in_features
+    )
+    w_padded = torch.zeros(
+        num_groups, padded_rows_per_group, in_features, dtype=torch.float32
+    )
+    w_padded[:, :real_rows_per_group, :] = w
+
+    s = qkv_scale.to(torch.float32).view(
+        num_groups, scale_rows_per_group, expected_scale_cols
+    )
+    s_exp = s.repeat_interleave(BLOCK, dim=1).repeat_interleave(BLOCK, dim=2)
+    s_exp = s_exp[:, :padded_rows_per_group, :in_features]
+
+    deq_padded = w_padded * s_exp
+    deq = deq_padded[:, :real_rows_per_group, :]
+
+    q_deq = (
+        deq[:, :qg_rows, :]
+        .reshape(num_groups * qg_rows, in_features)
+        .contiguous()
+    )
+    k_deq = (
+        deq[:, qg_rows : qg_rows + kg_rows, :]
+        .reshape(num_groups * kg_rows, in_features)
+        .contiguous()
+    )
+    v_deq = (
+        deq[:, qg_rows + kg_rows :, :]
+        .reshape(num_groups * vg_rows, in_features)
+        .contiguous()
+    )
+
+    q_w2, q_s2 = _requantize_per_row(q_deq)
+    k_w2, k_s2 = _requantize_per_row(k_deq)
+    v_w2, v_s2 = _requantize_per_row(v_deq)
+
+    return {"q_proj": (q_w2, q_s2), "k_proj": (k_w2, k_s2), "v_proj": (v_w2, v_s2)}
+
+
 # ---------------------------------------------------------------------------
 # Streaming weight access (one open safetensors handle at a time)
 # ---------------------------------------------------------------------------
@@ -213,59 +367,36 @@ def process_layer(
             out[f"{out_prefix}{name}.weight"] = t.detach().clone()
 
     # --- Attention: q/k/v ---
-    # MiMo-V2.5 ships the QKV projection *fused* into a single
-    # self_attn.qkv_proj.weight (shape [Q_dim+K_dim+V_dim, hidden]) with
-    # blockwise-128 FP8 scaling. The NxDI modeling code hard-codes separate
-    # q_proj / k_proj / v_proj, so slice the fused tensor back into three
-    # per-proj tensors. All per-head dimensions here are multiples of 128,
-    # so the blockwise scale slices cleanly along the fused output dim.
+    # MiMo-V2.5 ships QKV *fused* into a single self_attn.qkv_proj.weight,
+    # with an interleaved-group layout (see split_qkv_fused for details).
+    # The NxDI modeling code expects separate q_proj / k_proj / v_proj, so
+    # split the fused tensor back out. Falls back to per-proj tensors if
+    # the checkpoint is already split (pre-V2.5).
     qkv_w = lazy.get(f"{prefix}self_attn.qkv_proj.weight")
     qkv_s = lazy.get(f"{prefix}self_attn.qkv_proj.weight_scale_inv")
     if qkv_w is not None:
         num_heads = config["swa_num_attention_heads" if is_swa else "num_attention_heads"]
-        num_kv_heads = config["swa_num_key_value_heads" if is_swa else "num_key_value_heads"]
+        num_kv_heads_this = config[
+            "swa_num_key_value_heads" if is_swa else "num_key_value_heads"
+        ]
         qk_head_dim = config["swa_head_dim" if is_swa else "head_dim"]
-        v_head_dim = config["swa_v_head_dim" if is_swa else "v_head_dim"]
-        q_dim = num_heads * qk_head_dim
-        k_dim = num_kv_heads * qk_head_dim
-        v_dim = num_kv_heads * v_head_dim
-        assert qkv_w.shape[0] == q_dim + k_dim + v_dim, (
-            f"Layer {layer_idx} fused qkv_proj out_dim {qkv_w.shape[0]} != "
-            f"{q_dim}+{k_dim}+{v_dim}={q_dim+k_dim+v_dim} "
-            f"(is_swa={is_swa}, heads={num_heads}, kv_heads={num_kv_heads}, "
-            f"qk_hd={qk_head_dim}, v_hd={v_head_dim})"
+        v_hd = config["swa_v_head_dim" if is_swa else "v_head_dim"]
+        # num_groups is a model-level constant = full-attention num_kv_heads.
+        # SWA layers with num_kv_heads=8 still use 4 groups (2 K heads per group).
+        num_groups = config["num_key_value_heads"]
+        split = split_qkv_fused(
+            qkv_w,
+            qkv_s,
+            num_q_heads=num_heads,
+            num_kv_heads_this_layer=num_kv_heads_this,
+            num_groups=num_groups,
+            head_dim=qk_head_dim,
+            v_head_dim=v_hd,
         )
-        for block_size in (128,):
-            for name, dim in (("q_proj", q_dim), ("k_proj", k_dim), ("v_proj", v_dim)):
-                assert dim % block_size == 0, (
-                    f"{name} dim {dim} is not a multiple of {block_size}; "
-                    f"cannot slice fused qkv blockwise scale"
-                )
-        q_w_slice = qkv_w[:q_dim]
-        k_w_slice = qkv_w[q_dim : q_dim + k_dim]
-        v_w_slice = qkv_w[q_dim + k_dim :]
-        if qkv_s is not None:
-            q_blocks = q_dim // 128
-            k_blocks = k_dim // 128
-            q_s_slice = qkv_s[:q_blocks]
-            k_s_slice = qkv_s[q_blocks : q_blocks + k_blocks]
-            v_s_slice = qkv_s[q_blocks + k_blocks :]
-        else:
-            q_s_slice = k_s_slice = v_s_slice = None
-        for name, w, s in (
-            ("q_proj", q_w_slice, q_s_slice),
-            ("k_proj", k_w_slice, k_s_slice),
-            ("v_proj", v_w_slice, v_s_slice),
-        ):
-            # `s` may still reference the parent qkv scale tensor; clone it so
-            # rescale_fp8 sees a contiguous view and can call .view/.contiguous
-            # on a real tensor.
-            s = s.contiguous().clone() if s is not None else None
-            w = w.contiguous().clone()
-            w2, s2 = _maybe_fp8_to_neuron_per_row(w, s)
-            out[f"{out_prefix}self_attn.{name}.weight"] = w2
+        for proj, (w2, s2) in split.items():
+            out[f"{out_prefix}self_attn.{proj}.weight"] = w2
             if s2 is not None:
-                out[f"{out_prefix}self_attn.{name}.scale"] = s2
+                out[f"{out_prefix}self_attn.{proj}.scale"] = s2
     else:
         # Fallback path for checkpoints that ship split q/k/v (pre-V2.5).
         for proj in ("q_proj", "k_proj", "v_proj"):
