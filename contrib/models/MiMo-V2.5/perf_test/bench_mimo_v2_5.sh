@@ -196,51 +196,6 @@ run_bench "$CONFIG_NAME" 16 128
 run_bench "$CONFIG_NAME" 32 128
 stop_server
 
-###############################################################################
-# Config 2: BS=128, TP=64 + moe_tp=1/moe_ep=64, CB + bucketing (throughput).
-###############################################################################
-CONFIG_NAME="bs128_tp64_moetp1_ep64"
-echo "--- Config 2: BS=128, moe_tp=1/moe_ep=64, CB + bucketing ---"
-
-python3 -m vllm.entrypoints.openai.api_server \
-    --model "$MODEL_PATH" \
-    --tokenizer "$MODEL_PATH" \
-    --tensor-parallel-size 64 \
-    --max-model-len 1024 \
-    --max-num-seqs 128 \
-    --no-enable-chunked-prefill \
-    --no-enable-prefix-caching \
-    --port $PORT \
-    --trust_remote_code \
-    --additional-config '{
-        "override_neuron_config": {
-            '"$COMMON_MIMO_CONFIG"',
-            "moe_tp_degree": 1,
-            "moe_ep_degree": 64,
-            "batch_size": 128,
-            "ctx_batch_size": 1,
-            "tkg_batch_size": 128,
-            "max_context_length": 1024,
-            "seq_len": 1024,
-            "is_continuous_batching": true,
-            "enable_bucketing": true,
-            "context_encoding_buckets": [1024],
-            "token_generation_buckets": [1024],
-            "async_mode": true,
-            "on_device_sampling_config": {
-                "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
-            }
-        }
-    }' &
-
-wait_for_server
-sanity_check
-run_bench "$CONFIG_NAME" 1 16
-run_bench "$CONFIG_NAME" 16 128
-run_bench "$CONFIG_NAME" 32 128
-run_bench "$CONFIG_NAME" 128 512
-stop_server
-
 echo "=========================================="
 echo "MiMo-V2.5 FP8 benchmarks complete!"
 echo "Results saved to: $RESULTS_DIR"

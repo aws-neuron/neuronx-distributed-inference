@@ -83,8 +83,8 @@ bash contrib/models/MiMo-V2.5/perf_test/0_setup.sh
 bash contrib/models/MiMo-V2.5/perf_test/bench_mimo_v2_5.sh
 ```
 
-The bench script runs two configurations (BS=32 and BS=128, both
-`moe_tp_degree=1 / moe_ep_degree=64`) and logs results under
+The bench script runs one configuration (BS=32,
+`moe_tp_degree=1 / moe_ep_degree=64`) at three concurrency levels (1, 16, 32) and logs results under
 `/opt/dlami/nvme/logs/bench_results/mimo_v2_5/`.
 
 ### Environment variables
@@ -333,7 +333,7 @@ python3 -m vllm.entrypoints.openai.api_server \
     }'
 ```
 
-See `perf_test/bench_mimo_v2_5.sh` for the full benchmark recipe at BS=32 and BS=128.
+See `perf_test/bench_mimo_v2_5.sh` for the full benchmark recipe at BS=32.
 
 ### Testing the vLLM server
 
