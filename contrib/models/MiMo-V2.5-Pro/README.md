@@ -35,6 +35,22 @@ Key features:
 - **Sigmoid Router + noaux_tc**: `sigmoid(logits) + e_score_correction_bias` is used to pick top-8 experts; unbiased `sigmoid(logits)` becomes the affinity weights. `n_group=1, topk_group=1` degenerates group-limited routing to plain noaux_tc.
 - **attention_value_scale = 0.612**: HF reference multiplies `value_states` by this before `softmax(QK^T) × V` (NOT applied post-attention); the NxDI port matches.
 
+## Status (work-in-progress)
+
+**This port compiles cleanly and loads on Trn2 but does not yet produce coherent output.** Current symptoms under the default recipe (`tp_degree=64, moe_tp_degree=1, moe_ep_degree=64, batch_size=48, seq_len=1024`) on 2026-04-28:
+
+- Prefill drifts from token 1: "Explain in one sentence what a transformer neural network is." → `"100% of the time, 100% of the time, ..."` (greedy decode, temperature=0). Decode speed 0.72 tok/s. Note the output is syntactically valid English ("100% of the time" = BPE tokens `15/16/4/315/279/882` = `"1"/"0"/"%"/" of"/" the"/" time"`, all high-frequency) — not a sampling bug: greedy argmax is correctly picking the model's top token, but the logit distribution itself is wrong (output unrelated to the prompt). Same signature as Jim Burtoft's "Flash FP8 → `erotici` repeat" symptom.
+- Same failure pattern was observed on the MiMo-V2-Pro port under the same recipe (`"0.0.0.0:8080"` etc.). Root cause identified there was **FP8 expert-MLP precision loss**: Pro's expert weight std ≈ 0.0018 (10× smaller than Flash's ≈ 0.019), landing right at FP8 e4m3's subnormal threshold. V2.5-Pro inherits the same per-expert scale pathology (router bias mean ≈ 70.906 std ≈ 2.4e-4, verified via preprocess; mean-subtract workaround applied).
+- Reference: Jim Burtoft observed similar prompt-dependent FP8 degradation on Flash (see PR notes) and recommends selective BF16 retention for precision-sensitive layers.
+
+Other recipes to try (none verified yet on V2.5-Pro):
+- `moe_tp_degree=16, moe_ep_degree=4, BS=48` — balances E_local=96 vs HBM.
+- `moe_tp_degree=32, moe_ep_degree=2, BS=1` — mirrors Jim's Kimi-K2 PR, but V2-Pro OOM'd by 28MB on load at BS=48; BS=1 hits `NotImplementedError: Selective Loading with Expert parallelism`.
+
+Known NxDI limits that constrain recipe choice:
+- `BS * top_k / num_experts >= 1.0` required when `moe_ep_degree > 1` at decode (else NotImplementedError). With `num_experts=384, top_k=8` this forces `BS >= 48`.
+- `n_routed_experts=384 = 2^7 * 3` → `384 / ep_degree` is never a power of 2 (6, 12, 24, 48, 96, 192, 384). Kimi PR #131 says NKI `_bwmm_shard_on_block_nki_call` on SDK 2.29 has "depressed logits with EP=2" and recommends SDK 2.28. SDK 2.28 venv is not currently installed on the target DLAMI.
+
 ## Prerequisites
 
 - **Instance**: trn2.48xlarge (32 NeuronCores, logical_nc_config=2 → 64 logical cores)
