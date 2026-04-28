@@ -25,7 +25,7 @@
 
 set -e
 
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 
 MODEL_PATH="${MIMO_V2_5_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-BF16}"
 PORT="${PORT:-8000}"

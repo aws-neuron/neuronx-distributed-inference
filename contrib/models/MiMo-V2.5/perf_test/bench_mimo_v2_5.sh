@@ -20,7 +20,7 @@ set -e
 # this model on Trn2 — use the BF16 checkpoint with the old bench recipe
 # (`moe_tp_degree=64, moe_ep_degree=1, batch_size=1`).
 
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 
 MODEL_PATH="${MIMO_V2_5_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Neuron-FP8}"
 # The NxDI contrib MiMo-V2.5 modeling code is registered into vLLM /
