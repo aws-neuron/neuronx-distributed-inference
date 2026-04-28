@@ -87,6 +87,27 @@ The bench script runs one configuration (BS=32,
 `moe_tp_degree=1 / moe_ep_degree=64`) at three concurrency levels (1, 16, 32) and logs results under
 `/opt/dlami/nvme/logs/bench_results/mimo_v2_5/`.
 
+### Keeping a server up for ad-hoc testing
+
+`bench_mimo_v2_5.sh` is a one-shot wrapper (launch server → sanity →
+3 bench runs → teardown). If you want a long-running server to iterate
+against, use the three underlying scripts separately:
+
+```bash
+# Terminal 1: launch the server in the foreground (Ctrl-C to stop).
+bash contrib/models/MiMo-V2.5/perf_test/start_vllm_server.sh
+
+# Terminal 2: once "Application startup complete." prints, sanity-check:
+bash contrib/models/MiMo-V2.5/perf_test/sanity_check.sh
+
+# Run a single bench pass with a chosen concurrency:
+CONCURRENCY=16 NUM_PROMPTS=128 \
+    bash contrib/models/MiMo-V2.5/perf_test/run_bench_single.sh
+```
+
+`bench_mimo_v2_5.sh` composes exactly these three pieces; use whichever
+is more convenient.
+
 ### Environment variables
 
 `0_setup.sh` prints these at the end; setting them explicitly makes the
