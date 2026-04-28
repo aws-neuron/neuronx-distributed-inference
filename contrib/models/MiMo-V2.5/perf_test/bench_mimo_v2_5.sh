@@ -28,6 +28,14 @@ MODEL_PATH="${MIMO_V2_5_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Neuron-FP8}"
 # Default to this contrib package's own src/ relative to the script.
 : "${NXDI_CONTRIB_MIMO_V2_5_SRC:=$(cd "$(dirname "$0")/.." && pwd)/src}"
 export NXDI_CONTRIB_MIMO_V2_5_SRC
+# Preprocess writes architectures=["MiMoV2FlashForCausalLM"] into the
+# checkpoint's config.json to survive vLLM 0.16's builtin arch validator
+# (which knows MiMoV2FlashForCausalLM but not MiMoV2ForCausalLM). Alias
+# the V2.5 src as the Flash src so vllm-neuron's _register_contrib_models
+# hook (triggered on Flash arch names) registers our V2.5 modeling class
+# under MODEL_TYPES['mimov2flash']. The modeling module (modeling_mimo_v2)
+# and NeuronMiMoV2ForCausalLM class are shared between Flash and V2.5.
+export NXDI_CONTRIB_MIMO_V2_FLASH_SRC="$NXDI_CONTRIB_MIMO_V2_5_SRC"
 
 # First-time MiMo-V2.5 FP8 compile takes 30-60 minutes; extend vLLM's ready
 # timeout and the compiler's environment variables for FP8 numerics.

@@ -671,6 +671,23 @@ def process_flash_checkpoint(hf_model_path: str, save_path: str, tp_degree: int)
         if os.path.isfile(src):
             shutil.copy(src, os.path.join(save_path, name))
 
+    # --- Rewrite architectures in the copied config.json so vLLM's
+    # pydantic ModelConfig validator accepts the checkpoint. vLLM's
+    # builtin supported-archs list (Xiaomi's upstream PR) contains
+    # MiMoV2FlashForCausalLM but not the V2.5 arch `MiMoV2ForCausalLM`,
+    # and the vllm-neuron plugin registers contribs too late to patch
+    # that list. The NxDI side loads via auto_map + trust_remote_code,
+    # so the arch name only has to survive the vLLM pydantic check.
+    # auto_map still points at the V2.5 modeling/configuration modules.
+    cfg_path = os.path.join(save_path, "config.json")
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as _f:
+            _cfg = json.load(_f)
+        if _cfg.get("architectures") == ["MiMoV2ForCausalLM"]:
+            _cfg["architectures"] = ["MiMoV2FlashForCausalLM"]
+            with open(cfg_path, "w") as _f:
+                json.dump(_cfg, _f, indent=2)
+
     print(f"\nPreprocess complete. total_size={total_size/1e9:.2f} GB", flush=True)
     print(f"  tensors written: {len(weight_map_out)}", flush=True)
     print(f"  output dir: {save_path}", flush=True)

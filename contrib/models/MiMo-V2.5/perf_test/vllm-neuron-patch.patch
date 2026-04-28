@@ -11,7 +11,7 @@ index d2099eb..0c162e4 100644
 +    """Monkey-patch ``AutoConfig.from_pretrained`` to default ``trust_remote_code=True``.
 +
 +    NxDI's ``hf_adapter.load_config`` calls ``AutoConfig.from_pretrained(path)``
-+    without ``trust_remote_code``. Contrib models like MiMo-V2.5 that
++    without ``trust_remote_code``. Contrib models like MiMo-V2-Flash that
 +    ship a ``configuration_*.py`` with the checkpoint require custom code
 +    execution, so the default behaviour crashes with ``ValueError: The
 +    repository ... contains custom code which must be executed``.
@@ -39,7 +39,7 @@ index d2099eb..0c162e4 100644
 +    """Lazy-register NxDI contrib models on each process that calls the loader.
 +
 +    Driven by env vars:
-+      NXDI_CONTRIB_MIMO_V2_5_SRC -> path to contrib MiMo-V2.5 src/
++      NXDI_CONTRIB_MIMO_V2_FLASH_SRC -> path to contrib MiMo-V2-Flash src/
 +      NXDI_CONTRIB_MINIMAX_M2_SRC    -> path to contrib MiniMax-M2 src/
 +
 +    Registers the contrib model class into NxDI's MODEL_TYPES and, where
@@ -55,26 +55,26 @@ index d2099eb..0c162e4 100644
 +
 +    _patch_autoconfig_trust_remote_code()
 +
-+    mimo_src = _os.environ.get("NXDI_CONTRIB_MIMO_V2_5_SRC")
-+    if mimo_src and _os.path.isdir(mimo_src) and "mimov2" not in MODEL_TYPES:
++    mimo_src = _os.environ.get("NXDI_CONTRIB_MIMO_V2_FLASH_SRC")
++    if mimo_src and _os.path.isdir(mimo_src) and "mimov2flash" not in MODEL_TYPES:
 +        if mimo_src not in _sys.path:
 +            _sys.path.insert(0, mimo_src)
 +        try:
 +            from modeling_mimo_v2 import NeuronMiMoV2ForCausalLM
 +            MODEL_TYPES.setdefault(
-+                "mimov2", {"causal-lm": NeuronMiMoV2ForCausalLM}
++                "mimov2flash", {"causal-lm": NeuronMiMoV2ForCausalLM}
 +            )
 +            try:
 +                from vllm.model_executor.models.registry import ModelRegistry
-+                if "MiMoV2ForCausalLM" not in ModelRegistry.get_supported_archs():
++                if "MiMoV2FlashForCausalLM" not in ModelRegistry.get_supported_archs():
 +                    ModelRegistry.register_model(
-+                        "MiMoV2ForCausalLM", NeuronMiMoV2ForCausalLM
++                        "MiMoV2FlashForCausalLM", NeuronMiMoV2ForCausalLM
 +                    )
 +            except ImportError:
 +                pass
 +        except Exception as e:
 +            _w.warn(
-+                f"Failed to register MiMo-V2.5 contrib model: {e}",
++                f"Failed to register MiMo-V2-Flash contrib model: {e}",
 +                category=UserWarning,
 +            )
 +
