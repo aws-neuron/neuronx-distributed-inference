@@ -34,7 +34,7 @@ export NXDI_CONTRIB_MIMO_V2_5_SRC
 export VLLM_ENGINE_READY_TIMEOUT_S=7200
 
 PORT=8000
-RESULTS_DIR="/tmp/bench_results/mimo_v2_5"
+RESULTS_DIR="/opt/dlami/nvme/logs/bench_results/mimo_v2_5"
 mkdir -p "$RESULTS_DIR"
 
 # Common neuron config shared across all MiMo-V2.5 FP8 configs.

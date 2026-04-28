@@ -1,12 +1,11 @@
 # Contrib Model: MiMo-V2.5
 
-NeuronX Distributed Inference implementation of [XiaomiMiMo/MiMo-V2.5](https://huggingface.co/XiaomiMiMo/MiMo-V2.5).
+NeuronX Distributed Inference implementation of [XiaomiMiMo/MiMo-V2.5](https://huggingface.co/XiaomiMiMo/MiMo-V2.5). MiMo-V2.5 supersedes the earlier MiMo-V2-Flash release with the same decoder-only MoE architecture, an updated tokenizer, and a multimodal (vision + audio) head that the NxDI language path does not use.
 
 ## Model Information
 
 - **HuggingFace ID:** `XiaomiMiMo/MiMo-V2.5`
-- **Model Type:** Decoder-only MoE transformer with hybrid attention
-- **Architecture:** Custom MoE with full + sliding window attention
+- **Model Type:** Decoder-only MoE transformer with hybrid (full + SWA) attention
 - **License:** Check HuggingFace model card
 
 ## Architecture Details
@@ -14,37 +13,44 @@ NeuronX Distributed Inference implementation of [XiaomiMiMo/MiMo-V2.5](https://h
 | Parameter | Value |
 |-----------|-------|
 | Hidden Size | 4096 |
-| Layers | 48 |
-| Attention Heads | 64 Q |
+| Layers | 48 (layer 0 dense, layers 1–47 MoE) |
+| Q Heads | 64 |
 | KV Heads (full attn) | 4 |
 | KV Heads (sliding window) | 8 |
 | Q/K Head Dim | 192 |
 | V Head Dim | 128 |
 | Experts | 256 (top-8 routing) |
 | Expert Intermediate | 2048 |
-| Vocab Size | 151,936 |
-| RoPE | Partial (34% of dims), theta=5M (full), 10K (SWA) |
+| Vocab Size | 152,576 |
+| RoPE | Partial (64 of 192 head dims = 33.4%), theta=5M (full) / 10K (SWA) |
 | Sliding Window | 128 |
 | Max Position | 262,144 |
-| Total Params | ~143B (FP8 native) / ~286B (BF16 upcast) |
 
 Key features:
-- **Hybrid Attention**: 9 full attention layers (0, 5, 11, 17, 23, 29, 35, 41, 47) + 39 sliding window layers
-- **Asymmetric Head Dims**: Q/K use 192, V uses 128 (fused_qkv not supported)
-- **Attention Sink Bias**: Learnable per-head bias on sliding window layers only
-- **Sigmoid Router + noaux_tc**: e_score_correction_bias added to sigmoid scores before top-k selection; unbiased scores become affinity weights
-- **attention_value_scale = 0.707**: HF MiMo-V2 multiplies `value_states` by this before the attention softmax × V (NOT applied to attn_output); the NxDI model matches
+- **Hybrid Attention**: 9 full attention layers (0, 5, 11, 17, 23, 29, 35, 41, 47) + 39 sliding window layers (positions driven by `hybrid_layer_pattern`).
+- **Asymmetric Head Dims**: Q/K use 192, V uses 128. Plus asymmetric `num_kv_heads` between full (4) and SWA (8) layers.
+- **Fused QKV on disk, split on Neuron**: the HF checkpoint ships `qkv_proj.weight` fused (`attention_projection_layout="fused_qkv"`); the NxDI modeling code keeps separate `q_proj`/`k_proj`/`v_proj` linears, so the preprocess script slices the fused tensor back into three per-proj tensors (see "Checkpoint Preparation").
+- **Attention Sink Bias**: Learnable per-head bias on sliding window layers only (`add_swa_attention_sink_bias=true`, `add_full_attention_sink_bias=false`).
+- **Sigmoid Router + noaux_tc**: `e_score_correction_bias` added to sigmoid scores before top-k selection; unbiased scores become the affinity weights.
+- **attention_value_scale = 0.707**: HF MiMo-V2 multiplies `value_states` by this before the attention softmax × V (NOT applied to attn_output); the NxDI model matches.
 
 ## Prerequisites
 
 - **Instance**: trn2.48xlarge (32 NeuronCores, logical_nc_config=2 → 64 logical cores)
 - **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9)
-- **Venvs**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` (for preprocess + NxDI direct smoke), `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (for vLLM serving). Both ship with the DLAMI.
-- **Disk**: ~700 GB free under `/opt/dlami/nvme` (the HF FP8 checkpoint is ~290 GB, the Neuron-FP8 preprocessed output is ~310 GB, and `save_sharded_checkpoint=true` writes another ~300 GB per compiled config).
+- **Venv**: `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (ships with the DLAMI; has NxDI, vllm-neuron, and `huggingface_hub`/`s5cmd`).
+- **Disk**: ~900 GB free under `/opt/dlami/nvme` (HF FP8 checkpoint ~295 GB, Neuron-FP8 preprocessed output ~310 GB, and `save_sharded_checkpoint=true` writes another ~300 GB of per-rank sharded weights per compiled config). The DLAMI creates a 6.9 TB RAID0 at `/dev/md0` across the instance-store NVMes but does **not** add it to `/etc/fstab`, so it is not mounted automatically after a reboot. Before running any of the steps below, remount it if needed:
+
+  ```bash
+  # If /opt/dlami/nvme appears empty after an overnight reboot, the md0 array
+  # is still intact and just needs to be remounted:
+  mount | grep -q /opt/dlami/nvme || sudo mount /dev/md0 /opt/dlami/nvme
+  df -h /opt/dlami/nvme   # should show ~6.9 TB
+  ```
 
 ## Quick Start (FP8 on Trn2)
 
-End-to-end recipe to go from a fresh trn2.48xlarge to a working vLLM OpenAI server serving MiMo-V2.5 FP8. First-time compile takes ~45-60 minutes; subsequent runs hit the neuronx-cc cache and start in a few minutes.
+End-to-end recipe to go from a fresh trn2.48xlarge to a working vLLM OpenAI server serving MiMo-V2.5 FP8. First-time compile takes ~30 minutes; subsequent runs hit the neuronx-cc cache and start in a few minutes.
 
 ```bash
 # 1. Clone this repo on the Trn2 instance
@@ -53,34 +59,33 @@ git clone <your-fork>/neuronx-distributed-inference.git
 cd neuronx-distributed-inference
 git checkout contrib/MiMo-V2.5          # the branch this README lives on
 
-# 2. Download the HuggingFace FP8 checkpoint (~290 GB). Any HF-compatible
-#    downloader works; huggingface-cli example:
+# 2. Download the HuggingFace FP8 checkpoint (~295 GB).
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 huggingface-cli download XiaomiMiMo/MiMo-V2.5 \
-    --local-dir /opt/dlami/nvme/models/MiMo-V2.5
+    --local-dir /opt/dlami/nvme/models/MiMo-V2.5 --max-workers 16
 
-# 3. Preprocess HF FP8 -> Neuron FP8 (~20 min, ~24 GB peak RAM)
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+# 3. Preprocess HF FP8 -> Neuron FP8 (~16 min, ~15 GB peak RAM)
 python contrib/models/MiMo-V2.5/src/conversion_script/preprocess_mimo_v2_5_fp8.py \
     --hf_model_path /opt/dlami/nvme/models/MiMo-V2.5 \
     --save_path     /opt/dlami/nvme/models/MiMo-V2.5-Neuron-FP8 \
     --tp_degree 64
 
 # 4. (Optional) sanity-check the Neuron-FP8 checkpoint without vLLM
-#    ~45 min first compile; subsequent runs ~30s to load the pre-sharded NEFF.
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
-python contrib/models/MiMo-V2.5/perf_test/smoke_compile_mimo_v2_5.py  # compile
+#    ~30 min first compile (priority HLO + CE HLO + 27 min shard_checkpoint
+#    for 64 ranks); subsequent runs ~30s to load the pre-sharded NEFF.
+python contrib/models/MiMo-V2.5/perf_test/smoke_compile_mimo_v2_5.py  # compile + shard
 python contrib/models/MiMo-V2.5/perf_test/smoke_generate_mimo_v2_5.py # 20-token generate
 
 # 5. Install vllm-neuron with the contrib registration patch
 bash contrib/models/MiMo-V2.5/perf_test/0_setup.sh
 
-# 6. Start vLLM serving MiMo-V2.5 FP8 (first compile ~60 min; subsequent ~3 min)
+# 6. Start vLLM serving MiMo-V2.5 FP8
 bash contrib/models/MiMo-V2.5/perf_test/bench_mimo_v2_5.sh
 ```
 
 The bench script runs two configurations (BS=32 and BS=128, both
 `moe_tp_degree=1 / moe_ep_degree=64`) and logs results under
-`/tmp/bench_results/mimo_v2_5/`.
+`/opt/dlami/nvme/logs/bench_results/mimo_v2_5/`.
 
 For a quick `curl` sanity check while the server is up:
 
@@ -100,11 +105,7 @@ preprocessed Neuron-FP8 checkpoint (not the raw HF FP8 directory).
 
 ## Checkpoint Preparation
 
-The HuggingFace checkpoint ships as block-wise OCP FP8 (E4M3, ±448 range), which is not directly compatible with Neuron FP8 (IEEE-754 E4M3, ±240 range). Two preprocess scripts are provided:
-
-### Recommended: FP8 → Neuron-FP8 (streaming)
-
-`src/conversion_script/preprocess_mimo_v2_5_fp8.py` performs a per-layer streaming rescale from OCP FP8 to Neuron FP8 (per-row scales for attention Q/K/V and layer-0 dense MLP; blockwise scales for MoE experts). `o_proj` is listed in HF's `quantization_config.ignored_layers` and is kept BF16 on the Neuron side (it binds to a plain `RowParallelLinear`, not `QuantizedRowParallel`). Output is ~310 GB across 48 per-layer safetensors shards.
+The HuggingFace checkpoint ships as block-wise OCP FP8 (E4M3, ±448 range), which is not directly compatible with Neuron FP8 (IEEE-754 E4M3, ±240 range). `src/conversion_script/preprocess_mimo_v2_5_fp8.py` performs a per-layer streaming rescale: per-row scales for attention Q/K/V (after fused-qkv split) and the layer-0 dense MLP; blockwise 128×128 scales for MoE experts. `o_proj` is listed in HF's `quantization_config.ignored_layers` and is kept BF16 on the Neuron side (it binds to a plain `RowParallelLinear`, not `QuantizedRowParallel`). Output is ~310 GB across 48 per-layer safetensors shards.
 
 ```bash
 python contrib/models/MiMo-V2.5/src/conversion_script/preprocess_mimo_v2_5_fp8.py \
@@ -113,11 +114,26 @@ python contrib/models/MiMo-V2.5/src/conversion_script/preprocess_mimo_v2_5_fp8.p
     --tp_degree 64
 ```
 
-Peak RAM during preprocessing is ~24 GB; total runtime ~20 minutes on a trn2.48xlarge instance.
+Peak RAM during preprocessing is ~15 GB; total runtime ~16 minutes on a trn2.48xlarge instance.
 
-### Fallback: FP8 → BF16
+### V2.5-specific: fused qkv_proj split into 4 interleaved groups
 
-`src/conversion_script/preprocess_mimo_v2_fp8.py` dequantizes the entire checkpoint to BF16. Output is ~290 GB; BF16 is numerically equivalent to the published HF FP8 weights and is useful as a known-good reference. Throughput is ~2× worse than the FP8 path because every attention/MLP matmul operates on full BF16 weights.
+The HF checkpoint advertises `q_proj.weight` / `k_proj.weight` / `v_proj.weight` in its safetensors index, but the actual LFS objects on the Hub only carry a single fused `self_attn.qkv_proj.weight` tensor. NxDI's MiMoV2Attention hard-codes separate Q/K/V `ColumnParallelLinear` modules, so the preprocess script splits the fused tensor back into three per-proj tensors.
+
+The fused layout is **not** `[all_Q | all_K | all_V]`. It is **4 interleaved groups** (the group count equals the full-attention `num_key_value_heads = 4`), each packing `hpg` Q heads, `kpg` K heads, and `kpg` V heads contiguously:
+
+    group g (g = 0..3):
+        rows [g*R      : g*R + qg]          = Q heads [g*hpg : (g+1)*hpg]
+        rows [g*R + qg : g*R + qg + kg]     = K heads [g*kpg : (g+1)*kpg]
+        rows [g*R + qg + kg : g*R + R]      = V heads [g*kpg : (g+1)*kpg]
+
+    where hpg = num_q_heads / 4, kpg = num_kv_heads / 4,
+          qg = hpg * 192, kg = kpg * 192, vg = kpg * 128,
+          R  = qg + kg + vg
+
+For **full-attention layers** this gives `hpg=16, kpg=1, R=3392, total=13568` rows with 108 scale blocks (includes 2 phantom rows from `ceil(192/128)=2`). For **SWA layers** (`num_kv_heads=8`), `hpg=16, kpg=2, R=3712, total=14848` rows with 116 scale blocks (no phantom, since `kg=384` is 128-aligned). Layer 0 (dense) is still attention-FP8 and follows the full-layer layout.
+
+Any preprocess approach that treats the fused tensor as a plain `[Q|K|V]` concatenation produces garbled outputs — Q/K/V rows land in the wrong per-head slots after the split.
 
 ## Usage
 
@@ -231,12 +247,12 @@ MiMo-V2.5 can be served via [vllm-neuron](https://github.com/aws-neuron/vllm-neu
 
 ```bash
 # The setup script clones vllm-project/vllm-neuron at release-0.5.0, applies
-# the contrib registration patch, installs it editable, and downloads MiMo-V2.5
-# weights (BF16 by default; set MIMO_V2_5_PATH to override).
+# the contrib registration patch, installs it editable, and downloads
+# MiMo-V2.5 FP8 weights from HuggingFace (~295 GB; skipped if already present).
 bash contrib/models/MiMo-V2.5/perf_test/0_setup.sh
 ```
 
-The patch (`perf_test/vllm-neuron-patch.patch`) is 40 lines and only touches `vllm_neuron/__init__.py`. It adds a `_register_contrib_models()` hook that, when `NXDI_CONTRIB_MIMO_V2_5_SRC` is set, registers `NeuronMiMoV2ForCausalLM` into NxDI's `MODEL_TYPES` under the key `mimo_v2_5` **and** registers the `MiMoV2ForCausalLM` architecture into vLLM's `ModelRegistry`. No upstream vLLM or NxDI source is modified.
+`perf_test/vllm-neuron-patch.patch` adds a `_register_contrib_models()` hook to `vllm_neuron/worker/neuronx_distributed_model_loader.py`. When `NXDI_CONTRIB_MIMO_V2_5_SRC` is set, it registers `NeuronMiMoV2ForCausalLM` into NxDI's `MODEL_TYPES` under the key `mimov2` **and** registers the `MiMoV2ForCausalLM` architecture into vLLM's `ModelRegistry`. The hook also patches `AutoConfig.from_pretrained` to default `trust_remote_code=True` so NxDI's `load_pretrained_config` can read the V2.5 config. No upstream vLLM or NxDI source is modified.
 
 ### Serving (FP8, recommended)
 
@@ -306,27 +322,9 @@ The patch is applied to vllm-neuron 0.5.0 and:
 
 ## Performance
 
-> These numbers are from the earlier BF16 recipe (pre-FP8 rollout). FP8 numbers will be added once a stable bench run completes on the new recipe; preliminary single-stream qualitative tests show fluent multi-sentence output on long Chinese chat prompts with `moe_tp=1, moe_ep=64, batch_size=32`.
+> Benchmark numbers will be added once a stable bench run completes on the FP8 recipe. Preliminary single-stream sanity test produces fluent MiMo self-introduction output on the recipe below (`moe_tp=1, moe_ep=64, batch_size=32`).
 
-### Standalone NxDI (trn2.48xlarge, BF16, TP=64, EP=64)
-
-| Batch Size | Throughput (tok/s) |
-|------------|-------------------|
-| 1 | 29.92 |
-| 8 | 215.94 |
-| 32 | 649.14 |
-
-### vLLM Serving (trn2.48xlarge, BF16, BS=32, TP=64/EP=64, CB)
-
-Input/output: 900/90 tokens (random dataset)
-
-| Concurrency | Throughput (tok/s) | TPOT (ms) | TTFT (ms) |
-|-------------|-------------------|-----------|-----------|
-| 1 | 27.98 | 33.65 | 222 |
-| 16 | 224.57 | 64.95 | 570 |
-| 32 | 302.61 | 90.23 | 1351 |
-
-> **Compile time:** the first MiMo-V2.5 compile on SDK 2.29 is ~30-60 minutes for the TKG NEFF and similar for the CTE NEFF. Subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass.
+> **Compile time:** the first MiMo-V2.5 compile on SDK 2.29 is ~30 minutes (TKG + CE HLO compilation, weight layout optimization, then `shard_checkpoint` for 64 ranks which dominates at ~27 minutes). Subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and the NEFF loads in ~1 minute. `save_sharded_checkpoint=true` persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the `shard_checkpoint` pass entirely.
 
 ## Compatibility Matrix
 
@@ -347,7 +345,9 @@ pytest contrib/models/MiMo-V2.5/test/integration/test_model.py -v
 1. **Hybrid Attention**: `hybrid_layer_pattern` list determines full vs sliding window per layer; the modeling code constructs one `NeuronMiMoV2Attention` per layer with the correct `is_sliding_window` flag and rope_theta.
 2. **CONVERT_TO_MHA**: When `tp_degree > num_kv_heads` (64 > 4 full / 64 > 8 SWA), K/V are replicated to `num_attention_heads` (64) during state-dict conversion; this applies to both `.weight` and the per-row `.scale` on the FP8 path.
 3. **Attention Sink Bias**: Learnable per-head bias added as an extra "sink" column to attention scores in sliding window layers (not added in full-attention layers). Per-rank slicing of the bias happens inside `forward()` based on `parallel_state.get_tensor_model_parallel_rank()`.
-4. **FP8 Path Caveats**:
+4. **Fused qkv split in preprocess**: V2.5's HF checkpoint stores `self_attn.qkv_proj.weight` as 4 interleaved Q/K/V groups (see "Checkpoint Preparation" above). The preprocess script must slice these groups — naïve `[Q|K|V]` concat slicing produces garbage outputs.
+5. **weight_map rebuild**: V2.5's `model.safetensors.index.json` references legacy `model_N-00001-of-00002.safetensors` filenames that do not match the actual `model_pp0_epN_shardM.safetensors` objects on disk. `LazyWeightMap` scans the on-disk shards at startup and rebuilds `weight_map` directly from each file's manifest; the inconsistent index is ignored.
+6. **FP8 Path Caveats**:
    - Must use `moe_tp_degree=1, moe_ep_degree=64` (see "FP8 Configuration Notes" above).
    - Must use `batch_size >= 32` (NxDI EP>1 requirement).
    - Must keep outer `ep_degree=1` (only `moe_ep_degree` should vary).
@@ -361,4 +361,4 @@ pytest contrib/models/MiMo-V2.5/test/integration/test_model.py -v
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-25
+**Last Updated:** 2026-04-28

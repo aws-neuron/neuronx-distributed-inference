@@ -59,9 +59,14 @@ os.makedirs(COMPILED_PATH, exist_ok=True)
 # .hlo_module.pb files and one or both compilations crash with
 # "neuronx-cc returned non-zero exit status 70". Pin the workdir to a
 # unique per-COMPILED_PATH subdir to stay safe under any parallel invocation.
+# Default under /opt/dlami/nvme rather than /tmp so the HLO/NEFF artifacts
+# survive the nightly Trn2 reboot.
 os.environ.setdefault(
     "BASE_COMPILE_WORK_DIR",
-    os.path.join("/tmp/nxd_model", os.path.basename(COMPILED_PATH.rstrip("/"))),
+    os.path.join(
+        "/opt/dlami/nvme/tmp/nxd_model",
+        os.path.basename(COMPILED_PATH.rstrip("/")),
+    ),
 )
 
 

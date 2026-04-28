@@ -21,7 +21,7 @@
 #   OUTPUT_LEN       --random-output-len (default 90)
 #   RANGE_RATIO      --random-range-ratio (default 0.03)
 #   CONFIG_NAME      Used in the output filename (default bs1_tp64_ep1)
-#   RESULTS_DIR      Where to dump per-run log (default /tmp/bench_results/mimo_v2_5)
+#   RESULTS_DIR      Where to dump per-run log (default /opt/dlami/nvme/logs/bench_results/mimo_v2_5)
 
 set -e
 
@@ -35,7 +35,7 @@ INPUT_LEN="${INPUT_LEN:-900}"
 OUTPUT_LEN="${OUTPUT_LEN:-90}"
 RANGE_RATIO="${RANGE_RATIO:-0.03}"
 CONFIG_NAME="${CONFIG_NAME:-bs1_tp64_ep1}"
-RESULTS_DIR="${RESULTS_DIR:-/tmp/bench_results/mimo_v2_5}"
+RESULTS_DIR="${RESULTS_DIR:-/opt/dlami/nvme/logs/bench_results/mimo_v2_5}"
 
 mkdir -p "$RESULTS_DIR"
 
