@@ -54,15 +54,6 @@ This contrib provides:
 | Backbone forward/sec | 4.49 |
 | Compilation time | ~128s (CLIP 69s + T5 5s + backbone 53s + VAE ~2s) |
 
-### Comparison with FLUX.1-dev on Same Hardware
-
-| Model | Double Blocks | Single Blocks | E2E Time (25 steps) | Steps/sec |
-|-------|--------------|---------------|---------------------|-----------|
-| FLUX.1-lite-8B | 8 | 38 | 5.91s | 4.23 |
-| FLUX.1-dev | 19 | 38 | ~10s* | ~2.5* |
-
-*FLUX.1-dev numbers estimated from architecture scaling; FLUX.1-lite's reduced double blocks yield measurably faster inference.
-
 ## Usage
 
 ```python
