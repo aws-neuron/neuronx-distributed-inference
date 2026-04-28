@@ -15,7 +15,9 @@ import sys
 import time
 import traceback
 
-# Same env vars as smoke_compile — match AWS Llama-405B FP8 tutorial.
+# AWS Llama-3.1-405B FP8 tutorial env vars — these are RUNTIME flags that
+# affect XLA's fp8 special-scalar handling. Safe to set at generate time;
+# do NOT set at compile time (it changes HLO and busts the neuronx-cc cache).
 os.environ.setdefault("XLA_HANDLE_SPECIAL_SCALAR", "1")
 os.environ.setdefault("UNSAFE_FP8FNCAST", "1")
 
@@ -134,6 +136,10 @@ def main():
     print(f"[gen] Loaded in {time.time() - t0:.1f}s")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    # Decoder-only LM requires left-padding so the last token of each batch
+    # slot is the real prompt ending, not a pad token. Default HF tokenizer
+    # padding_side is 'right' which silently corrupts batched prefill.
+    tokenizer.padding_side = "left"
     adapter = HuggingFaceGenerationAdapter(model)
 
     # When CHAT_TEMPLATE=1, wrap the raw prompt in the checkpoint's chat
