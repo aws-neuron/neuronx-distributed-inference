@@ -59,7 +59,7 @@ Known NxDI limits that constrain recipe choice:
 
 ## Prerequisites
 
-- **Instance**: trn2.48xlarge (32 NeuronCores, logical_nc_config=2 → 64 logical cores)
+- **Instance**: trn2.48xlarge (128 physical NeuronCores, logical_nc_config=2 → 64 logical cores)
 - **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9)
 - **Venvs**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` (for preprocess + NxDI direct smoke), `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (for vLLM serving). Both ship with the DLAMI.
 - **Disk**: ~3 TB free under `/opt/dlami/nvme` (the HF FP8 checkpoint is ~962 GB, the Neuron-FP8 preprocessed output is ~1 TB, and `save_sharded_checkpoint=true` writes another ~300-1000 GB per compiled config (varies with recipe)).
