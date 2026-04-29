@@ -1,0 +1,95 @@
+{
+  "model": "/home/ubuntu/models/Qwen3-Omni-30B-A3B-Instruct",
+  "dataset": "openslr/librispeech_asr:test.clean",
+  "tp_degree": 8,
+  "audio_on_neuron": true,
+  "num_samples": 10,
+  "total_audio_duration_s": 91.52,
+  "total_inference_time_s": 37.75,
+  "avg_gen_time_s": 3.76,
+  "rtf": 0.4125,
+  "wer": 0.1116,
+  "cer": 0.0226,
+  "samples": [
+    {
+      "id": "6930-75918-0000",
+      "reference": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS",
+      "hypothesis": "Concorde returned to its place amidst the tents.",
+      "audio_duration_s": 3.5,
+      "gen_time_s": 3.769,
+      "wer": 0.25
+    },
+    {
+      "id": "6930-75918-0001",
+      "reference": "THE ENGLISH FORWARDED TO THE FRENCH BASKETS OF FLOWERS OF WHICH THEY HAD MADE A PLENTIFUL PROVISION TO GREET THE ARRIVAL OF THE YOUNG PRINCESS THE FRENCH IN RETURN INVITED THE ENGLISH TO A SUPPER WHICH WAS TO BE GIVEN THE NEXT DAY",
+      "hypothesis": "The English forwarded to the French baskets of flowers of which they had made a plentiful provision to greet the arrival of the young princess. The French in return invited the English to a supper which was to be given the next day.",
+      "audio_duration_s": 14.22,
+      "gen_time_s": 3.776,
+      "wer": 0.0465
+    },
+    {
+      "id": "6930-75918-0002",
+      "reference": "CONGRATULATIONS WERE POURED IN UPON THE PRINCESS EVERYWHERE DURING HER JOURNEY",
+      "hypothesis": "Congratulations were poured in upon the princess everywhere during her journey.",
+      "audio_duration_s": 5.03,
+      "gen_time_s": 3.757,
+      "wer": 0.0909
+    },
+    {
+      "id": "6930-75918-0003",
+      "reference": "FROM THE RESPECT PAID HER ON ALL SIDES SHE SEEMED LIKE A QUEEN AND FROM THE ADORATION WITH WHICH SHE WAS TREATED BY TWO OR THREE SHE APPEARED AN OBJECT OF WORSHIP THE QUEEN MOTHER GAVE THE FRENCH THE MOST AFFECTIONATE RECEPTION FRANCE WAS HER NATIVE COUNTRY AND SHE HAD SUFFERED TOO MUCH UNHAPPINESS IN ENGLAND FOR ENGLAND TO HAVE MADE HER FORGET FRANCE",
+      "hypothesis": "From the respect paid her on all sides she seemed like a queen, and from the adoration with which she was treated by two or three she appeared an object of worship. The queen mother gave the French the most affectionate reception. France was her native country, and she had suffered too much unhappiness in England for England to have made her forget France.",
+      "audio_duration_s": 23.32,
+      "gen_time_s": 3.767,
+      "wer": 0.0781
+    },
+    {
+      "id": "6930-75918-0004",
+      "reference": "SHE TAUGHT HER DAUGHTER THEN BY HER OWN AFFECTION FOR IT THAT LOVE FOR A COUNTRY WHERE THEY HAD BOTH BEEN HOSPITABLY RECEIVED AND WHERE A BRILLIANT FUTURE OPENED BEFORE THEM",
+      "hypothesis": "She taught her daughter then by her own affection for it that love for a country where they had both been hospitably received and where a brilliant future opened for them.",
+      "audio_duration_s": 11.06,
+      "gen_time_s": 3.756,
+      "wer": 0.0645
+    },
+    {
+      "id": "6930-75918-0005",
+      "reference": "THE COUNT HAD THROWN HIMSELF BACK ON HIS SEAT LEANING HIS SHOULDERS AGAINST THE PARTITION OF THE TENT AND REMAINED THUS HIS FACE BURIED IN HIS HANDS WITH HEAVING CHEST AND RESTLESS LIMBS",
+      "hypothesis": "The count had thrown himself back on his seat, leaning his shoulders against the partition of the tent, and remained thus, his face buried in his hands, with heaving chest and restless limbs.",
+      "audio_duration_s": 13.16,
+      "gen_time_s": 3.765,
+      "wer": 0.1515
+    },
+    {
+      "id": "6930-75918-0006",
+      "reference": "THIS HAS INDEED BEEN A HARASSING DAY CONTINUED THE YOUNG MAN HIS EYES FIXED UPON HIS FRIEND",
+      "hypothesis": "This has indeed been a harassing day,\" continued the young man, his eyes fixed upon his friend.",
+      "audio_duration_s": 5.85,
+      "gen_time_s": 3.757,
+      "wer": 0.1765
+    },
+    {
+      "id": "6930-75918-0007",
+      "reference": "YOU WILL BE FRANK WITH ME I ALWAYS AM",
+      "hypothesis": "You will be frank with me. I always am.",
+      "audio_duration_s": 3.31,
+      "gen_time_s": 3.751,
+      "wer": 0.2222
+    },
+    {
+      "id": "6930-75918-0008",
+      "reference": "CAN YOU IMAGINE WHY BUCKINGHAM HAS BEEN SO VIOLENT I SUSPECT",
+      "hypothesis": "Can you imagine why Buckingham has been so violent? I suspect.",
+      "audio_duration_s": 4.79,
+      "gen_time_s": 3.751,
+      "wer": 0.1818
+    },
+    {
+      "id": "6930-75918-0009",
+      "reference": "IT IS YOU WHO ARE MISTAKEN RAOUL I HAVE READ HIS DISTRESS IN HIS EYES IN HIS EVERY GESTURE AND ACTION THE WHOLE DAY",
+      "hypothesis": "It is you who are mistaken, Raoul. I have read his distress in his eyes, in his every gesture and action the whole day.",
+      "audio_duration_s": 7.28,
+      "gen_time_s": 3.754,
+      "wer": 0.1667
+    }
+  ]
+}

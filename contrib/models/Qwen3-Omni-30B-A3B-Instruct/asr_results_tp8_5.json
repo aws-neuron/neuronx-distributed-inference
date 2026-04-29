@@ -1,0 +1,55 @@
+{
+  "model": "/home/ubuntu/models/Qwen3-Omni-30B-A3B-Instruct",
+  "dataset": "openslr/librispeech_asr:test.clean",
+  "tp_degree": 8,
+  "audio_on_neuron": true,
+  "num_samples": 5,
+  "total_audio_duration_s": 57.14,
+  "total_inference_time_s": 18.92,
+  "avg_gen_time_s": 3.766,
+  "rtf": 0.3311,
+  "wer": 0.0764,
+  "cer": 0.0159,
+  "samples": [
+    {
+      "id": "6930-75918-0000",
+      "reference": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS",
+      "hypothesis": "Concorde returned to its place amidst the tents.",
+      "audio_duration_s": 3.5,
+      "gen_time_s": 3.769,
+      "wer": 0.25
+    },
+    {
+      "id": "6930-75918-0001",
+      "reference": "THE ENGLISH FORWARDED TO THE FRENCH BASKETS OF FLOWERS OF WHICH THEY HAD MADE A PLENTIFUL PROVISION TO GREET THE ARRIVAL OF THE YOUNG PRINCESS THE FRENCH IN RETURN INVITED THE ENGLISH TO A SUPPER WHICH WAS TO BE GIVEN THE NEXT DAY",
+      "hypothesis": "The English forwarded to the French baskets of flowers of which they had made a plentiful provision to greet the arrival of the young princess. The French in return invited the English to a supper which was to be given the next day.",
+      "audio_duration_s": 14.22,
+      "gen_time_s": 3.772,
+      "wer": 0.0465
+    },
+    {
+      "id": "6930-75918-0002",
+      "reference": "CONGRATULATIONS WERE POURED IN UPON THE PRINCESS EVERYWHERE DURING HER JOURNEY",
+      "hypothesis": "Congratulations were poured in upon the princess everywhere during her journey.",
+      "audio_duration_s": 5.03,
+      "gen_time_s": 3.759,
+      "wer": 0.0909
+    },
+    {
+      "id": "6930-75918-0003",
+      "reference": "FROM THE RESPECT PAID HER ON ALL SIDES SHE SEEMED LIKE A QUEEN AND FROM THE ADORATION WITH WHICH SHE WAS TREATED BY TWO OR THREE SHE APPEARED AN OBJECT OF WORSHIP THE QUEEN MOTHER GAVE THE FRENCH THE MOST AFFECTIONATE RECEPTION FRANCE WAS HER NATIVE COUNTRY AND SHE HAD SUFFERED TOO MUCH UNHAPPINESS IN ENGLAND FOR ENGLAND TO HAVE MADE HER FORGET FRANCE",
+      "hypothesis": "From the respect paid her on all sides she seemed like a queen, and from the adoration with which she was treated by two or three she appeared an object of worship. The queen mother gave the French the most affectionate reception. France was her native country, and she had suffered too much unhappiness in England for England to have made her forget France.",
+      "audio_duration_s": 23.32,
+      "gen_time_s": 3.778,
+      "wer": 0.0781
+    },
+    {
+      "id": "6930-75918-0004",
+      "reference": "SHE TAUGHT HER DAUGHTER THEN BY HER OWN AFFECTION FOR IT THAT LOVE FOR A COUNTRY WHERE THEY HAD BOTH BEEN HOSPITABLY RECEIVED AND WHERE A BRILLIANT FUTURE OPENED BEFORE THEM",
+      "hypothesis": "She taught her daughter then by her own affection for it that love for a country where they had both been hospitably received and where a brilliant future opened for them.",
+      "audio_duration_s": 11.06,
+      "gen_time_s": 3.751,
+      "wer": 0.0645
+    }
+  ]
+}
