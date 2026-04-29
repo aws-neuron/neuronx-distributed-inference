@@ -107,16 +107,19 @@ print(f"CosSim: {metrics['cosine_similarity']}")
 |----------|----------|----------|
 | trn2.3xlarge | Validated (13/13 tests) | Validated (13/13 tests) |
 | trn2.48xlarge | Expected compatible | Expected compatible |
-| inf2.xlarge | Validated (6/6 tests, n/s only) | Validated (6/6 tests, n/s only) |
+| inf2.xlarge | Validated (n/s) | Validated (all 5 variants) |
 
-### inf2 Single-Core Throughput
+### inf2 Single-Core Throughput (SDK 2.29)
 
-| Variant | inf2 SDK 2.28 | inf2 SDK 2.29 | trn2 SDK 2.28 |
-|---------|---------------|---------------|---------------|
-| YOLO26n | 60.1 img/s | 69.7 img/s | 32.3 img/s |
-| YOLO26s | 64.1 img/s | 76.7 img/s | 66.0 img/s |
+| Variant | Dtype | CosSim | img/s | trn2 single-core |
+|---------|-------|--------|-------|------------------|
+| YOLO26n | FP32 | 0.9966 | 55.2 | 32.3 |
+| YOLO26s | FP32 | 0.9934 | 82.8 | 66.0 |
+| YOLO26m | BF16 | 0.9877 | 104.0 | 75.5 |
+| YOLO26l | BF16 | 0.9966 | 91.6 | 66.3 |
+| YOLO26x | BF16 | 0.9950 | 69.9 | 57.3 |
 
-*Note: inf2 single-core outperforms trn2 single-core for small models. trn2 advantage comes from DP=8 (LNC=1) scaling.*
+*Note: inf2 single-core outperforms trn2 single-core for all variants. trn2 advantage comes from DP=8 (LNC=1) scaling.*
 
 ## Testing Instructions
 
