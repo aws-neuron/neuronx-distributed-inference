@@ -25,9 +25,9 @@ Key Neuron porting challenges:
 
 ## Validation Results
 
-**Validated:** 2026-04-25
-**Instance:** trn2.3xlarge (1 Trainium2 chip)
-**SDK:** Neuron SDK 2.28, PyTorch 2.9
+**Validated:** 2026-04-29
+**Instance:** trn2.3xlarge (1 Trainium2 chip), inf2.xlarge (1 Inferentia2 chip)
+**SDK:** Neuron SDK 2.28 and 2.29, PyTorch 2.9
 
 ### Peak Throughput (LNC=1, DP=8)
 
@@ -105,9 +105,18 @@ print(f"CosSim: {metrics['cosine_similarity']}")
 
 | Instance | SDK 2.28 | SDK 2.29 |
 |----------|----------|----------|
-| trn2.3xlarge | Validated | Expected compatible |
+| trn2.3xlarge | Validated (13/13 tests) | Validated (13/13 tests) |
 | trn2.48xlarge | Expected compatible | Expected compatible |
-| inf2.xlarge | Not tested (n/s only) | Not tested |
+| inf2.xlarge | Validated (6/6 tests, n/s only) | Validated (6/6 tests, n/s only) |
+
+### inf2 Single-Core Throughput
+
+| Variant | inf2 SDK 2.28 | inf2 SDK 2.29 | trn2 SDK 2.28 |
+|---------|---------------|---------------|---------------|
+| YOLO26n | 60.1 img/s | 69.7 img/s | 32.3 img/s |
+| YOLO26s | 64.1 img/s | 76.7 img/s | 66.0 img/s |
+
+*Note: inf2 single-core outperforms trn2 single-core for small models. trn2 advantage comes from DP=8 (LNC=1) scaling.*
 
 ## Testing Instructions
 
