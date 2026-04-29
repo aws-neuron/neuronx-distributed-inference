@@ -59,9 +59,9 @@ Key features:
 - GPU stacks (sglang on H100/H200) run the exact same OCP FP8 checkpoint correctly because they always dequantize FP8 → BF16 before the matmul. The issue is specific to Neuron's direct-FP8 compute path on subnormal-leaning tensors.
 - Reference: Jim Burtoft observed similar prompt-dependent FP8 degradation on Flash and his Kimi PR #131 names "blockwise kernel padding produces depressed logits with EP=2 on SDK 2.29; SDK 2.28 recommended".
 
-### Preprocess step required for BF16 attn
+### Preprocess emits BF16 q/k/v
 
-`src/conversion_script/repatch_qkv_bf16.py` reads the original HF fused `qkv_proj` weight + scale, dequants per-group (`num_q_heads_per_kv_group` × `head_dim` rows per group) to BF16, and overwrites `q_proj/k_proj/v_proj` in the preprocessed Neuron-FP8 checkpoint in place. Runs in ~22 min. Simply adding `q_proj/k_proj/v_proj` to `modules_to_not_convert` without this preprocess is **not** equivalent — NxDI casts the raw fp8_e4m3fn bytes to bfloat16 without applying the scale, which produces nonsense weights.
+`src/conversion_script/preprocess_mimo_v2_fp8.py` now dequants q/k/v to BF16 directly (`split_qkv_fused` for the fused Pro layout, `_dequant_attn_to_bf16` for the Flash-style split layout). Output checkpoint has no `q_proj.scale` / `k_proj.scale` / `v_proj.scale` entries. Compile-time `modules_to_not_convert` must include `q_proj`, `k_proj`, `v_proj` so NxDI routes them through a plain `ColumnParallelLinear`; `smoke_compile_mimo_v2.py` and `start_vllm_server.sh` already do.
 
 ### Recipes that were tried and did not resolve the drift (all on 2026-04-28/29)
 
@@ -121,18 +121,14 @@ git checkout contrib/MiMo-V2.5-Pro          # the branch this README lives on
 huggingface-cli download XiaomiMiMo/MiMo-V2.5-Pro \
     --local-dir /opt/dlami/nvme/models/MiMo-V2.5-Pro
 
-# 3. Preprocess HF FP8 -> Neuron FP8 (~20 min, ~24 GB peak RAM)
+# 3. Preprocess HF FP8 -> Neuron-FP8 (BF16 attn, FP8 MoE). ~20 min, ~24 GB
+#    peak RAM. The preprocess dequants q/k/v to BF16 in one pass — see
+#    "Checkpoint Preparation" below for why BF16 attn is the only recipe.
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 python contrib/models/MiMo-V2.5-Pro/src/conversion_script/preprocess_mimo_v2_fp8.py \
     --hf_model_path /opt/dlami/nvme/models/MiMo-V2.5-Pro \
     --save_path     /opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8 \
     --tp_degree 64
-
-# 3b. Dequant attention q/k/v to BF16 in place (~22 min, required for
-#     coherent output under the current FP8 recipe; see Status).
-python contrib/models/MiMo-V2.5-Pro/src/conversion_script/repatch_qkv_bf16.py \
-    --hf_model_path     /opt/dlami/nvme/models/MiMo-V2.5-Pro \
-    --neuron_model_path /opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8
 
 # 4. (Optional) sanity-check the Neuron-FP8 checkpoint without vLLM
 #    ~90 min first compile; subsequent runs ~60s to load the pre-sharded NEFF.
@@ -225,19 +221,11 @@ python contrib/models/MiMo-V2.5-Pro/src/conversion_script/preprocess_mimo_v2_fp8
 
 Peak RAM during preprocessing is ~24 GB; total runtime ~20 minutes on a trn2.48xlarge instance.
 
-### Required follow-up: dequant q/k/v to BF16 (`repatch_qkv_bf16.py`)
+### Why q/k/v are BF16 in the preprocessed output
 
-Under the default all-FP8 recipe, Pro's attention weights drift enough to produce gibberish output (see Status). The fix is to keep MoE experts FP8 but dequant q/k/v to BF16 before compile. `src/conversion_script/repatch_qkv_bf16.py` reads the HF fused `qkv_proj` + `weight_scale_inv`, dequants per-group (each group is one kv-head: `hpg` Q rows, `1×head_dim` K rows, `1×v_head_dim` V rows), and overwrites the q_proj/k_proj/v_proj entries in the preprocessed Neuron-FP8 checkpoint in place. The scale entries for q/k/v are dropped from the safetensors index.
+Pro's attention weights have `abs_mean ≈ 0.00124`, roughly 4× smaller than V2.5 (256 experts). The NKI blockwise FP8 accumulator at this magnitude drifts the logits across 70 layers and produces gibberish output — `"The capital of France is\n# 1000000000000000"`, `"Once upon a time in a small village there lived\n# 0000000000..."`, etc. Dequantizing q/k/v to BF16 while keeping MoE experts FP8 restores coherent output (verified on 2026-04-29 via `smoke_generate_mimo_v2.py`).
 
-```bash
-python contrib/models/MiMo-V2.5-Pro/src/conversion_script/repatch_qkv_bf16.py \
-    --hf_model_path     /path/to/MiMo-V2.5-Pro \
-    --neuron_model_path /path/to/MiMo-V2.5-Pro-Neuron-FP8
-```
-
-Runtime is ~22 minutes on a trn2.48xlarge, peak RAM ~20 GB. After running this, the compile-time `modules_to_not_convert` list in `smoke_compile_mimo_v2.py` / `start_vllm_server.sh` must include `q_proj`, `k_proj`, `v_proj` so NxDI keeps them as BF16 and routes them through a plain `ColumnParallelLinear` rather than the FP8 `QuantizedColumnParallel` path.
-
-**Do not skip this step.** Adding q_proj/k_proj/v_proj to `modules_to_not_convert` without running repatch first leaves the fp8 bytes in the checkpoint; NxDI then casts them to bf16 **without applying the blockwise scale**, producing nonsense weights and broken output.
+The preprocess handles this in a single pass: `split_qkv_fused()` unfuses Pro's `qkv_proj` into per-proj BF16 tensors directly, and the Flash-style per-proj fallback path dequants via `_dequant_attn_to_bf16()`. The checkpoint emitted by preprocess has no `q_proj.scale` / `k_proj.scale` / `v_proj.scale` entries. Compile-time `modules_to_not_convert` must therefore include `q_proj`, `k_proj`, `v_proj` so NxDI routes them through a plain `ColumnParallelLinear` rather than the FP8 `QuantizedColumnParallel` path — `smoke_compile_mimo_v2.py` already does this.
 
 ### Fallback: FP8 → BF16
 
@@ -264,8 +252,8 @@ compiled_path = "/path/to/compiled/"
 
 # Recommended recipe: BF16 attn + FP8 MoE.
 #   moe_tp_degree = 1, moe_ep_degree = 64
-#   q_proj/k_proj/v_proj in modules_to_not_convert (BF16; requires
-#       repatch_qkv_bf16.py to have been run on the checkpoint first)
+#   q_proj/k_proj/v_proj in modules_to_not_convert (BF16; preprocess
+#       emits BF16 for q/k/v, no separate step needed)
 #   seq_len = 256 (HBM-tight with BF16 attn; see Status)
 # See "FP8 Configuration Notes" below for why other moe_tp/ep ratios
 # collapse.
@@ -299,7 +287,7 @@ neuron_config = MoENeuronConfig(
     quantization_block_size=[128, 128],
     modules_to_not_convert=[
         "embed_tokens", "lm_head", "norm", "router", "o_proj",
-        "q_proj", "k_proj", "v_proj",  # BF16 attn — requires repatch
+        "q_proj", "k_proj", "v_proj",  # BF16 attn — preprocess emits BF16
     ],
     on_device_sampling_config=OnDeviceSamplingConfig(
         do_sample=True, temperature=0.6, top_k=20, top_p=0.95,

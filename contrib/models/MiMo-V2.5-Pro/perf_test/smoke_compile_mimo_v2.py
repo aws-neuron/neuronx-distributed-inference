@@ -148,14 +148,10 @@ def main():
         quantization_block_size=[128, 128],
         # BF16 attention: keep q/k/v_proj in BF16 (not FP8). Pro's q/k/v
         # abs_mean ~0.00124 is 4x smaller than V2.5 and the NKI blockwise
-        # FP8 accumulator drifts across 70 layers, producing gibberish
-        # output under the all-FP8 recipe. Dequantizing q/k/v to BF16
-        # restores coherent output while keeping MoE experts FP8.
-        # Prerequisite: run src/conversion_script/repatch_qkv_bf16.py on
-        # the preprocessed Neuron-FP8 checkpoint first; simply listing
-        # q/k/v here without the repatch step leaves the fp8 bytes in the
-        # checkpoint and NxDI silently casts them to bf16 without applying
-        # the scale, which produces nonsense weights.
+        # FP8 accumulator drifts across 70 layers. Preprocess already
+        # emits BF16 for q/k/v (see preprocess_mimo_v2_fp8.py docstring);
+        # this list just tells NxDI to skip FP8 quantization and route
+        # through ColumnParallelLinear instead of QuantizedColumnParallel.
         modules_to_not_convert=[
             "embed_tokens",
             "lm_head",

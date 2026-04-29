@@ -10,8 +10,11 @@ at a time and emits per-layer safetensors shards, capping peak RAM at
 
 MiMo-V2.5-Pro checkpoint layout:
   - q_proj, k_proj, v_proj are FUSED into a single `qkv_proj` tensor per
-    layer (num_kv_heads interleaved groups, MiMo-V2.5-Pro-specific). We split into
-    three per-row-quantized projections via `split_qkv_fused()`.
+    layer (num_kv_heads interleaved groups, MiMo-V2.5-Pro-specific). We
+    split into three per-proj BF16 tensors via `split_qkv_fused()`. BF16
+    (not FP8) is required: Pro's attention weights are small-magnitude
+    and the NKI blockwise FP8 accumulator drifts over 70 layers, producing
+    gibberish output. MoE experts can stay FP8.
   - o_proj is BF16 (listed in quantization_config.ignored_layers); kept
     as BF16 on the Neuron side (RowParallelLinear, not QuantizedRowParallel).
   - Layer 0 is a dense MLP (moe_layer_freq[0] == 0) with intermediate_size
@@ -172,6 +175,33 @@ def _requantize_per_row(dequant: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     return quantized, scales.to(torch.float32)
 
 
+def _dequant_attn_to_bf16(
+    weight: torch.Tensor, scale: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Dequantize an FP8 blockwise attention weight to BF16.
+
+    Used by the Flash-style path where q/k/v ship as separate per-proj
+    tensors (not fused). The fused-qkv path handles dequant inside
+    split_qkv_fused because it also has to unwind the phantom-row padding.
+    """
+    if weight.dtype != torch.float8_e4m3fn or scale is None:
+        return weight.to(torch.bfloat16)
+
+    out_features, in_features = weight.shape
+    scale_h, scale_w = scale.shape
+    block_h = (out_features + scale_h - 1) // scale_h
+    block_w = (in_features + scale_w - 1) // scale_w
+
+    wf = weight.float()
+    dequant = torch.zeros(out_features, in_features, dtype=torch.float32)
+    for i in range(scale_h):
+        for j in range(scale_w):
+            h0, h1 = i * block_h, min((i + 1) * block_h, out_features)
+            w0, w1 = j * block_w, min((j + 1) * block_w, in_features)
+            dequant[h0:h1, w0:w1] = wf[h0:h1, w0:w1] * scale[i, j].item()
+    return dequant.to(torch.bfloat16)
+
+
 def split_qkv_fused(
     qkv_weight: torch.Tensor,
     qkv_scale: Optional[torch.Tensor],
@@ -179,10 +209,10 @@ def split_qkv_fused(
     num_kv_heads: int,
     head_dim: int,
     v_head_dim: int,
-) -> Dict[str, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-    """Split Pro's pre-fused qkv_proj into q/k/v. MiMo-V2.5-Pro specific.
+) -> Dict[str, torch.Tensor]:
+    """Split Pro's pre-fused qkv_proj into q/k/v (BF16 output).
 
-    HF layout — cross-validated against sglang on H200:
+    MiMo-V2.5-Pro specific. HF layout — cross-validated against sglang on H200:
     `qkv_proj.weight` is NOT `[all_Q | all_K | all_V]`. It is num_kv_heads
     interleaved groups, each holding (heads_per_group Q heads, 1 K head,
     1 V head) packed contiguously:
@@ -209,6 +239,13 @@ def split_qkv_fused(
     V is immediately followed by group (g+1)'s Q. We recover the correct
     dequant by padding each group up to 3456 rows before applying the scale,
     then stripping the phantom rows.
+
+    Output dtype is always BF16 (no scale). Pro's q/k/v weights are
+    small-magnitude (abs_mean ~0.00124, 4x smaller than V2.5); the NKI
+    blockwise FP8 accumulator drifts at this scale and produces gibberish
+    output. Keeping q/k/v as BF16 while MoE experts stay FP8 is the only
+    configuration verified to produce coherent output, so this is the
+    single supported attention recipe.
     """
     in_features = qkv_weight.shape[1]
     hpg = num_q_heads // num_kv_heads
@@ -234,50 +271,53 @@ def split_qkv_fused(
     )
 
     if qkv_weight.dtype != torch.float8_e4m3fn or qkv_scale is None:
-        # BF16 path
+        # BF16 source path (rare — most Pro checkpoints ship as FP8+scale).
         w = qkv_weight.view(num_kv_heads, real_rows_per_group, in_features)
-        q_w = w[:, :qg_rows, :].reshape(num_kv_heads * qg_rows, in_features).contiguous()
-        k_w = w[:, qg_rows:qg_rows + kg_rows, :].reshape(num_kv_heads * kg_rows, in_features).contiguous()
-        v_w = w[:, qg_rows + kg_rows:, :].reshape(num_kv_heads * vg_rows, in_features).contiguous()
-        q_w2, q_s2 = convert_bf16_to_fp8_per_row(q_w)
-        k_w2, k_s2 = convert_bf16_to_fp8_per_row(k_w)
-        v_w2, v_s2 = convert_bf16_to_fp8_per_row(v_w)
-        return {"q_proj": (q_w2, q_s2), "k_proj": (k_w2, k_s2), "v_proj": (v_w2, v_s2)}
+    else:
+        # FP8 + blockwise scale path: dequant with phantom-row padding.
+        expected_scale_rows = num_kv_heads * scale_rows_per_group
+        expected_scale_cols = (in_features + BLOCK - 1) // BLOCK
+        assert qkv_scale.shape == (expected_scale_rows, expected_scale_cols), (
+            f"qkv scale shape {tuple(qkv_scale.shape)} != expected "
+            f"({expected_scale_rows}, {expected_scale_cols})"
+        )
 
-    # FP8 + blockwise scale path.
-    expected_scale_rows = num_kv_heads * scale_rows_per_group
-    expected_scale_cols = (in_features + BLOCK - 1) // BLOCK
-    assert qkv_scale.shape == (expected_scale_rows, expected_scale_cols), (
-        f"qkv scale shape {tuple(qkv_scale.shape)} != expected "
-        f"({expected_scale_rows}, {expected_scale_cols})"
+        wf = qkv_weight.to(torch.float32).view(
+            num_kv_heads, real_rows_per_group, in_features
+        )
+        w_padded = torch.zeros(
+            num_kv_heads, padded_rows_per_group, in_features, dtype=torch.float32
+        )
+        w_padded[:, :real_rows_per_group, :] = wf
+
+        s = qkv_scale.to(torch.float32).view(
+            num_kv_heads, scale_rows_per_group, expected_scale_cols
+        )
+        s_exp = s.repeat_interleave(BLOCK, dim=1).repeat_interleave(BLOCK, dim=2)
+        s_exp = s_exp[:, :padded_rows_per_group, :in_features]
+
+        w = (w_padded * s_exp)[:, :real_rows_per_group, :]
+
+    q_bf16 = (
+        w[:, :qg_rows, :]
+        .reshape(num_kv_heads * qg_rows, in_features)
+        .contiguous()
+        .to(torch.bfloat16)
+    )
+    k_bf16 = (
+        w[:, qg_rows:qg_rows + kg_rows, :]
+        .reshape(num_kv_heads * kg_rows, in_features)
+        .contiguous()
+        .to(torch.bfloat16)
+    )
+    v_bf16 = (
+        w[:, qg_rows + kg_rows:, :]
+        .reshape(num_kv_heads * vg_rows, in_features)
+        .contiguous()
+        .to(torch.bfloat16)
     )
 
-    w = qkv_weight.to(torch.float32).view(
-        num_kv_heads, real_rows_per_group, in_features
-    )
-    w_padded = torch.zeros(
-        num_kv_heads, padded_rows_per_group, in_features, dtype=torch.float32
-    )
-    w_padded[:, :real_rows_per_group, :] = w
-
-    s = qkv_scale.to(torch.float32).view(
-        num_kv_heads, scale_rows_per_group, expected_scale_cols
-    )
-    s_exp = s.repeat_interleave(BLOCK, dim=1).repeat_interleave(BLOCK, dim=2)
-    s_exp = s_exp[:, :padded_rows_per_group, :in_features]
-
-    deq_padded = w_padded * s_exp
-    deq = deq_padded[:, :real_rows_per_group, :]
-
-    q_deq = deq[:, :qg_rows, :].reshape(num_kv_heads * qg_rows, in_features).contiguous()
-    k_deq = deq[:, qg_rows:qg_rows + kg_rows, :].reshape(num_kv_heads * kg_rows, in_features).contiguous()
-    v_deq = deq[:, qg_rows + kg_rows:, :].reshape(num_kv_heads * vg_rows, in_features).contiguous()
-
-    q_w2, q_s2 = _requantize_per_row(q_deq)
-    k_w2, k_s2 = _requantize_per_row(k_deq)
-    v_w2, v_s2 = _requantize_per_row(v_deq)
-
-    return {"q_proj": (q_w2, q_s2), "k_proj": (k_w2, k_s2), "v_proj": (v_w2, v_s2)}
+    return {"q_proj": q_bf16, "k_proj": k_bf16, "v_proj": v_bf16}
 
 
 def _maybe_fp8_to_neuron_per_row(
@@ -330,22 +370,21 @@ def process_layer(
             num_kv = config["num_key_value_heads"]
             hd = config.get("head_dim")
             vhd = config.get("v_head_dim", hd)
+        # split_qkv_fused returns BF16 weights only (no .scale); see its
+        # docstring for the rationale on why attn stays BF16 while MoE is FP8.
         split = split_qkv_fused(qkv_w, qkv_s, num_q, num_kv, hd, vhd)
-        for proj, (w2, s2) in split.items():
-            out[f"{out_prefix}self_attn.{proj}.weight"] = w2
-            if s2 is not None:
-                out[f"{out_prefix}self_attn.{proj}.scale"] = s2
+        for proj, w_bf16 in split.items():
+            out[f"{out_prefix}self_attn.{proj}.weight"] = w_bf16
     else:
-        # Flash-style: q/k/v stored separately.
+        # Flash-style: q/k/v stored separately. Dequant to BF16 for the same
+        # reason as the fused path.
         for proj in ("q_proj", "k_proj", "v_proj"):
             w = lazy.get(f"{prefix}self_attn.{proj}.weight")
             if w is None:
                 continue
             s = lazy.get(f"{prefix}self_attn.{proj}.weight_scale_inv")
-            w2, s2 = _maybe_fp8_to_neuron_per_row(w, s)
-            out[f"{out_prefix}self_attn.{proj}.weight"] = w2
-            if s2 is not None:
-                out[f"{out_prefix}self_attn.{proj}.scale"] = s2
+            w_bf16 = _dequant_attn_to_bf16(w, s)
+            out[f"{out_prefix}self_attn.{proj}.weight"] = w_bf16
 
     # o_proj is listed in HF quantization_config.ignored_layers and ships as
     # BF16; on Neuron it binds to a plain RowParallelLinear (see
