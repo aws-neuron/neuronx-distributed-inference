@@ -12,7 +12,7 @@ echo "=========================================="
 echo "Setup: vllm-neuron + MiMo-V2.5-Pro weights"
 echo "=========================================="
 
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 
 PATCH_FILE="$(cd "$(dirname "$0")" && pwd)/vllm-neuron-patch.patch"
 

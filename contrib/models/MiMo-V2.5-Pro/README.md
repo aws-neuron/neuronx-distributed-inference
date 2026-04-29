@@ -83,7 +83,7 @@ Key features:
 
 - **Instance**: trn2.48xlarge (128 physical NeuronCores, logical_nc_config=2 → 64 logical cores)
 - **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9)
-- **Venvs**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` (for preprocess + NxDI direct smoke), `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (for vLLM serving). Both ship with the DLAMI.
+- **Venv**: `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (used by preprocess, smoke, and vLLM serving alike; ships with the DLAMI and is where `0_setup.sh` installs the patched `vllm-neuron`).
 - **Disk**: ~3 TB free under `/opt/dlami/nvme` (the HF FP8 checkpoint is ~962 GB, the Neuron-FP8 preprocessed output is ~1 TB, and `save_sharded_checkpoint=true` writes another ~300-1000 GB per compiled config (varies with recipe)).
 
 ### NVMe mount
@@ -124,7 +124,7 @@ huggingface-cli download XiaomiMiMo/MiMo-V2.5-Pro \
 # 3. Preprocess HF FP8 -> Neuron-FP8 (BF16 attn, FP8 MoE). ~20 min, ~24 GB
 #    peak RAM. The preprocess dequants q/k/v to BF16 in one pass — see
 #    "Checkpoint Preparation" below for why BF16 attn is the only recipe.
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 python contrib/models/MiMo-V2.5-Pro/src/conversion_script/preprocess_mimo_v2_fp8.py \
     --hf_model_path /opt/dlami/nvme/models/MiMo-V2.5-Pro \
     --save_path     /opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8 \

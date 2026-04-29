@@ -16,9 +16,8 @@ check for the preprocessed checkpoint. SKIP_WARMUP=1 on load() skips the
 forward pass that allocates the shared scratchpad — useful when HBM is
 tight.
 
-Run under /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference (NxDI direct).
-The `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` venv is only
-needed for vllm serving (bench_mimo_v2.sh).
+Run under /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16 (same venv
+as vllm serving; both NxDI direct and vllm-neuron are installed there).
 """
 
 import os

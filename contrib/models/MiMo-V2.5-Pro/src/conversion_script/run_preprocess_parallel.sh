@@ -15,7 +15,7 @@
 #   VENV             venv with torch + safetensors + contrib pkg on sys.path
 set -e
 
-VENV=${VENV:-/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference}
+VENV=${VENV:-/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16}
 source "$VENV/bin/activate"
 
 HF_MODEL_PATH=${HF_MODEL_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Pro}

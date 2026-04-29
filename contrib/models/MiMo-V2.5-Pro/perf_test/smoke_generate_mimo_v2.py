@@ -7,7 +7,7 @@ Flash wrapper, loads with skip_warmup=False, and generates 20 tokens for a
 single prompt via HuggingFaceGenerationAdapter. Purpose: sanity-check that
 the FP8 MoE + preprocessed scales actually produce coherent tokens.
 
-Run under /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference.
+Run under /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16.
 """
 
 import os
