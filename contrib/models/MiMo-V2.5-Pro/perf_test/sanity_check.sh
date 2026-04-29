@@ -1,25 +1,28 @@
 #!/bin/bash
 # Quick sanity check against an already-running vLLM server.
 #
-# Assumes vLLM is already listening on $PORT (default 8000) with MiMo-V2.5-Pro
-# loaded. Sends a single chat completion and prints the model's reply.
+# Posts a minimally-templated chat request to /v1/completions and prints the
+# model's reply. We go through /v1/completions (not /v1/chat/completions)
+# because Pro's default chat template prepends a ~240-token system prompt
+# that by itself overflows the seq_len=256 compile-time bucket; building the
+# im_start/im_end/assistant frame by hand keeps the prompt under ~30 tokens
+# and fits cleanly.
 #
 # Usage:
 #   bash sanity_check.sh                      # uses defaults
 #   PORT=8001 bash sanity_check.sh            # custom port
-#   PROMPT="..." bash sanity_check.sh         # custom prompt
+#   PROMPT="..." bash sanity_check.sh         # custom user content
 
 set -e
 
 MODEL_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8}"
 PORT="${PORT:-8000}"
-# "Introduce yourself" is a high-signal self-identification prompt that the
-# FP8 path answers coherently even under current MoE drift (see README
-# Status). Swap PROMPT=... if you want to probe other prompts.
+# "Introduce yourself" is the self-identification prompt that consistently
+# lands in the model's MiMo-aware region. Swap PROMPT=... to probe others.
 PROMPT="${PROMPT:-Hello! Please introduce yourself in one sentence.}"
-MAX_TOKENS="${MAX_TOKENS:-64}"
+MAX_TOKENS="${MAX_TOKENS:-80}"
 
-echo "Sanity check: POST /v1/chat/completions on port $PORT"
+echo "Sanity check: POST /v1/completions on port $PORT"
 echo "  Model:      $MODEL_PATH"
 echo "  Prompt:     $PROMPT"
 echo "  Max tokens: $MAX_TOKENS"
@@ -28,38 +31,55 @@ echo ""
 # Health check first — fail fast if server isn't up.
 if ! curl -sf "http://localhost:$PORT/health" > /dev/null; then
     echo "ERROR: vLLM server is not responding on http://localhost:$PORT"
-    echo "Start it with 'bash bench_mimo_v2.sh' or your own launcher first."
+    echo "Start it with 'bash start_vllm_server.sh' (or bench_mimo_v2.sh)"
+    echo "first and wait for 'Application startup complete.'"
     exit 1
 fi
 
-# NOTE: request-side `temperature` is ignored by vllm-neuron on this model:
-# on-device sampling_config (set at compile time in start_vllm_server.sh as
-# do_sample=true, T=0.6, top_k=20, top_p=0.95) is baked into the NEFF and
-# request params don't override it. Output will be stochastic.
-RESPONSE=$(curl -s "http://localhost:$PORT/v1/chat/completions" \
-    -H 'Content-Type: application/json' \
-    -d "$(cat <<EOF
-{
-    "messages": [{"role": "user", "content": "$PROMPT"}],
-    "model": "$MODEL_PATH",
-    "max_tokens": $MAX_TOKENS,
-    "stream": false
-}
-EOF
-)")
+# NOTE: request-side `temperature` / `top_k` / `top_p` are ignored by
+# vllm-neuron on this model: the on_device_sampling_config baked into the
+# NEFF at compile time wins. Output is always stochastic; re-run to see
+# variance.
+#
+# Build the chat framing in python so newlines and special tokens survive
+# JSON encoding without shell escape pitfalls, then POST to /v1/completions.
+python3 <<PYEOF
+import json
+import urllib.request
+import sys
 
-echo "Response:"
-echo "$RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$RESPONSE"
-echo ""
-
-# Extract the model's reply for a human-friendly one-liner summary.
-REPLY=$(echo "$RESPONSE" | python3 -c "
-import json, sys
+model = "$MODEL_PATH"
+user = """$PROMPT"""
+prompt = (
+    "<|im_start|>user\n"
+    + user
+    + "<|im_end|>\n<|im_start|>assistant\n"
+)
+body = json.dumps({
+    "model": model,
+    "prompt": prompt,
+    "max_tokens": int("$MAX_TOKENS"),
+    "stream": False,
+}).encode()
+req = urllib.request.Request(
+    "http://localhost:$PORT/v1/completions",
+    data=body,
+    headers={"Content-Type": "application/json"},
+)
 try:
-    r = json.load(sys.stdin)
-    print(r['choices'][0]['message']['content'].strip())
-except Exception as e:
-    print(f'(could not parse reply: {e})')
-" 2>/dev/null)
+    with urllib.request.urlopen(req, timeout=120) as r:
+        resp = json.load(r)
+except urllib.error.HTTPError as e:
+    print("HTTP error:", e.code, e.read().decode(errors="replace"))
+    sys.exit(1)
 
-echo "Model reply: $REPLY"
+if "error" in resp:
+    print("Error from server:", json.dumps(resp["error"], indent=2))
+    sys.exit(1)
+
+text = resp["choices"][0]["text"]
+print("Response:")
+print(text)
+print()
+print("Usage:", resp.get("usage", {}))
+PYEOF

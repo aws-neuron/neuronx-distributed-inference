@@ -17,8 +17,8 @@
 #                    /opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8)
 #   CONCURRENCY      --max-concurrency (default 1)
 #   NUM_PROMPTS      --num-prompts (default 16)
-#   INPUT_LEN        --random-input-len (default 900)
-#   OUTPUT_LEN       --random-output-len (default 90)
+#   INPUT_LEN        --random-input-len (default 180; matches seq_len=256)
+#   OUTPUT_LEN       --random-output-len (default 60; matches seq_len=256)
 #   RANGE_RATIO      --random-range-ratio (default 0.03)
 #   CONFIG_NAME      Used in the output filename (default bs48_tp64_moetp1_ep64)
 #   RESULTS_DIR      Where to dump per-run log
@@ -32,9 +32,11 @@ MODEL_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP
 PORT="${PORT:-8000}"
 CONCURRENCY="${CONCURRENCY:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-16}"
-INPUT_LEN="${INPUT_LEN:-900}"
-OUTPUT_LEN="${OUTPUT_LEN:-90}"
+INPUT_LEN="${INPUT_LEN:-180}"
+OUTPUT_LEN="${OUTPUT_LEN:-60}"
 RANGE_RATIO="${RANGE_RATIO:-0.03}"
+# seq_len=256 on the compiled server, so input+output must stay under 256.
+# Default 180+60=240 leaves a small margin for random-range-ratio expansion.
 CONFIG_NAME="${CONFIG_NAME:-bs48_tp64_moetp1_ep64}"
 RESULTS_DIR="${RESULTS_DIR:-/opt/dlami/nvme/logs/bench_results/mimo_v2_5_pro}"
 
