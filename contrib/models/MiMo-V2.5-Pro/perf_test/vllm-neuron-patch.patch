@@ -61,20 +61,24 @@ index d2099eb..0c162e4 100644
 +            _sys.path.insert(0, mimo_src)
 +        try:
 +            from modeling_mimo_v2 import NeuronMiMoV2ForCausalLM
-+            MODEL_TYPES.setdefault(
-+                "mimov2flash", {"causal-lm": NeuronMiMoV2ForCausalLM}
-+            )
++            # Register under both Flash and Pro model_type keys so the same
++            # NxDI wrapper serves MiMo-V2-Flash, MiMo-V2.5-Pro, and any sibling
++            # that inherits the same config.
++            for _mt in ("mimov2flash", "mimov2pro"):
++                MODEL_TYPES.setdefault(_mt, {"causal-lm": NeuronMiMoV2ForCausalLM})
 +            try:
 +                from vllm.model_executor.models.registry import ModelRegistry
-+                if "MiMoV2ForCausalLM" not in ModelRegistry.get_supported_archs():
-+                    ModelRegistry.register_model(
-+                        "MiMoV2ForCausalLM", NeuronMiMoV2ForCausalLM
-+                    )
++                # Override vLLM's GPU-only MiMoV2* stubs with our Neuron
++                # wrapper so ModelConfig validation accepts the architecture
++                # regardless of whether the checkpoint calls itself Flash or
++                # Pro.
++                for _arch in ("MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM"):
++                    ModelRegistry.register_model(_arch, NeuronMiMoV2ForCausalLM)
 +            except ImportError:
 +                pass
 +        except Exception as e:
 +            _w.warn(
-+                f"Failed to register MiMo-V2.5-Pro contrib model: {e}",
++                f"Failed to register MiMo-V2 contrib model: {e}",
 +                category=UserWarning,
 +            )
 +

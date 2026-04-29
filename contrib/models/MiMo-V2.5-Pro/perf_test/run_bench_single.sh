@@ -13,8 +13,8 @@
 #
 # Environment knobs:
 #   PORT             vLLM server port (default 8000)
-#   MIMO_V2_FLASH_PATH  Path to the BF16 checkpoint (default
-#                    /opt/dlami/nvme/models/MiMo-V2.5-Pro-BF16)
+#   MIMO_V2_FLASH_PATH  Path to the Neuron-FP8 checkpoint (default
+#                    /opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8)
 #   CONCURRENCY      --max-concurrency (default 1)
 #   NUM_PROMPTS      --num-prompts (default 16)
 #   INPUT_LEN        --random-input-len (default 900)
@@ -27,7 +27,7 @@ set -e
 
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
-MODEL_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Pro-BF16}"
+MODEL_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8}"
 PORT="${PORT:-8000}"
 CONCURRENCY="${CONCURRENCY:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-16}"

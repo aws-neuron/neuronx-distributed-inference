@@ -37,16 +37,21 @@ Key features:
 
 ## Status (work-in-progress)
 
-**This port compiles cleanly and loads on Trn2 but does not yet produce coherent output.** Current symptoms under the default recipe (`tp_degree=64, moe_tp_degree=1, moe_ep_degree=64, batch_size=48, seq_len=1024`) on 2026-04-28:
+**This port compiles cleanly and serves via vLLM on Trn2, but output quality is not production-ready under the default FP8 recipe.** Sanity checks on 2026-04-29 under `tp_degree=64, moe_tp_degree=1, moe_ep_degree=64, batch_size=48, seq_len=1024`:
 
-- Prefill drifts from token 1: "Explain in one sentence what a transformer neural network is." → `"100% of the time, 100% of the time, ..."` (greedy decode, temperature=0). Decode speed 0.72 tok/s. Note the output is syntactically valid English ("100% of the time" = BPE tokens `15/16/4/315/279/882` = `"1"/"0"/"%"/" of"/" the"/" time"`, all high-frequency) — not a sampling bug: greedy argmax is correctly picking the model's top token, but the logit distribution itself is wrong (output unrelated to the prompt). Same signature as Jim Burtoft's "Flash FP8 → `erotici` repeat" symptom.
-- Same failure pattern was observed on the MiMo-V2-Pro port under the same recipe (`"0.0.0.0:8080"` etc.). Root cause identified there appears to be **Neuron's NKI blockwise FP8 compute kernel handling Pro's tight expert-weight distribution** (std ≈ 0.0018, ~10× smaller than Flash's ≈ 0.019). This is NOT an FP8-format problem per se — sglang on H100/H200 runs the exact same OCP FP8 checkpoint and produces correct output, because GPU paths dequantize FP8→BF16 before the matmul. Neuron NKI does FP8 compute directly and seems to lose precision on subnormal-leaning tensors.
-- V2.5-Pro's MoE expert weights are byte-identical to V2-Pro (verified layer 1 expert 0 dequant stats match to 6 decimal places on 2026-04-28), so all V2-Pro workarounds remain required (router bias mean-subtract, qkv interleaved split, `_apply_2d_per_channel_fix`, `_apply_blockwise_scale_stride_fix`).
+- Prompt-dependent drift. Self-intro style prompts ("introduce yourself in one sentence") return coherent Chinese output; most other prompts collapse to repetition or unrelated text within a few tokens (e.g. `"The capital of France is\n# 1000000000000000"`, `"Once upon a time in a small village there lived\n# 0000000000..."`).
+- Same failure pattern was observed on the MiMo-V2-Pro port under the same recipe (`"0.0.0.0:8080"`, etc.). Root cause appears to be **Neuron's NKI blockwise FP8 compute kernel handling Pro's tight expert-weight distribution**: Pro's per-expert weight `abs_mean ≈ 0.00124` and blockwise `scale_mean ≈ 2.3e-5` are 4-7× smaller than V2.5 (256 experts) on the same recipe, and the NKI accumulator loses precision compounded across 70 layers. V2.5-Pro's MoE expert weights are byte-identical to V2-Pro (verified layer 1 expert 0 dequant stats match to 6 decimal places on 2026-04-28), so all V2-Pro workarounds remain required (router bias mean-subtract, qkv interleaved split, `_apply_2d_per_channel_fix`, `_apply_blockwise_scale_stride_fix`).
+- GPU stacks (sglang on H100/H200) run the exact same OCP FP8 checkpoint correctly, because they dequantize FP8→BF16 before the matmul. Neuron NKI does FP8 compute directly and drifts on subnormal-leaning tensors.
 - Reference: Jim Burtoft observed similar prompt-dependent FP8 degradation on Flash and his Kimi PR #131 names "blockwise kernel padding produces depressed logits with EP=2 on SDK 2.29; SDK 2.28 recommended".
 
-Other recipes to try (none verified yet on V2.5-Pro):
-- `moe_tp_degree=16, moe_ep_degree=4, BS=48` — balances E_local=96 vs HBM.
-- `moe_tp_degree=32, moe_ep_degree=2, BS=1` — mirrors Jim's Kimi-K2 PR, but V2-Pro OOM'd by 28MB on load at BS=48; BS=1 hits `NotImplementedError: Selective Loading with Expert parallelism`.
+Recipes that were tried and did not resolve the drift (all on 2026-04-28/29):
+- **q/k/v_proj dequant to BF16** (compile-time `modules_to_not_convert` includes `q_proj, k_proj, v_proj`): compiled but HBM OOM on load — BF16 attention weights pushed per-rank tensors to 20.93/24 GB, leaving no room for collective DMA rings.
+- **`use_torch_block_wise=True`** (PyTorch-fallback blockwise matmul for higher accumulator precision): compile+shard succeeded after ~2 h, but `model.load()` crashed with `status=4 Allocation Failure` — the fallback path raises HBM demand.
+
+Next experiments queued (none verified yet):
+- BF16 weights across two Trn2 instances with cross-node TP/PP (single-instance HBM cannot hold BF16 Pro).
+- SDK 2.28 venv test once installed, per Kimi PR #131.
+- Selective BF16 only on `gate_up_proj` (smallest MoE scales) while keeping `down_proj` FP8, if HBM allows.
 
 Known NxDI limits that constrain recipe choice:
 - `BS * top_k / num_experts >= 1.0` required when `moe_ep_degree > 1` at decode (else NotImplementedError). With `num_experts=384, top_k=8` this forces `BS >= 48`.
@@ -114,8 +119,8 @@ bash contrib/models/MiMo-V2.5-Pro/perf_test/0_setup.sh
 bash contrib/models/MiMo-V2.5-Pro/perf_test/bench_mimo_v2.sh
 ```
 
-The bench script runs two configurations (BS=32 and BS=128, both
-`moe_tp_degree=X / moe_ep_degree=Y (see bench script)`) and logs results under
+The bench script runs two configurations (BS=48 and BS=128, both
+`moe_tp_degree=1 / moe_ep_degree=64`) and logs results under
 `/tmp/bench_results/mimo_v25_pro/`.
 
 For a quick `curl` sanity check while the server is up:
@@ -182,10 +187,10 @@ neuron_config = MoENeuronConfig(
     ep_degree=1,          # keep outer EP = 1; only MoE-internal EP varies
     moe_tp_degree=1,
     moe_ep_degree=64,
-    batch_size=32,        # must be >= num_experts / top_k = 256 / 8 = 32
-    max_batch_size=32,
+    batch_size=48,        # must be >= num_experts / top_k = 384 / 8 = 48
+    max_batch_size=48,
     ctx_batch_size=1,
-    tkg_batch_size=32,
+    tkg_batch_size=48,
     seq_len=1024,
     n_active_tokens=128,
     torch_dtype=torch.bfloat16,
@@ -245,15 +250,15 @@ Both default to the recommended FP8 recipe (`moe_tp=1`, `moe_ep=64`).
 
 ### moe_tp_degree = 1, moe_ep_degree = 64
 
-**Why**: at `moe_tp_degree=64` each rank owns 1/64 of the intermediate dim, which for Flash (MoE intermediate = 2048) is 32 rows — **below the 128-row blockwise scale block**. NxDI's `_setup_for_scale` detects `weight_shape[axis] < block_size` and collapses the per-rank scale dim to 1, losing per-channel FP8 scale granularity. The resulting drift compounds across Flash's 47 MoE layers and manifests as output collapse ("helpful helpful helpful ...") after roughly 30 decode tokens.
+**Why**: at `moe_tp_degree=64` each rank owns 1/64 of the intermediate dim, which for MiMo-V2.5-Pro (MoE intermediate = 2048) is 32 rows — **below the 128-row blockwise scale block**. NxDI's `_setup_for_scale` detects `weight_shape[axis] < block_size` and collapses the per-rank scale dim to 1, losing per-channel FP8 scale granularity. The resulting drift compounds across Pro's 69 MoE layers and manifests as output collapse ("helpful helpful helpful ...") after roughly 30 decode tokens.
 
-`moe_tp_degree=1, moe_ep_degree=64` keeps each expert's weights and blockwise scales intact on a single rank (4 experts per rank), which preserves per-channel scale and produces correct output even on long multi-turn prompts.
+`moe_tp_degree=1, moe_ep_degree=64` keeps each expert's weights and blockwise scales intact on a single rank (6 experts per rank for Pro's 384 experts), which preserves per-channel scale. On V2.5 (256 experts) this recipe yields coherent output; on V2.5-Pro it still exhibits prompt-dependent drift (see Status).
 
-Intermediate ratios (`moe_tp=32/ep=2` or `moe_tp=16/ep=4`) have been empirically tested and still produce gibberish, so this is the only currently-supported moe_tp/ep combination for MiMo-V2.5-Pro FP8.
+Intermediate ratios (`moe_tp=32/ep=2`, `moe_tp=16/ep=4`) have been empirically tested and still produce gibberish, so `moe_tp=1/moe_ep=64` is the only currently-usable moe_tp/ep combination.
 
-### batch_size >= 32
+### batch_size >= 48
 
-NxDI's TKG (token generation) path refuses Expert Parallelism when `batch_size < num_experts / top_k`. For Flash that is 256 / 8 = 32, so the smallest working BS on the FP8 path is 32. BS=1 latency demos are not currently possible on FP8; use the BF16 checkpoint with `moe_tp=64, moe_ep=1, batch_size=1` for single-stream latency measurements.
+NxDI's TKG (token generation) path refuses Expert Parallelism when `batch_size < num_experts / top_k`. For Pro that is 384 / 8 = 48, so the smallest working BS on the FP8 path is 48. BS=1 latency demos are not possible on FP8; use the BF16 checkpoint with `moe_tp=64, moe_ep=1, batch_size=1` for single-stream latency measurements.
 
 ### outer ep_degree = 1
 
@@ -272,7 +277,7 @@ MiMo-V2.5-Pro can be served via [vllm-neuron](https://github.com/aws-neuron/vllm
 bash contrib/models/MiMo-V2.5-Pro/perf_test/0_setup.sh
 ```
 
-The patch (`perf_test/vllm-neuron-patch.patch`) is 40 lines and only touches `vllm_neuron/__init__.py`. It adds a `_register_contrib_models()` hook that, when `NXDI_CONTRIB_MIMO_V2_FLASH_SRC` is set, registers `NeuronMiMoV2ForCausalLM` into NxDI's `MODEL_TYPES` under the key `mimo_v2` **and** registers the `MiMoV2ForCausalLM` architecture into vLLM's `ModelRegistry`. No upstream vLLM or NxDI source is modified.
+The patch (`perf_test/vllm-neuron-patch.patch`) touches `vllm_neuron/worker/neuronx_distributed_model_loader.py`. It adds a `_register_contrib_models()` hook that, when `NXDI_CONTRIB_MIMO_V2_FLASH_SRC` is set, registers `NeuronMiMoV2ForCausalLM` into NxDI's `MODEL_TYPES` under keys `mimov2flash` **and** `mimov2pro`, **and** overrides vLLM's built-in `MiMoV2FlashForCausalLM` / `MiMoV2ProForCausalLM` (GPU-only stubs) in `ModelRegistry` with the Neuron wrapper so ModelConfig validation accepts either architecture. No upstream vLLM or NxDI source is modified. The checkpoint's `config.json` must set `architectures` to `["MiMoV2ProForCausalLM"]` (or `MiMoV2FlashForCausalLM` for V2.5); the preprocess script takes care of this.
 
 ### Serving (FP8, recommended)
 
@@ -289,7 +294,7 @@ python3 -m vllm.entrypoints.openai.api_server \
     --model "$MIMO_V2_FLASH_PATH" \
     --tensor-parallel-size 64 \
     --max-model-len 1024 \
-    --max-num-seqs 32 \
+    --max-num-seqs 48 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
     --trust_remote_code \
@@ -313,9 +318,9 @@ python3 -m vllm.entrypoints.openai.api_server \
             "blockwise_matmul_config": {"use_shard_on_block_dynamic_while": true, "block_sharding_strategy": "PING_PONG"},
             "moe_tp_degree": 1,
             "moe_ep_degree": 64,
-            "batch_size": 32,
+            "batch_size": 48,
             "ctx_batch_size": 1,
-            "tkg_batch_size": 32,
+            "tkg_batch_size": 48,
             "max_context_length": 1024,
             "seq_len": 1024,
             "is_continuous_batching": true,
@@ -330,39 +335,33 @@ python3 -m vllm.entrypoints.openai.api_server \
     }'
 ```
 
-See `perf_test/bench_mimo_v2.sh` for the full benchmark recipe at BS=32 and BS=128.
+See `perf_test/bench_mimo_v2.sh` for the full benchmark recipe at BS=48 and BS=128.
 
 ### vllm-neuron patch summary
 
 The patch is applied to vllm-neuron 0.5.0 and:
 
-- Maps the `MiMoV2ForCausalLM` architecture to Flash's model loader (reusing the Qwen2-family loader path, which Flash's tokenizer inherits from).
-- Passes `hf_config` from vLLM into `load_pretrained_config` so NxDI does not re-load the config without `trust_remote_code=True`.
-- Replaces vllm-neuron's internal `AutoModelForCausalLM.from_pretrained` call with `huggingface_hub.snapshot_download`, which is the only path that works for `trust_remote_code=True` models when no GPU is available for HF's CUDA-gated FP8 quantizer.
+- Patches `AutoConfig.from_pretrained` to default `trust_remote_code=True` so NxDI's `hf_adapter.load_config` can load the `MiMoV2Config` custom code that ships with the checkpoint.
+- Registers `NeuronMiMoV2ForCausalLM` into NxDI's `MODEL_TYPES` under `mimov2flash` and `mimov2pro` so the NxDI loader resolves either model_type to the contrib Neuron wrapper.
+- Overrides vLLM's built-in `MiMoV2FlashForCausalLM` and `MiMoV2ProForCausalLM` GPU stubs in `ModelRegistry`, since vLLM's ModelConfig validator rejects any architecture not in its registry and the Neuron path never instantiates vLLM's stub class anyway.
 
 ## Performance
 
-> These numbers are from the earlier BF16 recipe (pre-FP8 rollout). FP8 numbers will be added once a stable bench run completes on the new recipe; preliminary single-stream qualitative tests show fluent multi-sentence output on long Chinese chat prompts with `moe_tp=1, moe_ep=64, batch_size=32`.
+> The throughput numbers below are from a working vLLM server run on 2026-04-29 under the recommended FP8 recipe. Output quality under this recipe is **not production-usable** (see Status); the numbers show that the serving infrastructure runs end-to-end, not that the model answers correctly.
 
-### Standalone NxDI (trn2.48xlarge, BF16, TP=64, EP=64)
+### vLLM Serving (trn2.48xlarge, FP8, BS=48, TP=64, moe_tp=1/moe_ep=64, CB + bucketing)
 
-| Batch Size | Throughput (tok/s) |
-|------------|-------------------|
-| 1 | 29.92 |
-| 8 | 215.94 |
-| 32 | 649.14 |
+Input/output: 900/90 tokens (`vllm bench serve --dataset-name random`), `on_device_sampling_config={do_sample:true, temperature:0.6, top_k:20, top_p:0.95}`.
 
-### vLLM Serving (trn2.48xlarge, BF16, BS=32, TP=64/EP=64, CB)
+| Concurrency | Total tok/s | Output tok/s | TTFT median (ms) | TTFT P99 (ms) | TPOT median (ms) |
+|-------------|-------------|--------------|------------------|---------------|------------------|
+| 1  | 47  | 4.3  | 1,392  | 1,393  | 220 |
+| 16 | 391 | 35.6 | 2,361  | 17,394 | 422 |
+| 48 | 606 | 55   | 7,322  | 54,413 | 752 |
 
-Input/output: 900/90 tokens (random dataset)
+Per-stream ITL median holds at ~220 ms across all concurrency levels; TPOT/TTFT growth at higher concurrency comes from continuous-batching queue pressure, not per-step compute.
 
-| Concurrency | Throughput (tok/s) | TPOT (ms) | TTFT (ms) |
-|-------------|-------------------|-----------|-----------|
-| 1 | 27.98 | 33.65 | 222 |
-| 16 | 224.57 | 64.95 | 570 |
-| 32 | 302.61 | 90.23 | 1351 |
-
-> **Compile time:** the first Flash compile on SDK 2.29 is ~30-60 minutes for the TKG NEFF and similar for the CTE NEFF. Subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass.
+> **Compile time:** the first Pro compile on SDK 2.29 is ~60 minutes for the TKG NEFF and ~15 minutes for the CTE NEFF; subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass. First full server launch (compile + shard + warmup) is ~2 hours wall-clock.
 
 ## Compatibility Matrix
 
@@ -385,7 +384,7 @@ pytest contrib/models/MiMo-V2.5-Pro/test/integration/test_model.py -v
 3. **Attention Sink Bias**: Learnable per-head bias added as an extra "sink" column to attention scores in sliding window layers (not added in full-attention layers). Per-rank slicing of the bias happens inside `forward()` based on `parallel_state.get_tensor_model_parallel_rank()`.
 4. **FP8 Path Caveats**:
    - Must use `moe_tp_degree=1, moe_ep_degree=64` (see "FP8 Configuration Notes" above).
-   - Must use `batch_size >= 32` (NxDI EP>1 requirement).
+   - Must use `batch_size >= 48` (NxDI EP>1 requirement, `384 / 8 = 48`).
    - Must keep outer `ep_degree=1` (only `moe_ep_degree` should vary).
    - Several runtime monkey-patches (router bias, blockwise scale stride, 2D per-channel, EP scale handling) are installed automatically in `NeuronMiMoV2ForCausalLM.__init__` when `quantized=True`; the BF16 path is untouched.
 
@@ -397,4 +396,4 @@ pytest contrib/models/MiMo-V2.5-Pro/test/integration/test_model.py -v
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-25
+**Last Updated:** 2026-04-29

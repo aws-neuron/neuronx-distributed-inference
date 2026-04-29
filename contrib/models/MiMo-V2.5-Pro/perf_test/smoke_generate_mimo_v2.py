@@ -99,9 +99,8 @@ def main():
         context_encoding_buckets=[SEQ_LEN],
         router_config={"act_fn": "sigmoid", "dtype": "float32"},
         blockwise_matmul_config={
-            "use_torch_block_wise": True,
-            "use_shard_on_intermediate_dynamic_while": True,
-            "skip_dma_token": True,
+            "use_shard_on_block_dynamic_while": True,
+            "block_sharding_strategy": "PING_PONG",
         },
         save_sharded_checkpoint=True,
         quantized=True,

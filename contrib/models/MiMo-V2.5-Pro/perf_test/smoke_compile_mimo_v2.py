@@ -124,17 +124,12 @@ def main():
         moe_tp_degree=MOE_TP,
         context_encoding_buckets=[SEQ_LEN],
         router_config={"act_fn": "sigmoid", "dtype": "float32"},
-        # V2.5-Pro experiment: use PyTorch-fallback blockwise matmul instead
-        # of the NKI _call_shard_hidden_kernel path. Rationale: Pro's MoE
-        # expert weight scales run ~3-7x smaller than V2.5 (scale_mean
-        # ~5e-5 vs 2.5e-4); the NKI blockwise kernel's lower accumulator
-        # precision compounds across 70 layers into decode-time gibberish.
-        # PyTorch fallback dequantizes each block to BF16 before matmul,
-        # trading throughput for accumulator precision.
+        # SDK 2.29 ships only bwmm_shard_on_block / bwmm_shard_on_intermediate;
+        # default routes to _call_shard_hidden_kernel which is missing, so we
+        # take the shard-on-block path via this flag. Matches Flash + Kimi.
         blockwise_matmul_config={
-            "use_torch_block_wise": True,
-            "use_shard_on_intermediate_dynamic_while": True,
-            "skip_dma_token": True,
+            "use_shard_on_block_dynamic_while": True,
+            "block_sharding_strategy": "PING_PONG",
         },
         # Persist sharded FP8 weights to disk so subsequent load()s skip the
         # ~10-minute shard_checkpoint step (writes weights/tp{0..63}_*.safetensors

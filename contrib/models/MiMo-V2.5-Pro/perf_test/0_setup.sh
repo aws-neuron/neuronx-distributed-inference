@@ -39,15 +39,15 @@ pip install s5cmd
 python3 -c "import vllm_neuron; print('vllm-neuron installed:', vllm_neuron.__file__)"
 
 echo ""
-echo "[2/2] Downloading MiMo-V2.5-Pro BF16 weights..."
+echo "[2/2] Downloading MiMo-V2.5-Pro Neuron-FP8 weights..."
 
-MIMO_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Pro-BF16}"
+MIMO_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8}"
 if [ -d "$MIMO_PATH" ] && [ "$(ls "$MIMO_PATH"/*.safetensors 2>/dev/null | wc -l)" -gt 0 ]; then
     echo "  MiMo weights already exist at $MIMO_PATH, skipping download"
 else
-    echo "  Downloading BF16 weights from your S3 bucket (edit the URI if needed)..."
+    echo "  Downloading Neuron-FP8 weights from your S3 bucket (edit the URI if needed)..."
     mkdir -p "$MIMO_PATH"
-    s5cmd cp "s3://datalab/xiaomi/models/MiMo-V2.5-Pro-BF16/**" "$MIMO_PATH/"
+    s5cmd cp "s3://datalab/xiaomi/models/MiMo-V2.5-Pro-Neuron-FP8/**" "$MIMO_PATH/"
     echo "  Download complete: $(du -sh $MIMO_PATH | cut -f1)"
 fi
 

@@ -15,7 +15,7 @@ set -e
 # (4 experts per rank), which preserves the blockwise scale intact.
 #
 # NxDI's TKG path refuses Expert Parallelism with BS < num_experts/top_k
-# (256 / 8 = 32 for Flash), so the smallest working batch size here is 32.
+# (384 / 8 = 48 for V2.5-Pro), so the smallest working batch size here is 48.
 # If you want BS=1 behaviour, the FP8 path is not currently supported on
 # this model on Trn2 — use the BF16 checkpoint with the old bench recipe
 # (`moe_tp_degree=64, moe_ep_degree=1, batch_size=1`).
@@ -132,18 +132,19 @@ echo "Results: $RESULTS_DIR"
 echo ""
 
 ###############################################################################
-# Config 1: BS=32, TP=64 + moe_tp=1/moe_ep=64, CB + bucketing (smallest BS
-# that satisfies NxDI's Expert-Parallel BS >= num_experts/top_k requirement).
+# Config 1: BS=48, TP=64 + moe_tp=1/moe_ep=64, CB + bucketing (smallest BS
+# that satisfies NxDI's Expert-Parallel BS >= num_experts/top_k requirement:
+# 384 / 8 = 48).
 ###############################################################################
-CONFIG_NAME="bs32_tp64_moetp1_ep64"
-echo "--- Config 1: BS=32, moe_tp=1/moe_ep=64, CB + bucketing ---"
+CONFIG_NAME="bs48_tp64_moetp1_ep64"
+echo "--- Config 1: BS=48, moe_tp=1/moe_ep=64, CB + bucketing ---"
 
 python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" \
     --tokenizer "$MODEL_PATH" \
     --tensor-parallel-size 64 \
     --max-model-len 1024 \
-    --max-num-seqs 32 \
+    --max-num-seqs 48 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
     --port $PORT \
@@ -153,9 +154,9 @@ python3 -m vllm.entrypoints.openai.api_server \
             '"$COMMON_MIMO_CONFIG"',
             "moe_tp_degree": 1,
             "moe_ep_degree": 64,
-            "batch_size": 32,
+            "batch_size": 48,
             "ctx_batch_size": 1,
-            "tkg_batch_size": 32,
+            "tkg_batch_size": 48,
             "max_context_length": 1024,
             "seq_len": 1024,
             "is_continuous_batching": true,
@@ -173,7 +174,7 @@ wait_for_server
 sanity_check
 run_bench "$CONFIG_NAME" 1 16
 run_bench "$CONFIG_NAME" 16 128
-run_bench "$CONFIG_NAME" 32 128
+run_bench "$CONFIG_NAME" 48 192
 stop_server
 
 ###############################################################################
