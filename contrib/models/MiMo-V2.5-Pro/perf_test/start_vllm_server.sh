@@ -31,15 +31,7 @@ export NXDI_CONTRIB_MIMO_V2_FLASH_SRC
 # Persistent compile-artifact location (NEFF + per-rank sharded weights).
 # Setting this overrides vLLM's fallback of
 # <checkpoint>/neuron-compiled-artifacts/<hash>/.
-# Default points at the NxDI-smoke compile artifacts (produced by
-# perf_test/smoke_compile_mimo_v2.py) instead of a vllm-neuron-compiled
-# NEFF. Empirically, vllm-neuron's own compile path (-O3 +
-# --enable-internal-neff-wrapper + on_device_sampling + CB-baked NEFF)
-# produces garbled first-decode output on Pro (per-request `?` UTF-8
-# replacement chars followed by off-topic coherent text). The smoke
-# compile (-O1, no on-device sampler, static batch) works correctly
-# when vLLM loads it at runtime. Root cause TBD; not yet isolated.
-: "${NEURON_COMPILED_ARTIFACTS:=/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq256}"
+: "${NEURON_COMPILED_ARTIFACTS:=/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_bf16attn_seq256_vllm}"
 export NEURON_COMPILED_ARTIFACTS
 # NxDI HLO/NEFF staging directory, pinned to persistent storage so it
 # survives the nightly Trn2 reboot and a unique per-config subdir.
