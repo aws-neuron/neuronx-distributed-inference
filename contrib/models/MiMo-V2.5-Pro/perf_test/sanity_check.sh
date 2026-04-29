@@ -13,7 +13,10 @@ set -e
 
 MODEL_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8}"
 PORT="${PORT:-8000}"
-PROMPT="${PROMPT:-What is 1+1? Answer briefly.}"
+# "Introduce yourself" is a high-signal self-identification prompt that the
+# FP8 path answers coherently even under current MoE drift (see README
+# Status). Swap PROMPT=... if you want to probe other prompts.
+PROMPT="${PROMPT:-Hello! Please introduce yourself in one sentence.}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
 
 echo "Sanity check: POST /v1/chat/completions on port $PORT"
@@ -29,6 +32,10 @@ if ! curl -sf "http://localhost:$PORT/health" > /dev/null; then
     exit 1
 fi
 
+# NOTE: request-side `temperature` is ignored by vllm-neuron on this model:
+# on-device sampling_config (set at compile time in start_vllm_server.sh as
+# do_sample=true, T=0.6, top_k=20, top_p=0.95) is baked into the NEFF and
+# request params don't override it. Output will be stochastic.
 RESPONSE=$(curl -s "http://localhost:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d "$(cat <<EOF
@@ -36,7 +43,6 @@ RESPONSE=$(curl -s "http://localhost:$PORT/v1/chat/completions" \
     "messages": [{"role": "user", "content": "$PROMPT"}],
     "model": "$MODEL_PATH",
     "max_tokens": $MAX_TOKENS,
-    "temperature": 0.0,
     "stream": false
 }
 EOF
