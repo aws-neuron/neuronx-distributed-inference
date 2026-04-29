@@ -37,25 +37,47 @@ Key features:
 
 ## Status (work-in-progress)
 
-**This port compiles cleanly and serves via vLLM on Trn2, but output quality is not production-ready under the default FP8 recipe.** Sanity checks on 2026-04-29 under `tp_degree=64, moe_tp_degree=1, moe_ep_degree=64, batch_size=48, seq_len=1024`:
+**This port compiles cleanly and serves via vLLM on Trn2. Under the default all-FP8 recipe the output drifts on most prompts; a BF16-attn recipe (keep MoE FP8, dequant q/k/v_proj to BF16, compile at seq_len=256) restores coherent output and isolates the root cause.** Findings as of 2026-04-29:
 
-- Prompt-dependent drift. Self-intro style prompts ("introduce yourself in one sentence") return coherent Chinese output; most other prompts collapse to repetition or unrelated text within a few tokens (e.g. `"The capital of France is\n# 1000000000000000"`, `"Once upon a time in a small village there lived\n# 0000000000..."`).
-- Same failure pattern was observed on the MiMo-V2-Pro port under the same recipe (`"0.0.0.0:8080"`, etc.). Root cause appears to be **Neuron's NKI blockwise FP8 compute kernel handling Pro's tight expert-weight distribution**: Pro's per-expert weight `abs_mean ≈ 0.00124` and blockwise `scale_mean ≈ 2.3e-5` are 4-7× smaller than V2.5 (256 experts) on the same recipe, and the NKI accumulator loses precision compounded across 70 layers. V2.5-Pro's MoE expert weights are byte-identical to V2-Pro (verified layer 1 expert 0 dequant stats match to 6 decimal places on 2026-04-28), so all V2-Pro workarounds remain required (router bias mean-subtract, qkv interleaved split, `_apply_2d_per_channel_fix`, `_apply_blockwise_scale_stride_fix`).
-- GPU stacks (sglang on H100/H200) run the exact same OCP FP8 checkpoint correctly, because they dequantize FP8→BF16 before the matmul. Neuron NKI does FP8 compute directly and drifts on subnormal-leaning tensors.
+### All-FP8 recipe (`tp_degree=64, moe_tp=1, moe_ep=64, BS=48, seq_len=1024`)
+
+- **Prompt-dependent drift.** Self-intro prompts sometimes return coherent answers (sampling gets lucky on a strong self-identifying logit); most other prompts collapse to repetition or unrelated text within a few tokens (e.g. `"The capital of France is\n# 1000000000000000"`, `"Once upon a time in a small village there lived\n# 0000000000..."`, chat continuations that drift into RLHF-style self-reflection with Chinese/Thai).
+- **Not a sampling artifact.** `temperature` in the request is ignored — vllm-neuron's on-device sampling config (`do_sample=true, T=0.6, top_k=20, top_p=0.95`) is baked into the NEFF at compile time. Output is always stochastic, but the underlying logits are already drifted.
+- Same failure pattern was observed on MiMo-V2-Pro under the same recipe (`"0.0.0.0:8080"`, etc.). V2.5-Pro's MoE expert weights are byte-identical to V2-Pro (verified layer 1 expert 0 dequant stats match to 6 decimal places on 2026-04-28).
+
+### BF16-attn recipe (`q_proj/k_proj/v_proj` dequant to BF16, MoE kept FP8, `seq_len=256`)
+
+- **Output is coherent.** On the same self-intro prompt, smoke_generate with a minimal chat template produces a well-formed reasoning trace that correctly identifies the model:
+  ```
+  <think>Okay, the user is asking for a simple self-introduction in one sentence,
+  with no deeper or hidden needs apparent. As MiMo, based on Xiaomi's self-developed
+  large model, I need to respond in a friendly, positive, and helpful way that aligns
+  with providing assistance ...
+  ```
+- **This narrows the root cause to attention-path FP8 precision**, not the MoE experts. Pro's attention weights have `abs_mean ≈ 0.00124`, roughly 4× smaller than V2.5 (256 experts). The NKI blockwise FP8 accumulator on attention q/k/v at this magnitude loses enough precision to drift the logits across 70 layers; dequantizing q/k/v to BF16 before the matmul restores correct output. MoE experts (scales `≈ 2.3e-5`, also small) can stay FP8 under this recipe.
+- **Cost: HBM headroom and seq_len.** BF16 q/k/v adds ~2 GB per rank. At `seq_len=1024` this OOMs on load (previous attempt failed allocating 41 MB for rdh/alltoall rings). `seq_len=256` frees enough full-attention softmax scratch to fit; longer context needs a different HBM plan (cross-instance TP/PP, or larger instance).
+- GPU stacks (sglang on H100/H200) run the exact same OCP FP8 checkpoint correctly because they always dequantize FP8 → BF16 before the matmul. The issue is specific to Neuron's direct-FP8 compute path on subnormal-leaning tensors.
 - Reference: Jim Burtoft observed similar prompt-dependent FP8 degradation on Flash and his Kimi PR #131 names "blockwise kernel padding produces depressed logits with EP=2 on SDK 2.29; SDK 2.28 recommended".
 
-Recipes that were tried and did not resolve the drift (all on 2026-04-28/29):
-- **q/k/v_proj dequant to BF16** (compile-time `modules_to_not_convert` includes `q_proj, k_proj, v_proj`): compiled but HBM OOM on load — BF16 attention weights pushed per-rank tensors to 20.93/24 GB, leaving no room for collective DMA rings.
-- **`use_torch_block_wise=True`** (PyTorch-fallback blockwise matmul for higher accumulator precision): compile+shard succeeded after ~2 h, but `model.load()` crashed with `status=4 Allocation Failure` — the fallback path raises HBM demand.
+### Preprocess step required for BF16 attn
 
-Next experiments queued (none verified yet):
-- BF16 weights across two Trn2 instances with cross-node TP/PP (single-instance HBM cannot hold BF16 Pro).
-- SDK 2.28 venv test once installed, per Kimi PR #131.
-- Selective BF16 only on `gate_up_proj` (smallest MoE scales) while keeping `down_proj` FP8, if HBM allows.
+`src/conversion_script/repatch_qkv_bf16.py` reads the original HF fused `qkv_proj` weight + scale, dequants per-group (`num_q_heads_per_kv_group` × `head_dim` rows per group) to BF16, and overwrites `q_proj/k_proj/v_proj` in the preprocessed Neuron-FP8 checkpoint in place. Runs in ~22 min. Simply adding `q_proj/k_proj/v_proj` to `modules_to_not_convert` without this preprocess is **not** equivalent — NxDI casts the raw fp8_e4m3fn bytes to bfloat16 without applying the scale, which produces nonsense weights.
 
-Known NxDI limits that constrain recipe choice:
-- `BS * top_k / num_experts >= 1.0` required when `moe_ep_degree > 1` at decode (else NotImplementedError). With `num_experts=384, top_k=8` this forces `BS >= 48`.
-- `n_routed_experts=384 = 2^7 * 3` → `384 / ep_degree` is never a power of 2 (6, 12, 24, 48, 96, 192, 384). Kimi PR #131 says NKI `_bwmm_shard_on_block_nki_call` on SDK 2.29 has "depressed logits with EP=2" and recommends SDK 2.28. SDK 2.28 venv is not currently installed on the target DLAMI.
+### Recipes that were tried and did not resolve the drift (all on 2026-04-28/29)
+
+- **`use_torch_block_wise=True`** (PyTorch-fallback blockwise matmul for higher accumulator precision): compile+shard succeeded after ~2 h, but `model.load()` crashed with `status=4 Allocation Failure` — the fallback path raises HBM demand even with MoE-only scope.
+
+### Next experiments queued
+
+- **BF16-attn + larger `seq_len`.** `seq_len=256` is tight; Pro's chat template with the default system prompt is already 260 tokens. Either shrink the system prompt, or try BF16-attn at `seq_len=512` on a less-full HBM plan (e.g. MoE-EP with fewer experts per rank, or drop batch size below 48 via different recipe trade-offs).
+- **Cross-instance BF16** via pipeline/tensor parallelism on 2× Trn2 (single-instance HBM cannot hold full BF16 Pro).
+- **Selective BF16 only on MoE `gate_up_proj`** (smallest expert scales) while keeping `down_proj` FP8 — another axis to probe if attn drift returns at longer contexts.
+- **SDK 2.28 venv** test once installed, per Kimi PR #131.
+
+### Known NxDI limits that constrain recipe choice
+
+- `BS * top_k / num_experts >= 1.0` required when `moe_ep_degree > 1` at decode (else `NotImplementedError`). With `num_experts=384, top_k=8` this forces `BS >= 48`.
+- `n_routed_experts=384 = 2^7 × 3` → `384 / ep_degree` is never a power of 2 (6, 12, 24, 48, 96, 192, 384). Kimi PR #131 says NKI `_bwmm_shard_on_block_nki_call` on SDK 2.29 has "depressed logits with EP=2" and recommends SDK 2.28.
 
 ## Prerequisites
 
@@ -106,8 +128,14 @@ python contrib/models/MiMo-V2.5-Pro/src/conversion_script/preprocess_mimo_v2_fp8
     --save_path     /opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8 \
     --tp_degree 64
 
+# 3b. Dequant attention q/k/v to BF16 in place (~22 min, required for
+#     coherent output under the current FP8 recipe; see Status).
+python contrib/models/MiMo-V2.5-Pro/src/conversion_script/repatch_qkv_bf16.py \
+    --hf_model_path     /opt/dlami/nvme/models/MiMo-V2.5-Pro \
+    --neuron_model_path /opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8
+
 # 4. (Optional) sanity-check the Neuron-FP8 checkpoint without vLLM
-#    ~45 min first compile; subsequent runs ~30s to load the pre-sharded NEFF.
+#    ~90 min first compile; subsequent runs ~60s to load the pre-sharded NEFF.
 source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 python contrib/models/MiMo-V2.5-Pro/perf_test/smoke_compile_mimo_v2.py  # compile
 python contrib/models/MiMo-V2.5-Pro/perf_test/smoke_generate_mimo_v2.py # 20-token generate
@@ -197,6 +225,20 @@ python contrib/models/MiMo-V2.5-Pro/src/conversion_script/preprocess_mimo_v2_fp8
 
 Peak RAM during preprocessing is ~24 GB; total runtime ~20 minutes on a trn2.48xlarge instance.
 
+### Required follow-up: dequant q/k/v to BF16 (`repatch_qkv_bf16.py`)
+
+Under the default all-FP8 recipe, Pro's attention weights drift enough to produce gibberish output (see Status). The fix is to keep MoE experts FP8 but dequant q/k/v to BF16 before compile. `src/conversion_script/repatch_qkv_bf16.py` reads the HF fused `qkv_proj` + `weight_scale_inv`, dequants per-group (each group is one kv-head: `hpg` Q rows, `1×head_dim` K rows, `1×v_head_dim` V rows), and overwrites the q_proj/k_proj/v_proj entries in the preprocessed Neuron-FP8 checkpoint in place. The scale entries for q/k/v are dropped from the safetensors index.
+
+```bash
+python contrib/models/MiMo-V2.5-Pro/src/conversion_script/repatch_qkv_bf16.py \
+    --hf_model_path     /path/to/MiMo-V2.5-Pro \
+    --neuron_model_path /path/to/MiMo-V2.5-Pro-Neuron-FP8
+```
+
+Runtime is ~22 minutes on a trn2.48xlarge, peak RAM ~20 GB. After running this, the compile-time `modules_to_not_convert` list in `smoke_compile_mimo_v2.py` / `start_vllm_server.sh` must include `q_proj`, `k_proj`, `v_proj` so NxDI keeps them as BF16 and routes them through a plain `ColumnParallelLinear` rather than the FP8 `QuantizedColumnParallel` path.
+
+**Do not skip this step.** Adding q_proj/k_proj/v_proj to `modules_to_not_convert` without running repatch first leaves the fp8 bytes in the checkpoint; NxDI then casts them to bf16 **without applying the blockwise scale**, producing nonsense weights and broken output.
+
 ### Fallback: FP8 → BF16
 
 `src/conversion_script/preprocess_mimo_v2_fp8.py` dequantizes the entire checkpoint to BF16. Output is ~290 GB; BF16 is numerically equivalent to the published HF FP8 weights and is useful as a known-good reference. Throughput is ~2× worse than the FP8 path because every attention/MLP matmul operates on full BF16 weights.
@@ -220,9 +262,13 @@ from modeling_mimo_v2 import NeuronMiMoV2ForCausalLM, MiMoV2InferenceConfig
 model_path = "/path/to/MiMo-V2.5-Pro-Neuron-FP8/"
 compiled_path = "/path/to/compiled/"
 
-# Recommended FP8 recipe:
+# Recommended recipe: BF16 attn + FP8 MoE.
 #   moe_tp_degree = 1, moe_ep_degree = 64
-# See "FP8 Configuration Notes" below for why other moe_tp/ep ratios collapse.
+#   q_proj/k_proj/v_proj in modules_to_not_convert (BF16; requires
+#       repatch_qkv_bf16.py to have been run on the checkpoint first)
+#   seq_len = 256 (HBM-tight with BF16 attn; see Status)
+# See "FP8 Configuration Notes" below for why other moe_tp/ep ratios
+# collapse.
 neuron_config = MoENeuronConfig(
     tp_degree=64,
     ep_degree=1,          # keep outer EP = 1; only MoE-internal EP varies
@@ -232,7 +278,7 @@ neuron_config = MoENeuronConfig(
     max_batch_size=48,
     ctx_batch_size=1,
     tkg_batch_size=48,
-    seq_len=1024,
+    seq_len=256,          # HBM is tight with BF16 attn; seq_len=1024 OOMs
     n_active_tokens=128,
     torch_dtype=torch.bfloat16,
     logical_nc_config=2,
@@ -253,6 +299,7 @@ neuron_config = MoENeuronConfig(
     quantization_block_size=[128, 128],
     modules_to_not_convert=[
         "embed_tokens", "lm_head", "norm", "router", "o_proj",
+        "q_proj", "k_proj", "v_proj",  # BF16 attn — requires repatch
     ],
     on_device_sampling_config=OnDeviceSamplingConfig(
         do_sample=True, temperature=0.6, top_k=20, top_p=0.95,
@@ -334,6 +381,8 @@ bash contrib/models/MiMo-V2.5-Pro/perf_test/start_vllm_server.sh
 
 See "Environment variables" above for all the knobs (`NEURON_COMPILED_ARTIFACTS`, `BASE_COMPILE_WORK_DIR`, etc.) and their defaults.
 
+> **Note on output quality:** the shipped vLLM scripts use the **all-FP8 recipe** (`seq_len=1024`, attn+MoE both FP8). This currently produces prompt-dependent drift — see Status. The **BF16-attn recipe** that restores coherent output has so far only been validated end-to-end via `smoke_generate_mimo_v2.py` (direct NxDI, `seq_len=256`); porting it into `start_vllm_server.sh` requires also adding `q_proj/k_proj/v_proj` to the `modules_to_not_convert` list and dropping `seq_len` / `max_model_len` to 256, and the perf numbers below have not been re-measured in that configuration.
+
 ### vllm-neuron patch summary
 
 The patch is applied to vllm-neuron 0.5.0 and:
@@ -346,7 +395,7 @@ The patch is applied to vllm-neuron 0.5.0 and:
 
 > The throughput numbers below are from a working vLLM server run on 2026-04-29 under the recommended FP8 recipe. Output quality under this recipe is **not production-usable** (see Status); the numbers show that the serving infrastructure runs end-to-end, not that the model answers correctly.
 
-### vLLM Serving (trn2.48xlarge, FP8, BS=48, TP=64, moe_tp=1/moe_ep=64, CB + bucketing)
+### vLLM Serving (trn2.48xlarge, all-FP8 recipe, BS=48, TP=64, moe_tp=1/moe_ep=64, CB + bucketing, `seq_len=1024`)
 
 Input/output: 900/90 tokens (`vllm bench serve --dataset-name random`), `on_device_sampling_config={do_sample:true, temperature:0.6, top_k:20, top_p:0.95}`.
 
@@ -357,6 +406,8 @@ Input/output: 900/90 tokens (`vllm bench serve --dataset-name random`), `on_devi
 | 48 | 606 | 55   | 7,322  | 54,413 | 752 |
 
 Per-stream ITL median holds at ~220 ms across all concurrency levels; TPOT/TTFT growth at higher concurrency comes from continuous-batching queue pressure, not per-step compute.
+
+> **Numbers are from the all-FP8 recipe, which produces drifted output (see Status).** The BF16-attn recipe that restores coherent output has not yet been re-benchmarked on vLLM; throughput should be comparable (only q/k/v go BF16, MoE stays FP8) but at `seq_len=256` instead of 1024, so TTFT/latency characteristics will differ.
 
 > **Compile time:** the first Pro compile on SDK 2.29 is ~60 minutes for the TKG NEFF and ~15 minutes for the CTE NEFF; subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass. First full server launch (compile + shard + warmup) is ~2 hours wall-clock.
 

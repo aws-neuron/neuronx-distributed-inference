@@ -40,11 +40,15 @@ MODEL_PATH = os.environ.get(
 )
 COMPILED_PATH = os.environ.get(
     "MIMO_V25_PRO_COMPILED_PATH",
-    "/opt/dlami/nvme/compiled/mimo_v25_pro_moetp1_ep64_bs48/",
+    "/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq256/",
 )
 
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "64"))
-SEQ_LEN = int(os.environ.get("SEQ_LEN", "1024"))
+# Drop seq_len to 256 to free ~200 MB of full-attention softmax scratch per
+# rank. The previous BF16-attn attempt at seq_len=1024 OOM'd by 40 MB on load
+# (failed to allocate 41943040 bytes for rdh/alltoall); seq_len=256 reclaims
+# enough HBM to fit the extra BF16 q/k/v weights.
+SEQ_LEN = int(os.environ.get("SEQ_LEN", "256"))
 # BS=48 is the minimum that avoids forward_selective_loading on decode:
 # `BS * top_k / num_experts >= 1.0` → BS >= 384/8 = 48. At BS=1 the TKG
 # path raises `NotImplementedError: Selective Loading with Expert parallelism`.
@@ -142,12 +146,25 @@ def main():
         quantization_type="blockwise_symmetric",
         quantization_block_axis=[1, 2],
         quantization_block_size=[128, 128],
+        # BF16 attention: keep q/k/v_proj in BF16 (not FP8). Pro's q/k/v
+        # abs_mean ~0.00124 is 4x smaller than V2.5 and the NKI blockwise
+        # FP8 accumulator drifts across 70 layers, producing gibberish
+        # output under the all-FP8 recipe. Dequantizing q/k/v to BF16
+        # restores coherent output while keeping MoE experts FP8.
+        # Prerequisite: run src/conversion_script/repatch_qkv_bf16.py on
+        # the preprocessed Neuron-FP8 checkpoint first; simply listing
+        # q/k/v here without the repatch step leaves the fp8 bytes in the
+        # checkpoint and NxDI silently casts them to bf16 without applying
+        # the scale, which produces nonsense weights.
         modules_to_not_convert=[
             "embed_tokens",
             "lm_head",
             "norm",
             "router",
             "o_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
         ],
     )
 
