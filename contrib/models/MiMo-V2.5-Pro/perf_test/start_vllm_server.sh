@@ -31,7 +31,7 @@ export NXDI_CONTRIB_MIMO_V2_FLASH_SRC
 # Persistent compile-artifact location (NEFF + per-rank sharded weights).
 # Setting this overrides vLLM's fallback of
 # <checkpoint>/neuron-compiled-artifacts/<hash>/.
-: "${NEURON_COMPILED_ARTIFACTS:=/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8_vllm}"
+: "${NEURON_COMPILED_ARTIFACTS:=/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_bf16attn_seq256_vllm}"
 export NEURON_COMPILED_ARTIFACTS
 # NxDI HLO/NEFF staging directory, pinned to persistent storage so it
 # survives the nightly Trn2 reboot and a unique per-config subdir.
@@ -57,7 +57,7 @@ exec python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" \
     --tokenizer "$MODEL_PATH" \
     --tensor-parallel-size 64 \
-    --max-model-len 1024 \
+    --max-model-len 256 \
     --max-num-seqs 48 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
@@ -79,19 +79,19 @@ exec python3 -m vllm.entrypoints.openai.api_server \
             "quantization_type": "blockwise_symmetric",
             "quantization_block_axis": [1, 2],
             "quantization_block_size": [128, 128],
-            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj"],
+            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj", "q_proj", "k_proj", "v_proj"],
             "blockwise_matmul_config": {"use_shard_on_block_dynamic_while": true, "block_sharding_strategy": "PING_PONG"},
             "moe_tp_degree": 1,
             "moe_ep_degree": 64,
             "batch_size": 48,
             "ctx_batch_size": 1,
             "tkg_batch_size": 48,
-            "max_context_length": 1024,
-            "seq_len": 1024,
+            "max_context_length": 256,
+            "seq_len": 256,
             "is_continuous_batching": true,
             "enable_bucketing": true,
-            "context_encoding_buckets": [1024],
-            "token_generation_buckets": [1024],
+            "context_encoding_buckets": [256],
+            "token_generation_buckets": [256],
             "async_mode": true,
             "on_device_sampling_config": {
                 "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
