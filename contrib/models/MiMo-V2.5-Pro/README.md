@@ -119,9 +119,52 @@ bash contrib/models/MiMo-V2.5-Pro/perf_test/0_setup.sh
 bash contrib/models/MiMo-V2.5-Pro/perf_test/bench_mimo_v2.sh
 ```
 
-The bench script runs two configurations (BS=48 and BS=128, both
-`moe_tp_degree=1 / moe_ep_degree=64`) and logs results under
-`/tmp/bench_results/mimo_v25_pro/`.
+The bench script runs one configuration (BS=48,
+`moe_tp_degree=1 / moe_ep_degree=64`) at three concurrency levels (1, 16, 48)
+and logs results under `/opt/dlami/nvme/logs/bench_results/mimo_v2_5_pro/`.
+
+### Keeping a server up for ad-hoc testing
+
+`bench_mimo_v2.sh` is a one-shot wrapper (launch server → sanity →
+3 bench runs → teardown). If you want a long-running server to iterate
+against, use the three underlying scripts separately:
+
+```bash
+# Terminal 1: launch the server in the foreground (Ctrl-C to stop).
+bash contrib/models/MiMo-V2.5-Pro/perf_test/start_vllm_server.sh
+
+# Terminal 2: once "Application startup complete." prints, sanity-check:
+bash contrib/models/MiMo-V2.5-Pro/perf_test/sanity_check.sh
+
+# Run a single bench pass with a chosen concurrency:
+CONCURRENCY=16 NUM_PROMPTS=128 \
+    bash contrib/models/MiMo-V2.5-Pro/perf_test/run_bench_single.sh
+```
+
+`bench_mimo_v2.sh` composes exactly these three pieces; use whichever
+is more convenient.
+
+### Environment variables
+
+`0_setup.sh` prints these at the end; setting them explicitly makes the
+smoke / bench / manual-launch paths all behave the same. All of them have
+sensible defaults in the scripts — export them only if you want to
+override or if you plan to launch vLLM outside of `bench_mimo_v2.sh`.
+
+**Required (at least for manual `vllm api_server` launches):**
+
+| Variable | Purpose |
+|---|---|
+| `NXDI_CONTRIB_MIMO_V2_FLASH_SRC` | Path to `contrib/models/MiMo-V2.5-Pro/src/`. `vllm-neuron`'s registration hook reads it to plug `NeuronMiMoV2ForCausalLM` into NxDI's `MODEL_TYPES` table. The `_FLASH_` suffix is kept for backward compatibility with the shared registration hook that also serves V2-Flash and V2.5. |
+| `MIMO_V2_FLASH_PATH` | Preprocessed Neuron-FP8 checkpoint dir (the `--save_path` output from preprocess). Same naming rationale as above. |
+
+**Optional (recommended):**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NEURON_COMPILED_ARTIFACTS` | `/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8_vllm` | Where vLLM writes the NEFF + per-rank sharded weights. Default points at a persistent path under `/opt/dlami/nvme/compiled/` so multiple configs don't collide and runs after the nightly reboot can reuse the sharded weights. vLLM's fallback is `<checkpoint>/neuron-compiled-artifacts/<hash>/` which buries output inside the checkpoint dir. |
+| `BASE_COMPILE_WORK_DIR` | `/opt/dlami/nvme/tmp/nxd_model/<basename of NEURON_COMPILED_ARTIFACTS>` | NxDI's HLO / NEFF staging workdir. Default is `/tmp/nxd_model/`, which is wiped by the nightly Trn2 reboot and can silently corrupt parallel compiles that share a basename; the pinned value lives on persistent storage and is unique per config. |
+| `VLLM_ENGINE_READY_TIMEOUT_S` | `7200` | First-time compile of Pro's 384-expert MoE is ~60 min TKG + ~15 min CTE + ~30 min shard, well past vLLM's default. |
 
 For a quick `curl` sanity check while the server is up:
 
@@ -133,11 +176,9 @@ curl -s http://localhost:8000/v1/chat/completions \
          "max_tokens": 64, "temperature": 0.0}' | python3 -m json.tool
 ```
 
-If you get fluent sentence-ending output on a 30+ token generation, the
-FP8 path is working correctly. If you see repetition collapse
-("helpful helpful helpful..."), double-check that `moe_tp_degree=1`,
-`moe_ep_degree=64`, `batch_size>=32`, and that you are loading the
-preprocessed Neuron-FP8 checkpoint (not the raw HF FP8 directory).
+Output quality is currently prompt-dependent under the FP8 recipe (see
+Status). A successful sanity check confirms the serving path works; it
+does not yet confirm that all prompts produce coherent text.
 
 ## Checkpoint Preparation
 
@@ -272,8 +313,8 @@ MiMo-V2.5-Pro can be served via [vllm-neuron](https://github.com/aws-neuron/vllm
 
 ```bash
 # The setup script clones vllm-project/vllm-neuron at release-0.5.0, applies
-# the contrib registration patch, installs it editable, and downloads Flash
-# weights (BF16 by default; set MIMO_V2_FLASH_PATH to override).
+# the contrib registration patch, installs it editable, and downloads
+# Pro Neuron-FP8 weights from S3 (set MIMO_V2_FLASH_PATH to override).
 bash contrib/models/MiMo-V2.5-Pro/perf_test/0_setup.sh
 ```
 
@@ -281,61 +322,17 @@ The patch (`perf_test/vllm-neuron-patch.patch`) touches `vllm_neuron/worker/neur
 
 ### Serving (FP8, recommended)
 
-```bash
-export NXDI_CONTRIB_MIMO_V2_FLASH_SRC=/path/to/neuronx-distributed-inference/contrib/models/MiMo-V2.5-Pro/src
-export MIMO_V2_FLASH_PATH=/path/to/MiMo-V2.5-Pro-Neuron-FP8
-# First-time compile of Flash's 256-expert MoE takes 30-60 minutes.
-export VLLM_ENGINE_READY_TIMEOUT_S=7200
-# Optional: isolate compile cache per config so parallel Flash/Pro/etc. compiles
-# don't race on the default /var/tmp/neuron-compile-cache lock files.
-export NEURON_COMPILED_ARTIFACTS=/path/to/compiled/mimo_v25_pro_bs32_moetp1_ep64_fp8
+Use `perf_test/start_vllm_server.sh` for a foreground launch (stays up until Ctrl-C), or `perf_test/bench_mimo_v2.sh` for the one-shot launch → sanity → bench → teardown flow. Both scripts bake in the full `override_neuron_config` (TP=64, moe_tp=1, moe_ep=64, BS=48, CB + bucketing, blockwise FP8 MoE with `PING_PONG`, on-device sampling), the required env vars, and the persistent compile-artifact path. See "Keeping a server up for ad-hoc testing" above for the three-terminal workflow.
 
-python3 -m vllm.entrypoints.openai.api_server \
-    --model "$MIMO_V2_FLASH_PATH" \
-    --tensor-parallel-size 64 \
-    --max-model-len 1024 \
-    --max-num-seqs 48 \
-    --no-enable-chunked-prefill \
-    --no-enable-prefix-caching \
-    --trust_remote_code \
-    --additional-config '{
-        "override_neuron_config": {
-            "tp_degree": 64,
-            "logical_nc_config": 2,
-            "fused_qkv": false,
-            "sequence_parallel_enabled": false,
-            "glu_mlp": true,
-            "normalize_top_k_affinities": true,
-            "save_sharded_checkpoint": true,
-            "router_config": {"act_fn": "sigmoid", "dtype": "float32"},
-            "quantized": true,
-            "quantized_checkpoints_path": "/path/to/MiMo-V2.5-Pro-Neuron-FP8",
-            "quantization_dtype": "f8e4m3",
-            "quantization_type": "blockwise_symmetric",
-            "quantization_block_axis": [1, 2],
-            "quantization_block_size": [128, 128],
-            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj"],
-            "blockwise_matmul_config": {"use_shard_on_block_dynamic_while": true, "block_sharding_strategy": "PING_PONG"},
-            "moe_tp_degree": 1,
-            "moe_ep_degree": 64,
-            "batch_size": 48,
-            "ctx_batch_size": 1,
-            "tkg_batch_size": 48,
-            "max_context_length": 1024,
-            "seq_len": 1024,
-            "is_continuous_batching": true,
-            "enable_bucketing": true,
-            "context_encoding_buckets": [1024],
-            "token_generation_buckets": [1024],
-            "async_mode": true,
-            "on_device_sampling_config": {
-                "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
-            }
-        }
-    }'
+```bash
+# One-shot launch + bench + teardown (~2 h on cold cache, ~5 min on warm cache).
+bash contrib/models/MiMo-V2.5-Pro/perf_test/bench_mimo_v2.sh
+
+# Or keep the server up for interactive work:
+bash contrib/models/MiMo-V2.5-Pro/perf_test/start_vllm_server.sh
 ```
 
-See `perf_test/bench_mimo_v2.sh` for the full benchmark recipe at BS=48 and BS=128.
+See "Environment variables" above for all the knobs (`NEURON_COMPILED_ARTIFACTS`, `BASE_COMPILE_WORK_DIR`, etc.) and their defaults.
 
 ### vllm-neuron patch summary
 
