@@ -39,15 +39,14 @@ MODEL_PATH = os.environ.get(
 )
 COMPILED_PATH = os.environ.get(
     "MIMO_V25_PRO_COMPILED_PATH",
-    "/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq256/",
+    "/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512/",
 )
 
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "64"))
-# Drop seq_len to 256 to free ~200 MB of full-attention softmax scratch per
-# rank. The previous BF16-attn attempt at seq_len=1024 OOM'd by 40 MB on load
-# (failed to allocate 41943040 bytes for rdh/alltoall); seq_len=256 reclaims
-# enough HBM to fit the extra BF16 q/k/v weights.
-SEQ_LEN = int(os.environ.get("SEQ_LEN", "256"))
+# seq_len=512 is the largest value verified to fit HBM under the BF16-attn
+# recipe. seq_len=1024 OOMs on load (previous attempt failed allocating
+# ~40 MB for rdh/alltoall rings after per-rank tensors reached 20.9/24 GB).
+SEQ_LEN = int(os.environ.get("SEQ_LEN", "512"))
 # BS=48 is the minimum that avoids forward_selective_loading on decode:
 # `BS * top_k / num_experts >= 1.0` → BS >= 384/8 = 48. At BS=1 the TKG
 # path raises `NotImplementedError: Selective Loading with Expert parallelism`.

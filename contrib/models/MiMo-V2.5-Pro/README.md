@@ -37,7 +37,9 @@ Key features:
 
 ## Status (work-in-progress)
 
-**This port compiles cleanly and serves via vLLM on Trn2. The shipping recipe is BF16 attention + FP8 MoE at `seq_len=256` — verified to produce coherent output end-to-end via `smoke_generate_mimo_v2.py`.** Last updated 2026-04-29.
+**This port compiles cleanly and is verified to produce coherent output end-to-end via the NxDI direct smoke path (`smoke_generate_mimo_v2.py`). The shipping recipe is BF16 attention + FP8 MoE at `seq_len=512` (largest seq_len that fits HBM).**
+
+**Known issue — vLLM serving is broken.** The first `/v1/chat/completions` request against `vllm-neuron` returns coherent output; every subsequent request returns garbled text. Same compiled NEFF serves 5 successive greedy generations byte-identically via the smoke path, so the bug is specifically in vllm-neuron's runtime / request-state handling. Tracking upstream at https://github.com/vllm-project/vllm-neuron/issues/31. Last updated 2026-04-30.
 
 ### Why BF16 attn + FP8 MoE
 
@@ -49,8 +51,8 @@ GPU stacks (sglang on H100/H200) run the same OCP FP8 checkpoint correctly becau
 
 ### Cost and constraints
 
-- **HBM headroom.** BF16 q/k/v adds ~2 GB per rank. `seq_len=1024` OOMs on load (the previous attempt failed allocating ~40 MB for rdh/alltoall rings after per-rank tensors already reached 20.9/24 GB). `seq_len=256` frees enough full-attention softmax scratch to fit.
-- **Short context.** At `seq_len=256`, Pro's own chat template with the default system prompt is already 260 tokens. Longer context needs a different HBM plan (cross-instance TP/PP, or a larger instance).
+- **HBM headroom.** BF16 q/k/v adds ~2 GB per rank. `seq_len=1024` OOMs on load (the previous attempt failed allocating ~40 MB for rdh/alltoall rings after per-rank tensors already reached 20.9/24 GB). `seq_len=512` is the largest value empirically verified to fit HBM at BS=48.
+- **Short context.** Even at `seq_len=512`, Pro's full chat template with the default system prompt is ~260 tokens; that leaves ~250 tokens for user input + generation. Longer context needs a different HBM plan (cross-instance TP/PP, or a larger instance).
 - `BS * top_k / num_experts >= 1.0` required when `moe_ep_degree > 1` at decode (else `NotImplementedError`). With `num_experts=384, top_k=8` this forces `BS >= 48`.
 - `n_routed_experts=384 = 2^7 × 3` → `384 / ep_degree` is never a power of 2 (6, 12, 24, 48, 96, 192, 384). Kimi PR #131 says NKI `_bwmm_shard_on_block_nki_call` on SDK 2.29 has "depressed logits with EP=2" and recommends SDK 2.28.
 
@@ -61,7 +63,8 @@ GPU stacks (sglang on H100/H200) run the same OCP FP8 checkpoint correctly becau
 
 ### Next experiments queued
 
-- **BF16-attn at `seq_len=512`** (needs a tighter HBM plan — smaller batch, different EP ratio, or shrinking the default system prompt).
+- **Even longer `seq_len`** (> 512): needs a tighter HBM plan — smaller batch, different EP ratio, or cross-instance sharding.
+- **Upstream vllm-neuron fix** for the "first-request-only" serving bug (issue #31); patch branch at `whn09/vllm-neuron#fix/hybrid-attn-swa-spec` is a placeholder that did not resolve the symptom.
 - **Cross-instance BF16** via pipeline/tensor parallelism on 2× Trn2 (single-instance HBM cannot hold full BF16 Pro).
 - **Selective BF16 only on MoE `gate_up_proj`** (smallest expert scales) while keeping `down_proj` FP8 — another axis to probe if attn drift returns at longer contexts.
 - **SDK 2.28 venv** test once installed, per Kimi PR #131.
@@ -241,7 +244,7 @@ compiled_path = "/path/to/compiled/"
 #   moe_tp_degree = 1, moe_ep_degree = 64
 #   q_proj/k_proj/v_proj in modules_to_not_convert (BF16; preprocess
 #       emits BF16 for q/k/v, no separate step needed)
-#   seq_len = 256 (HBM-tight with BF16 attn; see Status)
+#   seq_len = 512 (largest empirically verified; see Status)
 # See "FP8 Configuration Notes" below for why other moe_tp/ep ratios
 # collapse.
 neuron_config = MoENeuronConfig(
@@ -253,7 +256,7 @@ neuron_config = MoENeuronConfig(
     max_batch_size=48,
     ctx_batch_size=1,
     tkg_batch_size=48,
-    seq_len=256,          # HBM is tight with BF16 attn; seq_len=1024 OOMs
+    seq_len=512,          # largest empirically verified; seq_len=1024 OOMs
     n_active_tokens=128,
     torch_dtype=torch.bfloat16,
     logical_nc_config=2,
@@ -356,7 +359,7 @@ bash contrib/models/MiMo-V2.5-Pro/perf_test/start_vllm_server.sh
 
 See "Environment variables" above for all the knobs (`NEURON_COMPILED_ARTIFACTS`, `BASE_COMPILE_WORK_DIR`, etc.) and their defaults.
 
-> **Note on the shipped vLLM scripts:** the current `start_vllm_server.sh` still uses `seq_len=1024` and does not list `q_proj/k_proj/v_proj` in `modules_to_not_convert`. Coupled with a BF16-attn preprocessed checkpoint this runs correctly (NxDI just sees BF16 tensors where it expected FP8 and casts them as-is) but at a longer context than the BF16-attn recipe has been HBM-validated for. If you hit a `status=4 Allocation Failure` on load, drop `seq_len` / `max_model_len` / `context_encoding_buckets` / `token_generation_buckets` to 256 and add `q_proj/k_proj/v_proj` to `modules_to_not_convert` to match the smoke-verified configuration. The bench numbers below were taken on the older all-FP8 checkpoint and have not been re-measured since the preprocess switched to BF16 attn.
+> **vLLM serving is currently broken.** With the BF16-attn checkpoint, every `vllm-neuron` configuration we tried (all-FP8-attn, BF16-attn with `seq_len=256` or `512`, CB on/off, on-device sampling on/off, `-O3` or `-O1` TKG compile) reproduces the same pattern: the first chat request returns coherent output, every subsequent request returns UTF-8-replacement-char + off-topic text. The same compiled NEFF serves 5 successive greedy `adapter.generate()` calls byte-identically under `smoke_generate_mimo_v2.py` — the bug is in vllm-neuron's runtime, not in the model or the NEFF. Tracking at https://github.com/vllm-project/vllm-neuron/issues/31. Until that is fixed, use `smoke_generate_mimo_v2.py` for direct NxDI inference; the bench numbers below are historical infra-validation data from the pre-BF16-attn all-FP8 checkpoint.
 
 ### vllm-neuron patch summary
 
@@ -368,7 +371,7 @@ The patch is applied to vllm-neuron 0.5.0 and:
 
 ## Performance
 
-> The throughput numbers below were captured on 2026-04-29 against a pre-BF16-attn checkpoint (all-FP8, `seq_len=1024`). They are historical — the shipping recipe is BF16 attn + FP8 MoE at `seq_len=256` and has not yet been re-benchmarked. The numbers are kept here for infra validation (continuous batching + bucketing + on-device sampling + vllm-neuron plugin all wire up end-to-end) and order-of-magnitude reference.
+> The throughput numbers below were captured on 2026-04-29 against a pre-BF16-attn checkpoint (all-FP8, `seq_len=1024`) before we discovered the vllm-neuron first-request bug. They are historical — the shipping recipe is BF16 attn + FP8 MoE at `seq_len=512` via the smoke path, and vLLM serving is currently blocked on issue #31. The numbers are kept here for order-of-magnitude reference.
 
 ### vLLM Serving (trn2.48xlarge, historical all-FP8 run, BS=48, TP=64, moe_tp=1/moe_ep=64, CB + bucketing, `seq_len=1024`)
 
@@ -419,4 +422,4 @@ pytest contrib/models/MiMo-V2.5-Pro/test/integration/test_model.py -v
 
 Henan Wang (whn09)
 
-**Last Updated:** 2026-04-29
+**Last Updated:** 2026-04-30
