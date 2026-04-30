@@ -8,9 +8,8 @@ Requirements:
     - trn2.48xlarge with NEURON_LOGICAL_NC_CONFIG=2 (64 logical cores)
     - LOCAL_WORLD_SIZE=64
     - Model weights at MODEL_PATH
-    - Neuron SDK 2.28+ (Deep Learning AMI Neuron Ubuntu 24.04)
-    - Selective loading threshold patched to 0.0 in
-      neuronx_distributed/modules/moe/model_utils.py
+    - Neuron SDK 2.29+ (Deep Learning AMI Neuron Ubuntu 24.04 20260410)
+    - Selective loading uses SDK default threshold (1.0) — do NOT patch to 0.0
 
 Usage:
     # Full test (compile + load + generate):
@@ -46,14 +45,14 @@ from modeling_kimi_k2 import NeuronKimiK2ForCausalLM, KimiK2InferenceConfig
 # ---------------------------------------------------------------------------
 
 MODEL_PATH = "/home/ubuntu/models/Kimi-K2-Instruct-0905"
-COMPILED_MODEL_PATH = "/home/ubuntu/kimi-k2/neuron-compiled-fp8-bw-no-ods"
+COMPILED_MODEL_PATH = "/home/ubuntu/kimi-k2/neuron-compiled-tp64-ep1"
 
 # Model configuration
-TP_DEGREE = 32
-EP_DEGREE = 2
+TP_DEGREE = 64
+EP_DEGREE = 1
 LNC = 2
 BATCH_SIZE = 1
-SEQ_LEN = 1024
+SEQ_LEN = 512
 N_ACTIVE_TOKENS = 128
 
 
@@ -306,8 +305,9 @@ def test_performance_tpot(compiled_model, tokenizer):
         median_tpot = sorted(tpots)[len(tpots) // 2]
         tok_per_sec = 1000.0 / median_tpot
         print(f"PASS: TPOT = {median_tpot:.1f} ms ({tok_per_sec:.1f} tok/s)")
-        # Kimi-K2 at BS=1 LNC=2: expected ~165 ms/token (6.0 tok/s)
-        assert median_tpot < 500, f"TPOT {median_tpot:.1f}ms exceeds 500ms threshold"
+        # Kimi-K2 at BS=1 TP=64 EP=1 LNC=2 with selective loading + blockwise FP8:
+        # ~145 ms/token (~6.9 tok/s). Note: includes CTE time amortized over 32 tokens.
+        assert median_tpot < 200, f"TPOT {median_tpot:.1f}ms exceeds 200ms threshold"
     else:
         pytest.skip("Could not measure TPOT (no tokens generated)")
 

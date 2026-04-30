@@ -13,7 +13,7 @@
 #   - YaRN RoPE (factor=64, max_position_embeddings=262144)
 #
 # Supported configuration:
-#   - trn2.48xlarge: TP=64, EP=2, LNC=1 (128 logical cores)
+#   - trn2.48xlarge: TP=64, EP=1, LNC=2 (64 logical cores)
 #   - Blockwise FP8 for routed expert weights
 #   - CPU greedy sampling (no on-device sampling)
 #
@@ -148,6 +148,7 @@ def initialize_kimi_k2_moe_module(config: "KimiK2InferenceConfig"):
             early_expert_affinity_modulation=config.neuron_config.early_expert_affinity_modulation,
             normalize_top_k_affinities=config.neuron_config.normalize_top_k_affinities,
             enable_spmd_rank=config.neuron_config.blockwise_matmul_config.parallelize_token_to_block_mapping,
+            capacity_factor=config.neuron_config.capacity_factor,
         ),
         blockwise_matmul_config=config.neuron_config.blockwise_matmul_config,
         sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
@@ -1508,24 +1509,18 @@ class NeuronKimiK2ForCausalLM(NeuronBaseForCausalLM):
         """Compiler args optimized for Kimi-K2 on trn2.
 
         Key flags:
-        - -O3 for TKG with EP > 1: avoids Modular flow perf degradation
+        - -O1 for both CTE and TKG (no EP all-to-all overhead at EP=1)
         - --internal-enable-dge-levels vector_dynamic_offsets: DGE optimization
-        - --enable-ccop-compute-overlap: CC overlap for MoE all-to-all
+        - --enable-ccop-compute-overlap: CC overlap for MoE
         - --lnc: must match runtime NEURON_LOGICAL_NC_CONFIG
         """
-        lnc = getattr(self.neuron_config, "logical_nc_config", 1)
-        ep_degree = getattr(self.neuron_config, "moe_ep_degree", 1)
-
-        if self.compile_tag == TOKEN_GENERATION_MODEL_TAG and ep_degree > 1:
-            optimization_level = "-O3"
-        else:
-            optimization_level = "-O1"
+        lnc = getattr(self.neuron_config, "logical_nc_config", 2)
 
         compiler_args = (
             "--enable-saturate-infinity "
             "--enable-mixed-precision-accumulation "
             "--model-type transformer "
-            f"{optimization_level}"
+            "-O1"
         )
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap "

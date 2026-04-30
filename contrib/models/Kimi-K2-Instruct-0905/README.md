@@ -53,74 +53,56 @@ NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2-Instruct-0
   - `_apply_ep_scale_fix`: Prevents EP-sharding of per-channel FP8 scale tensors (shape [1,1,W]).
   - `_apply_blockwise_scale_stride_fix`: Forces stride=1 for blockwise scale partitioning.
 
-- **Selective Loading Threshold:** Must be patched to 0.0 in
-  `neuronx_distributed/modules/moe/model_utils.py` on the target instance to ensure all
-  384 expert weights load correctly.
+- **Selective Loading:** Uses the SDK default threshold (1.0). At EP=1, selective loading
+  only loads the 8 active experts per token during TKG, producing a far simpler graph
+  (6.2 min compile vs 3.5h) and 2.7x faster TPOT. Do NOT patch the threshold to 0.0.
 
 ## Validation Results
 
-**Validated:** 2026-04-24 (SDK 2.28 and 2.29)
-**Recommended Configuration:** TP=32, EP=2, LNC=2, batch_size=1, seq_len=1024, blockwise FP8
+**Validated:** 2026-04-30 (SDK 2.29)
+**Recommended Configuration:** TP=64, EP=1, LNC=2, batch_size=1, seq_len=512, blockwise FP8
 
 ### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | PASS | Model compiles and loads on trn2.48xlarge |
-| Generation | PASS | Generates coherent text |
-| Throughput | PASS | 6.0 tok/s at BS=1 (LNC=2) |
+| Generation | PASS | Generates coherent text ("The capital of France is Paris.") |
+| Coherence | PASS | Coherent quantum computing explanation |
+| Throughput | PASS | 6.9 tok/s at BS=1 (LNC=2, EP=1) |
 
-### Performance Metrics (Recommended: LNC=2, TP=32)
+### Performance Metrics (Recommended: TP=64, EP=1, LNC=2)
 
 | Metric | Value |
 |--------|-------|
-| TPOT (per-token latency) | 165.5 ms |
-| Throughput (BS=1) | 6.0 tok/s |
-| TTFT (61 input tokens) | 1,420 ms |
-| Compile time (total) | 67 min |
-| Model load time | 30 min |
-| HBM I/O utilization | 17.55 GB / 24 GB |
+| TPOT (per-token latency) | 144.5 ms |
+| Throughput (BS=1) | 6.9 tok/s |
+| Compile time (CTE + TKG) | 16 min |
+| Model load time | 17 min |
 
-### LNC=2 vs LNC=1 Comparison
+### Configuration Comparison
 
-LNC=2 (TP=32, EP=2) is **76% faster** than LNC=1 (TP=64, EP=2) because each
-logical core gets 2x HBM bandwidth, and MoE decode is purely bandwidth-bound.
-
-| Config | TP | EP | Cores | TPOT | tok/s | Speedup |
-|--------|----|----|-------|------|-------|---------|
-| LNC=2 (recommended) | 32 | 2 | 64 | 165.5 ms | 6.0 | **+76%** |
-| LNC=1 | 64 | 2 | 128 | 297 ms | 3.4 | baseline |
-
-### Token Generation Sweep (LNC=2, BS=1, seq_len=1024)
-
-| Output Tokens | TTFT P50 (ms) | TPOT P50 (ms) | tok/s | E2E P50 (ms) |
-|---------------|---------------|----------------|-------|---------------|
-| 16 | 1,420.4 | 166.38 | 6.0 | 3,916.1 |
-| 32 | 1,419.8 | 165.58 | 6.0 | 6,553.0 |
-| 64 | 1,419.7 | 165.56 | 6.0 | 11,849.8 |
-| 128 | 1,419.8 | 165.48 | 6.0 | 22,435.8 |
-| 256 | 1,419.9 | 165.42 | 6.0 | 43,604.1 |
-| 512 | 1,420.0 | 165.47 | 6.0 | 85,974.4 |
+| Config | TP | EP | LNC | Cores | TPOT | tok/s | Compile | Speedup |
+|--------|----|----|-----|-------|------|-------|---------|---------|
+| **EP=1 selective (recommended)** | 64 | 1 | 2 | 64 | **144.5 ms** | **6.9** | **16 min** | **+105%** |
+| EP=2 LNC=2 (previous) | 32 | 2 | 2 | 64 | 165.5 ms | 6.0 | 67 min | +76% |
+| EP=2 LNC=1 (baseline) | 64 | 2 | 1 | 128 | 297.4 ms | 3.4 | ~60 min | baseline |
 
 ### Batching Results
 
 Batching provides **zero throughput improvement** on this model. The MoE computation is
-perfectly bandwidth-bound -- each TKG step must load all 192 local expert weight matrices
-from HBM regardless of batch size. BS=4 TPOT scales linearly (1,191 ms), yielding the
+perfectly bandwidth-bound -- each TKG step must load 8 active experts' weight matrices
+from HBM regardless of batch size. BS=4 TPOT scales linearly, yielding the
 same aggregate throughput as BS=1.
 
 ### Performance Bottleneck
 
-TPOT breakdown (estimated per ~165.5 ms token at LNC=2):
+TPOT breakdown (estimated per ~144.5 ms token at TP=64, EP=1, LNC=2):
 
-1. **MoE expert MLPs (~139 ms, ~84%):** 192 local experts x 2 matmuls per layer.
-   FP8 weights are dequantized to BF16 before the NKI kernel.
-2. **MLA attention (~13 ms, ~8%):** Weight absorption projections + KV cache.
-3. **Router + all-to-all (~8 ms, ~5%):** Router TopK + expert dispatch across EP=2.
-4. **Other (~5.5 ms, ~3%):** RMSNorm, residuals, lm_head.
-
-Primary optimization opportunity: native blockwise FP8 kernel in the nki-lib MoE TKG
-pipeline (currently blocked -- nki-lib requires per-channel FP8 scales).
+The decode step loads only 8 active experts per token (selective loading), but each expert's
+weight matrices are TP-sharded across 64 cores. MoE decode remains bandwidth-bound — the
+primary optimization opportunity is native per-channel FP8 support in the NKI kernel, which
+could reduce weight transfer by ~50% and bring TPOT to ~22 ms (Task 017).
 
 ## Usage
 
@@ -140,20 +122,20 @@ compiled_path = "/path/to/compiled"
 with open(os.path.join(model_path, "config.json")) as f:
     hf_config = json.load(f)
 
-# Configure for trn2.48xlarge (LNC=2, recommended)
+# Configure for trn2.48xlarge (TP=64, EP=1, LNC=2, recommended)
 neuron_config = MoENeuronConfig(
-    tp_degree=32,
-    ep_degree=2,
+    tp_degree=64,
+    ep_degree=1,
     logical_nc_config=2,
     max_batch_size=1,
-    seq_len=1024,
+    seq_len=512,
     n_active_tokens=128,
     torch_dtype="bfloat16",
     capacity_factor=1.0,
     glu_mlp=True,
-    moe_ep_degree=2,
-    moe_tp_degree=32,
-    context_encoding_buckets=[128, 1024],
+    moe_ep_degree=1,
+    moe_tp_degree=64,
+    context_encoding_buckets=[128, 512],
     router_config=RouterConfig(act_fn="sigmoid", dtype="float32"),
     # FP8 quantization
     quantized=True,
@@ -175,8 +157,8 @@ config = KimiK2InferenceConfig(neuron_config=neuron_config, **hf_kwargs)
 
 # Compile and load
 model = NeuronKimiK2ForCausalLM(model_path, config)
-model.compile(compiled_path)   # ~67 min
-model.load(compiled_path)      # ~30 min
+model.compile(compiled_path)   # ~16 min
+model.load(compiled_path)      # ~17 min
 
 # Generate (CPU greedy sampling, no on-device sampling)
 from transformers import AutoTokenizer
@@ -194,9 +176,10 @@ NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 python your_script.py
 
 | Instance / SDK Version | 2.29 | 2.28 | 2.27 and earlier |
 |------------------------|------|------|------------------|
-| trn2.48xlarge (LNC=2, recommended) | TKG working, CTE requires EP workaround* | **Working (6.0 tok/s)** | Not tested |
-| trn2.48xlarge (LNC=1) | Not tested | Working (3.4 tok/s) | Not tested |
-| trn2.3xlarge | Not supported (needs TP=32, EP=2 = 64 cores) | Not supported | Not supported |
+| trn2.48xlarge (TP=64, EP=1, LNC=2, recommended) | **Working (6.9 tok/s)** | CTE compile fails (neuronx-cc 2.23 BIR error) | Not tested |
+| trn2.48xlarge (TP=32, EP=2, LNC=2) | TKG working, CTE requires EP workaround* | Working (6.0 tok/s) | Not tested |
+| trn2.48xlarge (TP=64, EP=2, LNC=1) | Not tested | Working (3.4 tok/s) | Not tested |
+| trn2.3xlarge | Not supported (needs 64 cores) | Not supported | Not supported |
 | trn1.32xlarge | Not supported (needs 64 cores at LNC=2) | Not supported | Not supported |
 | inf2 | Not supported | Not supported | Not supported |
 
@@ -209,13 +192,11 @@ Notes below for root cause analysis and workaround.
 Run integration tests on a trn2.48xlarge:
 
 ```bash
-# Activate Neuron venv (SDK 2.28)
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
-
-# Or for SDK 2.29 (apply forward_blockwise workaround first, install tiktoken)
+# Activate Neuron venv (SDK 2.29, recommended)
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+pip install tiktoken  # Required for tokenizer
 
-# Run tests (LNC=2, recommended)
+# Run tests (TP=64, EP=1, LNC=2)
 NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
   pytest test/integration/test_model.py -v --capture=tee-sys
 ```
@@ -227,15 +208,13 @@ NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
   python test/integration/test_model.py
 ```
 
-**Note:** Compilation takes ~67 min and loading takes ~30 min. The first run will compile
+**Note:** Compilation takes ~16 min and loading takes ~17 min. The first run will compile
 NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compilation.
 
 ## Prerequisites
 
-1. **Selective loading threshold patch:** On the target instance, patch
-   `neuronx_distributed/modules/moe/model_utils.py` to set
-   `DEFAULT_SELECTIVE_LOADING_THRESHOLD = 0.0` (default is 0.05 on SDK 2.28 or
-   1.0 on SDK 2.29, both too high for 384 experts).
+1. **SDK 2.29:** Requires Neuron SDK 2.29 (neuronx-cc 2.24+). SDK 2.28 cannot compile
+   CTE at EP=1 due to a BIR verification error in neuronx-cc 2.23.
 
 2. **Model weights:** Download from HuggingFace:
    ```bash
@@ -252,122 +231,23 @@ NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compi
 
 ## SDK 2.29 Notes
 
-SDK 2.29 (NxDI 0.9.17334) removed the `blockwise_mm_baseline_shard_hidden` NKI kernel that
-was used for MoE context encoding inference on SDK 2.28. The kernel was in
-`neuronxcc.nki._private.blockwise_mm` which no longer exists in SDK 2.29 (the entire
-`_private` blockwise module was removed). The replacement dynamic-while kernels
-(`shard_on_intermediate` from nkilib `bwmm_shard_on_I.py`, and `shard_on_block` from nkilib
-`bwmm_shard_on_block.py`) produce incorrect output for this model's configuration.
+SDK 2.29 (NxDI 0.9.17334) is the **recommended SDK** for this model. The EP=1 configuration
+avoids the blockwise CTE kernel regressions that affected the EP=2 configuration on SDK 2.29.
 
-### Root Cause
+### Historical: EP=2 Blockwise CTE Issues (Resolved by EP=1)
 
-On SDK 2.28, the blockwise CTE dispatch in `blockwise.py` defaulted to
-`_call_shard_hidden_kernel` (a static kernel, no dynamic while loop). This kernel was the
-**only** blockwise CTE kernel validated to work with Kimi-K2's configuration (384 experts,
-EP=2, I_TP=64). In SDK 2.29:
+The previous EP=2 configuration was affected by SDK 2.29 removing the
+`blockwise_mm_baseline_shard_hidden` NKI kernel used for MoE context encoding. The
+replacement dynamic-while kernels (`shard_on_intermediate`, `shard_on_block`) produced
+incorrect output for EP=2 / I_TP=64. A `forward_all_experts_EP` workaround provided
+correct output but 7x slower TTFT (10,185 ms vs 1,420 ms).
 
-1. `_call_shard_hidden_kernel` now raises `NotImplementedError` (inference path removed)
-2. `blockwise_mm_baseline_shard_hidden` still appears in training kernel imports but fails
-   to load (`No module named 'neuronxcc.nki._private.blockwise_mm'`)
-3. The nkilib replacement kernels (`shard_on_I`, `shard_on_block`) were never ported from
-   the static `shard_hidden` approach — they use fundamentally different algorithms
+**Resolution:** Switching to EP=1 (Task 016) eliminates expert parallelism entirely,
+avoiding the broken blockwise CTE kernels. With `capacity_factor=1.0`, CTE uses the
+`forward_capacity_factor` path which compiles correctly on neuronx-cc 2.24.
 
-### Blockwise CTE Investigation Summary
-
-All available blockwise CTE kernel paths were tested exhaustively:
-
-| Kernel Path | Config | Compile | Output | TTFT |
-|------------|--------|---------|--------|------|
-| `shard_hidden` (SDK 2.28 default) | default | N/A | N/A | Raises `NotImplementedError` |
-| `shard_on_intermediate` (non-hybrid) | `use_shard_on_intermediate_dynamic_while=True` | PASS | "Kimi," (wrong) | 2,386 ms |
-| `shard_on_intermediate` (hybrid) | `use_shard_on_intermediate_dynamic_while=True` | PASS | "Moonshot AI." (wrong) | 1,159 ms |
-| `shard_on_block` + PING_PONG | `use_shard_on_block_dynamic_while=True` | PASS | ",,," (wrong) | 1,676 ms |
-| `shard_on_intermediate` (unpatched) | `use_shard_on_intermediate_dynamic_while=True` | FAIL | N/A | MLIR: `I_TP_sharded=32 < 128` |
-| PyTorch fallback | `use_torch_block_wise=True` | FAIL | N/A | `selective loading + EP` error |
-| EP workaround (`forward_all_experts_EP`) | patched dispatch | PASS | **"Paris" (correct)** | 10,185 ms |
-
-Key observations:
-- Wrong outputs are coherent text from the system prompt ("Kimi", "Moonshot AI") suggesting
-  corrupted CTE hidden states cause the model to regurgitate system message content
-- The `shard_on_intermediate` kernel passes standalone tests (5/5 cosine > 0.99998) — the
-  kernel math is correct in isolation
-- **Both** shard_on_I and shard_on_block produce wrong output, confirming the issue is not
-  specific to either kernel but to the dynamic-while blockwise approach with this model's
-  EP=2 / I_TP=64 configuration
-- Filed as internal ticket V2185857494
-
-**Recommended workaround:** Patch `expert_mlps_v2.py` in the `neuronx_distributed` package
-to use `forward_all_experts_EP` instead of `forward_blockwise` when expert parallelism is
-enabled:
-
-```python
-# In neuronx_distributed/modules/moe/expert_mlps_v2.py, in the forward() method,
-# find the context encoding dispatch (around line 1497):
-#     return self.forward_blockwise(...)
-# Replace with:
-if self.moe_expert_model_parallel_group.size() > 1:
-    return self.forward_all_experts_EP(hidden_states, expert_affinities, expert_index)
-return self.forward_blockwise(hidden_states, expert_affinities, expert_index, ...)
-```
-
-**Impact:** Token generation (TPOT) is unaffected (166.1 ms, identical to SDK 2.28). Context
-encoding (TTFT) is ~7x slower (10,185 ms vs 1,420 ms) because `forward_all_experts_EP` sends
-every token through every local expert rather than using the optimized blockwise dispatch. For
-long-output workloads this is negligible; for TTFT-sensitive workloads, use SDK 2.28.
-
-### SDK 2.28 Kernel Porting Attempt
-
-We attempted to extract the `blockwise_mm_baseline_shard_hidden` kernel source from the
-SDK 2.28 DLAMI and port it to run on SDK 2.29 with NKI 0.3.0. The kernel is 2961 lines of
-NKI code with a static unrolled loop (no dynamic while). Three NKI 0.3.0 compatibility
-issues were identified and fixed:
-
-1. **Output parameter immutability:** NKI 0.3.0 treats kernel parameters as immutable.
-   Fixed by removing `output` from the function signature and allocating internally via
-   `nl.ndarray((T, H), dtype=hidden_states.dtype, buffer=nl.shared_hbm)`.
-
-2. **`@nki.jit` mode:** Must use `nki.jit(fn, mode='torchxla')`, not `mode='trace'`.
-   The trace mode creates a `TraceKernel` that cannot handle torch tensors. The torchxla
-   mode creates a `PyTorchXLAKernel` matching how nkilib kernels are imported.
-
-3. **Helper function returning NKI data:** NKI 0.3.0 asserts "function without nki data as
-   input should not return nki data". Inlined the `create_block_hidden_states` helper body
-   directly in the kernel.
-
-After all NKI 0.3.0 fixes, the kernel generates valid HLO and TKG compiles successfully.
-However, **CTE compilation fails** with a BIR verifier assertion failure in neuronx-cc
-2.24.5133:
-
-```
-neuronxcc.driver.Exceptions.CompilerInternalError  (exit code 70)
-Assertion failure: bad_use.empty()  [inst_visitor.cpp:632]
-Dead memory locations in subgraphs nc00/sg01, nc00/sg02
-```
-
-This is a **neuronx-cc compiler regression** — the kernel's static unrolled loop creates
-dead memory allocations that the BIR verifier rejects. Tested with `-O1`, `-O2`, and bare
-minimum compiler flags — all fail identically with the same HLO hash.
-
-**Conclusion:** The shard_hidden kernel cannot be used on SDK 2.29 due to a compiler bug.
-The EP workaround (`forward_all_experts_EP`) is the only viable path until either the
-compiler is fixed or a new blockwise kernel validated for EP=2 is added to nkilib.
-
-**Recommendation:** Use SDK 2.28 for production deployments until the blockwise CTE regression
-is resolved. The `shard_hidden` kernel available in SDK 2.28 provides both correct output and
-optimal TTFT (1,420 ms).
-
-### SDK 2.29 Benchmark (LNC=2, TP=32, EP=2, BS=1, seq_len=1024)
-
-| Output Tokens | TTFT P50 (ms) | TPOT P50 (ms) | tok/s | E2E P50 (ms) |
-|---------------|---------------|----------------|-------|---------------|
-| 16 | 10,184.9 | 166.27 | 6.0 | 12,678.9 |
-| 32 | 10,185.1 | 166.13 | 6.0 | 15,335.3 |
-| 64 | 10,184.6 | 166.10 | 6.0 | 20,651.2 |
-| 128 | 10,184.7 | 166.15 | 6.0 | 31,286.4 |
-| 256 | 10,184.5 | 166.03 | 6.0 | 52,522.3 |
-| 512 | 10,184.6 | 166.06 | 6.0 | 95,040.9 |
-
-**Additional SDK 2.29 setup:** Install `tiktoken` (`pip install tiktoken`) in the venv.
+Detailed investigation of all blockwise kernel paths and the SDK 2.28 kernel porting
+attempt is documented in the git history (commits prior to Task 016).
 
 ## Known Limitations
 
@@ -394,4 +274,4 @@ optimal TTFT (1,420 ms).
 
 Annapurna Labs
 
-**Last Updated:** 2026-04-26
+**Last Updated:** 2026-04-30
