@@ -1,20 +1,34 @@
 #!/usr/bin/env python3
 """
-Integration tests for Kimi-K2.5 multimodal NeuronX implementation.
+Integration tests for Kimi-K2.5/K2.6 multimodal NeuronX implementation.
 
 Tests compilation, loading, and multimodal inference on trn2.48xlarge.
+Supports both K2.5 and K2.6 checkpoints — override paths via environment variables.
 
 Requirements:
     - trn2.48xlarge with NEURON_LOGICAL_NC_CONFIG=2 (64 logical cores)
     - LOCAL_WORLD_SIZE=64
-    - K2.5 model weights at MODEL_PATH
-    - Pre-computed MoonViT embeddings at VISION_EMBEDDINGS_PATH
+    - Model weights at KIMI_MODEL_PATH (default: /mnt/nvme/models/Kimi-K2.5)
+    - Pre-computed MoonViT embeddings at KIMI_VISION_EMB_PATH
     - Neuron SDK 2.29 (Deep Learning AMI Neuron Ubuntu 24.04 20260410)
     - tiktoken package installed (pip install tiktoken)
 
+Environment variables:
+    KIMI_MODEL_PATH       - Path to K2.5 or K2.6 checkpoint (default: /mnt/nvme/models/Kimi-K2.5)
+    KIMI_TEXT_MODEL_DIR   - Path for text-only model dir (default: /home/ubuntu/models/Kimi-K2.5-text)
+    KIMI_COMPILED_PATH    - Path for compiled NEFFs (default: derived from TEXT_MODEL_DIR)
+    KIMI_VISION_EMB_PATH  - Path to pre-computed vision embeddings (default: /mnt/nvme/models/moonvit_448_real_embeddings.pt)
+
 Usage:
-    # Full test (compile + load + generate):
+    # Full test with K2.5 (default):
     NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
+        pytest test_model.py -v --capture=tee-sys
+
+    # Full test with K2.6:
+    NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
+        KIMI_MODEL_PATH=/mnt/nvme/models/Kimi-K2.6 \
+        KIMI_TEXT_MODEL_DIR=/home/ubuntu/models/Kimi-K2.6-text \
+        KIMI_COMPILED_PATH=/mnt/nvme/models/Kimi-K2.6-text/neuron-compiled \
         pytest test_model.py -v --capture=tee-sys
 
     # Load-only (skip compile, use existing NEFFs):
@@ -58,13 +72,21 @@ from modeling_kimi_k25 import (
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — override via environment variables for K2.6 or custom paths
 # ---------------------------------------------------------------------------
 
-MODEL_PATH = "/mnt/nvme/models/Kimi-K2.5"
-TEXT_MODEL_DIR = "/home/ubuntu/models/Kimi-K2.5-text"
-COMPILED_MODEL_PATH = "/mnt/nvme/models/Kimi-K2.5-text/neuron-compiled-k25-vl-s512-v5"
-VISION_EMBEDDINGS_PATH = "/mnt/nvme/models/moonvit_448_real_embeddings.pt"
+MODEL_PATH = os.environ.get("KIMI_MODEL_PATH", "/mnt/nvme/models/Kimi-K2.5")
+TEXT_MODEL_DIR = os.environ.get(
+    "KIMI_TEXT_MODEL_DIR", "/home/ubuntu/models/Kimi-K2.5-text"
+)
+COMPILED_MODEL_PATH = os.environ.get(
+    "KIMI_COMPILED_PATH",
+    "/mnt/nvme/models/Kimi-K2.5-text/neuron-compiled-k25-vl-s512-v5",
+)
+VISION_EMBEDDINGS_PATH = os.environ.get(
+    "KIMI_VISION_EMB_PATH",
+    "/mnt/nvme/models/moonvit_448_real_embeddings.pt",
+)
 
 # Model configuration (TP=64, EP=1, LNC=2)
 TP_DEGREE = 64
@@ -430,7 +452,11 @@ if __name__ == "__main__":
     )
 
     print("=" * 80)
-    print("Kimi-K2.5 Multimodal Integration Tests")
+    print("Kimi-K2.5/K2.6 Multimodal Integration Tests")
+    print(f"  Model path: {MODEL_PATH}")
+    print(f"  Text model dir: {TEXT_MODEL_DIR}")
+    print(f"  Compiled path: {COMPILED_MODEL_PATH}")
+    print(f"  Vision embeddings: {VISION_EMBEDDINGS_PATH}")
     print("=" * 80)
 
     # Load vision embeddings

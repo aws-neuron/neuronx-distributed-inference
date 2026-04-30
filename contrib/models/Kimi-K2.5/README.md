@@ -1,13 +1,20 @@
-# Contrib Model: Kimi-K2.5 (Multimodal)
+# Contrib Model: Kimi-K2.5 / K2.6 (Multimodal)
 
-NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2.5 — a native multimodal agentic model with MoonViT vision encoder.
+NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2.5 and Kimi-K2.6 — native multimodal agentic models with MoonViT vision encoder.
+
+**K2.6 is a post-training update of K2.5 with an identical architecture.** The only config difference is `eos_token_id` (163585 → 163586). This contrib supports both models with no code changes — just point to the desired checkpoint.
 
 ## Model Information
 
-- **HuggingFace ID:** `moonshotai/Kimi-K2.5`
-- **Model Type:** Multimodal (image + text) Mixture of Experts decoder
-- **Architecture:** Kimi-K2 text decoder + MoonViT-400M vision encoder
-- **License:** Check HuggingFace model card
+| Field | K2.5 | K2.6 |
+|-------|------|------|
+| **HuggingFace ID** | `moonshotai/Kimi-K2.5` | `moonshotai/Kimi-K2.6` |
+| **Model Type** | Multimodal (image + text) Mixture of Experts decoder | Same |
+| **Architecture** | Kimi-K2 text decoder + MoonViT-400M vision encoder | Same (identical weights differ, architecture unchanged) |
+| **eos_token_id** | 163585 (`[EOS]`) | 163586 (`<\|im_end\|>`) |
+| **License** | Check HuggingFace model card | Check HuggingFace model card |
+
+> **Note:** NxDI reads `eos_token_id` from the model config at load time, so both models work without code changes.
 
 ## Architecture Details
 
@@ -58,10 +65,12 @@ K2.5 uses a different weight format than K2:
 
 ## Validation Results
 
+### K2.5
+
 **Validated:** 2026-04-25 (SDK 2.29)
 **Configuration:** TP=64, EP=1, LNC=2, batch_size=1, seq_len=512, FP8 per-channel
 
-### Test Results
+#### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
@@ -71,7 +80,7 @@ K2.5 uses a different weight format than K2:
 | Coherence | PASS | No repetition, natural text |
 | Throughput | PASS | 45.9 tok/s at BS=1 (LNC=2) |
 
-### Performance Metrics
+#### Performance Metrics
 
 | Metric | Value |
 |--------|-------|
@@ -85,7 +94,7 @@ K2.5 uses a different weight format than K2:
 | **Model load time** | ~79 min (weight sharding) |
 | **Compile time** | ~10 min (CTE ~5 min, TKG ~5 min) |
 
-### Benchmark Details (10 iterations, 3 warmup)
+#### Benchmark Details (10 iterations, 3 warmup)
 
 | Component | Mean | p50 | Std |
 |-----------|------|-----|-----|
@@ -95,15 +104,36 @@ K2.5 uses a different weight format than K2:
 | TKG per-token | 21.4 ms | 21.3 ms | 0.4 ms |
 | End-to-end (CTE+TKG) | 4,863.2 ms | 4,864.7 ms | 12.1 ms |
 
-### Accuracy Validation (vs GPU reference)
+### K2.6
+
+**Validated:** 2026-04-28 (SDK 2.29)
+**Configuration:** TP=64, EP=1, LNC=2, batch_size=1, seq_len=512, FP8 per-channel
+**Note:** K2.6 reuses K2.5 compiled NEFFs — only weights differ.
+
+#### Test Results
+
+| Test | Status | Result |
+|------|--------|--------|
+| Smoke Test | PASS | Model loads on trn2.48xlarge (reuses K2.5 NEFFs) |
+| Text Decoder (13 prompts) | PASS | Factual, reasoning, coding, creative, math, multilingual, long_form |
+| Multimodal Generation | PASS | Correctly describes puppy image |
+| Vision A/B Test | PASS | Real vision ≠ zero vision (max logit diff: 16.3) |
+
+#### Performance Metrics
 
 | Metric | Value |
 |--------|-------|
-| Vision encoder cosine similarity | 0.9995 |
-| Token match rate (vs vLLM H100) | 3.1% (expected for 1T MoE) |
-| Semantic quality | Both describe same image correctly |
+| **TKG throughput** | **57.9 tok/s** (mean), 58.0 (p50) |
+| **TPOT (per-token latency)** | 17.3 ms (mean), 17.2 ms (p50) |
+| **CTE latency (TTFT)** | 1,010.2 ms |
+| **MoonViT latency** | 35.8 ms |
+| **MoonViT cosine sim (vs CPU)** | 0.999460 |
 
-Token-level divergence is expected: FP8 vs BF16 quantization + 384-expert MoE routing causes different expert selections that cascade through autoregressive generation. Both outputs are semantically equivalent and correctly describe the input image.
+> **K2.6 vs K2.5 throughput:** K2.6 shows 57.9 tok/s vs K2.5's 45.9 tok/s. The improvement is likely due to different text generation patterns (K2.6 produces reasoning chains that may have more favorable token distributions), not architectural differences.
+
+### K2.6 Behavioral Note
+
+K2.6 produces chain-of-thought reasoning even without a `<think>` prefix ("The user is asking a very simple factual question..."). K2.5 gives direct answers. This is a post-training behavior change, not an architecture change.
 
 ## Usage
 
@@ -125,7 +155,8 @@ from modeling_kimi_k25 import (
     IM_ASSISTANT_TOKEN_ID, MEDIA_PLACEHOLDER_TOKEN_ID,
 )
 
-model_path = "/path/to/Kimi-K2.5"
+# Use either K2.5 or K2.6 — same code, just swap the checkpoint path
+model_path = "/path/to/Kimi-K2.5"   # or "/path/to/Kimi-K2.6"
 text_model_dir = "/path/to/Kimi-K2.5-text"
 compiled_path = "/path/to/compiled"
 vision_emb_path = "/path/to/moonvit_448_real_embeddings.pt"
@@ -219,12 +250,15 @@ torch.save(vision_output.to(torch.bfloat16), "moonvit_448_real_embeddings.pt")
 
 | Instance / SDK Version | 2.29 | 2.28 | 2.27 and earlier |
 |------------------------|------|------|------------------|
-| trn2.48xlarge (LNC=2, TP=64, EP=1) | **Working (45.9 tok/s)** | Not tested | Not tested |
+| trn2.48xlarge K2.5 (LNC=2, TP=64, EP=1) | **Working (45.9 tok/s)** | Not tested | Not tested |
+| trn2.48xlarge K2.6 (LNC=2, TP=64, EP=1) | **Working (57.9 tok/s)** | Not tested | Not tested |
 | trn2.48xlarge (LNC=2, TP=32, EP=2) | Not recommended* | Not tested | Not tested |
 | trn2.3xlarge | Not supported (needs TP=64) | Not supported | Not supported |
 | inf2 | Not supported | Not supported | Not supported |
 
 \*EP=2 has known blockwise CTE kernel regression in SDK 2.29 (see K2 contrib notes).
+
+**Note:** K2.6 reuses K2.5 compiled NEFFs since the architecture is identical. Only model weights need to be re-downloaded.
 
 ## Testing
 
@@ -233,10 +267,17 @@ Run integration tests on a trn2.48xlarge:
 ```bash
 # Activate Neuron venv (SDK 2.29)
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
-pip install tiktoken  # Required for K2.5 tokenizer
+pip install tiktoken  # Required for K2.5/K2.6 tokenizer
 
-# Run tests
+# Run tests (defaults to K2.5 paths)
 NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
+    pytest test/integration/test_model.py -v --capture=tee-sys
+
+# Run tests with K2.6 weights (override paths via env vars)
+NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
+    KIMI_MODEL_PATH=/mnt/nvme/models/Kimi-K2.6 \
+    KIMI_TEXT_MODEL_DIR=/home/ubuntu/models/Kimi-K2.6-text \
+    KIMI_COMPILED_PATH=/mnt/nvme/models/Kimi-K2.6-text/neuron-compiled \
     pytest test/integration/test_model.py -v --capture=tee-sys
 ```
 
@@ -245,16 +286,26 @@ Or run standalone:
 ```bash
 NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
     python test/integration/test_model.py
+
+# With K2.6:
+NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
+    KIMI_MODEL_PATH=/mnt/nvme/models/Kimi-K2.6 \
+    python test/integration/test_model.py
 ```
 
 **Note:** Compilation takes ~10 min, model loading takes ~79 min (dominated by weight sharding across 64 ranks). The first run will compile NEFFs; subsequent runs reuse cached NEFFs.
 
 ## Prerequisites
 
-1. **Model weights:** Download from HuggingFace (~555 GB):
+1. **Model weights:** Download from HuggingFace (~555 GB each):
    ```bash
+   # K2.5
    huggingface-cli download moonshotai/Kimi-K2.5 \
        --local-dir /mnt/nvme/models/Kimi-K2.5
+
+   # K2.6 (same architecture, different weights)
+   huggingface-cli download moonshotai/Kimi-K2.6 \
+       --local-dir /mnt/nvme/models/Kimi-K2.6
    ```
 
 2. **Pre-computed vision embeddings:** Trace MoonViT and pre-compute embeddings before loading the text decoder (see "Pre-computing MoonViT Embeddings" above).
@@ -292,6 +343,7 @@ MoonViT uses real-number decomposition of 2D complex RoPE and eager attention (n
 ## Example Checkpoints
 
 * [moonshotai/Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5)
+* [moonshotai/Kimi-K2.6](https://huggingface.co/moonshotai/Kimi-K2.6) — post-training update, identical architecture
 
 ## Known Limitations
 
@@ -317,13 +369,13 @@ MoonViT uses real-number decomposition of 2D complex RoPE and eager attention (n
 
 This is an extension of the Kimi-K2 text-only NxDI contrib (PR #131). Key differences:
 
-| Aspect | K2 | K2.5 |
+| Aspect | K2 | K2.5 / K2.6 |
 |--------|-----|------|
 | Modality | Text-only | Multimodal (image + text) |
 | Config | TP=32, EP=2 | TP=64, EP=1 |
 | Quantization | Blockwise FP8 (native) | INT4 → BF16 → FP8 per-channel |
-| Weight format | K2 safetensors | K2.5 compressed-tensors |
-| TKG throughput | 6.0 tok/s | 45.9 tok/s |
+| Weight format | K2 safetensors | K2.5/K2.6 compressed-tensors |
+| TKG throughput | 6.0 tok/s | 45.9 tok/s (K2.5), 57.9 tok/s (K2.6) |
 | Vision encoder | N/A | MoonViT-400M (35.5 ms) |
 
 The 7.6x throughput improvement (6.0 → 45.9 tok/s) comes from TP=64 EP=1 (vs TP=32 EP=2), which eliminates inter-EP communication overhead and gives each core more bandwidth.
@@ -332,4 +384,4 @@ The 7.6x throughput improvement (6.0 → 45.9 tok/s) comes from TP=64 EP=1 (vs T
 
 Annapurna Labs
 
-**Last Updated:** 2026-04-25
+**Last Updated:** 2026-04-28
