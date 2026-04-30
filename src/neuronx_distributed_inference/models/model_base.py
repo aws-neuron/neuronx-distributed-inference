@@ -20,6 +20,7 @@ from neuronx_distributed.parallel_layers.mappings import (
 )
 from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_group
 from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
+from neuronx_distributed.utils.tensor_capture.registry import TensorRegistry
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -1013,6 +1014,7 @@ class NeuronBaseModel(nn.Module):
                 res = res + attention_mask[0] * 0
 
         outputs = [res]
+
         if self.neuron_config.output_logits:
             logits = _gather_along_dim(
                 logits,
@@ -1020,6 +1022,12 @@ class NeuronBaseModel(nn.Module):
                 process_group=get_tp_group(self.config),
             )
             outputs += [logits]
+
+        # Add captured tensors if tensor capture is enabled
+        if self.neuron_config.tensor_capture_config:
+            captured_tensors = self._get_captured_tensors(outputs[0].device)
+            outputs += captured_tensors
+
         outputs += updated_kv_cache
 
         if self.neuron_config.enable_eagle_speculation:
@@ -3220,6 +3228,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                           return_dict: Optional[bool] = None,
                           llava_args: Optional[List] = [],
                           input_capture_hook: Optional[Callable] = None,
+                          tensor_capture_hook: Optional[Callable] = None,
                           slot_mapping: Optional[torch.LongTensor] = None,
                           block_table: Optional[torch.LongTensor] = None,
                           full_context_lens: Optional[torch.LongTensor] = None,
@@ -3321,6 +3330,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         return_dict: Optional[bool] = None,
         llava_args: Optional[List] = [],
         input_capture_hook: Optional[Callable] = None,
+        tensor_capture_hook: Optional[Callable] = None,
         slot_mapping: Optional[torch.LongTensor] = None,
         block_table: Optional[torch.LongTensor] = None,
         full_context_lens: Optional[torch.LongTensor] = None,
@@ -3363,6 +3373,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             return_dict=return_dict,
             llava_args=llava_args,
             input_capture_hook=input_capture_hook,
+            tensor_capture_hook=tensor_capture_hook,
             slot_mapping=slot_mapping,
             block_table=block_table,
             full_context_lens=full_context_lens,
@@ -3431,25 +3442,19 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         if not generation_model.is_neuron():
             self._copy_past_key_values(outputs)
 
-        # process outputs
-        if self.on_device_sampling and self.neuron_config.output_logits and not \
-                (self.neuron_config.enable_fused_speculation or self.neuron_config.is_medusa):
-            logits_or_next_tokens = outputs[:2]
-            constructed_outputs = self._construct_output_with_tokens_and_logits(next_tokens=logits_or_next_tokens[0], logits=logits_or_next_tokens[1])
-        else:
-            if is_run_on_neuron:
-                # When run on neuron, KV cache remains on device
-                logits_or_next_tokens = outputs
-            else:
-                # When run on cpu, KV cache is returned which has to be ignored
-                logits_or_next_tokens, *_ = outputs
-            constructed_outputs = self._construct_output(logits_or_next_tokens)
+        # Get processed and constructed outputs
+        constructed_outputs = self._get_constructed_outputs(outputs, is_run_on_neuron)
+
+        # Apply tensor_capture_hook if provided and tensors are captured
+        if tensor_capture_hook and constructed_outputs.captured_tensors:
+            # Apply the hook if captured tensors are found
+            tensor_capture_hook(self, constructed_outputs.captured_tensors)
 
         if logging.root.isEnabledFor(logging.DEBUG):
             logging.debug("---output---")
             logging.debug(
                 f"{'tokens' if self.on_device_sampling else 'logits'} = %s, ",
-                logits_or_next_tokens,
+                constructed_outputs.logits,
             )
 
         return constructed_outputs
@@ -3789,6 +3794,30 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     new_past_key_value
                 )
 
+    def _get_constructed_outputs(self, outputs, is_run_on_neuron):
+        # Process outputs
+        if self.on_device_sampling and self.neuron_config.output_logits and not \
+                (self.neuron_config.enable_fused_speculation or self.neuron_config.is_medusa):
+            logits_or_next_tokens = outputs[:2]
+            constructed_outputs = self._construct_output_with_tokens_and_logits(next_tokens=logits_or_next_tokens[0], logits=logits_or_next_tokens[1])
+            captured_tensors_offset = self._get_captured_tensors_offset()
+            if captured_tensors_offset > 0:
+                constructed_outputs.captured_tensors = outputs[2: 2 + captured_tensors_offset]
+        else:
+            if is_run_on_neuron:
+                # When run on neuron, KV cache remains on device
+                logits_or_next_tokens = outputs
+            else:
+                # When run on cpu, KV cache is returned which has to be ignored
+                logits_or_next_tokens, *_ = outputs
+            constructed_outputs = self._construct_output(logits_or_next_tokens)
+        return constructed_outputs
+
+    def _get_captured_tensors_offset(self):
+        if self.neuron_config.tensor_capture_config:
+            return self.neuron_config.tensor_capture_config.get_offset()
+        return 0
+
     def _construct_output_with_tokens_and_logits(self, next_tokens, logits, hidden_states=[]):
         OutputParams = CausalLMOutputWithPast(
             logits=logits,
@@ -3796,6 +3825,8 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             attentions=None,
         )
         OutputParams.tokens = next_tokens
+        # Initialize captured_tensors attribute
+        OutputParams.captured_tensors = None
         return OutputParams
 
     def _construct_output(self, logits_or_next_tokens):
@@ -3824,6 +3855,9 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             OutputParams.async_should_stop = self.async_should_stop
         else:
             OutputParams.tokens = next_tokens
+
+        # Initialize captured_tensors attribute
+        OutputParams.captured_tensors = None
 
         return OutputParams
 

@@ -1165,6 +1165,7 @@ class NeuronMllamaForCausalLM(NeuronBaseForCausalLM):
         vision_key_values: Optional[List[torch.FloatTensor]] = None,
         llava_args: Optional[List] = [],
         input_capture_hook: Optional[Callable] = None,
+        tensor_capture_hook: Optional[Callable] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
         Args:

@@ -186,7 +186,7 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
             model_init_kwargs=model_init_kwargs,
             # to turn on weight layout optimization
             priority_model_idx=(0 if enable_wlt_optimization else None),
-            pipeline_execution=False,
+            pipeline_execution=True,
             return_ranked_to_cpu=True
         )
         self.vision_models.append(self.vision_encoder_model)
@@ -264,6 +264,7 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
         use_cache: Optional[bool] = None,
         medusa_args=None,
         input_capture_hook: Optional[Callable] = None,
+        tensor_capture_hook: Optional[Callable] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
@@ -307,6 +308,8 @@ class NeuronLlama4ForCausalLM(NeuronBaseForImageToText):
             position_ids=position_ids,
             seq_ids=seq_ids,
             sampling_params=sampling_params,
+            input_capture_hook=input_capture_hook,
+            tensor_capture_hook=tensor_capture_hook,
             vision_embeddings=vision_embeddings,
             vision_mask=vision_mask,
         )

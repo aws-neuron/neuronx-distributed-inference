@@ -33,6 +33,40 @@ class LoraCheckpoint:
         keywords = ["lora_A", "lora_B"]
         return any(keyword in name for keyword in keywords)
 
+    # This is a function to load an adapter checkpoint on-the-fly, e.g. after inference
+    # begins. The checkpoint path is assumed to be available locally.
+    def load_streaming_ckpt(self, model, key, path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Invalid checkpoint path {path}.")
+
+        sharded_streaming_ckpts = None
+
+        # Streaming adapter data
+        streaming_ckpt = {}
+        streaming_weights_cpu = {}
+
+        lora_scaling, state_dict = self._load_lora_state_dict_from_path(path)
+        streaming_ckpt[key] = {"lora_scaling": lora_scaling, "state_dict": state_dict}
+
+        for name, module in model.named_modules():
+            if self.is_lora_module(name):
+                weight_shape = module.get_checkpoint_shape()
+                # Start at index 1 to retrieve only the weight shape
+                # (index 0 is the number of CPU LoRAs)
+                weight_shape_cpu = (1, ) + weight_shape[1:]
+                weight_dtype = module.get_weight_dtype()
+                weight_name = f"{name}.weight"
+                streaming_weights_cpu[weight_name] = torch.zeros(
+                    *weight_shape_cpu, dtype=weight_dtype, device="cpu"
+                )
+
+        self._load_lora_weights(model, {key : path}, streaming_ckpt, streaming_weights_cpu)
+
+        neuron_config = model.config.neuron_config
+        sharded_streaming_ckpts = self.shard_cpu_checkpoints(neuron_config.start_rank_id, neuron_config.local_ranks_size, neuron_config.tp_degree, model, ckpts=streaming_weights_cpu, keys=[key])
+
+        return sharded_streaming_ckpts
+
     def load_lora_state_dicts(self, ckpt_paths):
         r"""
         We support two checkpoint formats for LoRA adapters:
@@ -47,11 +81,7 @@ class LoraCheckpoint:
 
         lora_ckpts = {}
         for key, path in ckpt_paths.items():
-            assert os.path.exists(path)
-            if os.path.isdir(path):
-                lora_scaling, state_dict = self._load_lora_state_dict_from_folder(path)
-            else:
-                lora_scaling, state_dict = self._load_lora_state_dict_from_file(path)
+            lora_scaling, state_dict = self._load_lora_state_dict_from_path(path)
             lora_ckpts[key] = {"lora_scaling": lora_scaling, "state_dict": state_dict}
 
         return lora_ckpts
@@ -63,6 +93,16 @@ class LoraCheckpoint:
             return (lora_alpha, use_rslora)
         else:
             return None
+
+    def _load_lora_state_dict_from_path(self, path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Invalid checkpoint path {path}.")
+
+        if os.path.isdir(path):
+            lora_scaling, state_dict = self._load_lora_state_dict_from_folder(path)
+        else:
+            lora_scaling, state_dict = self._load_lora_state_dict_from_file(path)
+        return lora_scaling, state_dict
 
     def _load_lora_state_dict_from_file(self, filename):
         if filename.endswith(".safetensors"):
@@ -298,11 +338,16 @@ class LoraCheckpoint:
         # step 3: load CPU LoRA checkpoints into the CPU LoRA weights
         self._load_lora_weights(model, self.ckpt_paths_cpu, self.lora_ckpts_cpu, self.lora_weights_cpu)
 
-    def shard_cpu_checkpoints(self, start_rank_id, local_ranks_size, tp_deg, model, serialize_path=None):
+    def shard_cpu_checkpoints(self, start_rank_id, local_ranks_size, tp_deg, model, ckpts=None, keys=None, serialize_path=None):
         sharded_lora_cpu_checkpoints = []
 
+        if not ckpts:
+            ckpts = self.lora_weights_cpu
+        if not keys:
+            keys = self.ckpt_paths_cpu.keys()
+
         for rank in range(start_rank_id, start_rank_id + local_ranks_size):
-            sharded_lora_cpu_checkpoints.append(self._shard_cpu_weights(rank, tp_deg, model, self.lora_weights_cpu, self.ckpt_paths_cpu.keys(), serialize_path))
+            sharded_lora_cpu_checkpoints.append(self._shard_cpu_weights(rank, tp_deg, model, ckpts, keys, serialize_path))
 
         return sharded_lora_cpu_checkpoints
 

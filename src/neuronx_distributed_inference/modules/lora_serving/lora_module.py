@@ -90,7 +90,7 @@ class MultiLoraModuleLinear(MultiLoraModule):
             self.in_features,
             self.lora_max_rank,
             self.lora_dtype,
-            self.lora_memory_transpose,
+            self.lora_memory_transpose
         )
         self.lora_B = MultiLoraLinear(
             self.max_loras,
@@ -98,7 +98,7 @@ class MultiLoraModuleLinear(MultiLoraModule):
             self.lora_max_rank,
             self.out_features,
             self.lora_dtype,
-            self.lora_memory_transpose,
+            self.lora_memory_transpose
         )
 
 
@@ -114,7 +114,7 @@ class MultiLoraModuleConv2d(MultiLoraModule):
             base_layer.kernel_size,
             base_layer.stride,
             base_layer.padding,
-            self.lora_dtype,
+            self.lora_dtype
         )
         self.lora_B = MultiLoraConv2d(
             self.max_loras,
@@ -124,7 +124,7 @@ class MultiLoraModuleConv2d(MultiLoraModule):
             (1, 1),
             (1, 1),
             0,
-            self.lora_dtype,
+            self.lora_dtype
         )
 
 
@@ -142,7 +142,7 @@ class MultiLoraModuleEmbedding(MultiLoraModule):
             base_layer.scale_grad_by_freq,
             base_layer.sparse,
             self.lora_dtype,
-            self.lora_memory_transpose,
+            self.lora_memory_transpose
         )
         self.lora_B = MultiLoraLinear(
             self.max_loras,
@@ -150,7 +150,7 @@ class MultiLoraModuleEmbedding(MultiLoraModule):
             self.lora_max_rank,
             self.out_features,
             self.lora_dtype,
-            self.lora_memory_transpose,
+            self.lora_memory_transpose
         )
         self.skip_dtype_convert = True
 
@@ -172,7 +172,7 @@ class MultiLoraModuleColumnParallelLinear(MultiLoraModule):
             self.in_features,
             self.lora_max_rank,
             self.lora_dtype,
-            self.lora_memory_transpose,
+            self.lora_memory_transpose
         )
         self.lora_B = MultiLoraColumnParallelLinear(
             self.max_loras,
@@ -193,7 +193,7 @@ class MultiLoraModuleRowParallelLinear(MultiLoraModule):
             self.in_features,
             self.lora_max_rank,
             self.lora_dtype,
-            self.lora_memory_transpose,
+            self.lora_memory_transpose
         )
         multi_lora_linear = (
             MultiLoraColumnShardedLinear if self.shard_linear_layer else MultiLoraLinear
@@ -204,5 +204,5 @@ class MultiLoraModuleRowParallelLinear(MultiLoraModule):
             self.lora_max_rank,
             self.out_features,
             self.lora_dtype,
-            self.lora_memory_transpose,
+            self.lora_memory_transpose
         )

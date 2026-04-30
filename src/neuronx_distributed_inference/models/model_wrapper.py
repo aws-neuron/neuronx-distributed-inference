@@ -28,6 +28,9 @@ from neuronx_distributed_inference.modules.async_execution import (
     get_async_output,
     is_ranked_io,
 )
+from neuronx_distributed.utils.tensor_capture import (
+    enable_tensor_capture,
+)
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 from neuronx_distributed_inference.modules.padding import pad_with_first_batchline
 
@@ -1533,6 +1536,15 @@ class DecoderModelInstance(BaseModelInstance):
             reg = TensorReplacementRegister.get_instance()
             reg.hooks = hooks.values()
 
+        # Enable tensor capture if configured
+        if self.neuron_config.tensor_capture_config:
+            self.module = enable_tensor_capture(
+                self.module,
+                modules_to_capture=self.neuron_config.tensor_capture_config.modules_to_capture,
+                max_tensors=self.neuron_config.tensor_capture_config.max_intermediate_tensors,
+                capture_inputs=self.neuron_config.tensor_capture_config.capture_inputs
+            )
+
     def get(self, bucket_rank, **kwargs):
         if bucket_rank is not None:
             if self.neuron_config.is_prefix_caching:
@@ -1568,6 +1580,11 @@ class DecoderModelInstance(BaseModelInstance):
         # generating HLO
         self.input_output_aliases = {}
         num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
+
+        # Add tensor capture to output count if enabled
+        if self.neuron_config.tensor_capture_config:
+            num_output_from_trace += self.neuron_config.tensor_capture_config.get_offset()
+
         if self.neuron_config.enable_fused_speculation:
             num_output_from_trace += 1
             if self.module.draft_model.kv_mgr is not None:
@@ -1591,7 +1608,6 @@ class DecoderModelInstance(BaseModelInstance):
                 self.input_output_aliases[self.module.hidden_state_rolling_buffer.hidden_states] = (
                     num_output_from_trace * 2 + len(draft_past_key_values)
                 ) + len(target_past_key_values)
-
         else:
             # TODO: This else block is a short-term fix for Llava/ViT models to use DecoderModelInstance.
             #       Long-term, these models should use a different implementation of BaseModelInstance.

@@ -4,6 +4,7 @@ from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlam
 from neuronx_distributed_inference.models.llama4.modeling_llama4 import NeuronLlama4ForCausalLM
 from neuronx_distributed_inference.models.llama4.modeling_llama4_vision import NeuronLlama4ForImageEncoding
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+from neuronx_distributed_inference.models.mistral.modeling_mistral import NeuronMistralForCausalLM
 from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMllamaForCausalLM
 from neuronx_distributed_inference.models.mllama.utils import add_instruct
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
@@ -51,6 +52,7 @@ MODEL_TYPES = {
     "llama4": {"causal-lm": NeuronLlama4ForCausalLM,
                "image-encoding": NeuronLlama4ForImageEncoding},
     "mllama": {"causal-lm": NeuronMllamaForCausalLM},
+    "mistral": {"causal-lm": NeuronMistralForCausalLM},
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "pixtral": {"causal-lm": NeuronPixtralForCausalLM,
                 "image-encoding": NeuronPixtralForImageEncoding},

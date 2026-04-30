@@ -327,7 +327,7 @@ class AdapterCache:
 
     def init_weights_on_cpu(self, adapter_ids, cpu_weights, modules):
         num_ranks = len(cpu_weights)
-        for adapter_id in adapter_ids:
+        for i, adapter_id in enumerate(adapter_ids):
             self.map[adapter_id].init_weights_on_cpu(num_ranks)
             for rank in range(num_ranks):
                 for module in modules:
@@ -395,22 +395,6 @@ class AdapterCache:
             adapter_model = self.map[adapter_id]
             adapter_model.decay()
 
-    # Performed for CPU cache only since all adapter weights are stored in CPU map
-    def swap_adapters(self, weights, modules, adapter_id, weight_idx):
-        logger.debug(f"Swapping the adapter at position {weight_idx} with adapter ID {adapter_id}.")
-
-        start = time.monotonic()
-        adapter_cpu_weights = self.map[adapter_id].weights
-
-        for rank in range(len(weights)):
-            for module in modules:
-                neuron_tensor = weights[rank][module]
-                cpu_tensor = adapter_cpu_weights[rank][module]
-                neuron_tensor[weight_idx] = cpu_tensor.clone()
-
-        end = time.monotonic()
-        logger.debug(f"Swap time: {end-start} sec")
-
     def get_adapter_ids(self):
         return list(self._evictable_adapters_map().keys())
 
@@ -427,9 +411,9 @@ class AdapterCache:
         return self.size
 
     def get_swap_position(self):
-        # Check if there is space for more adapters on device
+        # Check if there is space for more adapters
         if not self.is_full():
-            # Add an entry to device adapter map if there is space
+            # Add an entry to the adapter map if there is space
             swap_position = self.adapter_id_position_mapping.index(-1)
         else:
             # Evict an adapter if there is no space
@@ -541,7 +525,8 @@ class LoraModelManager:
             self.remove_req_id(req_id)
 
     # Set up initialization of all adapter weights tracked in CPU memory
-    def init_dynamic_multi_lora(self, cpu_weights):
+    # model is only needed for streaming adapters support
+    def init_dynamic_multi_lora(self, cpu_weights, model=None):
         if not cpu_weights:
             return
 
@@ -643,25 +628,8 @@ class LoraModelManager:
     # Main workflow function for dynamic LoRA adapter swapping
     def dynamic_update_weights_for_lora(self, device_weights, adapter_ids):
         for adapter_id in adapter_ids.tolist():
-            # NxDI does not support streaming adapters (loading checkpoints on the fly), so all adapters must be in CPU memory already
-            assert self.cpu_adapter_cache.access_adapter(adapter_id)
-
-            # Check if adapter is already on device
-            if self.device_adapter_cache.access_adapter(adapter_id):  # hit
-                self.device_adapter_cache.update_adapter(adapter_id)
-            else:  # miss
-                swap_position = self.device_adapter_cache.get_swap_position()
-                logger.info(f"Swap Adapter ID {adapter_id} to position {swap_position}.")
-
-                # Perform adapter data swap
-                self.cpu_adapter_cache.swap_adapters(
-                    device_weights,
-                    self.lora_modules,
-                    adapter_id,
-                    swap_position,
-                )
-                # Update HBM adapter management
-                self.device_adapter_cache.add_adapter(adapter_id, swap_position)
+            self.insert_cpu_adapter(adapter_id)
+            self.insert_device_adapter(adapter_id, device_weights)
 
         # Increment decay count if decay period has not been reached
         # otherwise, decay access counts
@@ -679,9 +647,8 @@ class LoraModelManager:
         return torch.tensor(adapter_positions, dtype=adapter_ids.dtype)
 
     # LoRA APIs in vLLM
-    # NxDI does not support streaming adapters (loading checkpoints on the fly), so all adapters must be in CPU memory already
     def add_adapter(self, lora_request) -> bool:
-        return True
+        return self.add_new_cpu_adapter(lora_request.lora_name, lora_request.lora_path)
 
     def remove_adapter(self, adapter_id: int) -> bool:
         self.cpu_adapter_cache.remove_adapter(adapter_id)

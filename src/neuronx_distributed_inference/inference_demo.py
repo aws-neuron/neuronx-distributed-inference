@@ -26,6 +26,7 @@ from neuronx_distributed_inference.models.config import (
 )
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
+from neuronx_distributed_inference.models.mistral.modeling_mistral import NeuronMistralForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
@@ -52,6 +53,7 @@ set_random_seed(0)
 
 MODEL_TYPES = {
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
+    "mistral": {"causal-lm": NeuronMistralForCausalLM},
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
