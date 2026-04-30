@@ -722,6 +722,14 @@ class GLM5InferenceConfig(InferenceConfig):
         self.neuron_config.transpose_shared_experts_weights = False
         self.neuron_config.early_expert_affinity_modulation = False
 
+        # Disable the fused NKI mega-kernel. GLM-5's routing logic
+        # (selection_bias + routed_scaling_factor) is handled by the patched
+        # PyTorch router in GLM5MoE._patch_router(). The non-fused path in
+        # MoEFusedTKG.forward() calls self.router() which invokes the patched
+        # forward, then uses ExpertMLPsV2 for expert computation. This gives
+        # the compiler full visibility for global optimization (like DS-V3).
+        self.neuron_config.moe_fused_nki_kernel_enabled = False
+
         # --- FP8 Quantization ---
         # CRITICAL: GLM-5 at BF16 has 26.67 GB NEFF I/O (78 layers, 256 experts)
         # which exceeds the 24 GB per-core HBM limit at LNC=2. By enabling NxDI's
@@ -2184,18 +2192,10 @@ class NeuronGLM5Model(NeuronBaseModel):
                 hidden_size=config.hidden_size, eps=config.rms_norm_eps
             )
 
-        # Patch fused MoE TKG kernel for GLM-5 routing
-        # The nkilib override mechanism (pip install -e nki-lib) ensures that
-        # NxDI's MoEFusedTKG calls our modified nkilib kernel. We just need to
-        # inject selection_bias and routed_scaling_factor into the kernel call.
-        if getattr(config.neuron_config, "moe_fused_nki_kernel_enabled", False):
-            moe_layers = []
-            first_k = getattr(config, "first_k_dense_replace", 3)
-            for layer_idx in range(first_k, config.num_hidden_layers):
-                layer = self.layers[layer_idx]
-                if hasattr(layer, "feed_forward"):
-                    moe_layers.append((layer_idx, layer.feed_forward))
-            _patch_fused_tkg_with_nkilib(moe_layers, config)
+        # MoE routing is handled by GLM5MoE._patch_router() which patches
+        # the RouterTopK.forward to implement selection_bias + routed_scaling_factor.
+        # The MoEFusedTKG non-fused path calls self.router() which invokes the
+        # patched forward. No kernel-level patching is needed.
 
     def init_inference_optimization(self, config: GLM5InferenceConfig):
         if self.on_device_sampling:
@@ -2537,7 +2537,13 @@ class NeuronGLM5ForCausalLM(NeuronBaseForCausalLM):
                         )
 
                 # --- Fused MoE TKG: duplicate RMSNorm + transpose router weight ---
-                if neuron_config.moe_fused_nki_kernel_enabled:
+                # When init_tkg_module=True, the MoEFusedTKG module stores a
+                # transposed copy of router weights (weight_T) and a copy of
+                # the post_attention_layernorm for the mega-kernel path.
+                # These are always needed when init_tkg_module=True, regardless
+                # of whether the fused NKI kernel is enabled, because the
+                # MoEFusedTKG module expects these weights during loading.
+                if not neuron_config.on_cpu:
                     post_norm_key = f"{prefix}.post_attention_layernorm.weight"
                     if post_norm_key in state_dict:
                         state_dict[
