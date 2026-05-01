@@ -68,7 +68,6 @@ def benchmark_vllm_offline(model_path, workloads, warmup, iterations, dtype):
         trust_remote_code=True,
         max_model_len=4096,
         gpu_memory_utilization=0.90,
-        enforce_eager=True,  # Disable CUDA graphs for fair comparison
     )
     tokenizer = llm.get_tokenizer()
 
@@ -172,7 +171,6 @@ def benchmark_image_text(model_path, warmup, iterations, dtype):
         trust_remote_code=True,
         max_model_len=4096,
         gpu_memory_utilization=0.90,
-        enforce_eager=True,
         limit_mm_per_prompt={"image": 1},
     )
 
@@ -241,7 +239,10 @@ def get_gpu_info():
     if torch.cuda.is_available():
         info["gpu_name"] = torch.cuda.get_device_name(0)
         info["gpu_count"] = torch.cuda.device_count()
-        info["gpu_memory_gb"] = torch.cuda.get_device_properties(0).total_mem / 1e9
+        props = torch.cuda.get_device_properties(0)
+        info["gpu_memory_gb"] = (
+            getattr(props, "total_memory", getattr(props, "total_mem", 0)) / 1e9
+        )
     return info
 
 
