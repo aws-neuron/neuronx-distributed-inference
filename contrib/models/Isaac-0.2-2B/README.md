@@ -79,6 +79,20 @@ NeuronX Distributed Inference implementation for the PerceptronAI Isaac-0.2-2B-P
 
 **Compilation time:** ~196s (one-time, seq_len=1024)
 
+### GPU Comparison (L40S, vLLM 0.20.0, CUDA graphs enabled)
+
+| Metric | L40S GPU | trn2 Neuron (TP=1) | trn2 Neuron (DP=4) |
+|--------|----------|---------------------|---------------------|
+| **TPOT (short input)** | 5.75 ms | 9.0 ms | — |
+| **Throughput (short input)** | 174 tok/s | 111 tok/s | ~443 tok/s |
+| **TPOT (long input)** | 6.09 ms | 9.0 ms | — |
+| **Throughput (long input)** | 164 tok/s | 111 tok/s | ~443 tok/s |
+
+- **Per-core:** L40S is ~1.5x faster than a single NeuronCore
+- **Per-device (DP=4):** trn2.3xlarge is ~2.5x faster than L40S
+- GPU benchmark: L40S with vLLM 0.20.0, batch_size=1, CUDA graphs enabled (default)
+- Neuron benchmark: trn2.3xlarge, TP=1, batch_size=1, bfloat16, CTE flash attention
+
 ## Usage
 
 ```python
