@@ -29,7 +29,7 @@ NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2-Instruct-0
 | QK rope head dim | 64 |
 | Q LoRA rank | 1536 |
 | RoPE | YaRN (factor=64, max_position_embeddings=262144) |
-| Quantization | Blockwise FP8 (e4m3, 128x128 blocks) |
+| Quantization | Per-channel FP8 (e4m3, re-quantized from blockwise) |
 | Router activation | Sigmoid with `e_score_correction_bias` |
 | Top-K normalization | Enabled (`norm_topk_prob=True`) |
 | Routed scaling factor | 2.827 |
@@ -40,9 +40,12 @@ NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2-Instruct-0
   (qk_rope_head_dim + kv_lora_rank = 64 + 512). Weight absorption is used to avoid
   decompressing KV during decode.
 
-- **Blockwise FP8 Quantization:** Routed expert weights are kept in FP8 (e4m3) with
-  128x128 block scales. Non-expert weights (attention, embeddings, shared experts, norms)
-  are dequantized to BF16 during loading. Requires the
+- **Per-Channel FP8 Quantization:** Routed expert weights are stored in FP8 (e4m3) with
+  per-expert per-channel scales (`[E, 1, W]`). The checkpoint loader dequantizes blockwise
+  FP8 from the HuggingFace checkpoint to BF16, packs into `[E, H, W]` tensors, and
+  re-quantizes to per-channel FP8. This enables native FP8 in the NKI TKG megakernel
+  (no BF16 dequantization overhead). Non-expert weights (attention, embeddings, shared
+  experts, norms) are dequantized to BF16 during loading. Requires the
   `--experimental-unsafe-fp8e4m3fn-as-fp8e4m3` compiler flag.
 
 - **Streaming Checkpoint Loader:** Custom `checkpoint_loader_fn` that processes the 62
@@ -59,34 +62,43 @@ NeuronX Distributed Inference implementation of Moonshot AI's Kimi-K2-Instruct-0
 
 ## Validation Results
 
-**Validated:** 2026-04-30 (SDK 2.29)
-**Recommended Configuration:** TP=64, EP=1, LNC=2, batch_size=1, seq_len=512, blockwise FP8
+**Validated:** 2026-05-01 (SDK 2.29)
+**Recommended Configuration:** TP=64, EP=1, LNC=2, batch_size=1, seq_len=1024, per-channel FP8
 
 ### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | PASS | Model compiles and loads on trn2.48xlarge |
-| Generation | PASS | Generates coherent text ("The capital of France is Paris.") |
+| Generation (seq_len=512) | PASS | "The capital of France is Paris." |
+| Generation (seq_len=1024) | PASS | "The capital of France is Paris." |
 | Coherence | PASS | Coherent quantum computing explanation |
-| Throughput | PASS | 6.9 tok/s at BS=1 (LNC=2, EP=1) |
+| Throughput (seq_len=512) | PASS | 13.1 tok/s at BS=1 (76.3 ms TPOT) |
+| Throughput (seq_len=1024) | PASS | 24.3 tok/s at BS=1 (41.1 ms TPOT) |
 
-### Performance Metrics (Recommended: TP=64, EP=1, LNC=2)
+### Performance Metrics (Recommended: TP=64, EP=1, LNC=2, per-channel FP8)
 
-| Metric | Value |
-|--------|-------|
-| TPOT (per-token latency) | 144.5 ms |
-| Throughput (BS=1) | 6.9 tok/s |
-| Compile time (CTE + TKG) | 16 min |
-| Model load time | 17 min |
+| Metric | seq_len=512 | seq_len=1024 |
+|--------|-------------|--------------|
+| TPOT (per-token latency) | 76.3 ms | 41.1 ms |
+| Throughput (BS=1) | 13.1 tok/s | 24.3 tok/s |
+| Compile time (CTE + TKG) | 12.9 min | 11.6 min |
+| Model load time | ~71 min | ~93 min |
+
+**Note:** Load time is high because the loader dequantizes blockwise FP8 to BF16 and
+re-quantizes to per-channel FP8 for all 60 MoE layers x 384 experts at load time.
+A pre-sharding script (Task 018) could reduce this to ~17 min by saving pre-converted
+per-channel FP8 checkpoints.
 
 ### Configuration Comparison
 
-| Config | TP | EP | LNC | Cores | TPOT | tok/s | Compile | Speedup |
-|--------|----|----|-----|-------|------|-------|---------|---------|
-| **EP=1 selective (recommended)** | 64 | 1 | 2 | 64 | **144.5 ms** | **6.9** | **16 min** | **+105%** |
-| EP=2 LNC=2 (previous) | 32 | 2 | 2 | 64 | 165.5 ms | 6.0 | 67 min | +76% |
-| EP=2 LNC=1 (baseline) | 64 | 2 | 1 | 128 | 297.4 ms | 3.4 | ~60 min | baseline |
+| Config | TP | EP | LNC | Quant | TPOT | tok/s | Compile | Speedup vs baseline |
+|--------|----|----|-----|-------|------|-------|---------|---------------------|
+| **EP=1 per-channel FP8 seq=1024 (recommended)** | 64 | 1 | 2 | per-channel | **41.1 ms** | **24.3** | **11.6 min** | **+623%** |
+| EP=1 per-channel FP8 seq=512 | 64 | 1 | 2 | per-channel | 76.3 ms | 13.1 | 12.9 min | +290% |
+| EP=1 blockwise FP8 seq=512 | 64 | 1 | 2 | blockwise | 144.5 ms | 6.9 | 16 min | +105% |
+| EP=2 LNC=2 (previous) | 32 | 2 | 2 | blockwise | 165.5 ms | 6.0 | 67 min | +76% |
+| EP=2 LNC=1 (baseline) | 64 | 2 | 1 | blockwise | 297.4 ms | 3.4 | ~60 min | baseline |
 
 ### Batching Results
 
@@ -97,12 +109,16 @@ same aggregate throughput as BS=1.
 
 ### Performance Bottleneck
 
-TPOT breakdown (estimated per ~144.5 ms token at TP=64, EP=1, LNC=2):
+The decode step is bandwidth-bound: each token loads 8 active experts' weight matrices
+from HBM (selective loading). Per-channel FP8 enables native FP8 execution in the NKI
+TKG megakernel, eliminating the BF16 dequantization overhead that blockwise FP8 incurred.
+This reduced TPOT from 144.5 ms (blockwise) to 76.3 ms (per-channel, seq_len=512) — a
+1.9x improvement. Increasing seq_len from 512 to 1024 further halved TPOT to 41.1 ms
+(larger CTE bucket amortizes context encoding overhead and enables larger KV cache).
 
-The decode step loads only 8 active experts per token (selective loading), but each expert's
-weight matrices are TP-sharded across 64 cores. MoE decode remains bandwidth-bound — the
-primary optimization opportunity is native per-channel FP8 support in the NKI kernel, which
-could reduce weight transfer by ~50% and bring TPOT to ~22 ms (Task 017).
+Remaining optimization opportunities:
+- Pre-sharded per-channel FP8 checkpoints to reduce load time from ~93 min to ~17 min
+- Batching (unlikely to help — MoE decode is fully bandwidth-bound, BS>1 TPOT scales linearly)
 
 ## Usage
 
@@ -128,16 +144,16 @@ neuron_config = MoENeuronConfig(
     ep_degree=1,
     logical_nc_config=2,
     max_batch_size=1,
-    seq_len=512,
+    seq_len=1024,
     n_active_tokens=128,
     torch_dtype="bfloat16",
     capacity_factor=1.0,
     glu_mlp=True,
     moe_ep_degree=1,
     moe_tp_degree=64,
-    context_encoding_buckets=[128, 512],
+    context_encoding_buckets=[128, 1024],
     router_config=RouterConfig(act_fn="sigmoid", dtype="float32"),
-    # FP8 quantization
+    # Per-channel FP8 quantization for routed experts
     quantized=True,
     quantized_checkpoints_path=model_path,
     quantization_dtype="f8e4m3",
@@ -145,9 +161,7 @@ neuron_config = MoENeuronConfig(
         "self_attn", "shared_experts", "embed_tokens",
         "lm_head", "norm", "router", "layers.0",
     ],
-    quantization_type="blockwise_symmetric",
-    quantization_block_axis=[1, 2],
-    quantization_block_size=[128, 128],
+    quantization_type="expert_wise_per_channel_symmetric",
 )
 
 # Build config from HF config fields
@@ -157,8 +171,8 @@ config = KimiK2InferenceConfig(neuron_config=neuron_config, **hf_kwargs)
 
 # Compile and load
 model = NeuronKimiK2ForCausalLM(model_path, config)
-model.compile(compiled_path)   # ~16 min
-model.load(compiled_path)      # ~17 min
+model.compile(compiled_path)   # ~12 min
+model.load(compiled_path)      # ~71-93 min (re-quantizes blockwise->per-channel FP8)
 
 # Generate (CPU greedy sampling, no on-device sampling)
 from transformers import AutoTokenizer
@@ -176,7 +190,8 @@ NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 python your_script.py
 
 | Instance / SDK Version | 2.29 | 2.28 | 2.27 and earlier |
 |------------------------|------|------|------------------|
-| trn2.48xlarge (TP=64, EP=1, LNC=2, recommended) | **Working (6.9 tok/s)** | CTE compile fails (neuronx-cc 2.23 BIR error) | Not tested |
+| trn2.48xlarge (TP=64, EP=1, LNC=2, per-channel FP8, recommended) | **Working (24.3 tok/s @ seq=1024)** | CTE compile fails (neuronx-cc 2.23 BIR error) | Not tested |
+| trn2.48xlarge (TP=64, EP=1, LNC=2, blockwise FP8) | Working (6.9 tok/s) | CTE compile fails (neuronx-cc 2.23 BIR error) | Not tested |
 | trn2.48xlarge (TP=32, EP=2, LNC=2) | TKG working, CTE requires EP workaround* | Working (6.0 tok/s) | Not tested |
 | trn2.48xlarge (TP=64, EP=2, LNC=1) | Not tested | Working (3.4 tok/s) | Not tested |
 | trn2.3xlarge | Not supported (needs 64 cores) | Not supported | Not supported |
@@ -208,8 +223,9 @@ NEURON_LOGICAL_NC_CONFIG=2 LOCAL_WORLD_SIZE=64 \
   python test/integration/test_model.py
 ```
 
-**Note:** Compilation takes ~16 min and loading takes ~17 min. The first run will compile
-NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compilation.
+**Note:** Compilation takes ~12 min and loading takes ~71-93 min (the loader re-quantizes
+blockwise FP8 to per-channel FP8 for all MoE experts at load time). The first run will
+compile NEFFs to the compiled model path. Subsequent runs with existing NEFFs skip compilation.
 
 ## Prerequisites
 
@@ -274,4 +290,4 @@ attempt is documented in the git history (commits prior to Task 016).
 
 Annapurna Labs
 
-**Last Updated:** 2026-04-30
+**Last Updated:** 2026-05-01

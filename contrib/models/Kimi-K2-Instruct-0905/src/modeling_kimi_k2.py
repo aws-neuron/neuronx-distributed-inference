@@ -9,12 +9,13 @@
 #   - 384 routed experts (8 active per token) + 1 shared expert
 #   - Multi-Latent Attention (MLA) with compressed KV cache
 #   - Sigmoid routing with e_score_correction_bias + normalized top-K
-#   - Blockwise FP8 quantization (e4m3, 128x128 blocks)
+#   - Blockwise FP8 quantization (e4m3, 128x128 blocks) in HF checkpoint
+#   - Per-channel FP8 re-quantization for NKI TKG megakernel
 #   - YaRN RoPE (factor=64, max_position_embeddings=262144)
 #
 # Supported configuration:
 #   - trn2.48xlarge: TP=64, EP=1, LNC=2 (64 logical cores)
-#   - Blockwise FP8 for routed expert weights
+#   - Per-channel FP8 for routed expert weights (expert_wise_per_channel_symmetric)
 #   - CPU greedy sampling (no on-device sampling)
 #
 # References:
@@ -849,6 +850,38 @@ def _pack_experts_blockwise_fp8(
         raise ValueError(f"Unknown layout: {layout}")
 
 
+def _requantize_per_channel_fp8(bf16_weight: Tensor) -> Tuple[Tensor, Tensor]:
+    """Re-quantize a BF16 weight to per-expert per-channel FP8 E4M3.
+
+    Per-expert per-channel means one scale per output column PER EXPERT.
+    This matches NxDI's EXPERT_WISE_PER_CHANNEL_SYMMETRIC quantization type
+    which uses scale shape [E, 1, output_per_tp].
+
+    Args:
+        bf16_weight: [E, H, W] bfloat16 tensor (experts x input x output)
+    Returns:
+        (fp8_weight, per_expert_per_channel_scale) where:
+            fp8_weight: [E, H, W] float8_e4m3fn
+            per_expert_per_channel_scale: [E, 1, W] float32 (per-expert per-channel)
+    """
+    fp32_weight = bf16_weight.float()
+    # max abs per output column, PER EXPERT (reduce dim 1 = input rows only)
+    amax = fp32_weight.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)  # [E, 1, W]
+    scale = amax / _FP8_E4M3_MAX
+    scaled = (fp32_weight / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+    fp8_weight = scaled.to(torch.float8_e4m3fn)
+
+    # Clamp exponent-15 bytes (0x78-0x7E, 0xF8-0xFE become NaN in e4m3)
+    raw = fp8_weight.view(torch.uint8)
+    pos_exp15 = (raw >= 0x78) & (raw <= 0x7E)
+    neg_exp15 = (raw >= 0xF8) & (raw <= 0xFE)
+    raw = torch.where(pos_exp15, torch.tensor(0x77, dtype=torch.uint8), raw)
+    raw = torch.where(neg_exp15, torch.tensor(0xF7, dtype=torch.uint8), raw)
+    fp8_weight = raw.view(torch.float8_e4m3fn)
+
+    return fp8_weight, scale.to(torch.float32)
+
+
 # ---------------------------------------------------------------------------
 # State Dict Conversion
 # ---------------------------------------------------------------------------
@@ -1165,7 +1198,9 @@ class NeuronKimiK2ForCausalLM(NeuronBaseForCausalLM):
         expert packing, router renaming), and accumulates results to avoid OOM.
 
         When quantized=True (FP8 path):
-        - Routed expert weights stay in FP8 with blockwise scales
+        - Per-channel: dequant blockwise FP8 -> BF16 -> re-quantize per-channel FP8
+          with [E, 1, W] scales (expert_wise_per_channel_symmetric)
+        - Blockwise: keep original FP8 bytes with [E, H/bs, W/bs] block scales
         - All other weights are dequantized to BF16
 
         When quantized=False (BF16 path):
@@ -1197,6 +1232,13 @@ class NeuronKimiK2ForCausalLM(NeuronBaseForCausalLM):
         n_routed_experts = getattr(self.config, "n_routed_experts", 384)
         first_k_dense_replace = getattr(self.config, "first_k_dense_replace", 1)
         keep_experts_fp8 = getattr(self.config.neuron_config, "quantized", False)
+        quantization_type = getattr(
+            self.config.neuron_config, "quantization_type", "blockwise_symmetric"
+        )
+        use_per_channel = quantization_type in (
+            "per_channel_symmetric",
+            "expert_wise_per_channel_symmetric",
+        )
         num_layers = self.config.num_hidden_layers
 
         # Determine which shards are needed (supports reduced-layer testing)
@@ -1214,7 +1256,8 @@ class NeuronKimiK2ForCausalLM(NeuronBaseForCausalLM):
 
         logger.info(
             f"Streaming loader: {len(shard_files)} shards, {len(needed_shards)} needed, "
-            f"block_size={block_size}, experts={n_routed_experts}, fp8={keep_experts_fp8}"
+            f"block_size={block_size}, experts={n_routed_experts}, fp8={keep_experts_fp8}, "
+            f"quant_type={quantization_type}"
         )
 
         result_dict = {}
@@ -1341,53 +1384,84 @@ class NeuronKimiK2ForCausalLM(NeuronBaseForCausalLM):
                         isize, hsize = shard_data[e0_gate].shape
 
                         if keep_experts_fp8:
-                            gate_up_weights = []
-                            gate_up_scales = []
-                            down_weights = []
-                            down_scales = []
-
-                            for e in range(n_routed_experts):
-                                gk = f"{prefix}.mlp.experts.{e}.gate_proj.weight"
-                                uk = f"{prefix}.mlp.experts.{e}.up_proj.weight"
-                                dk = f"{prefix}.mlp.experts.{e}.down_proj.weight"
-                                gsk = expert_scale_keys.get(gk)
-                                usk = expert_scale_keys.get(uk)
-                                dsk = expert_scale_keys.get(dk)
-
-                                g_fp8 = shard_data.pop(gk) if gk in shard_data else None
-                                u_fp8 = shard_data.pop(uk) if uk in shard_data else None
-                                g_scale = (
-                                    shard_data.pop(gsk)
-                                    if gsk and gsk in shard_data
-                                    else None
+                            if use_per_channel:
+                                # Per-channel FP8: dequant blockwise -> BF16 -> pack -> requant per-channel
+                                gate_up_bf16 = torch.zeros(
+                                    n_routed_experts,
+                                    hsize,
+                                    2 * isize,
+                                    dtype=torch.bfloat16,
+                                    device="cpu",
                                 )
-                                u_scale = (
-                                    shard_data.pop(usk)
-                                    if usk and usk in shard_data
-                                    else None
+                                down_bf16 = torch.zeros(
+                                    n_routed_experts,
+                                    isize,
+                                    hsize,
+                                    dtype=torch.bfloat16,
+                                    device="cpu",
                                 )
 
-                                if g_fp8 is not None and u_fp8 is not None:
-                                    gate_up_weights.append((g_fp8, u_fp8))
-                                    gate_up_scales.append((g_scale, u_scale))
+                                for e in range(n_routed_experts):
+                                    gk = f"{prefix}.mlp.experts.{e}.gate_proj.weight"
+                                    uk = f"{prefix}.mlp.experts.{e}.up_proj.weight"
+                                    dk = f"{prefix}.mlp.experts.{e}.down_proj.weight"
+                                    gsk = expert_scale_keys.get(gk)
+                                    usk = expert_scale_keys.get(uk)
+                                    dsk = expert_scale_keys.get(dk)
 
-                                d_fp8 = shard_data.pop(dk) if dk in shard_data else None
-                                d_scale = (
-                                    shard_data.pop(dsk)
-                                    if dsk and dsk in shard_data
-                                    else None
-                                )
-                                if d_fp8 is not None:
-                                    down_weights.append(d_fp8)
-                                    down_scales.append(d_scale)
+                                    g_fp8 = (
+                                        shard_data.pop(gk) if gk in shard_data else None
+                                    )
+                                    u_fp8 = (
+                                        shard_data.pop(uk) if uk in shard_data else None
+                                    )
+                                    g_scale = (
+                                        shard_data.pop(gsk)
+                                        if gsk and gsk in shard_data
+                                        else None
+                                    )
+                                    u_scale = (
+                                        shard_data.pop(usk)
+                                        if usk and usk in shard_data
+                                        else None
+                                    )
 
-                            if gate_up_weights:
-                                gu_fp8, gu_scale = _pack_experts_blockwise_fp8(
-                                    gate_up_weights,
-                                    gate_up_scales,
-                                    block_size,
-                                    tp_degree=self.config.neuron_config.tp_degree,
-                                    layout="gate_up",
+                                    if g_fp8 is not None and u_fp8 is not None:
+                                        g_bf16 = _dequant_block_fp8_to_fp32(
+                                            g_fp8, g_scale, block_size
+                                        ).to(torch.bfloat16)
+                                        u_bf16 = _dequant_block_fp8_to_fp32(
+                                            u_fp8, u_scale, block_size
+                                        ).to(torch.bfloat16)
+                                        gate_up_bf16[e, :, :isize] = g_bf16.T
+                                        gate_up_bf16[e, :, isize:] = u_bf16.T
+                                        del (
+                                            g_fp8,
+                                            u_fp8,
+                                            g_scale,
+                                            u_scale,
+                                            g_bf16,
+                                            u_bf16,
+                                        )
+
+                                    d_fp8 = (
+                                        shard_data.pop(dk) if dk in shard_data else None
+                                    )
+                                    d_scale = (
+                                        shard_data.pop(dsk)
+                                        if dsk and dsk in shard_data
+                                        else None
+                                    )
+                                    if d_fp8 is not None:
+                                        d_bf16 = _dequant_block_fp8_to_fp32(
+                                            d_fp8, d_scale, block_size
+                                        ).to(torch.bfloat16)
+                                        down_bf16[e] = d_bf16.T
+                                        del d_fp8, d_scale, d_bf16
+
+                                # Re-quantize to per-channel FP8 [E, 1, W] scales
+                                gu_fp8, gu_scale = _requantize_per_channel_fp8(
+                                    gate_up_bf16
                                 )
                                 shard_data[
                                     f"{prefix}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
@@ -1395,15 +1469,10 @@ class NeuronKimiK2ForCausalLM(NeuronBaseForCausalLM):
                                 shard_data[
                                     f"{prefix}.mlp.expert_mlps.mlp_op.gate_up_proj.scale"
                                 ] = gu_scale
-                                del gate_up_weights, gate_up_scales
+                                del gate_up_bf16, gu_fp8, gu_scale
 
-                            if down_weights:
-                                dn_fp8, dn_scale = _pack_experts_blockwise_fp8(
-                                    down_weights,
-                                    down_scales,
-                                    block_size,
-                                    tp_degree=self.config.neuron_config.tp_degree,
-                                    layout="down",
+                                dn_fp8, dn_scale = _requantize_per_channel_fp8(
+                                    down_bf16
                                 )
                                 shard_data[
                                     f"{prefix}.mlp.expert_mlps.mlp_op.down_proj.weight"
@@ -1411,7 +1480,87 @@ class NeuronKimiK2ForCausalLM(NeuronBaseForCausalLM):
                                 shard_data[
                                     f"{prefix}.mlp.expert_mlps.mlp_op.down_proj.scale"
                                 ] = dn_scale
-                                del down_weights, down_scales
+                                del down_bf16, dn_fp8, dn_scale
+
+                            else:
+                                # Blockwise FP8: keep original FP8 bytes with block scales
+                                gate_up_weights = []
+                                gate_up_scales = []
+                                down_weights = []
+                                down_scales = []
+
+                                for e in range(n_routed_experts):
+                                    gk = f"{prefix}.mlp.experts.{e}.gate_proj.weight"
+                                    uk = f"{prefix}.mlp.experts.{e}.up_proj.weight"
+                                    dk = f"{prefix}.mlp.experts.{e}.down_proj.weight"
+                                    gsk = expert_scale_keys.get(gk)
+                                    usk = expert_scale_keys.get(uk)
+                                    dsk = expert_scale_keys.get(dk)
+
+                                    g_fp8 = (
+                                        shard_data.pop(gk) if gk in shard_data else None
+                                    )
+                                    u_fp8 = (
+                                        shard_data.pop(uk) if uk in shard_data else None
+                                    )
+                                    g_scale = (
+                                        shard_data.pop(gsk)
+                                        if gsk and gsk in shard_data
+                                        else None
+                                    )
+                                    u_scale = (
+                                        shard_data.pop(usk)
+                                        if usk and usk in shard_data
+                                        else None
+                                    )
+
+                                    if g_fp8 is not None and u_fp8 is not None:
+                                        gate_up_weights.append((g_fp8, u_fp8))
+                                        gate_up_scales.append((g_scale, u_scale))
+
+                                    d_fp8 = (
+                                        shard_data.pop(dk) if dk in shard_data else None
+                                    )
+                                    d_scale = (
+                                        shard_data.pop(dsk)
+                                        if dsk and dsk in shard_data
+                                        else None
+                                    )
+                                    if d_fp8 is not None:
+                                        down_weights.append(d_fp8)
+                                        down_scales.append(d_scale)
+
+                                if gate_up_weights:
+                                    gu_fp8, gu_scale = _pack_experts_blockwise_fp8(
+                                        gate_up_weights,
+                                        gate_up_scales,
+                                        block_size,
+                                        tp_degree=self.config.neuron_config.tp_degree,
+                                        layout="gate_up",
+                                    )
+                                    shard_data[
+                                        f"{prefix}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
+                                    ] = gu_fp8
+                                    shard_data[
+                                        f"{prefix}.mlp.expert_mlps.mlp_op.gate_up_proj.scale"
+                                    ] = gu_scale
+                                    del gate_up_weights, gate_up_scales
+
+                                if down_weights:
+                                    dn_fp8, dn_scale = _pack_experts_blockwise_fp8(
+                                        down_weights,
+                                        down_scales,
+                                        block_size,
+                                        tp_degree=self.config.neuron_config.tp_degree,
+                                        layout="down",
+                                    )
+                                    shard_data[
+                                        f"{prefix}.mlp.expert_mlps.mlp_op.down_proj.weight"
+                                    ] = dn_fp8
+                                    shard_data[
+                                        f"{prefix}.mlp.expert_mlps.mlp_op.down_proj.scale"
+                                    ] = dn_scale
+                                    del down_weights, down_scales
 
                         else:
                             # BF16 path

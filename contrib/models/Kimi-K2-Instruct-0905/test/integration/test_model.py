@@ -45,14 +45,14 @@ from modeling_kimi_k2 import NeuronKimiK2ForCausalLM, KimiK2InferenceConfig
 # ---------------------------------------------------------------------------
 
 MODEL_PATH = "/home/ubuntu/models/Kimi-K2-Instruct-0905"
-COMPILED_MODEL_PATH = "/home/ubuntu/kimi-k2/neuron-compiled-tp64-ep1"
+COMPILED_MODEL_PATH = "/home/ubuntu/kimi-k2/neuron-compiled-tp64-ep1-perchannel-1024"
 
 # Model configuration
 TP_DEGREE = 64
 EP_DEGREE = 1
 LNC = 2
 BATCH_SIZE = 1
-SEQ_LEN = 512
+SEQ_LEN = 1024
 N_ACTIVE_TOKENS = 128
 
 
@@ -75,7 +75,7 @@ def build_config():
         moe_tp_degree=TP_DEGREE,
         context_encoding_buckets=[N_ACTIVE_TOKENS, SEQ_LEN],
         router_config=RouterConfig(act_fn="sigmoid", dtype="float32"),
-        # FP8 quantization for routed experts
+        # FP8 quantization for routed experts (per-channel)
         quantized=True,
         quantized_checkpoints_path=MODEL_PATH,
         quantization_dtype="f8e4m3",
@@ -88,9 +88,7 @@ def build_config():
             "router",
             "layers.0",
         ],
-        quantization_type="blockwise_symmetric",
-        quantization_block_axis=[1, 2],
-        quantization_block_size=[128, 128],
+        quantization_type="expert_wise_per_channel_symmetric",
     )
 
     hf_kwargs = {
@@ -305,8 +303,8 @@ def test_performance_tpot(compiled_model, tokenizer):
         median_tpot = sorted(tpots)[len(tpots) // 2]
         tok_per_sec = 1000.0 / median_tpot
         print(f"PASS: TPOT = {median_tpot:.1f} ms ({tok_per_sec:.1f} tok/s)")
-        # Kimi-K2 at BS=1 TP=64 EP=1 LNC=2 with selective loading + blockwise FP8:
-        # ~145 ms/token (~6.9 tok/s). Note: includes CTE time amortized over 32 tokens.
+        # Kimi-K2 at BS=1 TP=64 EP=1 LNC=2 with per-channel FP8:
+        # ~76 ms/token at seq_len=512, ~41 ms at seq_len=1024.
         assert median_tpot < 200, f"TPOT {median_tpot:.1f}ms exceeds 200ms threshold"
     else:
         pytest.skip("Could not measure TPOT (no tokens generated)")
