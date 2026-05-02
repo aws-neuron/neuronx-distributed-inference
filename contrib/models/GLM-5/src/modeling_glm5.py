@@ -2306,15 +2306,21 @@ class NeuronGLM5ForCausalLM(NeuronBaseForCausalLM):
                     if sub_key in state_dict:
                         state_dict[sub_key] = state_dict[sub_key].to(target_dtype)
 
-        # --- Remove MTP layer weights (layer 78+) ---
-        keys_to_remove = [
-            k
-            for k in list(state_dict.keys())
-            if any(f"layers.{i}." in k for i in range(num_layers, num_layers + 10))
-        ]
+        # --- Remove excess layer weights (beyond num_hidden_layers) ---
+        # This handles both the MTP draft layer (layer 78 in full model) and
+        # any layers beyond num_hidden_layers when using a reduced-layer config
+        # for profiling (e.g. num_hidden_layers=58 to free HBM for profiler buffers).
+        import re
+
+        _layer_re = re.compile(r"layers\.(\d+)\.")
+        keys_to_remove = []
+        for k in list(state_dict.keys()):
+            m = _layer_re.search(k)
+            if m and int(m.group(1)) >= num_layers:
+                keys_to_remove.append(k)
         for k in keys_to_remove:
             del state_dict[k]
-            logger.info("Removed MTP layer weight: %s", k)
+            logger.info("Removed excess layer weight: %s", k)
 
         # --- Process each layer ---
         for layer in range(num_layers):
