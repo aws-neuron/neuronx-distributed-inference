@@ -1,0 +1,5 @@
+diffusers>=0.31.0
+transformers>=4.36.2
+accelerate
+ftfy
+imageio-ffmpeg
