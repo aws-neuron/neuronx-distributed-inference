@@ -37,20 +37,23 @@ Derived DeltaNet shapes:
 | `recurrent_state_buffer` | `[max_batch, 32, 128, 128]` |
 | `conv_state_buffer` | `[max_batch, 8192, 3]` |
 
+## Compatibility
+
+| Instance | Neuron SDK / environment | TP | dtype | seq_len | Status |
+| --- | --- | --- | --- | --- | --- |
+| `trn2.48xlarge` | PyTorch 2.9 NxDI inference env | 4 | BF16 | 160 | Unit and integration tests pass |
+
 ## Status
 
-This 9B contrib is prepared for bring-up. The implementation should be validated on Trn2 before TP=2 or Trn1 experiments.
+Validated on Trn2 with TP=4, batch=1, and seq_len=160. TP=2, Trn1, long-context HBM limits, and quantized inference are not validated for this contrib model.
 
 Validated baseline:
 
 - Qwen3.5-2B PR 141: trn2.3xlarge, TP=4, LNC=2, SDK 2.29, NKI 0.3.
 
-Unvalidated for this folder until run:
+## Compatible Checkpoints
 
-- Qwen3.5-9B compile and generation
-- TP=2
-- Trn1
-- long-context HBM limits
+- [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)
 
 ## Usage
 
@@ -72,7 +75,7 @@ neuron_config = NeuronConfig(
     batch_size=1,
     ctx_batch_size=1,
     tkg_batch_size=1,
-    seq_len=128,
+    seq_len=160,
     torch_dtype=torch.bfloat16,
     logical_nc_config=2,
     enable_bucketing=False,
@@ -140,17 +143,24 @@ Trainium integration:
 cd contrib/models/Qwen3.5-9B
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
-QWEN35_MODEL_PATH=/mnt/models/Qwen3.5-9B \
-QWEN35_COMPILED_PATH=/mnt/models/qwen35_9b_traced \
+NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+QWEN35_MODEL_PATH=/home/ubuntu/models/Qwen3.5-9B \
+QWEN35_COMPILED_PATH=/home/ubuntu/models/qwen35_9b_traced_trn2 \
 QWEN35_TP_DEGREE=4 \
-QWEN35_SEQ_LEN=128 \
+QWEN35_SEQ_LEN=160 \
 pytest test/integration/test_model.py --capture=tee-sys -v
 ```
+
+Validated results on `trn2.48xlarge`:
+
+- Unit tests: `44 passed`
+- Integration tests: `9 passed`
+- TTFT: `88.1 ms`
+- Throughput: `49.6 tok/s`
 
 ## Known Limitations
 
 1. SDK 2.29+ and NKI 0.3 are expected.
 2. DeltaNet weights are replicated across TP ranks in v1.
 3. Dummy KV wastes HBM for DeltaNet layers.
-4. First-token and multi-token logit parity are expected to show the same BF16 recurrent divergence reported by PR 141 until the DeltaNet precision work is done.
-5. Hybrid cache, DeltaNet TP sharding, quantization, speculative decoding, and MoE are out of scope for first bring-up.
+4. Hybrid cache, DeltaNet TP sharding, quantization, speculative decoding, and MoE are out of scope for first bring-up.
