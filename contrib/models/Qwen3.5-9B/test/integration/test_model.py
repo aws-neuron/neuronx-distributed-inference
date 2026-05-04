@@ -256,12 +256,33 @@ def test_top_token_valid(compiled_model, tokenizer, generation_config):
     )
     input_len = len(tokenizer.encode("Hello!"))
     first_new = tokens[input_len]
-    assert 0 <= first_new < tokenizer.vocab_size, (
+    assert 0 <= first_new < len(tokenizer), (
         f"Token {first_new} out of vocab range"
     )
     decoded = tokenizer.decode([first_new])
     assert len(decoded) > 0, f"Token {first_new} decoded to empty string"
     print(f"  First token: {first_new} -> '{decoded}'")
+
+
+@requires_model_path
+def test_olympics_prompt_no_invalid_tokens(
+    compiled_model, tokenizer, generation_config
+):
+    """Regression test for NaN logits producing the int32-min token id."""
+    prompt = "Give me a summary of the 2020 Olympics in 100 tokens."
+    tokens, _ = _generate(
+        compiled_model,
+        tokenizer,
+        generation_config,
+        prompt,
+        max_new_tokens=32,
+    )
+    input_len = len(tokenizer.encode(prompt))
+    generated = tokens[input_len:]
+    invalid = [token for token in generated if token < 0 or token >= len(tokenizer)]
+
+    assert len(generated) >= 5, f"Expected >= 5 generated tokens, got {generated}"
+    assert not invalid, f"Generated invalid token ids: {invalid}"
 
 
 @requires_model_path

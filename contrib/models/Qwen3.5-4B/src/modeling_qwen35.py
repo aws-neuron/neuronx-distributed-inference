@@ -221,6 +221,33 @@ def l2norm(x, dim=-1, eps=1e-6):
     return F.normalize(x, p=2, dim=dim, eps=eps)
 
 
+FUSED_DELTANET_DECAY_MIN = -60.0
+FUSED_DELTANET_DECAY_MAX = 0.0
+
+
+def _bound_fused_deltanet_log_decay(
+    g, batch_size, num_heads, total_seq_len, chunk_size
+):
+    """Bound cumulative DeltaNet decay before the fused NKI kernel.
+
+    The fused kernel internally computes both exp(cumsum(g)) and exp(-cumsum(g)).
+    Large negative cumulative decays make the second term overflow even though
+    the true pairwise decay exp(gc_i - gc_j) is bounded by one.  Return
+    equivalent per-token deltas whose per-chunk cumulative sum is clamped.
+    """
+    num_chunks = total_seq_len // chunk_size
+    g_chunks = g.reshape(batch_size, num_heads, num_chunks, chunk_size)
+    g_cumsum = g_chunks.cumsum(dim=-1).clamp(
+        min=FUSED_DELTANET_DECAY_MIN,
+        max=FUSED_DELTANET_DECAY_MAX,
+    )
+    g_first = g_cumsum[..., :1]
+    g_rest = g_cumsum[..., 1:] - g_cumsum[..., :-1]
+    return torch.cat([g_first, g_rest], dim=-1).reshape(
+        batch_size, num_heads, total_seq_len
+    )
+
+
 # ============================================================
 # Gated DeltaNet Module (Linear Recurrent Attention)
 # ============================================================
@@ -521,6 +548,7 @@ class NeuronGatedDeltaNet(nn.Module):
             beta = F.pad(beta, (0, pad_size))
             g = F.pad(g, (0, pad_size))
         total_seq_len = S + pad_size
+        g = _bound_fused_deltanet_log_decay(g, B, H, total_seq_len, chunk_size)
 
         BH = B * H
         # Flatten to (BH, S, dim) for per-(b,h) kernel calls
@@ -1122,40 +1150,36 @@ class Qwen35MRoPEEmbedding(nn.Module):
         device = x.device
         dtype = torch.float32
 
-        sections = self.mrope_section  # [11, 11, 10]
-        cos_parts = []
-        sin_parts = []
+        if position_ids_3d.ndim == 2:
+            position_ids_3d = position_ids_3d[None, ...].expand(
+                3, position_ids_3d.shape[0], -1
+            )
 
-        freq_offset = 0
-        for axis_idx, section_size in enumerate(sections):
-            pos = position_ids_3d[axis_idx].float()  # (batch, seq_len)
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (
+                torch.arange(0, self.rope_dim, 2, dtype=dtype, device=device)
+                / self.rope_dim
+            )
+        )
+        inv_freq = inv_freq[None, None, :, None].expand(
+            3, position_ids_3d.shape[1], -1, 1
+        )
+        positions = position_ids_3d[:, :, None, :].float()
+        freqs = (inv_freq.float() @ positions).transpose(2, 3)
 
-            dim_pairs = section_size  # number of (cos, sin) pairs for this axis
-            freqs = 1.0 / (
-                self.rope_theta
-                ** (
-                    torch.arange(0, dim_pairs * 2, 2, dtype=dtype, device=device)
-                    / (self.rope_dim)
-                )
-            )  # (dim_pairs,)
-
-            # freqs: (dim_pairs,), pos: (B, S) -> angles: (B, S, dim_pairs)
-            angles = pos.unsqueeze(-1) * freqs.unsqueeze(0).unsqueeze(0)
-
-            cos_parts.append(angles.cos())
-            sin_parts.append(angles.sin())
-
-        # Concatenate: (B, S, 32)
-        cos = torch.cat(cos_parts, dim=-1)
-        sin = torch.cat(sin_parts, dim=-1)
-
+        # Match HF Qwen3.5 mRoPE layout exactly: start from the temporal
+        # frequencies, then splice H/W frequencies into interleaved positions.
+        freqs_t = freqs[0]
         if self.mrope_interleaved:
-            # Interleave to (B, S, 64): [c0, c0, c1, c1, ...] for rotate_half
-            cos = cos.repeat_interleave(2, dim=-1)
-            sin = sin.repeat_interleave(2, dim=-1)
-        else:
-            cos = torch.cat([cos, cos], dim=-1)
-            sin = torch.cat([sin, sin], dim=-1)
+            for dim, offset in enumerate((1, 2), start=1):
+                length = self.mrope_section[dim] * 3
+                idx = slice(offset, length, 3)
+                freqs_t[..., idx] = freqs[dim, ..., idx]
+
+        emb = torch.cat((freqs_t, freqs_t), dim=-1)
+        cos = emb.cos().to(dtype=x.dtype)
+        sin = emb.sin().to(dtype=x.dtype)
 
         return cos, sin
 
@@ -1631,15 +1655,27 @@ class NeuronQwen35Model(NeuronBaseModel):
         if is_for_context_encoding:
             inputs_embeds = inputs_embeds * deltanet_padding_mask
 
-        # Vision embedding injection
+        # Vision embedding injection. Text-only calls still pass dummy vision
+        # tensors to keep the traced input signature stable; those tensors have
+        # one dummy entry per text token and must not overwrite text embeddings.
         if (vision_embeddings is not None) and (vision_mask is not None):
             if vision_embeddings.dtype != self.config.neuron_config.torch_dtype:
                 vision_embeddings = vision_embeddings.to(
                     self.config.neuron_config.torch_dtype
                 )
-            if is_for_context_encoding:
+            has_real_vision_inputs = (
+                vision_embeddings.ndim == 3
+                and vision_mask.ndim == 3
+                and vision_embeddings.shape[1] != seq_length
+            )
+            if is_for_context_encoding and has_real_vision_inputs:
                 inputs_embeds = self.encode_vision_to_input(
                     inputs_embeds, vision_embeddings, vision_mask
+                )
+            elif is_for_context_encoding and vision_embeddings.numel() > 0:
+                inputs_embeds = inputs_embeds + vision_embeddings.sum() * 0
+                inputs_embeds = (
+                    inputs_embeds + vision_mask.sum().to(inputs_embeds.dtype) * 0
                 )
 
         if position_ids is None:
