@@ -163,4 +163,5 @@ Validated results on `trn2.48xlarge`:
 1. SDK 2.29+ and NKI 0.3 are expected.
 2. DeltaNet weights are replicated across TP ranks in v1.
 3. Dummy KV wastes HBM for DeltaNet layers.
-4. Hybrid cache, DeltaNet TP sharding, quantization, speculative decoding, and MoE are out of scope for first bring-up.
+4. DeltaNet TP sharding, quantization, speculative decoding, and MoE are out of scope for first bring-up.
+5. A custom hybrid cache manager to remove dummy KV HBM overhead is planned as a follow-up PR.

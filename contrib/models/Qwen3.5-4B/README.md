@@ -163,4 +163,5 @@ Validated results on `trn2.48xlarge`:
 
 - DeltaNet weights are replicated across TP ranks in v1.
 - DeltaNet layers still allocate dummy KV cache through NxDI's normal cache manager.
-- MoE, VL, quantization, speculation, and custom hybrid cache cleanup are out of scope.
+- MoE, VL, quantization, and speculation are out of scope.
+- A custom hybrid cache manager to remove dummy KV HBM overhead is planned as a follow-up PR.
