@@ -1322,15 +1322,45 @@ class NeuronBaseModel(nn.Module):
         active_block_table = None if 'active_block_table' not in kwargs else kwargs['active_block_table']
         empty_active_block_table = True if active_block_table is None else len(active_block_table.shape) == 1
         may_have_prefix = self.is_prefix_caching and is_for_context_encoding and not empty_active_block_table
+
+        # Keep quantized KV on the existing materialized path for now. Prefix cache reads
+        # dequantize before block selection, while the raw block TKG path fetches block
+        # cache directly and does not receive dequant scale parameters.
+        should_skip_prefix_bhsd_materialization = (
+            not is_for_context_encoding
+            and self.neuron_config.is_prefix_caching
+            and self.neuron_config.is_block_kv_layout
+            and self.neuron_config.attn_block_tkg_nki_kernel_enabled
+            and active_block_table is not None
+            and not empty_active_block_table
+            and self.neuron_config.kv_quant_config is None
+            and not (
+                self.neuron_config.attn_block_tkg_nki_kernel_cache_update
+                and self.neuron_config.apply_seq_ids_mask
+            )
+            and self.attention_chunk_size is None
+            and self.sliding_window is None
+            and isinstance(self.kv_mgr, BlockKVCacheManager)
+        )
         if may_have_prefix or not is_for_context_encoding or windowed_context_encoding_window_idx >= 1:
             if not self.config.neuron_config.layer_boundary_markers:
-                past_key_values = self.kv_mgr.get_cache(
-                    seq_ids=seq_ids,
-                    seq_len=cache_size,
-                    is_for_context_encoding=is_for_context_encoding,
-                    windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
-                    **kwargs,
-                )
+                if should_skip_prefix_bhsd_materialization:
+                    # Block TKG attention fetches raw block KV through kv_mgr._fetch_cache()
+                    # before invoking the kernel. This placeholder is never consumed by that
+                    # path; it only preserves token-generation control flow.
+                    placeholder_past_key_value = hidden_states.new_zeros((1, 1, 1, 1))
+                    past_key_values = [
+                        (placeholder_past_key_value, placeholder_past_key_value)
+                        for _ in range(len(self.layers))
+                    ]
+                else:
+                    past_key_values = self.kv_mgr.get_cache(
+                        seq_ids=seq_ids,
+                        seq_len=cache_size,
+                        is_for_context_encoding=is_for_context_encoding,
+                        windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+                        **kwargs,
+                    )
             else:
                 get_kv_per_layer = True
 
