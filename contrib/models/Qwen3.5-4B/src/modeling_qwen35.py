@@ -84,6 +84,7 @@ from neuronx_distributed_inference.modules.attention.attention_base import (
     NeuronAttentionBase,
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
     ModuleMarkerStartWrapper,
@@ -221,7 +222,7 @@ def l2norm(x, dim=-1, eps=1e-6):
     return F.normalize(x, p=2, dim=dim, eps=eps)
 
 
-FUSED_DELTANET_DECAY_MIN = -60.0
+FUSED_DELTANET_DECAY_MIN = -20.0
 FUSED_DELTANET_DECAY_MAX = 0.0
 
 
@@ -286,6 +287,7 @@ class NeuronGatedDeltaNet(nn.Module):
         self.conv_kernel_size = tc.linear_conv_kernel_dim  # 4
         self.layer_idx = layer_idx
         self.rms_norm_eps = tc.rms_norm_eps
+        self.use_hybrid_cache_manager = getattr(tc, "use_hybrid_cache_manager", False)
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -747,6 +749,11 @@ class NeuronGatedDeltaNet(nn.Module):
         # zeros the decay gate so the recurrent state is preserved unchanged
         # through padding positions (no spurious decay).
         valid_mask_1d = kwargs.get("deltanet_padding_mask", None)  # [B, S, 1] or None
+        hybrid_cache_active = self.use_hybrid_cache_manager
+        recurrent_state_cache = None
+        conv_state_cache = None
+        if hybrid_cache_active and past_key_value is not None:
+            recurrent_state_cache, conv_state_cache = past_key_value
 
         # Project inputs
         deltanet_fp32 = os.environ.get("DELTANET_FP32") == "1"
@@ -774,7 +781,9 @@ class NeuronGatedDeltaNet(nn.Module):
         mixed = mixed.transpose(1, 2)
 
         if is_decode:
-            if seq_ids is not None:
+            if conv_state_cache is not None:
+                conv_state = conv_state_cache[:batch_size]
+            elif seq_ids is not None:
                 conv_state = torch.index_select(self.conv_state_buffer, 0, seq_ids)
             else:
                 conv_state = self.conv_state_buffer[:batch_size]
@@ -791,7 +800,9 @@ class NeuronGatedDeltaNet(nn.Module):
 
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)
             alloc_bs = self.conv_state_buffer.shape[0]
-            if seq_ids is not None:
+            if hybrid_cache_active:
+                new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
+            elif seq_ids is not None:
                 # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
                 # Add buffer dependency for input_output_alias
                 new_conv_state = (
@@ -827,7 +838,9 @@ class NeuronGatedDeltaNet(nn.Module):
                 new_conv_state = mixed[:, :, -3:].contiguous()
 
             alloc_bs = self.conv_state_buffer.shape[0]
-            if seq_ids is not None:
+            if hybrid_cache_active:
+                new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
+            elif seq_ids is not None:
                 # BS=1 optimization: scatter to index 0 = direct replacement
                 new_conv_state = (
                     new_conv_state.to(self.conv_state_buffer.dtype)
@@ -906,7 +919,9 @@ class NeuronGatedDeltaNet(nn.Module):
 
         if is_decode:
             # TKG: single-step recurrent update
-            if seq_ids is not None:
+            if recurrent_state_cache is not None:
+                recurrent_state = recurrent_state_cache[:batch_size].float()
+            elif seq_ids is not None:
                 recurrent_state = torch.index_select(
                     self.recurrent_state_buffer, 0, seq_ids
                 ).float()
@@ -918,7 +933,9 @@ class NeuronGatedDeltaNet(nn.Module):
             )
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
             alloc_bs = self.recurrent_state_buffer.shape[0]
-            if seq_ids is not None:
+            if hybrid_cache_active:
+                new_rec_state = new_state_bf16
+            elif seq_ids is not None:
                 # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
                 # Add buffer dependency for input_output_alias
                 new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
@@ -970,7 +987,9 @@ class NeuronGatedDeltaNet(nn.Module):
             if final_state is not None:
                 final_state_bf16 = final_state.to(self.recurrent_state_buffer.dtype)
                 alloc_bs = self.recurrent_state_buffer.shape[0]
-                if seq_ids is not None:
+                if hybrid_cache_active:
+                    new_rec_state = final_state_bf16
+                elif seq_ids is not None:
                     # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
                     # Add buffer dependency for input_output_alias
                     new_rec_state = final_state_bf16 + self.recurrent_state_buffer * 0
@@ -1004,6 +1023,9 @@ class NeuronGatedDeltaNet(nn.Module):
         output = output * F.silu(z_gate)
         output = output.reshape(batch_size, seq_len, self.value_dim)
         output = self.out_proj(output)
+
+        if hybrid_cache_active:
+            return output, (new_rec_state, new_conv_state), new_rec_state, new_conv_state
 
         # Return dummy KV for KVCacheManager
         dummy_k = torch.zeros(
@@ -1059,6 +1081,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("linear_key_head_dim", 128)
         kwargs.setdefault("linear_value_head_dim", 128)
         kwargs.setdefault("linear_conv_kernel_dim", 4)
+        kwargs.setdefault("use_hybrid_cache_manager", False)
 
         super().__init__(*args, **kwargs)
 
@@ -1512,7 +1535,11 @@ class NeuronQwen35DecoderLayer(nn.Module):
             )
             hidden_states = residual + attn_out
             present_key_value = dummy_kv
-            deltanet_states = (new_rec_state, new_conv_state)
+            deltanet_states = (
+                None
+                if getattr(self.config, "use_hybrid_cache_manager", False)
+                else (new_rec_state, new_conv_state)
+            )
         else:
             deltanet_states = None
             # Standard attention path
@@ -1543,6 +1570,240 @@ class NeuronQwen35DecoderLayer(nn.Module):
             deltanet_states,
         )
         return outputs
+
+
+# ============================================================
+# Hybrid Cache Manager (opt-in)
+# ============================================================
+
+
+class HybridDeltaNetCacheManager(KVCacheManager):
+    """Layer-type-aware cache manager for Qwen3.5/Qwen3.6 hybrid dense models."""
+
+    def __init__(self, config: Qwen35InferenceConfig, num_kv_head, **kwargs):
+        self.layer_types = list(config.layer_types)
+        self._validate_hybrid_config(config)
+        super().__init__(config, num_kv_head=num_kv_head, **kwargs)
+
+        dtype = (
+            config.neuron_config.attention_dtype
+            if config.neuron_config.attention_dtype is not None
+            else config.neuron_config.torch_dtype
+        )
+        cache_dtype = getattr(self, "cache_dtype", dtype)
+        max_batch_size = (
+            config.neuron_config.kv_cache_batch_size
+            + config.neuron_config.kv_cache_padding_size
+        )
+        recurrent_shape = [
+            max_batch_size,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+        ]
+        conv_dim = (
+            2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim
+        )
+        conv_shape = [
+            max_batch_size,
+            conv_dim,
+            config.linear_conv_kernel_dim - 1,
+        ]
+
+        params = []
+        for layer_idx, layer_type in enumerate(self.layer_types):
+            if layer_type == "linear_attention":
+                params.append(
+                    nn.Parameter(torch.zeros(recurrent_shape, dtype=dtype), requires_grad=False)
+                )
+                params.append(
+                    nn.Parameter(torch.zeros(conv_shape, dtype=dtype), requires_grad=False)
+                )
+            else:
+                k_shape = self.k_shapes[layer_idx] if hasattr(self, "k_shapes") else self.k_shape
+                v_shape = self.v_shapes[layer_idx] if hasattr(self, "v_shapes") else self.v_shape
+                params.append(
+                    nn.Parameter(torch.zeros(k_shape, dtype=cache_dtype), requires_grad=False)
+                )
+                params.append(
+                    nn.Parameter(torch.zeros(v_shape, dtype=cache_dtype), requires_grad=False)
+                )
+
+        self.past_key_values = nn.ParameterList(params)
+
+    @staticmethod
+    def _validate_hybrid_config(config: Qwen35InferenceConfig):
+        nc = config.neuron_config
+        unsupported = []
+        if nc.is_block_kv_layout:
+            unsupported.append("block KV layout")
+        if getattr(nc, "kv_quant_config", None) is not None or getattr(nc, "kv_cache_quant", False):
+            unsupported.append("KV cache quantization")
+        if nc.enable_fused_speculation or nc.speculation_length > 0 or nc.is_medusa:
+            unsupported.append("speculative decoding")
+        if getattr(nc, "enable_eagle_speculation", False) or getattr(nc, "is_eagle_draft", False):
+            unsupported.append("EAGLE speculation")
+        if nc.flash_decoding_enabled:
+            unsupported.append("flash decoding")
+        if nc.attention_dp_degree > 1:
+            unsupported.append("attention data parallelism")
+        if nc.kv_cache_tiling:
+            unsupported.append("KV cache tiling")
+        if nc.padding_side != "right":
+            unsupported.append("left padding")
+        if nc.is_continuous_batching:
+            unsupported.append("continuous batching")
+        if unsupported:
+            raise ValueError(
+                "HybridDeltaNetCacheManager v1 does not support: "
+                + ", ".join(unsupported)
+            )
+
+    def _is_deltanet_layer(self, idx: int) -> bool:
+        return self.layer_types[idx] == "linear_attention"
+
+    def get_seq_length(self, past_key_values=None):
+        for idx, layer_type in enumerate(self.layer_types):
+            if layer_type != "linear_attention":
+                if past_key_values is None:
+                    _, v_cache = self._fetch_cache(idx)
+                elif len(past_key_values) == len(self.past_key_values):
+                    v_cache = past_key_values[2 * idx + 1]
+                else:
+                    v_cache = past_key_values[idx][1]
+                return v_cache.shape[2]
+        return 0
+
+    def get_deltanet_state_by_layer_id(self, idx, kvcache_buffer=None, seq_ids=None):
+        recurrent_state, conv_state = self._fetch_cache(idx, kvcache_buffer)
+        if seq_ids is not None:
+            cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
+            recurrent_state = torch.index_select(recurrent_state, dim=0, index=cache_idx)
+            conv_state = torch.index_select(conv_state, dim=0, index=cache_idx)
+        elif self.kv_cache_padding_size > 0:
+            recurrent_state = recurrent_state[: -self.kv_cache_padding_size]
+            conv_state = conv_state[: -self.kv_cache_padding_size]
+        return recurrent_state, conv_state
+
+    def get_cache(
+        self,
+        seq_len: int,
+        skip_slice=False,
+        kvcache_buffer=None,
+        seq_ids=None,
+        windowed_context_encoding_window_idx=-1,
+        **kwargs,
+    ):
+        past_key_values = []
+        for idx in range(len(self.past_key_values) // 2):
+            if self._is_deltanet_layer(idx):
+                past_key_values.append(
+                    list(self.get_deltanet_state_by_layer_id(idx, kvcache_buffer, seq_ids))
+                )
+            else:
+                past_key_values.append(
+                    list(
+                        self.get_kv_by_layer_id(
+                            idx=idx,
+                            skip_slice=skip_slice,
+                            seq_len=seq_len,
+                            kvcache_buffer=kvcache_buffer,
+                            seq_ids=seq_ids,
+                            windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+                            **kwargs,
+                        )
+                    )
+                )
+        return past_key_values
+
+    def update_cache(
+        self,
+        is_for_context_encoding: bool,
+        seq_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        new_key_values: List[torch.Tensor],
+        seq_len: int,
+        scatter_index=None,
+        kv_active_mask=None,
+        kvcache_buffer=None,
+        windowed_context_encoding_window_idx: int = -1,
+        **kwargs,
+    ):
+        updated_cache = []
+        for idx, kv_per_layer in enumerate(new_key_values):
+            if self._is_deltanet_layer(idx):
+                recurrent_state, conv_state = self.update_deltanet_state_by_layer_id(
+                    idx=idx,
+                    seq_ids=seq_ids,
+                    state_per_layer=kv_per_layer,
+                    kvcache_buffer=kvcache_buffer,
+                )
+            else:
+                recurrent_state, conv_state = self.update_kv_by_layer_id(
+                    idx=idx,
+                    is_for_context_encoding=is_for_context_encoding,
+                    seq_ids=seq_ids,
+                    position_ids=position_ids,
+                    kv_per_layer=kv_per_layer,
+                    seq_len=seq_len,
+                    scatter_index=scatter_index,
+                    kv_active_mask=kv_active_mask,
+                    kvcache_buffer=kvcache_buffer,
+                    windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+                    **kwargs,
+                )
+            updated_cache.append(recurrent_state)
+            updated_cache.append(conv_state)
+        return updated_cache
+
+    def update_deltanet_state_by_layer_id(
+        self,
+        idx: int,
+        seq_ids: torch.Tensor,
+        state_per_layer: Tuple[torch.Tensor, torch.Tensor],
+        kvcache_buffer=None,
+    ):
+        latest_recurrent, latest_conv = state_per_layer
+        recurrent_cache, conv_cache = self._fetch_cache(idx, kvcache_buffer)
+        latest_recurrent = latest_recurrent.to(recurrent_cache.dtype)
+        latest_conv = latest_conv.to(conv_cache.dtype)
+
+        if seq_ids is not None:
+            cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
+            recurrent_index = cache_idx.view(-1, 1, 1, 1).expand_as(latest_recurrent)
+            conv_index = cache_idx.view(-1, 1, 1).expand_as(latest_conv)
+            recurrent_cache = torch.scatter(
+                input=recurrent_cache,
+                dim=0,
+                index=recurrent_index,
+                src=latest_recurrent,
+            )
+            conv_cache = torch.scatter(
+                input=conv_cache,
+                dim=0,
+                index=conv_index,
+                src=latest_conv,
+            )
+            return recurrent_cache, conv_cache
+
+        if latest_recurrent.shape[0] == recurrent_cache.shape[0]:
+            return (
+                latest_recurrent + recurrent_cache * 0,
+                latest_conv + conv_cache * 0,
+            )
+
+        pad_size = recurrent_cache.shape[0] - latest_recurrent.shape[0]
+        if pad_size > 0:
+            latest_recurrent = torch.cat(
+                [latest_recurrent, recurrent_cache[latest_recurrent.shape[0] :] * 0],
+                dim=0,
+            )
+            latest_conv = torch.cat(
+                [latest_conv, conv_cache[latest_conv.shape[0] :] * 0],
+                dim=0,
+            )
+        return latest_recurrent + recurrent_cache * 0, latest_conv + conv_cache * 0
 
 
 # ============================================================
@@ -1589,6 +1850,19 @@ class NeuronQwen35Model(NeuronBaseModel):
 
         # mRoPE embedding for VL
         self.mrope_emb = Qwen35MRoPEEmbedding(config)
+
+    def init_inference_optimization(self, config: Qwen35InferenceConfig):
+        super().init_inference_optimization(config)
+        if getattr(config, "use_hybrid_cache_manager", False):
+            self.kv_mgr = HybridDeltaNetCacheManager(
+                config,
+                num_kv_head=self.num_key_value_heads,
+                global_rank=self.rank_util,
+                attention_chunk_size=self.attention_chunk_size,
+                sliding_window=self.sliding_window,
+                windowed_context_encoding_size=self.windowed_context_encoding_size,
+                layer_to_cache_size_mapping=self.layer_to_cache_size_mapping,
+            )
 
     @property
     def _deltanet_state_params(self):
@@ -1639,7 +1913,10 @@ class NeuronQwen35Model(NeuronBaseModel):
 
         past_key_values_length = 0
         if past_key_values is not None:
-            past_key_values_length = past_key_values[0][1].shape[2]
+            if hasattr(self.kv_mgr, "get_seq_length"):
+                past_key_values_length = self.kv_mgr.get_seq_length(past_key_values)
+            else:
+                past_key_values_length = past_key_values[0][1].shape[2]
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1909,7 +2186,10 @@ class NeuronQwen35Model(NeuronBaseModel):
         outputs += updated_kv_cache
 
         # Append DeltaNet state tensors (for input_output_aliases)
-        if hasattr(self, "_deltanet_updated_states"):
+        if (
+            not getattr(self.config, "use_hybrid_cache_manager", False)
+            and hasattr(self, "_deltanet_updated_states")
+        ):
             outputs += self._deltanet_updated_states
 
         return outputs
@@ -2061,7 +2341,10 @@ class Qwen35DecoderModelInstance(DecoderModelInstance):
 
         state_start_idx = num_output_from_trace + num_kv
 
-        if hasattr(module, "_deltanet_state_params"):
+        if (
+            not getattr(module.config, "use_hybrid_cache_manager", False)
+            and hasattr(module, "_deltanet_state_params")
+        ):
             for i, param in enumerate(module._deltanet_state_params):
                 input_output_aliases[param] = state_start_idx + i
 
@@ -2301,6 +2584,8 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
     def _copy_past_key_values(self, outputs):
         """Override to also copy DeltaNet state buffers on CPU."""
         super()._copy_past_key_values(outputs)
+        if getattr(self.config, "use_hybrid_cache_manager", False):
+            return
 
         num_output_from_trace = 1
         if (

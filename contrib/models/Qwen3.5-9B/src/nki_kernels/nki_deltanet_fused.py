@@ -312,14 +312,21 @@ def deltanet_fused_chunked_fwd(
         # ============================================================
         # Decay mask: QK_decay[i,j] = QK[i,j] * exp(gc[i]) * exp(-gc[j])
         #
+        # Apply the strict causal mask before the split exp(gc) / exp(-gc)
+        # scaling. Upper-triangular entries are mathematically unused, but
+        # scaling them first can create very large finite values that poison
+        # later matmuls before the mask is applied.
+        # ============================================================
+        QK_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=QK_masked, data1=QK, data2=Lmask, op=nl.multiply)
+
         # Row scaling: QK_row[i,:] = QK[i,:] * exp(gc[i])
         # Then transpose, column scale, transpose back.
         # Uses tensor_scalar with (P_MAX,1) operand for row scaling.
-        # ============================================================
         QK_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
             dst=QK_row,
-            data=QK,
+            data=QK_masked,
             op0=nl.multiply,
             operand0=exp_gc_p,
             engine=nisa.vector_engine,
@@ -435,11 +442,16 @@ def deltanet_fused_chunked_fwd(
         qk_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=qk_raw, src=qk_psum)
 
+        # Mask before split scaling for the same reason as the A matrix above:
+        # upper-triangular decay factors are unused and can be numerically huge.
+        qk_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=qk_masked, data1=qk_raw, data2=Lmask_d, op=nl.multiply)
+
         # Row-scale by exp(gc)
         qk_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
             dst=qk_row,
-            data=qk_raw,
+            data=qk_masked,
             op0=nl.multiply,
             operand0=exp_gc_p,
             engine=nisa.vector_engine,
@@ -538,13 +550,40 @@ def deltanet_fused_chunked_fwd(
         # state is updated IN-PLACE in SBUF — no HBM round-trip!
         # ============================================================
 
-        # k_raw_decay = k * exp(-gc)
+        # k_raw_decay contributes as exp(g_last) * (k * exp(-gc))^T @ v_new.
+        # Compute the equivalent form with one bounded exponential,
+        # k * exp(g_last - gc), so the factor is always <= 1 for valid
+        # causal positions.
+        gl_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        for i_shuf in nl.static_range(P_MAX // 32):
+            nisa.nc_stream_shuffle(
+                src=gl_11[0:1, 0:1],
+                dst=gl_p[i_shuf * 32 : i_shuf * 32 + 32, 0:1],
+                shuffle_mask=_BROADCAST_MASK,
+            )
+        gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=gl_minus_gc_p,
+            data1=gl_p,
+            data2=gc_p,
+            op=nl.subtract,
+        )
+        exp_gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(
+            dst=exp_gl_minus_gc_p,
+            op=nl.exp,
+            data=gl_minus_gc_p,
+            bias=None,
+            scale=1.0,
+        )
+
+        # k_raw_decay = k * exp(g_last - gc)
         k_raw_decay = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
             dst=k_raw_decay,
             data=k_c,
             op0=nl.multiply,
-            operand0=exp_neg_gc_p,
+            operand0=exp_gl_minus_gc_p,
             engine=nisa.vector_engine,
         )
 
@@ -557,19 +596,17 @@ def deltanet_fused_chunked_fwd(
         kv_outer = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=kv_outer, src=kv_psum)
 
-        # state = state + kv_outer
-        state_plus = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=state_plus, data1=state, data2=kv_outer, op=nl.add)
-
-        # state = state_plus * exp(g_last)
-        # tensor_scalar broadcasts exp_gl_p (P_MAX, 1) across free dim
+        # state = state * exp(g_last) + kv_outer
+        # tensor_scalar broadcasts exp_gl_p (P_MAX, 1) across free dim.
+        state_decayed = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
-            dst=state,
-            data=state_plus,
+            dst=state_decayed,
+            data=state,
             op0=nl.multiply,
             operand0=exp_gl_p,
             engine=nisa.vector_engine,
         )
+        nisa.tensor_tensor(dst=state, data1=state_decayed, data2=kv_outer, op=nl.add)
 
     # ---- Write final state to HBM ----
     nisa.dma_copy(dst=final_state_out, src=state)

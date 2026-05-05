@@ -36,7 +36,10 @@ Usage:
 """
 
 import gc
+import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 
@@ -56,12 +59,21 @@ TP_DEGREE = int(os.environ.get("QWEN35_TP_DEGREE", "4"))
 SEQ_LEN = int(os.environ.get("QWEN35_SEQ_LEN", "128"))
 TTFT_THRESHOLD_MS = float(os.environ.get("TTFT_THRESHOLD_MS", "5000"))
 THROUGHPUT_THRESHOLD = float(os.environ.get("THROUGHPUT_THRESHOLD", "5.0"))
+USE_HYBRID_CACHE = os.environ.get("QWEN35_USE_HYBRID_CACHE", "0") == "1"
+RECORD_HBM = os.environ.get("QWEN35_RECORD_HBM", "0") == "1"
 
 requires_model_path = pytest.mark.skipif(
     not MODEL_PATH,
     reason=(
         "QWEN35_MODEL_PATH not set. Integration tests require the full 4B model "
         "weights. Set QWEN35_MODEL_PATH=/path/to/Qwen3.5-4B to run these tests."
+    ),
+)
+requires_hbm_recording = pytest.mark.skipif(
+    not RECORD_HBM,
+    reason=(
+        "QWEN35_RECORD_HBM=1 not set. This optional test records Neuron HBM "
+        "usage for dummy-KV vs hybrid-cache comparisons."
     ),
 )
 
@@ -119,6 +131,7 @@ def compiled_model(model_path):
 
     inf_config = Qwen35InferenceConfig(
         neuron_config=neuron_config,
+        use_hybrid_cache_manager=USE_HYBRID_CACHE,
         **config_dict,
     )
 
@@ -193,6 +206,73 @@ def _is_repetitive(text, max_repeat=5):
         if len(set(words[i : i + max_repeat])) == 1:
             return True
     return False
+
+
+def _parse_peak_neuron_memory(stdout):
+    peak_device = 0
+    peak_tensors = 0
+    samples = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            report = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for runtime in report.get("neuron_runtime_data", []):
+            memory_used = runtime.get("report", {}).get("memory_used", {})
+            used = memory_used.get("neuron_runtime_used_bytes", {})
+            peak_device = max(peak_device, int(used.get("neuron_device", 0) or 0))
+            nc_usage = (
+                used.get("usage_breakdown", {}).get("neuroncore_memory_usage", {})
+            )
+            tensor_bytes = sum(
+                int(core.get("tensors", 0) or 0) for core in nc_usage.values()
+            )
+            peak_tensors = max(peak_tensors, tensor_bytes)
+            samples += 1
+    return peak_device, peak_tensors, samples
+
+
+def _capture_neuron_hbm(tmp_path, fn):
+    if shutil.which("neuron-monitor") is None:
+        pytest.skip("neuron-monitor is not available")
+
+    monitor_config = {
+        "period": "0.5s",
+        "neuron_runtimes": [
+            {
+                "tag_filter": ".*",
+                "metrics": [{"type": "memory_used", "period": "0.5s"}],
+            }
+        ],
+    }
+    config_path = tmp_path / "neuron-monitor.json"
+    config_path.write_text(json.dumps(monitor_config))
+
+    proc = subprocess.Popen(
+        ["neuron-monitor", "--config-file", str(config_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(1.0)
+        result = fn()
+        time.sleep(1.0)
+    finally:
+        proc.terminate()
+    try:
+        stdout, stderr = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+
+    peak_device, peak_tensors, samples = _parse_peak_neuron_memory(stdout)
+    assert samples > 0, f"neuron-monitor produced no runtime samples: {stderr}"
+    assert peak_device > 0, "Expected non-zero Neuron device HBM usage"
+    return result, peak_device, peak_tensors, samples
 
 
 # ── Smoke Tests ─────────────────────────────────────────────────────────
@@ -360,6 +440,33 @@ def test_performance_throughput(compiled_model, tokenizer, generation_config):
     assert throughput > THROUGHPUT_THRESHOLD, (
         f"Throughput {throughput:.1f} tok/s < threshold {THROUGHPUT_THRESHOLD}"
     )
+
+
+@requires_model_path
+@requires_hbm_recording
+def test_hybrid_cache_hbm_snapshot(compiled_model, tokenizer, generation_config, tmp_path):
+    """Record peak Neuron HBM for dummy-KV vs hybrid-cache comparison runs."""
+    prompt = "Give me a summary of the 2020 Olympics in 100 tokens."
+    max_new_tokens = int(os.environ.get("QWEN35_HBM_NEW_TOKENS", "32"))
+
+    (_, text), peak_device, peak_tensors, samples = _capture_neuron_hbm(
+        tmp_path,
+        lambda: _generate(
+            compiled_model,
+            tokenizer,
+            generation_config,
+            prompt,
+            max_new_tokens=max_new_tokens,
+        ),
+    )
+
+    mode = "hybrid" if USE_HYBRID_CACHE else "dummy_kv"
+    print(
+        "  HBM "
+        f"mode={mode} peak_device_bytes={peak_device} "
+        f"peak_tensor_bytes={peak_tensors} samples={samples}"
+    )
+    assert len(text) > len(prompt)
 
 
 # ── Multi-Prompt Quality Test ──────────────────────────────────────────
