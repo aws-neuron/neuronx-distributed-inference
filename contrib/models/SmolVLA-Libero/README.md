@@ -52,7 +52,7 @@ in one core's HBM with vast headroom.
 **Validated:** 2026-05-06
 **Configuration:** TP=1, batch_size=1, bfloat16
 **Instance:** trn3pd98.3xlarge
-**NxDI:** 2.28 (`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference`)
+**NxDI:** 2.29 (`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference`)
 
 ### Test Results
 
@@ -183,7 +183,7 @@ action_chunk = policy.generate(images, lang_token_ids, state, lang_mask=lang_mas
 
 ## Compatibility Matrix
 
-| Instance / NxDI | 2.28 |
+| Instance / NxDI | 2.29 |
 |-----------------|------|
 | Trn3            | ✅ Working |
 | Trn2            | Not tested |
