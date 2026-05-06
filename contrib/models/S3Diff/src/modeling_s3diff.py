@@ -28,10 +28,11 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-# Scale factor and padding constants
+# Scale factor and tiling constants
 SF = 4
-PAD_H = 512
-PAD_W = 512
+TILE_SIZE = 512  # Pixel-space tile size (validated with trace())
+TILE_OVERLAP = 128  # Pixel-space overlap between tiles (must be divisible by 8)
+LATENT_SCALE = 8  # VAE spatial downscale factor
 
 # ---------------------------------------------------------------------------
 # DEResNet -- degradation estimator
@@ -254,6 +255,51 @@ class VAEDecoderWrapper(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Tiling utilities
+# ---------------------------------------------------------------------------
+
+
+def _make_gaussian_weight(h: int, w: int) -> torch.Tensor:
+    """Create a 2D Gaussian blending weight mask for tile overlap regions.
+
+    The weight is 1.0 at center and falls off toward edges, ensuring smooth
+    blending where tiles overlap.
+    """
+    y = torch.linspace(-1, 1, h)
+    x = torch.linspace(-1, 1, w)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    # Gaussian with sigma that gives ~0.1 weight at edges
+    d = (xx**2 + yy**2) / 2.0
+    weight = torch.exp(-d * 3.0)  # sigma ~0.58, edge weight ~0.05
+    return weight.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+
+
+def _compute_tile_positions(total_size: int, tile_size: int, overlap: int):
+    """Compute tile start positions along one dimension.
+
+    Returns list of (start, end) tuples covering the full dimension
+    with the specified overlap between adjacent tiles.
+    """
+    if total_size <= tile_size:
+        return [(0, total_size)]
+
+    stride = tile_size - overlap
+    positions = []
+    start = 0
+    while start < total_size:
+        end = min(start + tile_size, total_size)
+        # If the last tile is too small, shift it back
+        if end - start < tile_size and start > 0:
+            start = total_size - tile_size
+            end = total_size
+        positions.append((start, end))
+        if end >= total_size:
+            break
+        start += stride
+    return positions
+
+
+# ---------------------------------------------------------------------------
 # S3Diff Neuron Pipeline
 # ---------------------------------------------------------------------------
 
@@ -261,14 +307,24 @@ class VAEDecoderWrapper(nn.Module):
 class S3DiffNeuronPipeline:
     """End-to-end S3Diff super-resolution pipeline on Neuron.
 
-    Handles model loading, compilation, and inference.
+    Handles model loading, compilation, and inference. Supports arbitrary
+    input resolutions via tiling: images larger than the tile size (512x512
+    pixel HR) are split into overlapping tiles, processed independently,
+    and blended with Gaussian weights.
 
     Args:
         sd_turbo_path: Path to SD-Turbo checkpoint (stabilityai/sd-turbo)
         s3diff_weights_path: Path to s3diff.pkl weights
         de_net_path: Path to de_net.pth weights
         compile_dir: Directory for compiled model cache
-        lr_size: Input low-resolution size (default: 128)
+        lr_size: DEResNet input size (default: 128). The DEResNet is compiled
+            at this fixed size. Input images are resized to this before
+            degradation estimation.
+        tile_size: Pixel-space tile size for VAE/UNet (default: 512).
+            Must be divisible by 8.
+        tile_overlap: Pixel-space overlap between tiles (default: 128).
+            Must be divisible by 8. Larger overlap = smoother blending
+            but slower processing.
     """
 
     def __init__(
@@ -278,13 +334,19 @@ class S3DiffNeuronPipeline:
         de_net_path: str,
         compile_dir: str = "/tmp/s3diff/compiled/",
         lr_size: int = 128,
+        tile_size: int = TILE_SIZE,
+        tile_overlap: int = TILE_OVERLAP,
     ):
         self.sd_turbo_path = sd_turbo_path
         self.s3diff_weights_path = s3diff_weights_path
         self.de_net_path = de_net_path
         self.compile_dir = compile_dir
         self.lr_size = lr_size
-        self.hr_size = lr_size * SF
+        self.tile_size = tile_size
+        self.tile_overlap = tile_overlap
+
+        assert tile_size % LATENT_SCALE == 0, "tile_size must be divisible by 8"
+        assert tile_overlap % LATENT_SCALE == 0, "tile_overlap must be divisible by 8"
 
         # Will be set during load()
         self.de_net_neuron = None
@@ -479,13 +541,17 @@ class S3DiffNeuronPipeline:
         print("Model loaded successfully.")
 
     def compile(self):
-        """Compile all components with torch_neuronx.trace()."""
+        """Compile all components with torch_neuronx.trace().
+
+        Components are compiled at fixed tile_size (default 512x512 pixels).
+        Larger images are processed via tiling at inference time.
+        """
         import torch_neuronx
 
         os.makedirs(self.compile_dir, exist_ok=True)
         lr_h, lr_w = self.lr_size, self.lr_size
-        hr_h, hr_w = self.hr_size, self.hr_size
-        lat_h, lat_w = hr_h // 8, hr_w // 8
+        tile_h, tile_w = self.tile_size, self.tile_size
+        lat_h, lat_w = tile_h // LATENT_SCALE, tile_w // LATENT_SCALE
 
         # DEResNet
         path = os.path.join(self.compile_dir, "de_net.pt")
@@ -530,7 +596,7 @@ class S3DiffNeuronPipeline:
             self.vae_enc_neuron = torch_neuronx.trace(
                 self._vae_enc_wrapper,
                 (
-                    torch.randn(1, 3, hr_h, hr_w),
+                    torch.randn(1, 3, tile_h, tile_w),
                     torch.randn(1, 6, self.lora_rank_vae, self.lora_rank_vae),
                 ),
                 compiler_args=["--model-type=unet-inference", "-O1"],
@@ -587,8 +653,12 @@ class S3DiffNeuronPipeline:
     ) -> Image.Image:
         """Run 4x super-resolution on a low-resolution PIL image.
 
+        Supports arbitrary input sizes via tiling. Images whose HR size
+        (input * 4) exceeds tile_size are automatically split into overlapping
+        tiles, processed independently, and blended with Gaussian weights.
+
         Args:
-            lr_image: Input PIL image (should be lr_size x lr_size)
+            lr_image: Input PIL image (any size; will be 4x upscaled)
             pos_prompt: Positive text prompt
             neg_prompt: Negative text prompt
             cfg_scale: Classifier-free guidance scale
@@ -599,29 +669,22 @@ class S3DiffNeuronPipeline:
         to_tensor = transforms.ToTensor()
         im_lr = to_tensor(lr_image).unsqueeze(0)
 
-        # Preprocess: resize 4x + normalize + pad
+        # Resize LR image for DEResNet (fixed lr_size)
         ori_h, ori_w = im_lr.shape[2:]
-        im_lr_resize = F.interpolate(
+        im_lr_for_de = F.interpolate(
             im_lr,
-            size=(ori_h * SF, ori_w * SF),
+            size=(self.lr_size, self.lr_size),
             mode="bilinear",
             align_corners=False,
         )
-        im_lr_resize_norm = (im_lr_resize * 2 - 1.0).clamp(-1, 1)
-        resize_h, resize_w = im_lr_resize_norm.shape[2:]
-        im_lr_resize_norm = F.pad(
-            im_lr_resize_norm,
-            pad=(0, PAD_W - resize_w, 0, PAD_H - resize_h),
-            mode="reflect",
-        )
 
-        # 1. DEResNet -> degradation scores
-        deg_score = self.de_net_neuron(im_lr)
+        # 1. DEResNet -> degradation scores (on fixed lr_size input)
+        deg_score = self.de_net_neuron(im_lr_for_de)
 
-        # 2. Compute modulation on CPU
+        # 2. Compute modulation on CPU (same for all tiles)
         vae_de_mod_all, unet_de_mod_all = self.compute_modulation(deg_score)
 
-        # 3. Text encoding
+        # 3. Text encoding (same for all tiles)
         pos_tokens = self.tokenizer(
             pos_prompt,
             max_length=self.tokenizer.model_max_length,
@@ -639,21 +702,139 @@ class S3DiffNeuronPipeline:
         pos_enc = self.text_enc_neuron(pos_tokens)
         neg_enc = self.text_enc_neuron(neg_tokens)
 
-        # 4. VAE Encode (with de_mod)
-        latent = self.vae_enc_neuron(im_lr_resize_norm, vae_de_mod_all)
+        # Prepare HR image (4x bicubic upscale + normalize)
+        hr_h, hr_w = ori_h * SF, ori_w * SF
+        im_hr = F.interpolate(
+            im_lr,
+            size=(hr_h, hr_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        im_hr_norm = (im_hr * 2 - 1.0).clamp(-1, 1)
 
-        # 5. UNet x2 for CFG (with de_mod)
+        # Determine if tiling is needed
+        if hr_h <= self.tile_size and hr_w <= self.tile_size:
+            # Single tile path (pad to tile_size if needed)
+            pad_h = self.tile_size - hr_h
+            pad_w = self.tile_size - hr_w
+            if pad_h > 0 or pad_w > 0:
+                im_hr_norm = F.pad(
+                    im_hr_norm,
+                    pad=(0, pad_w, 0, pad_h),
+                    mode="reflect",
+                )
+            output = self._process_tile(
+                im_hr_norm,
+                vae_de_mod_all,
+                unet_de_mod_all,
+                pos_enc,
+                neg_enc,
+                cfg_scale,
+            )
+            output = output[:, :, :hr_h, :hr_w]
+        else:
+            # Tiled path for large images
+            output = self._process_tiled(
+                im_hr_norm,
+                hr_h,
+                hr_w,
+                vae_de_mod_all,
+                unet_de_mod_all,
+                pos_enc,
+                neg_enc,
+                cfg_scale,
+            )
+
+        return transforms.ToPILImage()((output[0] * 0.5 + 0.5).cpu().clamp(0, 1))
+
+    def _process_tile(
+        self, tile_pixels, vae_de_mod, unet_de_mod, pos_enc, neg_enc, cfg_scale
+    ):
+        """Process a single tile_size x tile_size pixel tile through the full pipeline."""
+        # VAE Encode
+        latent = self.vae_enc_neuron(tile_pixels, vae_de_mod)
+
+        # UNet x2 for CFG
         timestep = torch.tensor([999], dtype=torch.long)
-        pos_pred = self.unet_neuron(latent, timestep, pos_enc, unet_de_mod_all)
-        neg_pred = self.unet_neuron(latent, timestep, neg_enc, unet_de_mod_all)
+        pos_pred = self.unet_neuron(latent, timestep, pos_enc, unet_de_mod)
+        neg_pred = self.unet_neuron(latent, timestep, neg_enc, unet_de_mod)
         model_pred = neg_pred + cfg_scale * (pos_pred - neg_pred)
 
-        # 6. Scheduler step (CPU)
+        # Scheduler step (CPU)
         x_denoised = self.sched.step(
             model_pred.cpu(), torch.tensor([999]), latent.cpu(), return_dict=True
         ).prev_sample
 
-        # 7. VAE Decode
+        # VAE Decode
         output = self.vae_dec_neuron(x_denoised).clamp(-1, 1)
-        output = output[:, :, :resize_h, :resize_w]
-        return transforms.ToPILImage()((output[0] * 0.5 + 0.5).cpu().clamp(0, 1))
+        return output
+
+    def _process_tiled(
+        self,
+        im_hr_norm,
+        hr_h,
+        hr_w,
+        vae_de_mod,
+        unet_de_mod,
+        pos_enc,
+        neg_enc,
+        cfg_scale,
+    ):
+        """Process a large image via overlapping tiles with Gaussian blending."""
+        tile_size = self.tile_size
+        overlap = self.tile_overlap
+
+        # Compute tile positions
+        row_positions = _compute_tile_positions(hr_h, tile_size, overlap)
+        col_positions = _compute_tile_positions(hr_w, tile_size, overlap)
+
+        # Prepare output accumulator and weight map
+        output_acc = torch.zeros(1, 3, hr_h, hr_w)
+        weight_acc = torch.zeros(1, 1, hr_h, hr_w)
+
+        # Gaussian weight for blending
+        gauss_weight = _make_gaussian_weight(tile_size, tile_size)
+
+        n_tiles = len(row_positions) * len(col_positions)
+        tile_idx = 0
+
+        for y_start, y_end in row_positions:
+            for x_start, x_end in col_positions:
+                tile_idx += 1
+                th = y_end - y_start
+                tw = x_end - x_start
+
+                # Extract tile (pad if at edge and smaller than tile_size)
+                tile = im_hr_norm[:, :, y_start:y_end, x_start:x_end]
+                pad_h = tile_size - th
+                pad_w = tile_size - tw
+                if pad_h > 0 or pad_w > 0:
+                    tile = F.pad(tile, pad=(0, pad_w, 0, pad_h), mode="reflect")
+
+                # Process tile
+                tile_output = self._process_tile(
+                    tile,
+                    vae_de_mod,
+                    unet_de_mod,
+                    pos_enc,
+                    neg_enc,
+                    cfg_scale,
+                )
+
+                # Crop back to actual tile dimensions
+                tile_output = tile_output[:, :, :th, :tw]
+
+                # Blend with Gaussian weight
+                w = gauss_weight[:, :, :th, :tw]
+                output_acc[:, :, y_start:y_end, x_start:x_end] += tile_output.cpu() * w
+                weight_acc[:, :, y_start:y_end, x_start:x_end] += w
+
+                if n_tiles > 1:
+                    print(
+                        f"  Tile {tile_idx}/{n_tiles} "
+                        f"[{y_start}:{y_end}, {x_start}:{x_end}]"
+                    )
+
+        # Normalize by accumulated weights
+        output = output_acc / weight_acc.clamp(min=1e-8)
+        return output.clamp(-1, 1)

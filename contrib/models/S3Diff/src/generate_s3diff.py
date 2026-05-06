@@ -5,13 +5,20 @@
 S3Diff one-step 4x super-resolution on AWS Neuron.
 
 Downloads required weights (SD-Turbo, S3Diff LoRA, DEResNet), compiles all
-components, and runs super-resolution inference.
+components, and runs super-resolution inference. Supports arbitrary input
+resolutions via tiling (images whose 4x upscaled size exceeds 512x512 are
+automatically processed with overlapping tiles).
 
 Usage:
     python generate_s3diff.py \
         --input_image /path/to/lr_image.png \
         --output_image /path/to/sr_output.png \
         --compile_dir /tmp/s3diff/compiled/
+
+    # Multi-resolution examples:
+    # 128x128 input -> 512x512 output (single tile, ~0.5s)
+    # 256x256 input -> 1024x1024 output (9 tiles, ~4.8s)
+    # 512x512 input -> 2048x2048 output (25 tiles, ~13.3s)
 
 Requirements:
     pip install diffusers transformers peft accelerate torchvision
@@ -84,7 +91,7 @@ def main():
         "--input_image",
         type=str,
         default=None,
-        help="Path to input low-resolution image (128x128 recommended)",
+        help="Path to input low-resolution image (any size; will be 4x upscaled)",
     )
     parser.add_argument(
         "--output_image", type=str, default="sr_output.png", help="Output path"
@@ -95,6 +102,18 @@ def main():
     parser.add_argument("--compile_dir", type=str, default=DEFAULT_COMPILE_DIR)
     parser.add_argument("--num_images", type=int, default=3)
     parser.add_argument("--warmup_rounds", type=int, default=5)
+    parser.add_argument(
+        "--tile_size",
+        type=int,
+        default=512,
+        help="Pixel-space tile size for VAE/UNet (default: 512). Must be divisible by 8.",
+    )
+    parser.add_argument(
+        "--tile_overlap",
+        type=int,
+        default=128,
+        help="Pixel-space overlap between tiles (default: 128). Must be divisible by 8.",
+    )
     parser.add_argument("--download", action="store_true", help="Download weights")
     args = parser.parse_args()
 
@@ -110,15 +129,24 @@ def main():
         lr_image = Image.fromarray(test_img)
     else:
         lr_image = Image.open(args.input_image).convert("RGB")
-        print(f"Input image: {lr_image.size}")
 
-    # Build pipeline
+    lr_w, lr_h = lr_image.size
+    hr_w, hr_h = lr_w * 4, lr_h * 4
+    print(f"Input image: {lr_w}x{lr_h} -> Output: {hr_w}x{hr_h}")
+    if hr_h > args.tile_size or hr_w > args.tile_size:
+        print(
+            f"Tiling enabled (tile_size={args.tile_size}, overlap={args.tile_overlap})"
+        )
+
+    # Build pipeline (lr_size is always 128 for DEResNet)
     pipeline = S3DiffNeuronPipeline(
         sd_turbo_path=args.sd_turbo_path,
         s3diff_weights_path=args.s3diff_weights,
         de_net_path=args.de_net_weights,
         compile_dir=args.compile_dir,
-        lr_size=lr_image.size[0],
+        lr_size=128,
+        tile_size=args.tile_size,
+        tile_overlap=args.tile_overlap,
     )
 
     print("\nLoading model...")

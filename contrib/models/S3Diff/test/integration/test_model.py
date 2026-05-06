@@ -4,7 +4,8 @@ Integration tests for S3Diff one-step super-resolution on Neuron.
 Tests:
 1. test_smoke_pipeline_loads: Pipeline loads without errors
 2. test_sr_produces_correct_size: 128x128 -> 512x512
-3. test_warm_generation_time: < 2s per image
+3. test_warm_generation_time: < 2s per image (single tile)
+4. test_tiled_sr_256_to_1024: 256x256 -> 1024x1024 via tiling
 
 Requirements:
     - trn2.3xlarge
@@ -118,6 +119,38 @@ def test_warm_generation_time(pipeline):
     assert elapsed < 2.0, f"Generation took {elapsed:.3f}s, expected < 2s"
 
 
+def test_tiled_sr_256_to_1024(pipeline):
+    """256x256 input produces 1024x1024 output via tiling."""
+    test_img = make_test_image(256)
+    sr_img = pipeline(test_img)
+
+    assert isinstance(sr_img, Image.Image)
+    assert sr_img.size == (1024, 1024), f"Expected (1024, 1024), got {sr_img.size}"
+
+    # Verify reasonable pixel distribution (not blank/NaN)
+    sr_array = np.array(sr_img)
+    assert sr_array.shape == (1024, 1024, 3)
+    assert sr_array.std() > 10, "Output appears blank or uniform"
+    assert not np.any(np.isnan(sr_array.astype(np.float32))), "Output contains NaN"
+
+    # Save for inspection
+    os.makedirs(os.path.join(COMPILE_DIR, "test_outputs"), exist_ok=True)
+    sr_img.save(os.path.join(COMPILE_DIR, "test_outputs", "test_sr_1024.png"))
+    print(f"Tiled SR output (1024x1024) saved, pixel std={sr_array.std():.1f}")
+
+
+def test_tiled_sr_timing(pipeline):
+    """Tiled 256->1024 generation should complete in < 10s."""
+    test_img = make_test_image(256)
+
+    t0 = time.time()
+    pipeline(test_img)
+    elapsed = time.time() - t0
+    print(f"Tiled generation time (256->1024): {elapsed:.3f}s")
+
+    assert elapsed < 10.0, f"Tiled generation took {elapsed:.3f}s, expected < 10s"
+
+
 # Standalone runner
 if __name__ == "__main__":
     print("=" * 60)
@@ -132,28 +165,36 @@ if __name__ == "__main__":
         lr_size=LR_SIZE,
     )
 
-    print("\n[1/5] Loading...")
+    print("\n[1/6] Loading...")
     pipe.load()
 
-    print("\n[2/5] Compiling...")
+    print("\n[2/6] Compiling...")
     t0 = time.time()
     pipe.compile()
     print(f"  Compilation: {time.time() - t0:.1f}s")
 
-    print("\n[3/5] Warmup...")
+    print("\n[3/6] Warmup...")
     test_img = make_test_image()
     pipe(test_img)
 
-    print("\n[4/5] test_smoke_pipeline_loads")
+    print("\n[4/6] test_smoke_pipeline_loads")
     test_smoke_pipeline_loads(pipe)
     print("  PASSED")
 
-    print("\n[5/5] test_sr_produces_correct_size")
+    print("\n[5/6] test_sr_produces_correct_size")
     test_sr_produces_correct_size(pipe)
     print("  PASSED")
 
     print("\n[6/6] test_warm_generation_time")
     test_warm_generation_time(pipe)
+    print("  PASSED")
+
+    print("\n[7/7] test_tiled_sr_256_to_1024")
+    test_tiled_sr_256_to_1024(pipe)
+    print("  PASSED")
+
+    print("\n[8/8] test_tiled_sr_timing")
+    test_tiled_sr_timing(pipe)
     print("  PASSED")
 
     print("\nAll tests passed!")
