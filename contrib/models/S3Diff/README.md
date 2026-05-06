@@ -130,7 +130,9 @@ python test/integration/test_model.py
 
 ## Known Issues
 
-- **LoRA + `--auto-cast=matmult` produces NaN**: The LoRA modulation einsum operations are numerically unstable when `--auto-cast=matmult` casts them to BF16. The VAE encoder, UNet, and VAE decoder all use `--model-type=unet-inference` instead, which avoids this issue. Only DEResNet and text encoder (no LoRA) use `--auto-cast=matmult`.
+- **Fixed resolution only (128x128 -> 512x512)**: This implementation uses `torch_neuronx.trace()` which compiles static tensor shapes. Each input resolution requires a separate compilation. The pipeline is validated at 128x128 input only.
+- **Higher resolutions (256->1024, 512->2048, etc.) produce degraded or NaN output** when using trace(). The LoRA modulation einsum operations accumulate BF16 rounding errors at larger spatial dimensions. For multi-resolution or high-resolution (1K/2K/4K) super-resolution, use `torch.compile(backend="neuron")` on the UNet's `Transformer2DModel` blocks instead, with latent tiling for resolutions above 1K. See [xniwangaws/NeuronStuff/s3diff-benchmark](https://github.com/xniwangaws/NeuronStuff/tree/main/s3diff-benchmark) for a validated multi-resolution implementation using PyTorch Native (6.14s @ 1K, 60s @ 2K, 303s @ 4K).
+- **LoRA + `--auto-cast=matmult` produces NaN**: The LoRA modulation einsum operations are numerically unstable when `--auto-cast=matmult` casts them to BF16. The VAE encoder, UNet, and VAE decoder all use `--model-type=unet-inference` instead, which avoids this issue at 128x128. Only DEResNet and text encoder (no LoRA) use `--auto-cast=matmult`.
 - **Compilation time**: ~21 minutes total (UNet is the slowest at ~12 min). Compiled models are cached for reuse.
 - **CFG is sequential**: Two separate UNet passes (positive + negative prompt), not batched. Batching with batch_size=2 would halve UNet wall time but requires recompilation.
 - **Neuron runtime HBM**: Once loaded, compiled models stay in HBM even if the Python object is deleted (within the same process). Plan memory accordingly.
