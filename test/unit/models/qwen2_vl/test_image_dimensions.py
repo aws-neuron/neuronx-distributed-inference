@@ -15,6 +15,7 @@ from neuronx_distributed_inference.models.qwen2_vl.utils.constants import (
 from neuronx_distributed_inference.models.qwen2_vl.utils.vision_utils import (
     calculate_max_grid_size, get_image_dimensions
 )
+from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLNeuronConfig
 
 
 class TestCalculateMaxGridSize:
@@ -69,9 +70,7 @@ class TestGetImageDimensions:
 
     def test_with_custom_dimensions(self):
         """Test get_image_dimensions returns custom values from config."""
-        neuron_config = Mock()
-        neuron_config.default_image_width = 1024
-        neuron_config.default_image_height = 768
+        neuron_config = Qwen2VLNeuronConfig(default_image_width=1024, default_image_height=768)
 
         width, height = get_image_dimensions(neuron_config)
 
@@ -80,7 +79,7 @@ class TestGetImageDimensions:
 
     def test_with_default_fallback(self):
         """Test get_image_dimensions falls back to defaults when not in config."""
-        neuron_config = Mock(spec=[])  # Empty spec = no attributes
+        neuron_config = Qwen2VLNeuronConfig()
 
         width, height = get_image_dimensions(neuron_config)
 
@@ -89,8 +88,7 @@ class TestGetImageDimensions:
 
     def test_with_partial_config(self):
         """Test get_image_dimensions with only width specified."""
-        neuron_config = Mock(spec=['default_image_width'])
-        neuron_config.default_image_width = 800
+        neuron_config = Qwen2VLNeuronConfig(default_image_width = 800)
 
         width, height = get_image_dimensions(neuron_config)
 

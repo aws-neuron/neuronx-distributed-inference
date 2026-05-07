@@ -34,6 +34,25 @@ NeuronX Distributed Inference implementation of helium 1 2b.
 
 **Status:** ✅ GOOD
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-20
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.43 | 0.00 |
+| MBU (%) | 0.24 | 0.59 |
+| HFU (%) | 0.46 | 0.01 |
+| Execution Time (us) | 0.02 | 0.01 |
+| HBM Read | 2.10 GB | 1.93 GB |
+| HBM Write | 222.09 MB | 2.10 MB |
+
+**Throughput:** 40.09 tok/s | **Compile Time:** 193.53s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -98,6 +117,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

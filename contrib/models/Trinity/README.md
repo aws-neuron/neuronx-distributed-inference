@@ -583,6 +583,36 @@ Trinity's mixed attention (sliding window + full attention every 4th layer) requ
 
 3. **`TrinityKVCacheManager`** replaces the standard `KVCacheManager` with per-layer awareness. All layers share uniform `max_length` cache buffers (required for CTE `fill_prefix` safety), but during TKG, scatter indices are modulated per-layer (sliding: `position % sliding_window`, global: raw position) and KV reads are sliced per-layer (sliding: `sliding_window`, global: `max_length`).
 
+## LNC (Logical NeuronCore) Configuration
+
+On trn2 instances, the LNC setting determines the number of logical NeuronCores and therefore the **valid TP degrees**. The Neuron runtime requires `NEURON_RT_NUM_CORES` to be either 1 or the full device (all logical cores). Intermediate values are rejected at runtime.
+
+| LNC | Logical Cores (trn2.3xlarge) | Valid TP | HBM per Core |
+|-----|------------------------------|----------|--------------|
+| LNC=2 (default) | 4 | **1 or 4 only** | 24 GB |
+| LNC=1 | 8 | **1 or 8 only** | 12 GB shared |
+
+**Common pitfall:** TP=2 is NOT valid with LNC=2 on trn2.3xlarge. The runtime error is: `NEURON_RT_NUM_CORES must request one core, or the whole device (multiple of 8)`. To use TP=2, switch to LNC=1 (which gives 8 logical cores, making TP=2 valid). However, LNC=1 halves HBM bandwidth per core.
+
+**Practical impact on Trinity:**
+- **Nano (TP=1):** Works on both LNC=1 and LNC=2
+- **Nano (TP=2):** Requires LNC=1. Use TP=1 or TP=4 with default LNC=2
+- **Mini (TP=4):** Works on LNC=2 (default) -- uses all 4 logical cores
+- **Large (TP=64):** Works on LNC=2 (default) on trn2.48xlarge -- uses all 64 logical cores
+
+To check or change LNC:
+```bash
+# Check current LNC
+neuron-ls  # Shows logical core count
+
+# Set LNC=1 (persistent, requires reboot)
+echo 'NEURON_LOGICAL_NC_CONFIG=1' | sudo tee /etc/environment
+sudo reboot
+
+# Set LNC=1 (current session only)
+export NEURON_LOGICAL_NC_CONFIG=1
+```
+
 ## Compatibility Matrix
 
 | Model | Instance | TP | LNC | Max seq_len | Status |
@@ -792,4 +822,4 @@ The NxDI framework uses several NKI (Neuron Kernel Interface) kernels during Tri
 
 Jim Burtoft
 
-**Last Updated:** 2026-03-18 (added fused MoE TKG with expert_bias benchmark: Mini +29% throughput, 5/5 correctness match)
+**Last Updated:** 2026-03-18 (added LNC configuration note with valid TP degrees per LNC mode; added fused MoE TKG with expert_bias benchmark: Mini +29% throughput, 5/5 correctness match)

@@ -19,9 +19,9 @@ from neuronx_distributed_inference.modules.attention import gqa
     ],
     # fmt: on
 )
-@patch('neuronx_distributed_inference.modules.attention.gqa._traced_qkv_kernel_nki')
-def test_kernel_qkv_forward_rope_fusion(mock_traced_qkv_kernel_nki, batch_size, seq_len, fuse_rope):
-    """Test that _traced_qkv_kernel_nki is called with correct arguments when rope fusion is enabled."""
+@patch('neuronx_distributed_inference.modules.attention.gqa.qkv_kernel')
+def test_kernel_qkv_forward_rope_fusion(mock_qkv_kernel, batch_size, seq_len, fuse_rope):
+    """Test that qkv_kernel is called with correct arguments when rope fusion is enabled."""
     
     # Test parameters
     hidden_size = 16
@@ -35,12 +35,12 @@ def test_kernel_qkv_forward_rope_fusion(mock_traced_qkv_kernel_nki, batch_size, 
     cos_cache = torch.rand((batch_size, seq_len, head_dim)) if fuse_rope else None
     sin_cache = torch.rand((batch_size, seq_len, head_dim)) if fuse_rope else None
     
-    # Mock _traced_qkv_kernel_nki
+    # Mock qkv kernel
     fused_qkv_size = (num_attention_heads + 2 * num_key_value_heads) * head_dim // tp_degree
     QKV = torch.rand((batch_size, seq_len, fused_qkv_size))
     
     mock_kernel_call = MagicMock(return_value=QKV)
-    mock_traced_qkv_kernel_nki.__getitem__ = MagicMock(return_value=mock_kernel_call)
+    mock_qkv_kernel.__getitem__ = MagicMock(return_value=mock_kernel_call)
     
     # Create a mock GroupQueryAttention_QKV instance
     qkv_proj = Mock(spec=gqa.GroupQueryAttention_QKV)
@@ -77,7 +77,7 @@ def test_kernel_qkv_forward_rope_fusion(mock_traced_qkv_kernel_nki, batch_size, 
     )
     
     # Verify the kernel was called
-    mock_traced_qkv_kernel_nki.__getitem__.assert_called_once()
+    mock_qkv_kernel.__getitem__.assert_called_once_with(qkv_proj.logical_nc_config)
     mock_kernel_call.assert_called_once()
     
     # Check the kernel arguments
@@ -85,20 +85,14 @@ def test_kernel_qkv_forward_rope_fusion(mock_traced_qkv_kernel_nki, batch_size, 
     
     if fuse_rope:
         # When rope fusion is enabled, cos_cache and sin_cache should be passed
-        assert "cos_cache" in kernel_kwargs
-        assert "sin_cache" in kernel_kwargs
-        assert "num_q_heads" in kernel_kwargs
-        assert "num_kv_heads" in kernel_kwargs
         torch.testing.assert_close(kernel_kwargs["cos_cache"], cos_cache)
         torch.testing.assert_close(kernel_kwargs["sin_cache"], sin_cache)
         assert kernel_kwargs["num_q_heads"] == num_attention_heads // tp_degree
         assert kernel_kwargs["num_kv_heads"] == num_key_value_heads // tp_degree
     else:
         # When rope fusion is disabled, cos_cache and sin_cache should NOT be passed
-        assert "cos_cache" not in kernel_kwargs
-        assert "sin_cache" not in kernel_kwargs
-        assert "num_q_heads" not in kernel_kwargs
-        assert "num_kv_heads" not in kernel_kwargs
+        assert kernel_kwargs["cos_cache"] is None
+        assert kernel_kwargs["sin_cache"] is None
     
     # Verify result is a tuple with Q, K, V, residual
     assert len(result) == 4

@@ -8,31 +8,61 @@ from torch_neuronx.xla_impl.ops import xla_hlo_call
 
 from neuronx_distributed_inference.modules.custom_calls import neuron_cumsum
 
-import neuronxcc.nki.isa as nisa
-import neuronxcc.nki.language as nl
-import neuronxcc.nki as nki
-import neuronxcc.nki.typing as nt
-from neuronxcc.nki._pre_prod_kernels.util.kernel_helpers import get_program_sharding_info
+import nki
+import nki.language as nl
+import nki.isa as nisa
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 
-@nki.compiler.skip_middle_end_transformations
-@nki.jit(platform_target='trn2', experimental_flags='enable-mutable-parameter')
-def write_kv_cache_at_batch_kernel(K: nt.tensor, V: nt.tensor, K_prior: nt.tensor[nt.mutable], V_prior: nt.tensor[nt.mutable], batch_idx):
-    batch_idx = nl.load(batch_idx)
+@nki.jit
+def write_kv_cache_at_batch_kernel(K, V, K_prior, V_prior, batch_idx):
+    """ NKI kernel to correspondingly write K and V to the
+    batch_idx of K_prior and V_prior. Return the updated K_prior and V_prior
 
-    _, h, s, d = K.shape
-    _, v_h, v_s, v_d = V.shape
-    _, n_prgs, prg_id = get_program_sharding_info()
+    K: src tensor of shape (1, H, S, D) on HBM
+    V: src tensor of shape (1, H, S, D) on HBM
+    K_prior: dst tensor of shape (B, H, S_prior, D) on HBM
+    V_prior: dst tensor of shape (B, H, S_prior, D) on HBM
+    batch_idx: tensor of shape (1, ) on HBM
+    """
 
-    assert n_prgs == 2 or n_prgs == 1, "LNC sharding not specified"
+    _, n_prgs, prg_id = get_verified_program_sharding_info("write_kv_cache_at_batch_kernel", (0, 1), 2)
 
-    _, i_h, i_s, i_d = nl.mgrid[:1, :h, :s, :d]
-    _, v_i_h, v_i_s, v_i_d = nl.mgrid[:1, :v_h, :v_s, :v_d]
+    batch_idx_sbuf = nl.ndarray((1, 1), dtype=batch_idx.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=batch_idx_sbuf, src=batch_idx.reshape((1, 1)))
 
+    # each nc will process one K or V
     if prg_id == 0:
-        nisa.dma_copy(src=K, dst=K_prior[batch_idx, i_h, i_s, i_d], oob_mode=nisa.oob_mode.skip)
+        S = K.shape[2]
+        B, H, S_prior, D = K_prior.shape
+        K_prior_view = K_prior.ap(
+            pattern=[
+                [D * S_prior * H, 1], [D * S_prior, H], [D, S], [1, D]
+            ],
+            offset=0,
+            scalar_offset=batch_idx_sbuf,
+            indirect_dim=0,
+        )
+        nisa.dma_copy(
+            src=K, dst=K_prior_view,
+            oob_mode=nisa.oob_mode.skip
+        )
     if prg_id == n_prgs - 1:
-        nisa.dma_copy(src=V, dst=V_prior[batch_idx, v_i_h, v_i_s, v_i_d], oob_mode=nisa.oob_mode.skip)
+
+        S = V.shape[2]
+        B, H, S_prior, D = V_prior.shape
+        V_prior_view = V_prior.ap(
+            pattern=[
+                [D * S_prior * H, 1], [D * S_prior, H], [D, S], [1, D]
+            ],
+            offset=0,
+            scalar_offset=batch_idx_sbuf,
+            indirect_dim=0,
+        )
+        nisa.dma_copy(
+            src=V, dst=V_prior_view,
+            oob_mode=nisa.oob_mode.skip
+        )
 
     return K_prior, V_prior
 

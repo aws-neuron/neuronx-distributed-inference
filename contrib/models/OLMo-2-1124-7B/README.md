@@ -91,6 +91,25 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 # ... (see integration test for full example)
 ```
 
+### Device Profiling Metrics
+
+**Configuration:** TP=8, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.14 | 0.00 |
+| MBU (%) | 0.29 | 0.53 |
+| HFU (%) | 0.16 | 0.00 |
+| Execution Time (us) | 0.02 | 0.01 |
+| HBM Read | 1.87 GB | 1.73 GB |
+| HBM Write | 82.95 MB | 1.02 MB |
+
+**Throughput:** 57.01 tok/s | **Compile Time:** 369.97s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Implementation Notes
 
 ### Q-K Normalization with Tensor Parallelism

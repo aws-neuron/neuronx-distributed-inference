@@ -113,7 +113,7 @@ STRIDED_KERNEL_CP_CONFIG_CP16_TP4 = NeuronConfig(
 )
 
 @pytest.fixture(scope="module", autouse=True)
-def model_path():
+def model_path(set_module_seed):
     # Load model from config, and save with random weights.
     config_path = os.path.dirname(os.path.abspath(__file__)) + "/config.json"
 

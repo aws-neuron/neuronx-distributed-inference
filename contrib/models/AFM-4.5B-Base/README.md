@@ -39,6 +39,25 @@ NeuronX Distributed Inference implementation of AFM 4.5B Base (Arcee architectur
 2. **ReLU² Activation:** Uses `relu(x).pow(2)` instead of SwiGLU - only `up_proj` and `down_proj` (no `gate_proj`)
 3. **State Dict Conversion:** QKV projections are separate in HF, combined into `qkv_proj` for Neuron
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.28 | 0.00 |
+| MBU (%) | 0.58 | 0.61 |
+| HFU (%) | 0.31 | 0.03 |
+| Execution Time (us) | 0.04 | 0.03 |
+| HBM Read | 9.23 GB | 8.60 GB |
+| HBM Write | 218.55 MB | 2.03 MB |
+
+**Throughput:** 24.92 tok/s | **Compile Time:** 588.37s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python

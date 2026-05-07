@@ -1,12 +1,14 @@
 import pytest
 import torch
+import os
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.modules.kvcache.data_parallel_kv_cache_manager import DataParallelKVCacheManager
 from neuronx_distributed_inference.modules.kvcache.utils import write_kv_cache_at_batch_kernel
 
 from torch_xla.core import xla_model as xm
-from neuronxcc.nki.language import nc 
+from torch_neuronx.utils import get_platform_target
+
 class MockSPMDRank:
     def __init__(self, rank):
         self._rank = rank
@@ -112,6 +114,13 @@ def test_kernel_update_oob_seq_ids(create_manager):
     ])
 def test_write_kv_cache_at_batch_kernel_execution(batch_size, num_heads, seq_len, prior_seq_len, head_dim, idx, lnc):
     """Test actual execution of write_kv_cache_at_batch_kernel function."""
+    # setup NKI envvar if not available
+    if not os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+        os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
+    
+    if get_platform_target() == "trn1" and lnc == 2:
+        pytest.skip("LNC-2 is not supported in trn1")
+                     
     device = xm.xla_device()
     
     # Create input K and V tensors with known values
@@ -136,8 +145,7 @@ def test_write_kv_cache_at_batch_kernel_execution(batch_size, num_heads, seq_len
     V_prior = V_prior.to(device)
 
     # Call the kernel function directly
-    grid = (nc(lnc),)
-    K_prior, V_prior = write_kv_cache_at_batch_kernel[grid](K, 
+    K_prior, V_prior = write_kv_cache_at_batch_kernel[lnc](K, 
                                                     V, 
                                                     K_prior,
                                                     V_prior, 

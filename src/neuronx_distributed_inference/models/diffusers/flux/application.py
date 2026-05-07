@@ -14,11 +14,7 @@ from neuronx_distributed_inference.models.diffusers.flux.modeling_flux import (
     FluxBackboneInferenceConfig,
     NeuronFluxBackboneApplication,
 )
-from neuronx_distributed_inference.models.diffusers.flux.pipeline import (
-    NeuronFluxPipeline,
-    NeuronFluxFillPipeline,
-    NeuronFluxControlPipeline,
-)
+from neuronx_distributed_inference.models.diffusers.flux.pipeline import NeuronFluxPipeline
 from neuronx_distributed_inference.models.diffusers.flux.vae.modeling_vae import (
     NeuronVAEDecoderApplication,
     VAEDecoderInferenceConfig,
@@ -34,39 +30,43 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-def get_flux_parallelism_config(instance_type: str, context_parallel_enabled: bool = True):
+def get_flux_parallelism_config(
+    backbone_tp_degree: int,
+    context_parallel_enabled: bool = False,
+    cfg_parallel_enabled: bool = False
+) -> int:
     """
-    Get the world_size and backbone_tp_degree based on instance type and context parallel settings.
+    Get the world_size based on backbone_tp_degree and parallelism settings.
 
     Args:
-        instance_type: The instance type (e.g., "trn1", "trn2")
-        context_parallel_enabled: Whether context parallelism is enabled (default: True)
+        backbone_tp_degree: The tensor parallelism degree for the backbone model
+        context_parallel_enabled: Whether context parallelism is enabled (default: False)
+        cfg_parallel_enabled: Whether CFG parallelism is enabled (default: False)
 
     Returns:
-        tuple: (world_size, backbone_tp_degree)
+        int: world_size (equals backbone_tp_degree, or 2x if context/CFG parallel enabled)
+
+    Note:
+        context_parallel_enabled and cfg_parallel_enabled are mutually exclusive.
+        Both require world_size = 2 × backbone_tp_degree (dp_degree=2).
     """
-    world_size = 8
-    backbone_tp_degree = 8
+    # Validate mutual exclusivity
+    if context_parallel_enabled and cfg_parallel_enabled:
+        raise ValueError(
+            "context_parallel_enabled and cfg_parallel_enabled are mutually exclusive. "
+            "Only one can be True at a time."
+        )
 
-    if instance_type == "trn1":
-        if context_parallel_enabled:
-            world_size = 16
-            backbone_tp_degree = 8
-        else:
-            world_size = 8
-            backbone_tp_degree = 8
-    elif instance_type == "trn2":
-        if context_parallel_enabled:
-            world_size = 8
-            backbone_tp_degree = 4
-        else:
-            world_size = 4
-            backbone_tp_degree = 4
+    # Determine if we need 2x world_size (either for context parallel or CFG parallel)
+    use_2x_world_size = context_parallel_enabled or cfg_parallel_enabled
 
-    return world_size, backbone_tp_degree
+    world_size = backbone_tp_degree * 2 if use_2x_world_size else backbone_tp_degree
+
+    return world_size
 
 
-def create_flux_config(model_path, world_size, backbone_tp_degree, dtype, height, width, inpaint=False):
+def create_flux_config(model_path, world_size, backbone_tp_degree, dtype, height, width, inpaint=False,
+                       cfg_parallel_enabled=False, context_parallel_enabled=False):
     text_encoder_path = os.path.join(model_path, "text_encoder")
     text_encoder_2_path = os.path.join(model_path, "text_encoder_2")
     backbone_path = os.path.join(model_path, "transformer")
@@ -98,6 +98,8 @@ def create_flux_config(model_path, world_size, backbone_tp_degree, dtype, height
         torch_dtype=dtype,
     )
     backbone_config = FluxBackboneInferenceConfig(
+        cfg_parallel_enabled=cfg_parallel_enabled,
+        context_parallel_enabled=context_parallel_enabled,
         neuron_config=backbone_neuron_config,
         load_config=load_diffusers_config(backbone_path),
         height=height,
@@ -144,6 +146,7 @@ class NeuronFluxApplication(nn.Module):
         transformer_path: Optional[str] = None,
         height: int = 1024,
         width: int = 1024,
+        pipeline_class=NeuronFluxPipeline,
     ):
         super().__init__()
         self.model_path = model_path
@@ -156,7 +159,7 @@ class NeuronFluxApplication(nn.Module):
         self.width = width
         self.max_sequence_length = 512
 
-        self.pipe = NeuronFluxPipeline.from_pretrained(
+        self.pipe = pipeline_class.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
         )
@@ -180,291 +183,24 @@ class NeuronFluxApplication(nn.Module):
             model_path=self.vae_decoder_path, config=self.decoder_config
         )
 
-    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None):
-        compiler_workdir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
+    def _compile_component(self, component, component_name, compiled_model_path, compiler_workdir, debug):
+        component_path = os.path.join(compiled_model_path, f"{component_name}/")
+        if os.path.exists(component_path):
+            logger.info(f"{component_name} already compiled at {component_path}, skipping compilation.")
+        else:
+            os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(compiler_workdir, component_name)
+            component.compile(component_path, debug)
 
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(
-            compiler_workdir, "text_encoder"
-        )
-        self.pipe.text_encoder.compile(
-            os.path.join(compiled_model_path, "text_encoder/"),
-            debug,
-            pre_shard_weights_hook,
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(
-            compiler_workdir, "text_encoder_2"
-        )
-        self.pipe.text_encoder_2.compile(
-            os.path.join(compiled_model_path, "text_encoder_2/"),
-            debug,
-            pre_shard_weights_hook,
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(
-            compiler_workdir, "transformers"
-        )
-        self.pipe.transformer.compile(
-            os.path.join(compiled_model_path, "transformer/"),
-            debug,
-            pre_shard_weights_hook,
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(compiler_workdir, "decoder")
-        self.pipe.vae.decoder.compile(
-            os.path.join(compiled_model_path, "decoder/"), debug, pre_shard_weights_hook
-        )
+    def compile(self, compiled_model_path, debug=False):
+        compiler_workdir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
+        self._compile_component(self.pipe.text_encoder, "text_encoder", compiled_model_path, compiler_workdir, debug)
+        self._compile_component(self.pipe.text_encoder_2, "text_encoder_2", compiled_model_path, compiler_workdir, debug)
+        self._compile_component(self.pipe.transformer, "transformer", compiled_model_path, compiler_workdir, debug)
+        self._compile_component(self.pipe.vae.decoder, "decoder", compiled_model_path, compiler_workdir, debug)
         os.environ["BASE_COMPILE_WORK_DIR"] = compiler_workdir
 
     def load(
         self, compiled_model_path, start_rank_id=None, local_ranks_size=None, skip_warmup=False
-    ):
-        self.pipe.text_encoder.load(
-            os.path.join(compiled_model_path, "text_encoder/"),
-            start_rank_id,
-            local_ranks_size,
-            skip_warmup,
-        )
-        self.pipe.text_encoder_2.load(
-            os.path.join(compiled_model_path, "text_encoder_2/"),
-            start_rank_id,
-            local_ranks_size,
-            skip_warmup,
-        )
-        self.pipe.transformer.load(
-            os.path.join(compiled_model_path, "transformer/"),
-            start_rank_id,
-            local_ranks_size,
-            skip_warmup,
-        )
-        self.pipe.vae.decoder.load(
-            os.path.join(compiled_model_path, "decoder/"),
-            start_rank_id,
-            local_ranks_size,
-            skip_warmup,
-        )
-
-    def __call__(self, *args, **kwargs):
-        return self.pipe(*args, **kwargs)
-
-
-class NeuronFluxFillApplication(nn.Module):
-    def __init__(
-        self,
-        model_path: str,
-        text_encoder_config: InferenceConfig,
-        text_encoder2_config: InferenceConfig,
-        backbone_config: InferenceConfig,
-        decoder_config: InferenceConfig,
-        text_encoder_path: Optional[str] = None,
-        text_encoder_2_path: Optional[str] = None,
-        vae_decoder_path: Optional[str] = None,
-        transformer_path: Optional[str] = None,
-        height: int = 1024,
-        width: int = 1024,
-    ):
-        super().__init__()
-        self.model_path = model_path
-        self.text_encoder_path = text_encoder_path or os.path.join(
-            model_path, "text_encoder"
-        )
-        self.text_encoder_2_path = text_encoder_2_path or os.path.join(
-            model_path, "text_encoder_2"
-        )
-        self.transformer_path = transformer_path or os.path.join(
-            model_path, "transformer"
-        )
-        self.vae_decoder_path = vae_decoder_path or os.path.join(model_path, "vae")
-
-        self.height = height
-        self.width = width
-        self.max_sequence_length = 512
-
-        self.pipe = NeuronFluxFillPipeline.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-        )
-
-        self.text_encoder_config = text_encoder_config
-        self.text_encoder2_config = text_encoder2_config
-        self.backbone_config = backbone_config
-        self.decoder_config = decoder_config
-
-        self.pipe.text_encoder = NeuronClipApplication(
-            model_path=self.text_encoder_path, config=self.text_encoder_config
-        )
-        self.pipe.text_encoder_2 = NeuronT5Application(
-            model_path=self.text_encoder_2_path, config=self.text_encoder2_config
-        )
-        self.pipe.transformer = NeuronFluxBackboneApplication(
-            model_path=self.transformer_path,
-            config=self.backbone_config,
-        )
-        self.pipe.vae.decoder = NeuronVAEDecoderApplication(
-            model_path=self.vae_decoder_path, config=self.decoder_config
-        )
-
-    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None):
-        compiler_workdir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
-
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(
-            compiler_workdir, "text_encoder"
-        )
-        self.pipe.text_encoder.compile(
-            os.path.join(compiled_model_path, "text_encoder/"),
-            debug,
-            pre_shard_weights_hook,
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(
-            compiler_workdir, "text_encoder_2"
-        )
-        self.pipe.text_encoder_2.compile(
-            os.path.join(compiled_model_path, "text_encoder_2/"),
-            debug,
-            pre_shard_weights_hook,
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(
-            compiler_workdir, "transformers"
-        )
-        self.pipe.transformer.compile(
-            os.path.join(compiled_model_path, "transformer/"),
-            debug,
-            pre_shard_weights_hook,
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(compiler_workdir, "decoder")
-        self.pipe.vae.decoder.compile(
-            os.path.join(compiled_model_path, "decoder/"), debug, pre_shard_weights_hook
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = compiler_workdir
-
-    def load(
-        self,
-        compiled_model_path,
-        start_rank_id=None,
-        local_ranks_size=None,
-        skip_warmup=False,
-    ):
-        self.pipe.text_encoder.load(
-            os.path.join(compiled_model_path, "text_encoder/"),
-            start_rank_id,
-            local_ranks_size,
-            skip_warmup,
-        )
-        self.pipe.text_encoder_2.load(
-            os.path.join(compiled_model_path, "text_encoder_2/"),
-            start_rank_id,
-            local_ranks_size,
-            skip_warmup,
-        )
-        self.pipe.transformer.load(
-            os.path.join(compiled_model_path, "transformer/"),
-            start_rank_id,
-            local_ranks_size,
-            skip_warmup,
-        )
-        self.pipe.vae.decoder.load(
-            os.path.join(compiled_model_path, "decoder/"),
-            start_rank_id,
-            local_ranks_size,
-            skip_warmup,
-        )
-
-    def __call__(self, *args, **kwargs):
-        return self.pipe(*args, **kwargs)
-
-
-class NeuronFluxControlApplication(nn.Module):
-    def __init__(
-        self,
-        model_path: str,
-        text_encoder_config: InferenceConfig,
-        text_encoder2_config: InferenceConfig,
-        backbone_config: InferenceConfig,
-        decoder_config: InferenceConfig,
-        text_encoder_path: Optional[str] = None,
-        text_encoder_2_path: Optional[str] = None,
-        vae_decoder_path: Optional[str] = None,
-        transformer_path: Optional[str] = None,
-        height: int = 1024,
-        width: int = 1024,
-    ):
-        super().__init__()
-        self.model_path = model_path
-        self.text_encoder_path = text_encoder_path or os.path.join(
-            model_path, "text_encoder"
-        )
-        self.text_encoder_2_path = text_encoder_2_path or os.path.join(
-            model_path, "text_encoder_2"
-        )
-        self.transformer_path = transformer_path or os.path.join(
-            model_path, "transformer"
-        )
-        self.vae_decoder_path = vae_decoder_path or os.path.join(model_path, "vae")
-
-        self.height = height
-        self.width = width
-        self.max_sequence_length = 512
-
-        self.pipe = NeuronFluxControlPipeline.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-        )
-
-        self.text_encoder_config = text_encoder_config
-        self.text_encoder2_config = text_encoder2_config
-        self.backbone_config = backbone_config
-        self.decoder_config = decoder_config
-
-        self.pipe.text_encoder = NeuronClipApplication(
-            model_path=self.text_encoder_path, config=self.text_encoder_config
-        )
-        self.pipe.text_encoder_2 = NeuronT5Application(
-            model_path=self.text_encoder_2_path, config=self.text_encoder2_config
-        )
-        self.pipe.transformer = NeuronFluxBackboneApplication(
-            model_path=self.transformer_path,
-            config=self.backbone_config,
-        )
-        self.pipe.vae.decoder = NeuronVAEDecoderApplication(
-            model_path=self.vae_decoder_path, config=self.decoder_config
-        )
-
-    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None):
-        compiler_workdir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model/")
-
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(
-            compiler_workdir, "text_encoder"
-        )
-        self.pipe.text_encoder.compile(
-            os.path.join(compiled_model_path, "text_encoder/"),
-            debug,
-            pre_shard_weights_hook,
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(
-            compiler_workdir, "text_encoder_2"
-        )
-        self.pipe.text_encoder_2.compile(
-            os.path.join(compiled_model_path, "text_encoder_2/"),
-            debug,
-            pre_shard_weights_hook,
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(
-            compiler_workdir, "transformers"
-        )
-        self.pipe.transformer.compile(
-            os.path.join(compiled_model_path, "transformer/"),
-            debug,
-            pre_shard_weights_hook,
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = os.path.join(compiler_workdir, "decoder")
-        self.pipe.vae.decoder.compile(
-            os.path.join(compiled_model_path, "decoder/"), debug, pre_shard_weights_hook
-        )
-        os.environ["BASE_COMPILE_WORK_DIR"] = compiler_workdir
-
-    def load(
-        self,
-        compiled_model_path,
-        start_rank_id=None,
-        local_ranks_size=None,
-        skip_warmup=False,
     ):
         self.pipe.text_encoder.load(
             os.path.join(compiled_model_path, "text_encoder/"),

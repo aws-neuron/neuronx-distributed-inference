@@ -56,8 +56,7 @@ class SDPA_Meta(nn.Module):
 
 
 class SDPA_Maskless(nn.Module):
-    def __init__(self, use_flash_attention):
-        self.use_flash_attention = use_flash_attention
+    def __init__(self):
         super().__init__()
 
     def forward(self, x, ar, Q, K, V):
@@ -80,11 +79,7 @@ class SDPA_Maskless(nn.Module):
             V,
             mask_gen_vectors=mask_gen_vectors,
             dtype=TORCH_DTYPE,
-            use_flash_attention=self.use_flash_attention,
         )
-        if self.use_flash_attention:
-            # Output is BHDS from the kernel, convert to BHSD
-            attn_output = attn_output.transpose(-1, -2)
         return attn_output
 
 
@@ -114,12 +109,12 @@ def test_maskless_sdpa():
 
     cpu_model_meta = SDPA_Meta()
     save_checkpoint(cpu_model_meta)
-    cpu_model_maskless = SDPA_Maskless(use_flash_attention=False)
+    cpu_model_maskless = SDPA_Maskless()
     cpu_model_maskless.load_state_dict(load_checkpoint())
 
     example_inputs = get_example_inputs()
     neuron_model_maskless = trace_nxd_model(
-        SDPA_Maskless, example_inputs, tp_degree=1, use_flash_attention=True
+        SDPA_Maskless, example_inputs, tp_degree=1
     )
 
     aspect_ratios = [[1, 1], [1, 2], [1, 3], [1, 4], [2, 1], [2, 2], [3, 1], [4, 1]]

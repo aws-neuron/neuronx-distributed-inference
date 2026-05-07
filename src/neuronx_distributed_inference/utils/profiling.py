@@ -11,13 +11,14 @@ from neuronx_distributed_inference.utils.constants import (
 PROFILE_BASE_DIR = "./profile/"
 
 
-def run_shell_command(cmd_str):
-    print("Running command: " + cmd_str)
+def run_shell_command(cmd):
+    print("Running command: " + " ".join(cmd))
+
     try:
-        process = subprocess.run(cmd_str, capture_output=True, shell=True)
+        process = subprocess.run(cmd, capture_output=True, shell=False)
         process.check_returncode()
     except Exception as exception:
-        print(f"Got an exception when running command {cmd_str}")
+        print(f"Got an exception when running command {' '.join(cmd)}")
         stdout = process.stdout.decode('utf-8')
         print(f"STDOUT: {stdout}")
         print(f"STDERR: {process.stderr.decode('utf-8')}")
@@ -30,7 +31,7 @@ def run_shell_command(cmd_str):
     return process.stdout.decode("utf-8")
 
 
-def run_profiler_on_neff(neff_path, output_ntff_folder, world_size):
+def run_profiler_on_neff(neff_path, output_ntff_folder, world_size, extra_flags=None):
     os.makedirs(output_ntff_folder, exist_ok=True)
     ntff_prefix = output_ntff_folder + "profile"
     capture_command = ["/opt/aws/neuron/bin/neuron-profile", "capture",
@@ -38,15 +39,16 @@ def run_profiler_on_neff(neff_path, output_ntff_folder, world_size):
                        # Run world_size workers for collectives
                        "--collectives-workers-per-node", str(world_size),
                        # Generate ntff only for worker 0
-                       "--collectives-profile-id 0",
+                       "--collectives-profile-id", "0",
                        # Run two executions
-                       "--num-exec 2",
+                       "--num-exec", "2",
                        # Profile the second execution (first is warmup)
-                       "--profile-nth-exec 2",
+                       "--profile-nth-exec", "2",
                        # Ignore errors
                        "--ignore-exec-errors",
                        ]
-    capture_command = " ".join(capture_command)
+    if extra_flags:
+        capture_command.extend(extra_flags)
     run_shell_command(capture_command)
 
     # Use the data from the second execution (to exclude one-time initialization overheads)
@@ -55,7 +57,6 @@ def run_profiler_on_neff(neff_path, output_ntff_folder, world_size):
                     "-n", neff_path, "-s", ntff_path,
                     "--output-format", "summary-json",
                     "--ignore-nc-buf-usage"]
-    view_command = " ".join(view_command)
     output = run_shell_command(view_command)
     metrics = list(json.loads(output).values())[0]
     print("Profiling metrics: " + str(metrics))

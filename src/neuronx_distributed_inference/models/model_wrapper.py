@@ -28,6 +28,9 @@ from neuronx_distributed_inference.modules.async_execution import (
     get_async_output,
     is_ranked_io,
 )
+from neuronx_distributed.utils.tensor_capture import (
+    enable_tensor_capture,
+)
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 from neuronx_distributed_inference.modules.padding import pad_with_first_batchline
 
@@ -108,10 +111,7 @@ class ModelWrapper(torch.nn.Module):
             if self.neuron_config.scratchpad_page_size:
                 self.compiler_args += f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size} "
 
-            if self.is_block_kv_layout and (
-                self.neuron_config.attn_block_tkg_nki_kernel_enabled
-                or self.neuron_config.attn_tkg_nki_kernel_enabled
-            ):
+            if self.is_block_kv_layout and self.neuron_config.attn_block_tkg_nki_kernel_enabled:
                 # Remove once NCC-6661 is resolved.
                 self.compiler_args += " --internal-backend-options='--enable-verifier=false' "
 
@@ -495,16 +495,21 @@ class ModelWrapper(torch.nn.Module):
         for arg in args[len(padded_args):empty_tensor_count]:
             padded_args.append(arg)
 
-        # Tensors for replacement
+        # Tensors for replacement - don't pad 2D tensors (tensor replacement args)
         tf_tensors_start = len(args) - 2 * tf_arg_count
         tf_tensors_end = len(args) - tf_arg_count
         for arg in args[tf_tensors_start:tf_tensors_end]:
-            padded_arg = pad_helper(
-                arg,
-                pad_type="repeat_first_batchline",
-                batch_sort_indices=indices,
-            )
-            padded_args.append(padded_arg)
+            # Don't pad 2D tensors (tensor replacement arguments like router outputs)
+            if arg.dim() == 2:
+                padded_args.append(arg)
+            else:
+                # Pad 3D+ tensors normally
+                padded_arg = pad_helper(
+                    arg,
+                    pad_type="repeat_first_batchline",
+                    batch_sort_indices=indices,
+                )
+                padded_args.append(padded_arg)
 
         # Masks for replacement that don't need to be padded up to batch dim
         for arg in args[-tf_arg_count:]:
@@ -1127,14 +1132,10 @@ class ModelWrapper(torch.nn.Module):
                 return tuple(args)
         else:
             padded_attn_mask = F.pad(args[1], (0, prefix_bucket - args[1].shape[1]), "constant", 0)
-            attn_tkg_nki_kernel_enabled = (
-                self.neuron_config.attn_block_tkg_nki_kernel_enabled
-                or self.neuron_config.attn_tkg_nki_kernel_enabled
-            )
             block_table_arg_idx = 8 if self.neuron_config.enable_fused_speculation else 12
             block_table = args[block_table_arg_idx]
             pad_right = (prefix_bucket // self.neuron_config.pa_block_size) - block_table.shape[1]
-            block_table_padding = -1 if attn_tkg_nki_kernel_enabled else 0
+            block_table_padding = -1 if self.neuron_config.attn_block_tkg_nki_kernel_enabled else 0
             padded_block_table = F.pad(block_table, (0, pad_right), "constant", block_table_padding)
             new_args = list(args)
             new_args[1] = padded_attn_mask
@@ -1535,6 +1536,15 @@ class DecoderModelInstance(BaseModelInstance):
             reg = TensorReplacementRegister.get_instance()
             reg.hooks = hooks.values()
 
+        # Enable tensor capture if configured
+        if self.neuron_config.tensor_capture_config:
+            self.module = enable_tensor_capture(
+                self.module,
+                modules_to_capture=self.neuron_config.tensor_capture_config.modules_to_capture,
+                max_tensors=self.neuron_config.tensor_capture_config.max_intermediate_tensors,
+                capture_inputs=self.neuron_config.tensor_capture_config.capture_inputs
+            )
+
     def get(self, bucket_rank, **kwargs):
         if bucket_rank is not None:
             if self.neuron_config.is_prefix_caching:
@@ -1570,6 +1580,11 @@ class DecoderModelInstance(BaseModelInstance):
         # generating HLO
         self.input_output_aliases = {}
         num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
+
+        # Add tensor capture to output count if enabled
+        if self.neuron_config.tensor_capture_config:
+            num_output_from_trace += self.neuron_config.tensor_capture_config.get_offset()
+
         if self.neuron_config.enable_fused_speculation:
             num_output_from_trace += 1
             if self.module.draft_model.kv_mgr is not None:
@@ -1593,7 +1608,6 @@ class DecoderModelInstance(BaseModelInstance):
                 self.input_output_aliases[self.module.hidden_state_rolling_buffer.hidden_states] = (
                     num_output_from_trace * 2 + len(draft_past_key_values)
                 ) + len(target_past_key_values)
-
         else:
             # TODO: This else block is a short-term fix for Llava/ViT models to use DecoderModelInstance.
             #       Long-term, these models should use a different implementation of BaseModelInstance.

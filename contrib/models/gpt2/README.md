@@ -58,6 +58,25 @@ All benchmarks pass within ±2% of the HF reference. Largest delta is truthfulqa
 
 **Status:** ✅ PASS
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.06 | 0.00 |
+| MBU (%) | 0.16 | 0.28 |
+| HFU (%) | 0.10 | 0.05 |
+| Execution Time (us) | 0.00 | 0.00 |
+| HBM Read | 132.55 MB | 126.27 MB |
+| HBM Write | 9.10 MB | 505.2 KB |
+
+**Throughput:** 308.10 tok/s | **Compile Time:** 40.53s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Implementation Notes
 
 ### Absolute Position Embeddings

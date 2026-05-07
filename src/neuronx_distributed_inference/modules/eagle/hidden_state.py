@@ -1,17 +1,16 @@
 import torch
 
-import neuronxcc.nki.isa as nisa
-import neuronxcc.nki.language as nl
-import neuronxcc.nki as nki
-import neuronxcc.nki.typing as nt
+import nki
+import nki.isa as nisa
+import nki.language as nl
 
 
-@nki.jit(experimental_flags='enable-mutable-parameter')
+@nki.jit
 def rolling_buffer_set_state(
-    buffer: nt.tensor[nt.mutable],  # float [max_batch_size, buffer_size, hidden_size]
-    hidden_states: nt.tensor,       # float [batch_size, hidden_size]
-    batch_ids: nt.tensor,           # int   [batch_size]
-    position_ids: nt.tensor         # int   [batch_size]
+    buffer: nl.ndarray,  # float [max_batch_size, buffer_size, hidden_size] - mutable
+    hidden_states: nl.ndarray,   # float [batch_size, hidden_size]
+    batch_ids: nl.ndarray,       # int   [batch_size]
+    position_ids: nl.ndarray,    # int   [batch_size]
 ):
     """
     Insert hidden states into a rolling buffer at the batch & token position.
@@ -45,18 +44,30 @@ def rolling_buffer_set_state(
 
     reshaped = buffer.reshape((max_batch_size * buffer_size, hidden_size))
 
-    # Loop over batch to avoid issues with HBM -> HBM Vector DMAs (uCode-135)
-    for i in nl.static_range(batch_size):
+    batch_id_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    position_id_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    index = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
 
+    # Loop over batch to avoid issues with HBM -> HBM Vector DMAs (uCode-135)
+    for i in range(batch_size):
         # Compute positional offset into the rolling buffer
-        batch_id = nl.load(batch_ids[i])
-        position_id = nl.load(position_ids[i])
-        base = nisa.tensor_scalar(batch_id, nl.multiply, buffer_size)
-        index = nisa.tensor_tensor(base, position_id, op=nl.add)
+        nisa.dma_copy(dst=batch_id_sb, src=batch_ids[i])
+        nisa.dma_copy(dst=position_id_sb, src=position_ids[i])
+        nisa.tensor_scalar(dst=base, data=batch_id_sb, op0=nl.multiply, operand0=buffer_size)
+        nisa.tensor_tensor(dst=index, data1=base, data2=position_id_sb, op=nl.add)
 
         # Scatter into the hidden buffer on one NeuronCore
-        b_i, h_i = nl.mgrid[i:i + 1, :hidden_size]
-        nisa.dma_copy(src=hidden_states[b_i, h_i], dst=reshaped[index, h_i], oob_mode=nisa.oob_mode.skip)
+        nisa.dma_copy(
+            dst=reshaped.ap(
+                pattern=[[hidden_size, 1], [1, hidden_size]],
+                offset=0,
+                scalar_offset=index,
+                indirect_dim=0
+            ),
+            src=hidden_states[i, 0:hidden_size],
+            oob_mode=nisa.oob_mode.skip
+        )
 
     return buffer
 
@@ -129,7 +140,7 @@ class HiddenStateRollingBuffer(torch.nn.Module):
         if hidden_state.device.type == 'cpu' or not self.use_kernel:
             result = torch.index_put(self.hidden_states, index, hidden_state)
         else:
-            result = rolling_buffer_set_state(self.hidden_states, hidden_state, *index)
+            result = rolling_buffer_set_state(self.hidden_states.data, hidden_state, *index)
 
         if self.inplace:
             self.hidden_states.data = result

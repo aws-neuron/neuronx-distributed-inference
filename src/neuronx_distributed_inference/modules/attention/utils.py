@@ -621,30 +621,6 @@ def validate_tp_prefill_to_dp_decode(num_kv_heads, world_size, dp_degree):
     assert tp_heads_per_rank == dp_heads_per_rank, "DP configuration is not supported"
 
 
-def reshape_qkv_for_chunked_flash_attention_kernel(Q, K, V, chunk_size, torch_dtype):
-    # Since bsz is always 1, we can bring n_chunks dimension into batch dimension
-    # Starting shape for Q, K, V: BHSD. Since S = n_chunks * chunk_size, we can reshape as follows
-    bsz, num_heads, q_len, head_dim = Q.shape
-    n_chunks = math.ceil(q_len / chunk_size)
-    Q = Q.reshape(bsz, num_heads, n_chunks, chunk_size, head_dim).squeeze(0)
-    Q = (
-        Q.permute(1, 0, 3, 2)
-        .reshape((n_chunks * num_heads, head_dim, chunk_size))
-        .to(torch_dtype)
-    )
-    K = K.reshape(bsz, num_heads, n_chunks, chunk_size, head_dim).squeeze(0)
-    K = (
-        K.permute(1, 0, 3, 2)
-        .reshape((n_chunks * num_heads, head_dim, chunk_size))
-        .to(torch_dtype)
-    )
-    V = V.reshape(bsz, num_heads, n_chunks, chunk_size, head_dim).squeeze(0)
-    V = V.reshape((n_chunks * num_heads, chunk_size, head_dim)).to(
-        torch_dtype
-    )
-    return Q, K, V
-
-
 def get_last_kv_chunk(attention_chunk_size, position_ids, latest_k, latest_v):
     """
     For chunked attention, first determine the latest chunk we are in based on position id.

@@ -10,9 +10,9 @@ from neuronx_distributed.operators.topk import get_topk_implementation
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
 from neuronx_distributed.utils.utils import hardware
-from neuronxcc.nki._private_kernels.cumsum import cumsum as nki_cumsum
+from nkilib.core.cumsum.cumsum import cumsum as nki_cumsum
 from torch_neuronx.utils import get_platform_target
-from torch_neuronx.xla_impl.ops import nki_jit, xla_hlo_call
+from torch_neuronx.xla_impl.ops import xla_hlo_call
 
 from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.modules.attention.attention_process_groups import get_tp_cp_group_mesh, get_cp_group_mesh
@@ -64,9 +64,7 @@ def cumsum(tensor_in, dim, on_cpu: False):
     if torch.is_floating_point(tensor_in):
         logger.debug("Using NKI cumsum")
         tensor_in = tensor_in.view(-1, cumsum_len)
-        nki_cumsum_func = nki_jit()(nki_cumsum)
-        output = torch.zeros_like(tensor_in, device=tensor_in.device, dtype=tensor_in.dtype)
-        nki_cumsum_func(tensor_in, output, axis=1)
+        output = nki_cumsum(tensor_in, axis=1)
         output = output.view(init_shape)
         if is_transposed:
             output = torch.transpose(output, cumsum_dim, last_dim)
@@ -504,7 +502,7 @@ class DataParallelSampler(Sampler):
                 self.rank_id_map[self.all2all_mesh[r][c]] = torch.tensor(self.all2all_mesh[r])
 
     def _batch_sharded_topk(self, tensor, k, dim, rank_id):
-        topk_implementation, call_topk_kernel_with_sorted_parameter, _ = get_topk_implementation(use_topk_rotated_kernel=self.top_k_kernel_enabled, lnc=self.lnc, dim=dim, tensor=tensor)
+        topk_implementation, call_topk_kernel_with_sorted_parameter, _ = get_topk_implementation(use_topk_rotated_kernel=self.top_k_kernel_enabled, lnc=self.lnc)
         tensor = xm.all_to_all(
             tensor,
             split_dimension=0,

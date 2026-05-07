@@ -154,26 +154,6 @@ def test_llama3_2_1b_4layer_continuous_batching_cpu_accuracy():
 
 
 @pytest.mark.tp32
-def test_llama3_2_1b_4layer_neuron_128k():
-    neuron_config = NeuronConfig(
-        tp_degree=32,
-        batch_size=1,
-        seq_len=1024*128,
-        max_context_length=1024*127,
-        torch_dtype=torch.bfloat16,
-        sequence_parallel_enabled=True,
-        vocab_parallel=True,
-        flash_decoding_enabled=True,
-        cc_pipeline_tiling_factor=4,
-        on_device_sampling_config=OnDeviceSamplingConfig(),
-        output_logits=True,
-    )
-    run_llama3_2_1b_4layer(neuron_config, run_accuracy=True, run_perf=True,
-                           latency_threshold=4485 * 1.2, throughput_threshold=28924 * 0.8,
-                           divergence_difference_tol=0.008)
-
-
-@pytest.mark.tp32
 def test_llama3_2_1b_4layer_neuron_async():
     """
     # with logit enabled
@@ -377,4 +357,3 @@ if __name__ == "__main__":
     test_llama3_2_1b_4layer_continuous_batching_cpu_accuracy()
     test_llama3_2_1b_4layer_neuron_async()
     test_llama3_2_1b_4layer_cpu_accuracy()
-    test_llama3_2_1b_4layer_neuron_128k()

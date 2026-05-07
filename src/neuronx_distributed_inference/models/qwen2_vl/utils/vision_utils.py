@@ -5,6 +5,7 @@ Utility functions for Qwen2-VL vision model.
 from neuronx_distributed_inference.models.qwen2_vl.utils.constants import (
     DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT
 )
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 
 def get_image_dimensions(neuron_config):
@@ -41,3 +42,20 @@ def calculate_max_grid_size(image_width, image_height, patch_size=14):
     max_dimension = max(image_width, image_height)
     max_grid = int((max_dimension * buffer_factor) / patch_size) + 1
     return max_grid
+
+
+def calculate_pixels_per_image(image_width, image_height, patch_size=14):
+    """
+    Calculate the pixels per image based on image dimensions and patch size.
+
+    Args:
+        image_width: Width of the input image
+        image_height: Height of the input image
+        patch_size: Size of each patch (default: 14)
+
+    Returns:
+        pixels per image
+    """
+    resized_height, resized_width = smart_resize(width=image_width, height=image_height)
+    pixels_per_image = (resized_height // patch_size) * (resized_width // patch_size)
+    return pixels_per_image

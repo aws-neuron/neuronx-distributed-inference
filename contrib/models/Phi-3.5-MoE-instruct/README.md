@@ -49,6 +49,25 @@ NeuronX Distributed Inference implementation of Phi-3.5-MoE-Instruct from Micros
 
 **Note:** Low token matching is due to sampling divergence at close probability tokens, not model incorrectness. High cosine similarity (0.9937) confirms logit distributions are nearly identical. Both HF and Neuron outputs are coherent and semantically equivalent.
 
+### Device Profiling Metrics
+
+**Configuration:** TP=8, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-20
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.37 | 0.00 |
+| MBU (%) | 0.48 | 0.88 |
+| HFU (%) | 0.36 | 0.00 |
+| Execution Time (us) | 0.19 | 0.01 |
+| HBM Read | 33.49 GB | 2.90 GB |
+| HBM Write | 3.15 GB | 2.31 MB |
+
+**Throughput:** 5.34 tok/s | **Compile Time:** 1333.15s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -121,6 +140,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

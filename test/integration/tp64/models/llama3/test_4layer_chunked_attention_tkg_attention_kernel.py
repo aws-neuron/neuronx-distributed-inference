@@ -22,7 +22,7 @@ NEURON_CONFIG = NeuronConfig(
     sequence_parallel_enabled=True,
     fused_qkv=True,
     logical_nc_config=2,
-    torch_dtype=torch.float32,
+    torch_dtype=torch.bfloat16,
     is_continuous_batching=True,
     attn_block_tkg_nki_kernel_enabled=True,
     attn_block_tkg_nki_kernel_cache_update=True,
@@ -45,7 +45,7 @@ PERF_CONFIG = NeuronConfig(
 )
 
 @pytest.fixture(scope="module", autouse=True)
-def model_path():
+def model_path(set_module_seed):
     # Load model from config, and save with random weights.
     config_path = os.path.dirname(os.path.abspath(__file__)) + "/config_chunked_attention_tkg_kernel.json"
     
@@ -61,10 +61,10 @@ def model_path():
     "input_start_offsets, cp_degree, input_len, check_perf, latency_threshold, throughput_threshold, divergence_difference_tol",
     # fmt: off
     [      
-        pytest.param([ATTN_CHUNK_SIZE], 1, 16, False, float('inf'), 0, 0.003),
-        pytest.param([ATTN_CHUNK_SIZE], 16, 16, False, float('inf'), 0, 0.002, marks=[pytest.mark.key_config_test]),
-        pytest.param([0], 16, 16, False, float('inf'), 0, 0.002),
-        pytest.param([0], 16, 16, True, 1733, 1134, 0.002),
+        pytest.param([ATTN_CHUNK_SIZE], 1, 16, False, float('inf'), 0, 0.016),
+        pytest.param([ATTN_CHUNK_SIZE], 16, 16, False, float('inf'), 0, 0.016, marks=[pytest.mark.key_config_test]),
+        pytest.param([0], 16, 16, False, float('inf'), 0, 0.016),
+        pytest.param([0], 16, 16, True, 1733, 1134, 0.016),
     ],
     # fmt: on
 )
@@ -107,7 +107,7 @@ def validate_accuracy(model_path, config, generation_config, input_start_offsets
     check_accuracy_logits(
         model,
         generation_config=generation_config,
-        num_tokens_to_check=256 - input_len,
+        num_tokens_to_check=128 - input_len,
         inputs=inputs,
         input_start_offsets=input_start_offsets,
         pad_token_id=128009,

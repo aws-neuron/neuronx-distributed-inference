@@ -20,7 +20,7 @@ from neuronx_distributed_inference.utils.testing import _rand_interval
 from .test_config import get_qwen2_vl_config
 
 
-NUM_OF_IMAGES = 50
+NUM_OF_IMAGES = 128
 NUM_TOKENS_TO_CHECK = 16
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -62,7 +62,7 @@ def save_checkpoint(config_path):
 @pytest.mark.parametrize(
     "dtype, model_type, tkg_batch_size, text_tp_degree, vision_tp_degree, world_size, text_seq_length, vision_seq_len, max_new_tokens",
     [
-        pytest.param(torch.float16, "Qwen2_VL_Vision_Text", 1, 4, 4, 4, 256*(NUM_OF_IMAGES+1), 1012*NUM_OF_IMAGES, 256),
+        pytest.param(torch.float16, "Qwen2_VL_Vision_Text", 1, 4, 1, 4, 256 * (NUM_OF_IMAGES + 1), 1012 * NUM_OF_IMAGES, 256),
     ],
 )
 def test_original_cpu_vs_nxdi_neuron(dtype, model_type, tkg_batch_size, text_tp_degree, vision_tp_degree, world_size, text_seq_length, vision_seq_len, max_new_tokens):
@@ -85,6 +85,7 @@ def test_original_cpu_vs_nxdi_neuron(dtype, model_type, tkg_batch_size, text_tp_
                                 max_new_tokens=max_new_tokens,
                                 text_buckets = [text_seq_length],
                                 vision_buckets= [NUM_OF_IMAGES],
+                                enable_ve_data_parallel=True,
                                 )
     generation_config = GenerationConfig(do_sample=False,
                                          bos_token_id = 151643,
@@ -166,4 +167,4 @@ def test_original_cpu_vs_nxdi_neuron(dtype, model_type, tkg_batch_size, text_tp_
     return
 
 if __name__ == "__main__":
-    test_original_cpu_vs_nxdi_neuron(torch.float16, "Qwen2_VL_Vision_Text", 1, 4, 4, 4, 256*(NUM_OF_IMAGES+1), 1012*NUM_OF_IMAGES, 256)
+    test_original_cpu_vs_nxdi_neuron(torch.float16, "Qwen2_VL_Vision_Text", 1, 4, 1, 4, 256 * (NUM_OF_IMAGES + 1), 1012 * NUM_OF_IMAGES, 256)

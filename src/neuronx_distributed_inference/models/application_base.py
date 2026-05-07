@@ -289,7 +289,7 @@ class NeuronApplicationBase(torch.nn.Module):
                 )
                 specific_config.save(submodel_path)
 
-    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None, dry_run=False):
+    def compile(self, compiled_model_path, debug=False, pre_shard_weights_hook=None, dry_run=False, disable_fail_fast=False):
         # set compile-time env vars if needed
         set_compile_env_vars(self.neuron_config)
 
@@ -299,9 +299,10 @@ class NeuronApplicationBase(torch.nn.Module):
         self.config.save(compiled_model_path)
         logger.info(f"Saving the neuron_config to {compiled_model_path}")
 
-        traced_model = self.get_builder(debug).trace(
-            initialize_model_weights=False, dry_run=dry_run
-        )
+        trace_kwargs = dict(initialize_model_weights=False, dry_run=dry_run)
+        if disable_fail_fast:
+            trace_kwargs["disable_fail_fast"] = True
+        traced_model = self.get_builder(debug).trace(**trace_kwargs)
 
         self._save_configs_to_compiler_workdir()
 
@@ -414,7 +415,8 @@ class NeuronApplicationBase(torch.nn.Module):
         self.traced_model.nxd_model.initialize(weights, start_rank_tensor)
 
         if self.neuron_config.lora_config and self.neuron_config.lora_config.dynamic_multi_lora:
-            self.lora_model_manager.init_dynamic_multi_lora(lora_cpu_weights)
+            cte_model = self.get_cte_model()
+            self.lora_model_manager.init_dynamic_multi_lora(lora_cpu_weights, cte_model)
 
         logger.info(f"Finished weights loading in {time.monotonic() - start_time} seconds")
 

@@ -71,6 +71,7 @@ def benchmark_sampling(
             vision_mask,
             num_chunks,
             has_image,
+            image_grid_thw,
         ) = get_sample_inputs(END_TO_END_MODEL, model.config, sampling_params, image=image)
 
         input_param = {
@@ -109,6 +110,9 @@ def benchmark_sampling(
 
         if vision_mask is not None:
             input_param["vision_mask"] = vision_mask
+
+        if image_grid_thw is not None:
+            input_param["image_grid_thw"] = image_grid_thw
 
         if target == "all":
             latency_collectors = create_submodule_latency_collectors(model)
@@ -225,7 +229,8 @@ def get_sample_inputs(model_type, config: InferenceConfig, sampling_params, imag
     if model_type == END_TO_END_MODEL:
         input_ids = torch.randint(0, 100, (batch_size, input_length))
         attention_mask = torch.ones((batch_size, input_length), dtype=torch.int32)
-        pixel_values, aspect_ratios, vision_mask, num_chunks, has_image = (
+        pixel_values, aspect_ratios, vision_mask, num_chunks, has_image, image_grid_thw = (
+            None,
             None,
             None,
             None,
@@ -245,6 +250,17 @@ def get_sample_inputs(model_type, config: InferenceConfig, sampling_params, imag
                 num_channels = config.vision_config.num_channels
                 image_size = config.vision_config.image_size
                 pixel_values = torch.ones([neuron_config.batch_size, num_channels, image_size, image_size])
+            elif config.model_type == "qwen3_vl":
+                from neuronx_distributed_inference.models.qwen2_vl.utils.constants import DEFAULT_PIXELS_PER_IMAGE
+                TOTAL_PATCHES = config.vision_config.in_channels * config.vision_config.patch_size * config.vision_config.patch_size * config.vision_config.temporal_patch_size
+                DEFAULT_TEMPORAL_PATCHES = 1
+                DEFAULT_HIGHT_PATCHES = 22
+                DEFAULT_WIDTH_PATCHES =  DEFAULT_PIXELS_PER_IMAGE // DEFAULT_HIGHT_PATCHES
+                pixel_values = torch.ones([DEFAULT_PIXELS_PER_IMAGE, TOTAL_PATCHES])
+                num_image_tokens = DEFAULT_PIXELS_PER_IMAGE // (config.vision_config.spatial_merge_size ** 2)
+                inject_pos = input_length // 2
+                input_ids[:, inject_pos : inject_pos + num_image_tokens] = config.image_token_id
+                image_grid_thw = torch.tensor([[ DEFAULT_TEMPORAL_PATCHES, DEFAULT_HIGHT_PATCHES, DEFAULT_WIDTH_PATCHES]])
             else:
                 pixel_values, aspect_ratios, num_chunks, has_image = get_image_tensors(
                     config, [[]] * batch_size
@@ -262,6 +278,7 @@ def get_sample_inputs(model_type, config: InferenceConfig, sampling_params, imag
             vision_mask,
             num_chunks,
             has_image,
+            image_grid_thw,
         )
 
     elif model_type == CONTEXT_ENCODING_MODEL:

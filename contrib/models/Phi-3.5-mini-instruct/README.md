@@ -59,6 +59,25 @@ NeuronX Distributed Inference implementation of Phi 3.5 mini instruct.
    - Split fused gate_up into `gate_proj` and `up_proj`
    - Let preshard_hook handle o_proj mapping (don't add extra prefix)
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.24 | 0.00 |
+| MBU (%) | 0.46 | 0.57 |
+| HFU (%) | 0.26 | 0.00 |
+| Execution Time (us) | 0.02 | 0.02 |
+| HBM Read | 3.84 GB | 3.75 GB |
+| HBM Write | 109.93 MB | 2.47 MB |
+
+**Throughput:** 46.44 tok/s | **Compile Time:** 236.26s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python

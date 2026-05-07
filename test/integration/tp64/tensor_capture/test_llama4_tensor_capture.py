@@ -328,6 +328,7 @@ def test_llama4_tensor_capture_modules_only():
     model_tempdir.cleanup()
 
 @pytest.mark.tp64
+@pytest.mark.xfail(reason="Llama4 is incompatible with NKI Beta v2 kernels, so no longer supported in NxDI")
 def test_llama4_tensor_capture_with_inputs():
     """Test tensor capture with modules_to_capture and capture_inputs enabled for Llama4"""
     # Load model config and save with random weights
@@ -379,6 +380,7 @@ def test_llama4_tensor_capture_with_inputs():
 
 
 @pytest.mark.tp64
+@pytest.mark.xfail(reason="Llama4 is incompatible with NKI Beta v2 kernels, so no longer supported in NxDI")
 def test_llama4_tensor_capture_all_options():
     """Test tensor capture with all options enabled for Llama4"""
     # Load model config and save with random weights

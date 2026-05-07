@@ -217,7 +217,7 @@ def get_compiler_args(world_size=4):
     compiler_args = "--model-type=transformer -O1"
     # Add flags for cc-overlap
     compiler_args += (
-        " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
+        " --tensorizer-options='--enable-ccop-compute-overlap'"
     )
     compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
 

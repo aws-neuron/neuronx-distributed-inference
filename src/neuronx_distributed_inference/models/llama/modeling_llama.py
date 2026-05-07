@@ -24,7 +24,6 @@ import logging
 import math
 from torch.nn import functional as F
 
-from importlib import import_module
 from typing import List, Optional, Tuple, Type
 
 import torch
@@ -39,21 +38,13 @@ from neuronx_distributed.parallel_layers.mappings import (
     gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
-    reduce_scatter_to_sequence_parallel_region_tiled,
 )
 from neuronx_distributed.parallel_layers.utils import get_padding_length
 from neuronx_distributed.utils import cpu_mode
-from neuronxcc.nki._private_kernels.mlp import (
-    mlp_fused_add_isa_kernel,
-    mlp_isa_kernel,
-    quant_mlp_fused_add_isa_kernel,
-    quant_mlp_isa_kernel,
-)
-from neuronxcc.nki._private_kernels.rmsnorm import rmsnorm_quant_isa_kernel
-from neuronxcc.nki.compiler.backends.neuron.dimensions import CCPipeline  # noqa: N813
-from neuronxcc.nki.language import nc
+import nki.language as nl
+from nkilib.core.rmsnorm.rmsnorm_quant import rmsnorm_quant_kernel, RmsNormQuantKernelArgs
 from torch import nn
-from torch_neuronx.xla_impl.ops import nki_jit
+from torch_neuronx.xla_impl.ops import RmsNorm
 from transformers import LlamaForCausalLM
 from transformers.activations import ACT2FN
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
@@ -77,58 +68,16 @@ from neuronx_distributed_inference.modules.attention.attention_process_groups im
     init_context_parallel_attention_process_groups
 )
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
-from torch_neuronx.xla_impl.ops import RmsNorm
-
 from neuronx_distributed_inference.modules.eagle.utils import tiled_all_gather_matmul
 from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
-from neuronx_distributed_inference.utils.decorator_peeling import peel_decorations
 from neuronx_distributed_inference.utils.distributed import get_tp_group
 from neuronx_distributed_inference.models.gpt_oss.mx_layout_transform import shuffle_hidden_dim
 
-from neuronxcc.nki._pre_prod_kernels import NormType
-
-from torch_neuronx.utils import get_platform_target
-from neuronxcc.nki import jit
-from neuronxcc.nki.compiler import skip_middle_end_transformations, enable_stack_allocator
+from nkilib.core.mlp.mlp import mlp
+from nkilib.core.utils.common_types import NormType, QuantizationType, ActFnType
 logger = logging.getLogger("Neuron")
 
-use_quantization_type = False
-try:
-    from neuronxcc.nki._pre_prod_kernels import QuantizationType
-    use_quantization_type = True
-except Exception:
-    logger.info("Could not import QuantizationType. Using old quant kernel interface.")
-
-
-def import_nki_mlp_tkg_kernel():
-    mod = import_module("neuronxcc.nki._pre_prod_kernels.mlp_tkg.mlp_tkg_isa")
-
-    if get_platform_target() == "trn1":
-        return None
-
-    nki_mlp_tkg_isa_function = getattr(mod, "nki_mlp_tkg_isa_kernel", None)
-    if nki_mlp_tkg_isa_function is None:
-        return None
-
-    # Check feature flag for backwards compatibility
-    has_fp8_enablement = getattr(mod, "MLP_TKG_FP8_ENABLED", False)
-    if has_fp8_enablement is False:
-        return None
-
-    # nki_mlp_tkg_isa_function's decoration's in the compiler suffer from bug in detecting the correct target platform
-    # This can be circumvented by utilizing mode='torchxla' instead of mode='trace'. Which is what the peeling of decorations and redecorations do here
-    # This should not be done in the compiler side since it results in the loss of JAX compatibility and causes unit tests to fail
-    # TODO: Remove peeling and redecorating hack once the bug is resolved
-    undecorated_nki_mlp_tkg_isa_function = peel_decorations(nki_mlp_tkg_isa_function)
-    decorated_nki_mlp_tkg_isa_function = jit(undecorated_nki_mlp_tkg_isa_function, mode='torchxla', platform_target=get_platform_target(), show_compiler_tb=True, debug_kernel=True)
-    decorated_nki_mlp_tkg_isa_function = skip_middle_end_transformations(decorated_nki_mlp_tkg_isa_function)
-    decorated_nki_mlp_tkg_isa_function = enable_stack_allocator(decorated_nki_mlp_tkg_isa_function, log_level=logging.INFO)
-
-    return decorated_nki_mlp_tkg_isa_function
-
-
-_trace_nki_mlp_tkg_kernel = import_nki_mlp_tkg_kernel()
 
 _LLAMA_MODULE_MAP = {}
 
@@ -369,13 +318,16 @@ class NeuronLlamaMLP(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.act_fn = ACT2FN[config.hidden_act]
 
+        self.kernel_act_fn = ActFnType.SiLU
+        if config.hidden_act == 'gelu_pytorch_tanh':
+            self.kernel_act_fn = ActFnType.GELU_Tanh_Approx
+
         self.sequence_parallel_enabled = getattr(
             self.neuron_config, "sequence_parallel_enabled", False
         )
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
         self.rms_norm_eps = config.rms_norm_eps
         self.mlp_kernel_enabled = self.neuron_config.mlp_kernel_enabled
-        self.mlp_tkg_nki_kernel_enabled = self.neuron_config.mlp_tkg_nki_kernel_enabled
         self.fused_rmsnorm_skip_gamma = self.config.neuron_config.fused_rmsnorm_skip_gamma
         self.quantized_mlp_kernel_enabled = self.neuron_config.quantized_mlp_kernel_enabled
         self.rmsnorm_quantize_kernel_enabled = self.neuron_config.rmsnorm_quantize_kernel_enabled
@@ -500,11 +452,6 @@ class NeuronLlamaMLP(nn.Module):
             model_state_dict[new_keys[key_index]] = copy.deepcopy(model_state_dict[old_keys[key_index]])
 
     def _kernel_enabled_nki_mlp_tkg(self, x, rmsnorm, residual, adapter_ids):
-        full_seqlen = x.shape[1] * (self.config.neuron_config.tp_degree if self.sequence_parallel_enabled else 1)
-        if full_seqlen <= self.neuron_config.seq_len_threshold_for_cc_tiling:  # Keep regular grid for TKG.
-            grid = (nc(self.logical_nc_config),)
-        else:  # Add CC pipelining dim for CTE kernel grid
-            grid = (CCPipeline(self.neuron_config.cc_pipeline_tiling_factor) * nc(self.logical_nc_config),)
         fused_residual = residual is not None
         fused_rmsnorm = rmsnorm is not None
         logger.debug(
@@ -524,45 +471,6 @@ class NeuronLlamaMLP(nn.Module):
             norm_weights = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
             norm_type = NormType.NO_NORM
 
-        # Handle SP RMSnorm
-        if self.sequence_parallel_enabled:
-            # This RMSNormQuant kernel will do quantization inside, so we pass the
-            # clamp_bound for clipping.
-            if self.rmsnorm_quantize_kernel_enabled and self.quantized_mlp_kernel_enabled:
-                logger.debug("Running NKI MLP TKG kernel with quantization and sequence-parallel RMSnorm-Quantize kernel!")
-
-                _rmsnorm_quant_fwd_call = nki_jit()(rmsnorm_quant_isa_kernel)
-                quant_rmsnorm_out = torch.zeros(
-                    size=(
-                        x.shape[0],  # batch size
-                        x.shape[1],  # sequence length
-                        x.shape[2] + 4,  # hidden size + 4 bytes for packing fp32 scale
-                    ),
-                    dtype=torch.int8,
-                    device=x.device,
-                )
-                clamp_bound = self.quantize_clamp_bound
-                _rmsnorm_quant_fwd_call[grid](
-                    x, norm_weights, clamp_bound, quant_rmsnorm_out, kernel_name="QuantOnly"
-                )
-                x = gather_from_sequence_parallel_region(
-                    quant_rmsnorm_out,
-                    self.sequence_dimension,
-                    process_group=self.tensor_model_parallel_group,
-                    tile_cc=self.neuron_config.tile_cc,
-                )
-
-            else:
-                logger.debug(
-                    "Running MLP kernel with external (native compiler) sequence-parallel RMSnorm!"
-                )
-                x = gather_from_sequence_parallel_region(
-                    x,
-                    self.sequence_dimension,
-                    process_group=self.tensor_model_parallel_group,
-                    tile_cc=self.neuron_config.tile_cc,
-                )
-
         # Grab weights
         # all weights of the layers are stored in (out, in) shape
         # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
@@ -571,31 +479,29 @@ class NeuronLlamaMLP(nn.Module):
         down_w = self.down_proj.weight.data
 
         if self.quantized_mlp_kernel_enabled:
-            gate_w_scale = self.gate_proj.scale
-            up_w_scale = self.up_proj.scale
-            down_w_scale = self.down_proj.scale
+            gate_w_scale = self.gate_proj.scale.data
+            up_w_scale = self.up_proj.scale.data
+            down_w_scale = self.down_proj.scale.data
+            quant_type = QuantizationType.ROW
         else:
             gate_w_scale = None
             up_w_scale = None
             down_w_scale = None
+            quant_type = QuantizationType.NONE
 
-        clamp_bound = self.quantize_clamp_bound
-
-        input_quantized = (x.dtype == torch.int8)
-        mlp_output = _trace_nki_mlp_tkg_kernel[grid](
-            hidden=residual if fused_residual else x,
-            gate_w=gate_w,
-            up_w=up_w,
-            down_w=down_w,
-            attn_output=x if fused_residual else None,
-            norm_weights=norm_weights,
+        mlp_output = mlp[self.logical_nc_config](
+            hidden_tensor=x,
+            gate_proj_weights_tensor=gate_w,
+            up_proj_weights_tensor=up_w,
+            down_proj_weights_tensor=down_w,
+            normalization_weights_tensor=norm_weights,
+            normalization_type=norm_type,
+            quantization_type=quant_type,
             gate_w_scale=gate_w_scale,
             up_w_scale=up_w_scale,
             down_w_scale=down_w_scale,
             eps=self.rms_norm_eps,
-            norm_type=norm_type,
-            store_add=fused_residual,
-            input_quantized=input_quantized,
+            activation_fn=self.kernel_act_fn,
         )
 
         residual = mlp_output[1] if fused_residual else None
@@ -603,315 +509,164 @@ class NeuronLlamaMLP(nn.Module):
 
         # All-reduce or reduce-scatter, depending on whether SP is enabled
         if self.sequence_parallel_enabled:
-            if self.neuron_config.tile_cc:
-                output_tensor = reduce_scatter_to_sequence_parallel_region_tiled(
-                    output_tensor,
-                    self.sequence_dimension,
-                    process_group=self.tensor_model_parallel_group,
-                )
-            else:
-                output_tensor = reduce_scatter_to_sequence_parallel_region(
-                    output_tensor,
-                    self.sequence_dimension,
-                    process_group=self.tensor_model_parallel_group,
-                )
+            output_tensor = reduce_scatter_to_sequence_parallel_region(
+                output_tensor,
+                self.sequence_dimension,
+                process_group=self.tensor_model_parallel_group,
+            )
         else:
             output_tensor = reduce_from_tensor_model_parallel_region(
-                output_tensor, process_group=self.tensor_model_parallel_group,
+                output_tensor,
+                process_group=self.tensor_model_parallel_group,
             )
 
         logger.debug(f"NKI MLP TKG output shape {output_tensor.shape}")
         return (output_tensor, residual)
 
     def _kernel_enabled_quantized_mlp(self, x, rmsnorm, residual, adapter_ids):
-        full_seqlen = x.shape[1] * (self.config.neuron_config.tp_degree if self.sequence_parallel_enabled else 1)
-        if full_seqlen <= self.neuron_config.seq_len_threshold_for_cc_tiling:  # Keep regular grid for TKG.
-            grid = (nc(self.logical_nc_config),)
-        else:  # Add CC pipelining dim for CTE kernel grid
-            grid = (CCPipeline(self.neuron_config.cc_pipeline_tiling_factor) * nc(self.logical_nc_config),)
+        """CTE-only path using nkilib. TKG is handled by _kernel_enabled_nki_mlp_tkg."""
         fused_residual = residual is not None
         fused_rmsnorm = rmsnorm is not None
         logger.debug(
-            f"MLP: quantized kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_nc_config={self.logical_nc_config}"
+            f"MLP: quantized CTE kernel (nkilib), fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_nc_config={self.logical_nc_config}"
         )
 
-        # Can't do residual add in the kernel if SP is enabled
         if fused_residual:
             assert (
                 not self.sequence_parallel_enabled
             ), "Quantized MLP cannot have both fused residual add and sequence parallel RMSnorm!"
-            # Using fused residual add
-            _mlp_fwd_call = nki_jit()(quant_mlp_fused_add_isa_kernel)
-        else:
-            _mlp_fwd_call = nki_jit()(quant_mlp_isa_kernel)
 
-        if fused_rmsnorm:
-            ln_w = rmsnorm.weight.unsqueeze(0)
-        else:
-            ln_w = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
-
-        # Handle SP RMSnorm
-        x_orig_dtype = x.dtype
         if self.sequence_parallel_enabled:
-            # This RMSNormQuant kernel will do quantization inside, so we pass the
-            # clamp_bound for clipping.
-            # If we don't use this kernel, the MLP kernel below will do the
-            # quantization, so we also pass clamp_bound to that kernel.
-            if self.rmsnorm_quantize_kernel_enabled:
-                logger.debug(
-                    "Running Quantized MLP kernel with sequence-parallel RMSnorm-Quantize kernel!"
-                )
-                _rmsnorm_quant_fwd_call = nki_jit()(rmsnorm_quant_isa_kernel)
-                quant_rmsnorm_out = torch.zeros(
-                    size=(
-                        x.shape[0],  # batch size
-                        x.shape[1],  # sequence length
-                        x.shape[2] + 4,  # hidden size + 4 bytes for packing fp32 scale
-                    ),
-                    dtype=torch.int8,
-                    device=x.device,
-                )
-                clamp_bound = self.quantize_clamp_bound
-                _rmsnorm_quant_fwd_call[grid](
-                    x, ln_w, clamp_bound, quant_rmsnorm_out, kernel_name="QuantOnly"
-                )
-                x = gather_from_sequence_parallel_region(
-                    quant_rmsnorm_out,
-                    self.sequence_dimension,
-                    process_group=self.tensor_model_parallel_group,
-                    tile_cc=self.neuron_config.tile_cc,
-                )
-
+            if fused_rmsnorm:
+                norm_weights = rmsnorm.weight.unsqueeze(0)
+                norm_type = NormType.RMS_NORM_SKIP_GAMMA if self.fused_rmsnorm_skip_gamma else NormType.RMS_NORM
             else:
-                logger.debug(
-                    "Running Quantized MLP kernel with external (native compiler) sequence-parallel RMSnorm!"
-                )
-                x = gather_from_sequence_parallel_region(
-                    x, self.sequence_dimension, process_group=self.tensor_model_parallel_group, tile_cc=self.neuron_config.tile_cc
-                )
+                norm_weights = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
+                norm_type = NormType.NO_NORM
 
-        # Build output tensor
-        output_tensor_seqlen = x.shape[1]
-        output_tensor = torch.zeros(
-            size=(
-                x.shape[0],  # batch size
-                output_tensor_seqlen,
-                self.hidden_size,  # hidden size
-            ),
-            dtype=x_orig_dtype,
-            device=x.device,
+            quant_args = RmsNormQuantKernelArgs(
+                lower_bound=self.quantize_clamp_bound,
+                norm_type=norm_type,
+                quantization_type=QuantizationType.ROW,
+                eps=self.rms_norm_eps,
+            )
+            x_quantized = rmsnorm_quant_kernel[self.logical_nc_config](
+                hidden=x, ln_w=norm_weights, kargs=quant_args,
+            )
+            x_quantized = gather_from_sequence_parallel_region(
+                x_quantized, self.sequence_dimension, process_group=self.tensor_model_parallel_group
+            )
+        else:
+            if fused_rmsnorm:
+                norm_weights = rmsnorm.weight.unsqueeze(0)
+                norm_type = NormType.RMS_NORM_SKIP_GAMMA if self.fused_rmsnorm_skip_gamma else NormType.RMS_NORM
+            else:
+                norm_weights = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
+                norm_type = NormType.NO_NORM
+
+            quant_args = RmsNormQuantKernelArgs(
+                lower_bound=self.quantize_clamp_bound,
+                norm_type=norm_type,
+                quantization_type=QuantizationType.ROW,
+                eps=self.rms_norm_eps,
+            )
+            x_quantized = rmsnorm_quant_kernel[self.logical_nc_config](
+                hidden=x, ln_w=norm_weights, kargs=quant_args,
+            )
+
+        gate_w = self.gate_proj.weight.data
+        up_w = self.up_proj.weight.data
+        down_w = self.down_proj.weight.data
+        gate_w_scale = self.gate_proj.scale.data
+        up_w_scale = self.up_proj.scale.data
+        down_w_scale = self.down_proj.scale.data
+
+        mlp_output = mlp[self.logical_nc_config](
+            hidden_tensor=x_quantized,
+            gate_proj_weights_tensor=gate_w,
+            up_proj_weights_tensor=up_w,
+            down_proj_weights_tensor=down_w,
+            normalization_weights_tensor=None,
+            normalization_type=norm_type,
+            quantization_type=quant_args.quantization_type,
+            gate_w_scale=gate_w_scale,
+            up_w_scale=up_w_scale,
+            down_w_scale=down_w_scale,
+            quant_clipping_bound=self.quantize_clamp_bound,
+            output_dtype={torch.bfloat16: nl.bfloat16, torch.float16: nl.float16, torch.float32: nl.float32}[x.dtype],
+            eps=self.rms_norm_eps,
+            force_cte_mode=True,
+            activation_fn=self.kernel_act_fn,
         )
 
-        # Grab weights
-        # all weights of the layers are stored in (out, in) shape
-        # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
-        gate_w = self.gate_proj.weight.data
-        gate_w_scale = self.gate_proj.scale
-        up_w = self.up_proj.weight.data
-        up_w_scale = self.up_proj.scale
-        down_w = self.down_proj.weight.data
-        down_w_scale = self.down_proj.scale
-        clamp_bound = self.quantize_clamp_bound
+        output_tensor = mlp_output[0] if isinstance(mlp_output, list) else mlp_output
 
-        if fused_residual:
-            residual_output_tensor = torch.zeros(
-                size=(
-                    x.shape[0],  # batch size
-                    output_tensor_seqlen,
-                    self.hidden_size,  # hidden size
-                ),
-                dtype=x.dtype,
-                device=x.device,
-            )
-
-            _mlp_fwd_call[grid](
-                x,  # attn_output
-                residual,  # hidden
-                ln_w,  # ln_w
-                gate_w,  # gate_w
-                gate_w_scale,
-                up_w,  # up_w
-                up_w_scale,
-                down_w,  # down_w
-                down_w_scale,
-                clamp_bound,
-                output_tensor,  # out
-                add_out=residual_output_tensor,
-                fused_rmsnorm=fused_rmsnorm,
-                eps=self.rms_norm_eps,
-                kernel_name="MLP",
-                store_add=True,
-            )
-            residual = residual_output_tensor
-        else:
-            if use_quantization_type:
-                _mlp_fwd_call[grid](
-                    x,  # hidden
-                    # should be fine to pass gamma is as a dummy even if not using fused rmsnorm
-                    ln_w,
-                    gate_w,  # gate_w
-                    gate_w_scale,
-                    None,
-                    up_w,  # up_w
-                    up_w_scale,
-                    None,
-                    down_w,  # down_w
-                    down_w_scale,
-                    None,
-                    clamp_bound,
-                    QuantizationType.ROW,
-                    output_tensor,  # out
-                    # Run RMSNorm inside the kernel if NOT using SP rmsnorm
-                    fused_rmsnorm=fused_rmsnorm,
-                    eps=self.rms_norm_eps,
-                    kernel_name="MLP",
-                )
-            else:
-                _mlp_fwd_call[grid](
-                    x,  # hidden
-                    # should be fine to pass gamma is as a dummy even if not using fused rmsnorm
-                    ln_w,
-                    gate_w,  # gate_w
-                    gate_w_scale,
-                    up_w,  # up_w
-                    up_w_scale,
-                    down_w,  # down_w
-                    down_w_scale,
-                    clamp_bound,
-                    output_tensor,  # out
-                    # Run RMSNorm inside the kernel if NOT using SP rmsnorm
-                    fused_rmsnorm=fused_rmsnorm,
-                    eps=self.rms_norm_eps,
-                    kernel_name="MLP",
-                )
-            residual = None
-
-        # All-reduce or reduce-scatter, depending on whether SP is enabled
         if self.sequence_parallel_enabled:
-            if self.neuron_config.tile_cc:
-                output_tensor = reduce_scatter_to_sequence_parallel_region_tiled(
-                    output_tensor, self.sequence_dimension, process_group=self.tensor_model_parallel_group,
-                )
-            else:
-                output_tensor = reduce_scatter_to_sequence_parallel_region(
-                    output_tensor, self.sequence_dimension, process_group=self.tensor_model_parallel_group,
-                )
+            output_tensor = reduce_scatter_to_sequence_parallel_region(
+                output_tensor, self.sequence_dimension, process_group=self.tensor_model_parallel_group,
+            )
         else:
             output_tensor = reduce_from_tensor_model_parallel_region(output_tensor)
 
-        logger.debug(f"Quantized MLP output shape {output_tensor.shape}")
-        return (output_tensor, residual)
+        logger.debug(f"Quantized MLP CTE output shape {output_tensor.shape}")
+        return (output_tensor, None)
 
     def _kernel_enabled_mlp(self, x, rmsnorm, residual, adapter_ids):
+        """CTE-only path using nkilib. TKG is handled by _kernel_enabled_nki_mlp_tkg."""
         fused_residual = residual is not None
         fused_rmsnorm = rmsnorm is not None
         logger.debug(
-            f"MLP: kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, skip_gamma={self.fused_rmsnorm_skip_gamma}, logical_nc_config={self.logical_nc_config}"
+            f"MLP: CTE kernel (nkilib), fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, skip_gamma={self.fused_rmsnorm_skip_gamma}, logical_nc_config={self.logical_nc_config}"
         )
 
-        # Choose which kernel to call
         if fused_residual:
             assert (
                 not self.sequence_parallel_enabled
             ), "MLP kernel cannot have both fused residual add and sequence parallel RMSnorm!"
-            # Using fused residual add
-            _mlp_fwd_call = nki_jit()(mlp_fused_add_isa_kernel)
-        else:
-            _mlp_fwd_call = nki_jit()(mlp_isa_kernel)
 
         if self.sequence_parallel_enabled:
             x = gather_from_sequence_parallel_region(
-                x, self.sequence_dimension, process_group=self.tensor_model_parallel_group, tile_cc=self.neuron_config.tile_cc
+                x, self.sequence_dimension, process_group=self.tensor_model_parallel_group
             )
 
-        # Build output tensor
-        output_tensor_seqlen = x.shape[1]
-        output_tensor = torch.zeros(
-            size=(
-                x.shape[0],  # batch size
-                output_tensor_seqlen,
-                self.hidden_size,  # hidden size
-            ),
-            dtype=x.dtype,
-            device=x.device,
-        )
-
-        # Grab weights
-        # all weights of the layers are stored in (out, in) shape
-        # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
         if fused_rmsnorm:
-            ln_w = rmsnorm.weight.unsqueeze(0)
+            norm_weights = rmsnorm.weight.unsqueeze(0)
+            norm_type = NormType.RMS_NORM_SKIP_GAMMA if self.fused_rmsnorm_skip_gamma else NormType.RMS_NORM
         else:
-            ln_w = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
+            norm_weights = torch.zeros(size=(1, self.hidden_size), dtype=x.dtype, device=x.device)
+            norm_type = NormType.NO_NORM
+
         gate_w = self.gate_proj.weight.data
         up_w = self.up_proj.weight.data
         down_w = self.down_proj.weight.data
 
-        if output_tensor_seqlen <= self.neuron_config.seq_len_threshold_for_cc_tiling:  # Keep regular grid for TKG. Messes up the MLP impl
-            grid = (nc(self.logical_nc_config),)
-        else:  # Add CC pipelining dim for CTE kernel grid
-            grid = (CCPipeline(self.neuron_config.cc_pipeline_tiling_factor) * nc(self.logical_nc_config),)
+        mlp_output = mlp[self.logical_nc_config](
+            hidden_tensor=x,
+            gate_proj_weights_tensor=gate_w,
+            up_proj_weights_tensor=up_w,
+            down_proj_weights_tensor=down_w,
+            normalization_weights_tensor=norm_weights,
+            fused_add_tensor=residual if fused_residual else None,
+            store_fused_add_result=fused_residual,
+            normalization_type=norm_type,
+            quant_clipping_bound=self.quantize_clamp_bound if self.quantized_mlp_kernel_enabled else 0.0,
+            eps=self.rms_norm_eps,
+            activation_fn=self.kernel_act_fn,
+        )
 
-        if fused_residual:
-            residual_output_tensor = torch.zeros(
-                size=(
-                    x.shape[0],  # batch size
-                    output_tensor_seqlen,
-                    self.hidden_size,  # hidden size
-                ),
-                dtype=x.dtype,
-                device=x.device,
-            )
+        residual = mlp_output[1] if fused_residual else None
+        output_tensor = mlp_output[0] if fused_residual else mlp_output
 
-            _mlp_fwd_call[grid](
-                x,  # attn_output
-                residual,  # hidden
-                ln_w,  # ln_w
-                gate_w,  # gate_w
-                up_w,  # up_w
-                down_w,  # down_w
-                output_tensor,  # out
-                kernel_name="MLP",
-                add_out=residual_output_tensor,
-                fused_rmsnorm=fused_rmsnorm,
-                skip_gamma=self.fused_rmsnorm_skip_gamma,
-                eps=self.rms_norm_eps,
-                store_add=True,
-            )
-            residual = residual_output_tensor
-        else:
-            _mlp_fwd_call[grid](
-                x,  # hidden
-                # should be fine to pass gamma is as a dummy even if not using fused rmsnorm
-                ln_w,
-                gate_w,
-                up_w,
-                down_w,
-                output_tensor,  # out
-                kernel_name="MLP",
-                # Run RMSNorm inside the kernel if NOT using SP rmsnorm
-                fused_rmsnorm=fused_rmsnorm,
-                skip_gamma=self.fused_rmsnorm_skip_gamma,
-                eps=self.rms_norm_eps,
-            )
-            residual = None
-
-        # All-reduce or reduce-scatter, depending on whether SP is enabled
         if self.sequence_parallel_enabled:
-            if self.neuron_config.tile_cc:
-                output_tensor = reduce_scatter_to_sequence_parallel_region_tiled(
-                    output_tensor, self.sequence_dimension, process_group=self.tensor_model_parallel_group,
-                )
-            else:
-                output_tensor = reduce_scatter_to_sequence_parallel_region(
-                    output_tensor, self.sequence_dimension, process_group=self.tensor_model_parallel_group,
-                )
+            output_tensor = reduce_scatter_to_sequence_parallel_region(
+                output_tensor, self.sequence_dimension, process_group=self.tensor_model_parallel_group,
+            )
         else:
             output_tensor = reduce_from_tensor_model_parallel_region(
                 output_tensor, process_group=self.tensor_model_parallel_group
             )
 
-        logger.debug(f"MLP output shape {output_tensor.shape}")
+        logger.debug(f"MLP CTE output shape {output_tensor.shape}")
         return (output_tensor, residual)
 
     def _native_mlp(self, x, adapter_ids=None):
@@ -949,7 +704,7 @@ class NeuronLlamaMLP(nn.Module):
         Returns a tuple of (output, residual), where residual is the output of the residual add
         """
         TKG_BS_SEQLEN_THRESHOLD = 128
-        if self.mlp_kernel_enabled:
+        if self.mlp_kernel_enabled and not self.neuron_config.on_cpu:
             if self.tensor_model_parallel_group is not None:
                 tp_degree = self.tensor_model_parallel_group.size()
             else:
@@ -961,11 +716,11 @@ class NeuronLlamaMLP(nn.Module):
                 real_seqlen = x.shape[1]
 
             batch_seqlen = x.shape[0] * real_seqlen
-            is_small_batch_seqlen = batch_seqlen <= TKG_BS_SEQLEN_THRESHOLD
+            is_small_batch_seqlen = batch_seqlen <= TKG_BS_SEQLEN_THRESHOLD and not self.sequence_parallel_enabled
 
             # The TKG NKI kernel should be used if B * S is sufficiently small
             # even if that is during context encoding, due to performance improvements
-            use_tkg_nki_kernel = _trace_nki_mlp_tkg_kernel and is_small_batch_seqlen and self.mlp_tkg_nki_kernel_enabled
+            use_tkg_nki_kernel = is_small_batch_seqlen
             if use_tkg_nki_kernel:
                 return self._kernel_enabled_nki_mlp_tkg(x, rmsnorm, residual, adapter_ids=adapter_ids)
             else:
@@ -1362,7 +1117,6 @@ class NeuronLlamaModel(NeuronBaseModel):
                 shard_across_embedding=not config.neuron_config.vocab_parallel,
                 sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
                 sequence_dimension=self.sequence_dimension,
-                tile_cc=self.neuron_config.tile_cc,
                 pad=True,
                 tensor_model_parallel_group=get_tp_group(config),
                 use_spmd_rank=config.neuron_config.vocab_parallel,

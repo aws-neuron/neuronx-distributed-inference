@@ -1,0 +1,18 @@
+{
+    "tp_degree": 2,
+    "cp_degree": 1,
+    "attention_dp_degree": 1,
+    "batch_size": 1,
+    "ctx_batch_size": 1,
+    "tkg_batch_size": 1,
+    "max_context_length": 1024,
+    "seq_len": 1024, 
+    "torch_dtype": "bfloat16",
+    "logical_nc_config": 2,
+    "fused_qkv": false,
+    "is_continuous_batching": false,
+    "sequence_parallel_enabled": false,
+    "qkv_kernel_enabled": false,
+    "attn_kernel_enabled": false,
+    "strided_context_parallel_kernel_enabled": false
+}
