@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from neuronx_distributed_inference.models.config import NeuronConfig
 from nxdi_wan.application_cp import NeuronWanCPApplication, NeuronWanCPSecondHalfApplication, WanCPInferenceConfig
 
-MODEL_PATH = "/mnt/work/.cache/models--Wan-AI--Wan2.2-T2V-A14B-Diffusers/snapshots/5be7df9619b54f4e2667b2755bc6a756675b5cd7"
+MODEL_PATH = os.environ.get("WAN_MODEL_PATH", "/mnt/work/.cache/models--Wan-AI--Wan2.2-T2V-A14B-Diffusers/snapshots/5be7df9619b54f4e2667b2755bc6a756675b5cd7")
 SUBFOLDER = os.environ.get("TRANSFORMER_SUBFOLDER", "transformer")
 HALF = os.environ.get("HALF", "first")  # "first" or "second"
 

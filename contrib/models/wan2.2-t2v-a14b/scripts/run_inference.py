@@ -255,12 +255,13 @@ def encode(text):
 torch.save({{"prompt": encode("{PROMPT}"), "negative": encode("")}}, "/dev/shm/wan_te_embeds.pt")
 print("DONE")
 '''
-    with open('/tmp/_run_te.py', 'w') as f:
+    te_script_path = os.path.join(os.environ.get('TMPDIR', '/tmp'), '_run_te.py')
+    with open(te_script_path, 'w') as f:
         f.write(te_script)
 
     t0 = time.time()
     te_log = open(f"{OUTPUT_DIR}/te_worker.log", "w")
-    te_proc = subprocess.run(["python", "/tmp/_run_te.py"], cwd=project_dir,
+    te_proc = subprocess.run(["python", te_script_path], cwd=project_dir,
                              stdout=te_log, stderr=subprocess.STDOUT, timeout=120)
     te_log.close()
     if te_proc.returncode != 0:
