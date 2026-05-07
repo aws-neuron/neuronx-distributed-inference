@@ -186,41 +186,30 @@ encoder = build_vjepa21_encoder(arch="vit_large", img_size=384, num_frames=16, p
 
 ## Demos
 
-### Neuron Smoke Test (`demo_neuron.py`)
+### Neuron Smoke Test (`test/integration/test_pretrained_smoke.py`)
 
-Runs pretrained ViT-B on both CPU (FP32) and Neuron (BF16), compares feature embeddings. Serves as a quick validation that the Neuron port is working correctly. No external dependencies beyond torch-neuronx.
+Validates pretrained ViT-B on both CPU (FP32) and Neuron (BF16), comparing feature embeddings via cosine similarity. Run as a pytest test:
 
 ```bash
 # On a Neuron instance (trn2/inf2):
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
-python demo_neuron.py                        # synthetic video (no extra deps)
-python demo_neuron.py path/to/video.mp4      # your own video (needs decord, pillow)
+cd contrib/models/jepa-2-1/
+
+# CPU-only checks (pretrained weight load, output shape, no NaN)
+pytest test/integration/test_pretrained_smoke.py::TestPretrainedCPU -v
+
+# Full Neuron validation (compiles ViT-B, checks cosine sim > 0.999)
+pytest test/integration/test_pretrained_smoke.py::TestPretrainedNeuron -v
 ```
 
-Expected output:
-```
-Using synthetic video (moving circle, no dependencies needed)
-Input shape: torch.Size([1, 3, 16, 384, 384])
-
-Loading pretrained ViT-B (CPU, FP32)...
-CPU output: shape=torch.Size([1, 4608, 768]), norm=2042.1
-
-Tracing for Neuron (BF16)...
-Compilation: 416.1s
-Neuron output: shape=torch.Size([1, 4608, 768]), norm=2046.2
-Latency: 248.0ms
-
-Cosine similarity (CPU FP32 vs Neuron BF16): 1.000502  [PASS]
-```
-
-### Video Classification (`demo_classify.py`)
+### Video Classification (`examples/demo_classify.py`)
 
 Classifies a video using a finetuned V-JEPA 2 model on Something-Something v2 (174 action classes). Runs on CPU — no Neuron hardware needed.
 
 ```bash
 pip install transformers accelerate torchvision decord
-python demo_classify.py                          # Big Buck Bunny sample (CC-BY-3.0)
-python demo_classify.py path/to/video.mp4        # your own video
+python examples/demo_classify.py                          # Big Buck Bunny sample (CC-BY-3.0)
+python examples/demo_classify.py path/to/video.mp4        # your own video
 ```
 
 Note: This demo uses the HuggingFace `VJEPA2ForVideoClassification` model (V-JEPA 2, not 2.1) to demonstrate what the encoder features can do. The Neuron port (`modeling_jepa21.py`) is the V-JEPA 2.1 encoder only.

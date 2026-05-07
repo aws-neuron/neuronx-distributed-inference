@@ -139,8 +139,8 @@ trn2.3xlarge has 2 logical NeuronCores → 2x throughput. Scales linearly with b
 |-------|--------|-------------|-------------------|--------|
 | ViT-B | 86M | ~8 min | 0.9998 | ✅ |
 | ViT-L | 300M | ~18 min | 0.9999 | ✅ |
-| ViT-g | 1.01B | OOM at ~30 min | — | ❌ Host OOM |
-| ViT-G | 1.8B | Not attempted | — | ❌ Blocked |
+| ViT-g | 1.01B | ~51 min | 0.9999 | ✅ (trn2.48xlarge) |
+| ViT-G | 1.8B | ~11 min (image) | 0.9998 | ✅ (trn2.48xlarge, image only) |
 
 ### Latency (batch=1, single NeuronCore)
 
@@ -199,7 +199,6 @@ pytest test/integration/test_pretrained_smoke.py -v
 
 ### Test gaps (future work)
 
-- No ViT-g/ViT-G tests (blocked by compilation on trn2.3xlarge)
 - No 64-frame tests
 - No predictor tests
 
@@ -240,16 +239,13 @@ Checkpoints loaded via `torch.hub.load_state_dict_from_url`. State dict keys pre
 
 ## Open Work Items
 
-### P0 — Needed for production readiness
-1. **Compile ViT-g (1B) and ViT-G (1.8B)**: Use `parallel_model_trace` from NxD (markers already in code) or compile on trn2.48xlarge (2TB RAM). The modular compilation markers are already inserted.
-
 ### P1 — Valuable additions
-2. **64-frame inference**: 18,432 tokens — NKI flash attention should become beneficial here. Need to benchmark.
-3. **Downstream tasks**: Attentive pooler for classification, predictor for action anticipation.
+1. **64-frame inference**: 18,432 tokens — NKI flash attention should become beneficial here. Need to benchmark.
+2. **Downstream tasks**: Attentive pooler for classification, predictor for action anticipation.
 
 ### P2 — Nice to have
-4. **Tensor parallelism**: For ViT-G on multi-device instances. Would require wrapping with NxD parallel layers.
-5. **Dynamic resolution**: Test with non-384 resolutions using `interpolate_rope=True`.
+3. **Tensor parallelism**: For ViT-G on multi-device instances. Would require wrapping with NxD parallel layers.
+4. **Dynamic resolution**: Test with non-384 resolutions using `interpolate_rope=True`.
 
 ## Reference Code in the NxDI Repo
 
