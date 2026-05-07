@@ -1,114 +1,140 @@
-# Contrib Model: Mistral Small 3.1 24B Instruct 2503
+# Contrib Model: Mistral-Small-3.1-24B-Instruct-2503
 
-NeuronX Distributed Inference implementation of Mistral Small 3.1 24B Instruct 2503.
+NKI-optimized NeuronX Distributed Inference configuration for Mistral-Small-3.1-24B with **stock TKG** fused attention kernel. Closest to GPU parity in the Mistral family (1.27x gap). No custom kernel needed.
 
 ## Model Information
 
-- **HuggingFace ID:** `Mistral-Small-3.1-24B-Instruct-2503`
-- **Model Type:** Decoder-only transformer
+- **HuggingFace ID:** `mistralai/Mistral-Small-3.1-24B-Instruct-2503`
+- **Model Type:** Decoder-only dense transformer (24B params, text-only extraction from multimodal)
+- **Architecture:** Mistral3ForConditionalGeneration -> extracted as LlamaForCausalLM
+- **GQA:** 32 query heads / 8 KV heads, head_dim=128
+- **NxDI Path:** NeuronLlamaModel (stock `modeling_llama.py`)
 - **License:** Check HuggingFace model card
 
-## Architecture Details
+## Text Extraction Required
 
+The HuggingFace checkpoint is a multimodal model (`Mistral3ForConditionalGeneration`). The text decoder must be extracted before serving with vLLM. The `extract_text_model.py` script handles this.
 
-## Validation Results
+### Why LlamaForCausalLM (Not MistralForCausalLM)
 
-**Validated:** 2026-01-29  
-**Configuration:** TP=8, batch_size=None, seq_len=None, None
+Same as Ministral 3B: the NxDI Mistral path hardcodes `head_dim = hidden_size // num_attention_heads`, giving `5120/32 = 160` instead of the actual 128. The Llama path reads head_dim from config correctly.
 
-### Test Results
+## Performance Results
 
-| Test | Status | Result |
-|------|--------|--------|
-| Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ✅ PASS | **96.2% match** |
+**Instance:** trn2.3xlarge | **SDK:** 2.29 | **TP:** 8 | **LNC:** 1 | **Precision:** BF16
 
+### Stock TKG Optimized (max_num_seqs=1)
 
-**Status:** ✅ EXCELLENT
+| Workload | tok/s P50 | TPOT P50 | vs Baseline |
+|----------|:---------:|:--------:|:-----------:|
+| short-short (128/128) | **47.73** | 20.95ms | +6.2% |
+| short-long (128/512) | **47.56** | 21.03ms | +7.4% |
+| long-short (2048/128) | **47.48** | 21.06ms | +13.7% |
+| long-long (2048/512) | **47.21** | 21.18ms | +13.6% |
 
-### Device Profiling Metrics
+TPOT is flat at ~21ms regardless of context length. TKG eliminates context-length degradation entirely.
 
-**Configuration:** TP=8, batch_size=1, seq_len=512, bfloat16
-**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+### Baseline (max_num_seqs=4, no TKG)
 
-| Metric | Context Encoding | Token Generation |
-|--------|-----------------|------------------|
-| MFU (%) | 0.38 | 0.00 |
-| MBU (%) | 0.21 | 0.60 |
-| HFU (%) | 0.40 | 0.00 |
-| Execution Time (us) | 0.08 | 0.02 |
-| HBM Read | 6.41 GB | 5.74 GB |
-| HBM Write | 670.20 MB | 3.59 MB |
+| Workload | tok/s P50 | TPOT P50 |
+|----------|:---------:|:--------:|
+| short-short (128/128) | 44.95 | 22.25ms |
+| short-long (128/512) | 44.29 | 22.58ms |
+| long-short (2048/128) | 41.75 | 23.95ms |
+| long-long (2048/512) | 41.55 | 24.07ms |
 
-**Throughput:** 11.92 tok/s | **Compile Time:** 384.88s
+### GPU Comparison (1x H100, vLLM 0.19.0)
 
-> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
-> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+| Metric | Neuron (TKG) | GPU | Ratio |
+|--------|:-----------:|:---:|:-----:|
+| tok/s (short-short) | **47.73** | 60.8 | 1.27x GPU |
+| $/M tokens (spot) | **$5.24** | $7.08 | **Neuron 26% cheaper** |
 
-## Usage
+## Quick Start
 
-```python
-from transformers import AutoTokenizer, GenerationConfig
-from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+### 1. Launch Instance
 
-# Import model classes from src
-from src.modeling_mistral_small_3_1_24b_instruct_2503 import NeuronMistralSmall3124BInstruct2503ForCausalLM, MistralSmall3124BInstruct2503InferenceConfig
+trn2.3xlarge with Deep Learning AMI Neuron (Ubuntu 24.04) 20260410 (SDK 2.29).
 
-model_path = "/path/to/Mistral-Small-3.1-24B-Instruct-2503/"
-compiled_model_path = "/path/to/compiled/"
-
-# Configure
-neuron_config = NeuronConfig(
-    tp_degree=8,
-    batch_size=None,
-    seq_len=512,
-    torch_dtype=torch.None,
-)
-
-config = MistralSmall3124BInstruct2503InferenceConfig(
-    neuron_config,
-    load_config=load_pretrained_config(model_path),
-)
-
-# Compile and load
-model = NeuronMistralSmall3124BInstruct2503ForCausalLM(model_path, config)
-model.compile(compiled_model_path)
-model.load(compiled_model_path)
-
-# Generate
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-# ... (see integration test for full example)
+**Set LNC=1 (required for TP=8):**
+```bash
+echo 'NEURON_LOGICAL_NC_CONFIG=1' | sudo tee /etc/environment
+sudo reboot
+# After reboot: neuron-ls should show 8 cores
 ```
 
-## Compatibility Matrix
-
-| Instance/Version | 2.20+ | 2.19 and earlier |
-|------------------|-------|------------------|
-| Trn1             | ✅ Working | Not tested |
-| Inf2             | Not tested | Not tested |
-
-## Testing
-
-Run integration tests:
+### 2. Download and Extract Text Model
 
 ```bash
-pytest nxdi_contrib_models/models/Mistral-Small-3.1-24B-Instruct-2503/test/integration/test_model.py --capture=tee-sys
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
+
+huggingface-cli download mistralai/Mistral-Small-3.1-24B-Instruct-2503 \
+    --local-dir /home/ubuntu/models/Mistral-Small-3.1-24B-Instruct-2503
+
+python src/extract_text_model.py \
+    --src /home/ubuntu/models/Mistral-Small-3.1-24B-Instruct-2503 \
+    --dst /home/ubuntu/models/Mistral-Small-24B-text-only
 ```
 
-Or run manually:
+### 3. Apply Patches
 
 ```bash
-cd nxdi_contrib_models/models/Mistral-Small-3.1-24B-Instruct-2503
-python3 test/integration/test_model.py
+python src/setup_patches.py --tkg-mode stock
 ```
 
-## Example Checkpoints
+Only 2 library-level patches needed (eps guards). **No custom TKG kernel** -- at TP=8 there is 1 KV head per rank, so the stock NxDI TKG kernel works natively.
 
-* Mistral-Small-3.1-24B-Instruct-2503
+### 4. Start vLLM Server
 
-## Maintainer
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model /home/ubuntu/models/Mistral-Small-24B-text-only \
+    --tensor-parallel-size 8 \
+    --max-model-len 8192 \
+    --max-num-seqs 1 \
+    --no-enable-prefix-caching \
+    --disable-log-requests \
+    --port 8000 \
+    --additional-config '{"override_neuron_config": {
+        "fused_qkv": true,
+        "qkv_nki_kernel_enabled": true,
+        "qkv_kernel_enabled": true,
+        "attn_block_tkg_nki_kernel_enabled": true,
+        "attn_block_tkg_nki_kernel_cache_update": true
+    }}'
+```
 
-Annapurna Labs
+## Technical Details
 
-**Last Updated:** 2026-01-29
+### Why Stock TKG Works (No Custom Kernel)
+
+At TP=8, the 8 KV heads are sharded to **1 KV head per rank**. The stock NxDI TKG kernel handles this natively. No multi-KV adapter or forked kernel is needed -- just enable the config flags. This makes this the cleanest TKG integration in the Mistral family.
+
+### TKG Eliminates Long-Input Concurrency Degradation
+
+Baseline long-short drops from 41.75 -> 33.54 tok/s at conc=4 (20% drop). TKG stays flat at 47.5 tok/s -- a +41.7% improvement for long-input concurrent workloads.
+
+### Voxtral Small-24B Cross-Reference
+
+Voxtral Small-24B uses this exact same text backbone (23.6B LlamaForCausalLM, hidden=5120, 40 layers). All decode-path optimizations from this contrib apply directly to Voxtral's text decoder. The stock TKG flag can be added to Voxtral's NeuronConfig without any custom kernel code.
+
+## Files
+
+```
+Mistral-Small-3.1-24B-Instruct-2503/
+  README.md                              -- This file
+  src/
+    __init__.py
+    modeling_mistral3.py                 -- Original auto-generated model (kept for reference)
+    setup_patches.py                     -- Master patch script (--tkg-mode stock)
+    extract_text_model.py                -- Extract text decoder from multimodal checkpoint
+    attention_block_tkg_multi_kv.py      -- Multi-KV TKG kernel (included for completeness)
+    multi_kv_adapter.py                  -- Adapter monkeypatch (not needed for stock TKG)
+    fix_nki030.py                        -- NKI 0.3.0 compatibility fix
+    fix_nki030_v2.py                     -- NKI 0.3.0 compatibility fix (v2)
+  test/
+    __init__.py
+    integration/
+      __init__.py
+      test_model.py                      -- Smoke test + token matching
+```
