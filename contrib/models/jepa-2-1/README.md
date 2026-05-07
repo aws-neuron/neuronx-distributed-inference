@@ -299,6 +299,45 @@ Tests: trace ViT-B image/video, Neuron vs CPU accuracy, trace ViT-L image = **4 
 
 5. **NKI flash attention integration:** Integrated `attention_isa_kernel` with correct tensor layouts (q/k: `(B*H, d, seqlen)`, v: `(B*H, seqlen, d)`). Works correctly but slower at short sequences.
 
+## Folder Structure
+
+```
+contrib/models/jepa-2-1/
+├── README.md
+├── AGENT.md                          # Technical reference for coding agents
+├── demo_neuron.py                    # Neuron smoke test (pretrained ViT-B, CPU vs Neuron)
+├── pyproject.toml
+├── examples/
+│   └── demo_classify.py              # CPU video classification demo (HF V-JEPA 2 + SSv2)
+├── src/
+│   ├── __init__.py
+│   └── modeling_jepa21.py            # Self-contained encoder (3D RoPE, Conv3d, NKI flash)
+└── test/
+    ├── __init__.py
+    ├── unit/
+    │   ├── __init__.py
+    │   └── test_encoder.py           # CPU-only: construction, forward, components
+    └── integration/
+        ├── __init__.py
+        └── test_model.py             # Neuron: trace, accuracy, ViT-B/L
+```
+
+## Known Limitations
+
+* ViT-g (1B) and ViT-G (1.8B) require trn2.48xlarge for compilation (>130GB host RAM needed); compiled models run on any trn2 instance
+* ViT-G video (16 frames) exceeds neuronx-cc's 10M instruction limit (17.8M instructions); requires `parallel_model_trace` to split across NeuronCores
+* `use_sdpa=False` is required (SDPA not supported by `torch_neuronx.trace()`)
+* NKI flash attention is slower than compiler-generated attention at 4,608 tokens (16 frames)
+* Modular compilation markers are not respected by `torch_neuronx.trace()` — need `parallel_model_trace` for graph splitting
+* Not a causal LM — no vLLM integration, no KV cache, no token generation
+* Pretrained weight download requires network access to `dl.fbaipublicfiles.com`
+
+## Future Work
+
+* ViT-G video (16 frames) via `parallel_model_trace` to split the 17.8M-instruction graph across NeuronCores
+* 64-frame inference (18,432 tokens) where NKI flash attention becomes beneficial
+* Downstream tasks: attentive pooler for classification, predictor for action anticipation
+
 ## Example Checkpoints
 
 Pretrained weights are downloaded automatically when `pretrained=True`:
@@ -316,4 +355,3 @@ Source: `https://dl.fbaipublicfiles.com/vjepa2/`
 
 Community contribution
 
-**Last Updated:** 2026-04-29

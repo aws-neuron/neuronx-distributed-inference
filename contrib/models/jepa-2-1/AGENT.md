@@ -7,23 +7,26 @@ This file is for coding agents working on this model. It documents architecture 
 ```
 contrib/models/jepa-2-1/
 ├── AGENT.md              ← You are here
-├── PR_README.md          ← PR description (paste into GitHub PR body)
 ├── README.md             ← User-facing documentation
-├── pyproject.toml
+├── pyproject.toml        ← Project config (pytest settings, dependencies)
+├── examples/
+│   └── demo_classify.py  ← CPU video classification demo (HF V-JEPA 2 + SSv2, no Neuron needed)
 ├── src/
 │   ├── __init__.py       ← Exports: build_vjepa21_encoder, VisionTransformer, VisionTransformerPredictor
 │   └── modeling_jepa21.py ← Self-contained encoder (~700 lines, no upstream imports)
 └── test/
     ├── unit/
-    │   └── test_encoder.py    ← 14 CPU-only tests (construction, forward, components)
+    │   └── test_encoder.py           ← 14 CPU-only tests (construction, forward, components)
     └── integration/
-        └── test_model.py      ← 4 Neuron tests (trace, accuracy, ViT-B/L)
+        ├── test_model.py             ← 4 Neuron tests (trace, accuracy, ViT-B/L, random weights)
+        └── test_pretrained_smoke.py  ← 5 tests: 3 CPU + 2 Neuron (pretrained weight validation)
 ```
 
 ## Source Code
 
 - **Upstream**: [github.com/facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2)
 - **Neuron port**: `src/modeling_jepa21.py` — self-contained, no upstream imports
+- **Examples**: `examples/demo_classify.py` — CPU-only video classification demo using HuggingFace V-JEPA 2 finetuned on SSv2 (174 action classes). Requires `transformers`, `accelerate`, `torchvision`, `decord`.
 - **Key difference from most NxDI contrib models**: This is a vision encoder, NOT a causal LM. It does not use `NeuronBaseForCausalLM`, KV cache, token generation, or vLLM. Compilation uses `torch_neuronx.trace()` directly.
 
 ## Classes and Functions in `modeling_jepa21.py`
@@ -169,8 +172,11 @@ trn2.3xlarge has 2 logical NeuronCores → 2x throughput. Scales linearly with b
 cd contrib/models/jepa-2-1/
 pytest test/unit/ -v
 
-# Integration tests (needs Neuron hardware, 4 tests)
-pytest test/integration/test_model.py -v
+# Integration tests (needs Neuron hardware, 4 + 5 tests)
+pytest test/integration/ -v
+
+# Just the pretrained smoke tests (3 CPU + 2 Neuron)
+pytest test/integration/test_pretrained_smoke.py -v
 ```
 
 ### What the tests cover
@@ -183,43 +189,42 @@ pytest test/integration/test_model.py -v
 **Integration tests (`test/integration/test_model.py`):**
 - `TestNeuronTrace`: trace ViT-B image, trace ViT-B video, Neuron vs CPU accuracy via `neuron_allclose` (3 tests)
 - `TestNeuronTraceVitLarge`: trace ViT-L image (1 test)
+- Uses random weights (fast compilation, no download)
+
+**Pretrained smoke tests (`test/integration/test_pretrained_smoke.py`):**
+- `TestPretrainedCPU`: loads pretrained ViT-B, checks output shape, checks no NaN/Inf (3 tests)
+- `TestPretrainedNeuron`: compiles pretrained ViT-B, validates cosine similarity > 0.999 vs CPU, checks no NaN/Inf (2 tests)
+- Downloads ~350MB pretrained weights on first run
+- Neuron tests take ~14 min (two compilations of ViT-B 16-frame)
 
 ### Test gaps (future work)
 
-- No pretrained weight validation (tests use random weights)
-- No ViT-g/ViT-G tests (blocked by compilation)
+- No ViT-g/ViT-G tests (blocked by compilation on trn2.3xlarge)
 - No 64-frame tests
 - No predictor tests
 
-## Instance Details
+## Instance Requirements
 
-- **Type**: trn2.3xlarge (persistent spot) in sa-east-1
-- **Instance ID**: i-0cae7b2ac61807cf9
-- **SSH**: `ssh -i ~/.ssh/trn2-sa-east-1.pem ubuntu@52.67.239.128`
-- **Hardware**: 1 Neuron device, 2 logical NeuronCores, 96 GB HBM, 124 GB system RAM
+- **Minimum for ViT-B/L**: trn2.3xlarge (1 Neuron device, 2 logical NeuronCores, 96 GB HBM, 124 GB system RAM)
+- **Required for ViT-g/G compilation**: trn2.48xlarge (>130 GB host RAM needed for compilation; compiled models run on any trn2)
 - **Neuron SDK**: torch-neuronx 2.9.0, neuronx-cc 2.24.5133, NxDI 0.9.17334
 - **Venv**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate`
-
-### Compiled files on instance
-
-```
-~/jepa-2-1/vjepa21_vitb_16f_384_v2.pt   (335M) — ViT-B baseline (best)
-~/jepa-2-1/vjepa21_vitl_16f_384.pt      (1.1G) — ViT-L baseline (best)
-~/jepa-2-1/vjepa21_vitb_nki_16f_384.pt  (405M) — ViT-B + NKI flash (slower)
-~/jepa-2-1/vjepa21_vitl_nki_16f_384.pt  (1.4G) — ViT-L + NKI flash (slower)
-```
 
 ## Workflow
 
 ```bash
-# Sync local → trn2
-rsync -avz --exclude='__pycache__' --exclude='._*' \
-  ~/dev/neuron-docs/neuronx-distributed-inference/contrib/models/jepa-2-1/ \
-  -e "ssh -i ~/.ssh/trn2-sa-east-1.pem" ubuntu@52.67.239.128:jepa-2-1/
+# Activate the Neuron venv on the instance
+. /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
-# Run on trn2
-ssh -i ~/.ssh/trn2-sa-east-1.pem ubuntu@52.67.239.128 \
-  "cd jepa-2-1 && source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && python ..."
+# Run unit tests (CPU only, no Neuron device needed)
+cd contrib/models/jepa-2-1/
+pytest test/unit/ -v
+
+# Run integration tests (needs Neuron hardware)
+pytest test/integration/ -v
+
+# Run only the pretrained smoke tests
+pytest test/integration/test_pretrained_smoke.py -v
 ```
 
 ## Weight Loading
@@ -237,15 +242,14 @@ Checkpoints loaded via `torch.hub.load_state_dict_from_url`. State dict keys pre
 
 ### P0 — Needed for production readiness
 1. **Compile ViT-g (1B) and ViT-G (1.8B)**: Use `parallel_model_trace` from NxD (markers already in code) or compile on trn2.48xlarge (2TB RAM). The modular compilation markers are already inserted.
-2. **Validate with pretrained weights**: Current tests use random weights. Need to verify that pretrained models produce meaningful features on Neuron.
 
 ### P1 — Valuable additions
-3. **64-frame inference**: 18,432 tokens — NKI flash attention should become beneficial here. Need to benchmark.
-4. **Downstream tasks**: Attentive pooler for classification, predictor for action anticipation.
+2. **64-frame inference**: 18,432 tokens — NKI flash attention should become beneficial here. Need to benchmark.
+3. **Downstream tasks**: Attentive pooler for classification, predictor for action anticipation.
 
 ### P2 — Nice to have
-5. **Tensor parallelism**: For ViT-G on multi-device instances. Would require wrapping with NxD parallel layers.
-6. **Dynamic resolution**: Test with non-384 resolutions using `interpolate_rope=True`.
+4. **Tensor parallelism**: For ViT-G on multi-device instances. Would require wrapping with NxD parallel layers.
+5. **Dynamic resolution**: Test with non-384 resolutions using `interpolate_rope=True`.
 
 ## Reference Code in the NxDI Repo
 
