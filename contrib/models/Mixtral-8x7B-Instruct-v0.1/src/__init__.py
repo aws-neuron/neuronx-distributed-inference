@@ -1,1 +1,1 @@
-from .mixtral_model import NeuronMixtralForCausalLM, MixtralInferenceConfig
+from .modeling_mixtral import NeuronMixtralForCausalLM, MixtralInferenceConfig

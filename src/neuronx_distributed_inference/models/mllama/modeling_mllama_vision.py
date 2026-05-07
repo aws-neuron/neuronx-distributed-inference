@@ -40,16 +40,6 @@ from .encoder_utils import (
 from .hf_embeddings import PrecomputedAspectRatioEmbedding, PrecomputedPositionEmbedding
 from .utils import get_negative_inf_value, to_2tuple
 
-# Try except for the compatibility with older compiler version
-try:
-    from neuronxcc.nki._private_kernels.attention import attention_isa_kernel  # noqa: E402
-except ImportError:
-    from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
-
-from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
-
-_flash_fwd_call = nki_jit()(attention_isa_kernel)
-
 logger = logging.getLogger(__name__)
 
 
@@ -178,8 +168,11 @@ class NeuronImageAttention(NeuronAttentionBase):
         )
 
     @staticmethod
-    def perform_maskless_sdpa(Q, K, V, mask_gen_vectors, use_flash_attention, dtype):
+    def perform_maskless_sdpa(Q, K, V, mask_gen_vectors, dtype):
         """
+        Perform scaled dot-product attention with maskless approach.
+        Uses mask generation vectors concatenated to Q and K to handle padding.
+
         Define as static method for easier unit testing.
         """
         bsz, num_heads, q_len, head_dim = Q.shape
@@ -191,81 +184,26 @@ class NeuronImageAttention(NeuronAttentionBase):
             K.dtype
         ).detach().clone() * get_negative_inf_value(K.dtype)
         K_cat = torch.cat([K, K_cat_v], dim=3)
-        if use_flash_attention:
-            # Append to V to have uniform head_dim across QKV, to avoid error within kernel
-            V_cat = torch.cat(
-                [
-                    V,
-                    torch.zeros(
-                        V.shape[0], V.shape[1], V.shape[2], 1, device=V.device, dtype=V.dtype
-                    ),
-                ],
-                dim=3,
-            )
-            Q, K, V = Q_cat, K_cat, V_cat
-            new_head_dim = head_dim + 1
-            logger.debug(f"Using flash_fwd for Q.shape={Q.shape}")
-            # original Q shape: batch, num_heads, seqlen, d_head
-            Q = (
-                Q.permute(0, 1, 3, 2)  # after permute: batch, num_heads, d_head, seqlen
-                .reshape((bsz * num_heads, new_head_dim, q_len))
-                .to(dtype)
-            )
-            Q = Q * scale
-            K = K.permute(0, 1, 3, 2).reshape((bsz * num_heads, new_head_dim, q_len)).to(dtype)
-            V = V.reshape((bsz * num_heads, q_len, new_head_dim)).to(dtype)
-            # shape: (B*H)DS
-            attn_output = torch.zeros(
-                bsz * num_heads, new_head_dim, q_len, dtype=Q.dtype, device=Q.device
-            )
-            logger.debug("Input parameter shapes")
-            logger.debug(f"Q input shape {Q.shape}")
-            logger.debug(f"K input shape {K.shape}")
-            logger.debug(f"V input shape {V.shape}")
-            logger.debug(f"Attn output shape {attn_output.shape}")
-            # Use non-causal flash attention kernel
-            _flash_fwd_call(
-                Q,
-                K,
-                V,
-                1.0,
-                attn_output,
-                kernel_name="AttentionMMSoftmaxMMWithoutSwap",
-            )
-            # shape: BHDS
-            attn_output = attn_output.reshape((bsz, num_heads, new_head_dim, q_len))
-            attn_output = attn_output[:, :, :head_dim, :]
-            logger.debug(f"Attn output after reshape {attn_output.shape}")
-        else:
-            # shape: BHSD
-            attn_output = neuron_scaled_dot_product_attention(
-                Q_cat, K_cat, V, attn_mask=None, scale=scale
-            )
+
+        # shape: BHSD
+        attn_output = neuron_scaled_dot_product_attention(
+            Q_cat, K_cat, V, attn_mask=None, scale=scale
+        )
         return attn_output
 
     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask) -> Tensor:
         K_active = repeat_kv(K, self.num_key_value_groups)
         V_active = repeat_kv(V, self.num_key_value_groups)
-        self.attn_kernel_enabled = (
-            (self.attn_kernel_enabled or q_len >= 4096)
-            and (Q.shape == K_active.shape == V_active.shape)
-            and (self.padding_side == "right" or bsz == 1)
-        )
+
         attn_output = self.perform_maskless_sdpa(
             Q=Q,
             K=K_active,
             V=V_active,
             mask_gen_vectors=attention_mask,
-            use_flash_attention=self.attn_kernel_enabled,
             dtype=self.torch_dtype,
         )
 
-        flash_attention_strategy = (
-            FlashAttentionStrategy.UNSHARDED_KERNEL
-            if self.attn_kernel_enabled
-            else FlashAttentionStrategy.NONE
-        )
-        return attn_output, flash_attention_strategy
+        return attn_output, FlashAttentionStrategy.NONE
 
 
 class ImageTransformerBlock(nn.Module):

@@ -26,10 +26,12 @@ from neuronx_distributed_inference.models.config import (
 )
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
+from neuronx_distributed_inference.models.mistral.modeling_mistral import NeuronMistralForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+from neuronx_distributed_inference.models.gemma3.modeling_gemma3 import NeuronGemma3ForCausalLM
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.accuracy import (
     check_accuracy,
@@ -51,11 +53,13 @@ set_random_seed(0)
 
 MODEL_TYPES = {
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
+    "mistral": {"causal-lm": NeuronMistralForCausalLM},
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
     "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
+    "gemma3": {"causal-lm": NeuronGemma3ForCausalLM},
 }
 
 
@@ -300,7 +304,6 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--attn-kernel-enabled", action=argparse.BooleanOptionalAction, default=None)
     run_parser.add_argument("--strided-context-parallel-kernel-enabled", action="store_true")
     run_parser.add_argument("--mlp-kernel-enabled", action="store_true")
-    run_parser.add_argument("--mlp-tkg-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--quantized-mlp-kernel-enabled", action="store_true")
     run_parser.add_argument("--fused-rmsnorm-skip-gamma", action="store_true")
     run_parser.add_argument(
@@ -312,12 +315,9 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--quantize-clamp-bound", type=float, default=float("inf"))
     run_parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
     run_parser.add_argument("--qkv-kernel-fuse-residual-add", action="store_true")
-    run_parser.add_argument("--attn-tkg-nki-kernel-enabled", action="store_true")
-    run_parser.add_argument("--attn-tkg-builtin-kernel-enabled", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-cascaded-attention", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-cache-update", action="store_true")
-    run_parser.add_argument("--attn-block-cte-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--k-cache-transposed", action="store_true")
     run_parser.add_argument("--is-eagle3", action="store_true")
 

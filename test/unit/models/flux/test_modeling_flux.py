@@ -33,6 +33,7 @@ def mock_config():
         width=1024,
         vae_scale_factor=8,
         neuron_config=neuron_config,
+        cfg_parallel_enabled=False,
     )
     return config
 
@@ -69,8 +70,8 @@ class TestUtilityFunctions:
         key = torch.randn(1, 18, 256, 64)
         value = torch.randn(1, 18, 256, 64)
         
-        with patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux._flash_fwd_call') as mock_flash:
-            mock_flash.return_value = None
+        with patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux.attention_cte') as mock_attention_cte:
+            mock_attention_cte.return_value = torch.randn(18, 256, 64)
             output = attention_wrapper_sharded_without_swap(query, key, value)
             assert output is not None
             assert output.shape == (1, 18, 256, 64)
@@ -83,9 +84,10 @@ class TestUtilityFunctions:
         key = torch.randn(1, 18, 256, 64)
         value = torch.randn(1, 18, 256, 64)
         
-        with patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux._flash_fwd_call') as mock_flash, \
+        with patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux.attention_cte') as mock_attention_cte, \
              patch.dict('os.environ', {'NEURON_RT_VIRTUAL_CORE_SIZE': '2'}):
-            mock_flash.return_value = None
+            mock_kernel = MagicMock(return_value=torch.randn(18, 256, 64))
+            mock_attention_cte.__getitem__ = MagicMock(return_value=mock_kernel)
             output = attention_wrapper_sharded_without_swap(query, key, value)
             assert output is not None
 
@@ -249,7 +251,9 @@ class TestNeuronFluxBackboneApplication:
             app.context_parallel_enabled = False
             
             compiler_args = app.get_compiler_args()
-            assert '--cc-pipeline-tiling-factor=4' in compiler_args
+            # TRN2 without context parallel uses -O1 and ccop-compute-overlap
+            assert '-O1' in compiler_args
+            assert '--enable-ccop-compute-overlap' in compiler_args
 
 
 class TestBasicFunctionality:
@@ -278,10 +282,10 @@ class TestBasicFunctionality:
         process_group = MagicMock()
         
         with patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux.gather_from_tensor_model_parallel_region_with_dim') as mock_gather, \
-             patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux._flash_fwd_call') as mock_flash:
+             patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux.attention_cte') as mock_attention_cte:
             
             mock_gather.return_value = torch.randn(256, 18, 64)
-            mock_flash.return_value = None
+            mock_attention_cte.return_value = torch.randn(18, 256, 64)
             
             output = attention_wrapper_context_parallel_single_transformer(query, key, value, process_group)
             assert output is not None
@@ -297,11 +301,12 @@ class TestBasicFunctionality:
         process_group = MagicMock()
         
         with patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux.gather_from_tensor_model_parallel_region_with_dim') as mock_gather, \
-             patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux._flash_fwd_call') as mock_flash, \
+             patch('neuronx_distributed_inference.models.diffusers.flux.modeling_flux.attention_cte') as mock_attention_cte, \
              patch.dict('os.environ', {'NEURON_RT_VIRTUAL_CORE_SIZE': '2'}):
             
             mock_gather.return_value = torch.randn(256, 18, 64)
-            mock_flash.return_value = None
+            mock_kernel = MagicMock(return_value=torch.randn(18, 256, 64))
+            mock_attention_cte.__getitem__ = MagicMock(return_value=mock_kernel)
             
             output = attention_wrapper_context_parallel_single_transformer(query, key, value, process_group)
             assert output is not None

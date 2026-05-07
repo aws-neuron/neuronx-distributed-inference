@@ -147,7 +147,7 @@ def test_sampling_batch_sharding(batch_size, tp_degree, sampling_dp_degree, num_
         "batch_size": batch_size      
     }
     config_dict["on_device_sampling_config"] = {
-        "top_k_kernel_enabled": False,
+        "top_k_kernel_enabled": True,
         "global_topk": 256,
         "do_sample": True,
         "top_k": 50,

@@ -1,8 +1,14 @@
 # fmt: off
+import os
 import torch
 import torch_neuronx
+from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.modules.attention.utils import create_block_diagonal_attn_mask
+
+# Setup platform target for NKI kernels
+if not os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
 
 
 # Tests on create_block_diagonal_attn_mask()

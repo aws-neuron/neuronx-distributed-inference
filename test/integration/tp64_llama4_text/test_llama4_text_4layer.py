@@ -318,7 +318,7 @@ LLAMA4_128E_BASELINE_CONFIG = MoENeuronConfig(
 
 
 @pytest.fixture(scope="module", autouse=True)
-def model_path_from_config(request):
+def model_path_from_config(set_module_seed, request):
     hf_config_name = request.param
     assert hf_config_name in {"config_16E_4layer.json", "config_128E_4layer.json", "config_16E_4layer_2048_chunk_size.json"}
 
@@ -390,10 +390,10 @@ def save_checkpoint(config_path, torch_dtype = None, disable_attn_temperature_tu
         pytest.param("config_16E_4layer.json", SCOUT_CP_CHUNKED_ATTN_CONFIG_16K, 128, 1234, 30,  DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, None, marks=pytest.mark.xfail), # generate within first chunk
         pytest.param("config_16E_4layer.json", SCOUT_CP_CHUNKED_ATTN_CONFIG_32K, 128, 1234, 30,  DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, None, marks=pytest.mark.xfail), # generate within first chunk
         pytest.param("config_16E_4layer.json", SCOUT_CHUNKED_ATTN_NO_FLASH_ATTN_CONFIG, 8200, 1234, 128, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, None, marks=pytest.mark.xfail), # torch chunked attn, prompt > chunk_size
-        pytest.param("config_16E_4layer.json", SCOUT_CHUNKED_ATTN_PERF_CONFIG, 128, 1234, 30, 0.004, None, marks=pytest.mark.xfail), # Chunked attn with MOE and TKG mega kernel
+        pytest.param("config_16E_4layer.json", SCOUT_CHUNKED_ATTN_PERF_CONFIG, 128, 1234, 30, 0.004, None, marks=pytest.mark.xfail(reason="Uses beta1 blockwise kernels which are deprecated")), # Chunked attn with MOE and TKG mega kernel
         pytest.param("config_16E_4layer.json", SCOUT_CHUNKED_ATTN_NO_FLASH_ATTN_CONFIG, 128, 1234, 128, 0.004, None, marks=pytest.mark.xfail), # torch chunked attn, prompt < chunk_size
         pytest.param("config_16E_4layer.json", SCOUT_BASELINE_CONFIG, 128, 1234, 128, 0.004, None, marks=pytest.mark.xfail),
-        pytest.param("config_16E_4layer.json", SCOUT_PERF_CONFIG, 128, 1234, 128, 0.004, None, marks=[pytest.mark.key_config_test, pytest.mark.xfail(reason="Unstable due to random weights, see P316201525")]),
+        pytest.param("config_16E_4layer.json", SCOUT_PERF_CONFIG, 128, 1234, 128, 0.004, None, marks=[pytest.mark.key_config_test, pytest.mark.xfail(reason="Uses beta1 blockwise kernels which are deprecated")]),
         pytest.param("config_16E_4layer.json", SCOUT_SHORT_SEQ_CONFIG, 128, 1234, 128, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, None, marks=pytest.mark.xfail),
         # pytest.param("config_128E_4layer.json", LLAMA4_128E_BASELINE_CONFIG, 128, 1234, 128),
         # pytest.param("config_128E_4layer.json", LLAMA4_128E_PERF_CONFIG, 128, 1234, 128),

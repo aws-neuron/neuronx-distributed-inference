@@ -89,6 +89,7 @@ def save_checkpoint(config_path):
         pytest.param(
             dtype, model_type, latency_threshold, throughput_threshold,
             id=f"dtype_{str(dtype).split('.')[-1]}_config_{model_type}",
+            marks=pytest.mark.xfail(reason="attention_cte DMA transpose is not supported on Trn1"),
         )
         for (dtype, model_type, latency_threshold, throughput_threshold) in [
             (torch.float16, "mllama", 11550*1.1, 712*0.9),

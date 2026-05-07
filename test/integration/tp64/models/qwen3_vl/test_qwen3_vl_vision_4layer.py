@@ -26,7 +26,6 @@ with open(os.path.join(CURR_DIR, "model_configs/bs1_bf16_baseline.yaml"), "r") a
 TEXT_NEURON_CONFIG = Qwen3VLNeuronConfig(**MODEL_CONFIG["inference_config"]["neuron_config"]["text_neuron_config"])
 VISION_NEURON_CONFIG = Qwen3VLNeuronConfig(**MODEL_CONFIG["inference_config"]["neuron_config"]["vision_neuron_config"])
 
-
 @pytest.mark.skip("Skip in NxDTest. Will use NIT test templates to add logit matching test.")
 def test_original_vs_neuron():
     # Input processing
@@ -56,7 +55,12 @@ def test_original_vs_neuron():
     sd = load_state_dict(model_path)
     hf_model.load_state_dict(sd, strict=False)
     hf_hidden_states, hf_ds_feat_list = hf_model(**vision_inputs)
-    
+    # add batch dim to hf_hidden_states
+    hf_hidden_states = hf_hidden_states.unsqueeze(0)
+    if neuron_hidden_states.shape[1] > hf_hidden_states.shape[1]:
+        # neuron output is padded on sequence dim
+        neuron_hidden_states = neuron_hidden_states[:, :hf_hidden_states.shape[1], :]
+
     # Validate hidden_states
     passed, max_error = check_accuracy_embeddings(
         neuron_hidden_states.float(),
@@ -70,6 +74,10 @@ def test_original_vs_neuron():
 
     # Validate deepstack features
     for i, (neuron_ds_feat, hf_ds_feat) in enumerate(zip(neuron_ds_feat_list, hf_ds_feat_list)):
+        hf_ds_feat = hf_ds_feat.unsqueeze(0)
+        if neuron_ds_feat.shape[1] > hf_ds_feat.shape[1]:
+            # neuron output is padded on sequence dim
+            neuron_ds_feat = neuron_ds_feat[:, :hf_ds_feat.shape[1], :]
         passed, max_error = check_accuracy_embeddings(
             neuron_ds_feat.float(),
             hf_ds_feat.float(),

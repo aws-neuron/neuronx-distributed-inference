@@ -75,6 +75,25 @@ gate_proj_weight = gate_up_proj[:intermediate_size, :]
 up_proj_weight = gate_up_proj[intermediate_size:, :]
 ```
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.22 | 0.00 |
+| MBU (%) | 0.43 | 0.58 |
+| HFU (%) | 0.23 | 0.00 |
+| Execution Time (us) | 0.05 | 0.04 |
+| HBM Read | 8.97 GB | 8.79 GB |
+| HBM Write | 151.61 MB | 2.68 MB |
+
+**Throughput:** 18.69 tok/s | **Compile Time:** 876.97s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python

@@ -2,6 +2,18 @@ import os
 import pytest
 from neuronx_distributed_inference.utils.random import set_random_seed
 
+@pytest.fixture(scope="module", autouse=True)
+def set_module_seed():
+    """
+    Sets a constant seed at module scope to ensure deterministic behavior in module-scoped fixtures.
+
+    Module-scoped fixtures (e.g., save_checkpoint creating random weights) run before
+    function-scoped fixtures. Without this, random weights vary between runs, causing
+    flaky logit validation due to varying precision loss accumulation.
+    """
+    set_random_seed(0)
+
+
 @pytest.fixture(autouse=True)
 def set_constant_seed():
     """

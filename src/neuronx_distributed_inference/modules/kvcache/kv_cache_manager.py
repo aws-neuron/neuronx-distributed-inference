@@ -21,7 +21,6 @@ from neuronx_distributed_inference.modules.attention.utils import get_kv_head_in
 from neuronx_distributed_inference.modules.attention.attention_process_groups import get_tp_cp_group_mesh
 from neuronx_distributed_inference.utils.distributed import split_along_dim, get_dp_rank
 
-from neuronxcc.nki.language import nc
 
 # Pad on the KV cache to avoid overwrite on inactive seq_ids
 KV_CACHE_PAD_FOR_SEQ_IDS_MASKING = 128
@@ -321,11 +320,7 @@ class KVCacheManager(nn.Module):
             k_cache = torch.scatter(input=k_cache, dim=3 if self.k_cache_transposed else 2, index=slice_index, src=accepted_k_cache)
             v_cache = torch.scatter(input=v_cache, dim=2, index=slice_index, src=accepted_v_cache)
 
-        attn_kernel_enabled = (
-            self.neuron_config.attn_tkg_builtin_kernel_enabled
-            or self.neuron_config.attn_tkg_nki_kernel_enabled
-            or self.neuron_config.attn_block_tkg_nki_kernel_enabled
-        )
+        attn_kernel_enabled = self.neuron_config.attn_block_tkg_nki_kernel_enabled
         if attn_kernel_enabled:  # Attention TKG Kernels do not need slicing.
             skip_slice = True
 
@@ -493,8 +488,7 @@ class KVCacheManager(nn.Module):
                 elif self.neuron_config.kv_cache_update_with_kernel:
                     cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
                     # For trn2+ we use the dma_skipping KV update kernel for better performance
-                    grid = (nc(self.neuron_config.logical_nc_config),)
-                    k_cache, v_cache = write_kv_cache_at_batch_kernel[grid](latest_k, latest_v, k_cache, v_cache, cache_idx)
+                    k_cache, v_cache = write_kv_cache_at_batch_kernel[self.neuron_config.logical_nc_config](latest_k, latest_v, k_cache.data, v_cache.data, cache_idx)
                 else:
                     cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
                     indices = [cache_idx] + [torch.zeros(1, device=seq_ids.device) for _ in range(k_cache.dim() - 1)]

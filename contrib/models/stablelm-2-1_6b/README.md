@@ -49,6 +49,25 @@ NeuronX Distributed Inference implementation of StableLM 2 1.6B.
 
 **Status:** ✅ PASS
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.15 | 0.00 |
+| MBU (%) | 0.34 | 0.55 |
+| HFU (%) | 0.16 | 0.00 |
+| Execution Time (us) | 0.01 | 0.01 |
+| HBM Read | 1.50 GB | 1.45 GB |
+| HBM Write | 54.79 MB | 999.5 KB |
+
+**Throughput:** 79.95 tok/s | **Compile Time:** 173.75s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Implementation Notes
 
 ### Partial Rotary Embedding

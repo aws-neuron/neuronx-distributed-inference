@@ -33,6 +33,25 @@ NeuronX Distributed Inference implementation of starcoder2 3b.
 
 **Status:** ✅ GOOD
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.66 | 0.00 |
+| MBU (%) | 0.31 | 0.61 |
+| HFU (%) | 0.68 | 0.00 |
+| Execution Time (us) | 0.05 | 0.02 |
+| HBM Read | 6.28 GB | 6.08 GB |
+| HBM Write | 218.27 MB | 1.70 MB |
+
+**Throughput:** 19.53 tok/s | **Compile Time:** 355.17s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -97,6 +116,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

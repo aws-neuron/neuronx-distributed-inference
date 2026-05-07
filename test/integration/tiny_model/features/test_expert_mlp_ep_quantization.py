@@ -224,7 +224,7 @@ class TestRoutedExpertsFP8(unittest.TestCase):
 
         if quant:
             neuron_config.quantized = True
-            neuron_config.quantization_dtype = "f8e3m4",
+            neuron_config.quantization_dtype = "f8e4m3",
             neuron_config.quantization_type = "expert_wise_per_channel_symmetric"
 
         inference_config = InferenceConfig(
@@ -268,20 +268,19 @@ class TestRoutedExpertsFP8(unittest.TestCase):
     def test_expert_mlp_fp8_quantization(self):
         test_configs = [
             {
-                # Qwen3 configs with 16 experts
                 "model_type": "Qwen3",
                 "early_expert_affinity_modulation": False,
                 "disable_normalize_top_k_affinities": False,
-                "hidden_size": 2048,
-                "intermediate_size": 768,
+                "hidden_size": 3072,
+                "intermediate_size": 3072,
                 "num_experts": 16,
-                "top_k":8,
+                "top_k":4,
             },
         ]
 
         blockwise_configs = []
-        block_sizes = [256]
-        block_strategies = [ "PING_PONG"]
+        block_sizes = [512]
+        use_shard_on_intermediate_kernel = [True, False]
         skip_dma_configs = [[False, False]]
         use_experts_bias = [False, True]
 
@@ -294,7 +293,7 @@ class TestRoutedExpertsFP8(unittest.TestCase):
                 skip_dma_configs,
                 use_experts_bias,
             )
-            
+
             # for block_size, strategy, skip_token, skip_weight in param_combinations:
             for block_size, use_shard_on_intermediate_kernel, skip_dma, use_experts_bias in param_combinations:
                 config = base_config.copy()
@@ -302,10 +301,10 @@ class TestRoutedExpertsFP8(unittest.TestCase):
                 config["blockwise_matmul_config"] = {
                     "block_size": block_size,
                     "use_block_parallel": False,
-                    "block_sharding_strategy": strategy,
                     "skip_dma_token": skip_dma[0],
                     "skip_dma_weight": skip_dma[1],
-                    "use_torch_block_wise": True,
+                    "use_torch_block_wise": not use_shard_on_intermediate_kernel,
+                    "use_shard_on_intermediate_dynamic_while": use_shard_on_intermediate_kernel,
                 }
                 blockwise_configs.append(config)
 

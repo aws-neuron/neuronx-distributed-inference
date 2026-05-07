@@ -54,6 +54,25 @@ NeuronX Distributed Inference implementation of OLMo 2 0425 1B Instruct.
 
 **Status:** ✅ PASS
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.21 | 0.00 |
+| MBU (%) | 0.45 | 0.58 |
+| HFU (%) | 0.22 | 0.00 |
+| Execution Time (us) | 0.01 | 0.01 |
+| HBM Read | 1.31 GB | 1.29 GB |
+| HBM Write | 28.64 MB | 700.7 KB |
+
+**Throughput:** 123.11 tok/s | **Compile Time:** 96.43s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Implementation Notes
 
 ### Post-Layer Normalization

@@ -47,6 +47,25 @@ NeuronX Distributed Inference implementation of Command R7B from Cohere For AI.
 
 **Note:** Low token matching may be due to model-specific generation behavior. Model generates coherent text and has outstanding throughput performance.
 
+### Device Profiling Metrics
+
+**Configuration:** TP=8, batch_size=1, seq_len=2048, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-21
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.23 | 0.00 |
+| MBU (%) | 0.12 | 0.57 |
+| HFU (%) | 0.26 | 0.01 |
+| Execution Time (us) | 0.19 | 0.01 |
+| HBM Read | 6.93 GB | 2.06 GB |
+| HBM Write | 1.86 GB | 2.96 MB |
+
+**Throughput:** 7.46 tok/s | **Compile Time:** 167.57s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -118,6 +137,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

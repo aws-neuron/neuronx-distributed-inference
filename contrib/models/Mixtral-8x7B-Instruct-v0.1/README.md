@@ -33,6 +33,25 @@ NeuronX Distributed Inference implementation of Mixtral 8x7B Instruct v0.1.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=8, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-20
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.21 | 0.00 |
+| MBU (%) | 0.38 | 0.99 |
+| HFU (%) | 0.21 | 0.00 |
+| Execution Time (us) | 0.08 | 0.01 |
+| HBM Read | 11.94 GB | 6.01 GB |
+| HBM Write | 260.47 MB | 2.21 MB |
+
+**Throughput:** 12.64 tok/s | **Compile Time:** 1208.41s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -97,6 +116,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

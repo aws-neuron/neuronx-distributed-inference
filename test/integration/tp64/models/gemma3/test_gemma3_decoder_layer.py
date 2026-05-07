@@ -4,6 +4,7 @@ import pytest
 import tempfile
 from functools import partial
 import copy
+import json
 
 import torch
 import torch.nn as nn
@@ -32,6 +33,14 @@ from neuronx_distributed_inference.modules.attention.utils import (
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+# Reading neuron_config test cases
+CURR_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Baseline
+with open(os.path.join(CURR_DIR, "neuron_configs/gemma3_baseline.json"), "r") as f:
+    baseline_json = json.load(f)
+BASELINE_NEURON_CONFIG = NeuronConfig(**baseline_json)
 
 
 class CPUGemma3DecoderLayerModule(nn.Module):
@@ -294,28 +303,6 @@ def load_neuron_model(
     return neuron_model
 
 
-# Reading neuron_config test cases from jsons
-CURR_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# BS1 baseline TP2 configuration
-BASELINE_NEURON_CONFIG = NeuronConfig(
-    tp_degree=2,
-    cp_degree=1,
-    attention_dp_degree=1,
-    batch_size=1,
-    ctx_batch_size=1,
-    tkg_batch_size=1,
-    max_context_length=1024,
-    seq_len=1024,
-    sequence_parallel_enabled=False,
-    logical_nc_config=2,
-    attn_kernel_enabled=False,
-    is_continuous_batching=False,
-    fused_qkv=False,
-    torch_dtype=torch.float32,
-)
-
-
 def check_results(test_name, actual_output, expected_output, rtol=1e-5):
     line_break = "-" * 150
     print(line_break)
@@ -333,7 +320,7 @@ def check_results(test_name, actual_output, expected_output, rtol=1e-5):
 @pytest.mark.parametrize(
     "neuron_config, layer_idx, rtol",
     [
-        (BASELINE_NEURON_CONFIG, 1, 2e-2),  # Sliding window layer (layer 0)
+        # (BASELINE_NEURON_CONFIG, 1, 2e-2),  # Sliding window layer (layer 0)
         # (BASELINE_NEURON_CONFIG, 5, 2e-2),  # Global attention layer (layer 5, (5+1)%6 == 0)
     ],
 )

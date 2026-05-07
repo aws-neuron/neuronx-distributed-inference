@@ -16,8 +16,7 @@ from neuronx_distributed_inference.modules.attention.utils import (get_kernel_ca
                                                                    get_last_kv_window,
                                                                    order_strided_tensor,
                                                                    stride_tensor,
-                                                                   chunk_and_reorder_tensor,
-                                                                   reshape_qkv_for_chunked_flash_attention_kernel)
+                                                                   chunk_and_reorder_tensor)
 
 class TestMoveHeadsFront(unittest.TestCase):
     def test_move_heads_front(self):
@@ -100,25 +99,6 @@ def test_validate_tp_prefill_to_dp_decode(num_kv_heads, world_size, dp_degree, w
             validate_tp_prefill_to_dp_decode(num_kv_heads=num_kv_heads, world_size=world_size, dp_degree=dp_degree)
     else:
         validate_tp_prefill_to_dp_decode(num_kv_heads=num_kv_heads, world_size=world_size, dp_degree=dp_degree)
-
-
-@pytest.mark.parametrize(
-    "n_heads, seq_len, head_dim, chunk_size",
-    # fmt: off
-    [
-        (8, 1024, 128, 512),
-    ]
-    # fmt: on
-)
-def test_reshape_qkv_for_chunked_flash_attention_kernel(n_heads, seq_len, head_dim, chunk_size):
-    q = torch.randn(1, n_heads, seq_len, head_dim)
-    k = torch.randn(1, n_heads, seq_len, head_dim)
-    v = torch.randn(1, n_heads, seq_len, head_dim)
-    n_chunks = math.ceil(seq_len / chunk_size)
-    actual_q, actual_k, actual_v = reshape_qkv_for_chunked_flash_attention_kernel(q, k, v, chunk_size, torch.float32)
-    assert actual_q.shape == (n_chunks * n_heads, head_dim, chunk_size)
-    assert actual_k.shape == (n_chunks * n_heads, head_dim, chunk_size)
-    assert actual_v.shape == (n_chunks * n_heads, chunk_size, head_dim)
 
 
 @pytest.mark.parametrize(

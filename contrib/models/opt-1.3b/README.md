@@ -33,6 +33,25 @@ NeuronX Distributed Inference implementation of opt 1.3b.
 
 **Status:** ✅ GOOD
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-20
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.28 | 0.00 |
+| MBU (%) | 0.55 | 0.48 |
+| HFU (%) | 0.32 | 0.02 |
+| Execution Time (us) | 0.01 | 0.01 |
+| HBM Read | 2.65 GB | 2.65 GB |
+| HBM Write | 52.12 MB | 496.0 KB |
+
+**Throughput:** 78.09 tok/s | **Compile Time:** 74.34s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -97,6 +116,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

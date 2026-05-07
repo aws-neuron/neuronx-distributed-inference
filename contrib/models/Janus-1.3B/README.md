@@ -28,6 +28,25 @@ NeuronX Distributed Inference implementation of Janus 1.3B.
 
 **Status:** ✅ GOOD
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=512, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.47 | 0.00 |
+| MBU (%) | 0.26 | 0.49 |
+| HFU (%) | 0.49 | 0.01 |
+| Execution Time (us) | 0.03 | 0.01 |
+| HBM Read | 3.10 GB | 2.99 GB |
+| HBM Write | 240.14 MB | 1.79 MB |
+
+**Throughput:** 31.77 tok/s | **Compile Time:** 264.29s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -92,6 +111,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

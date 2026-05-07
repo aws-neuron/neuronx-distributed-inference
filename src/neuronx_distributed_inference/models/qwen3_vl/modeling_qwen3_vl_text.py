@@ -1,3 +1,18 @@
+# Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch Qwen3-VL ext model for NxD Inference."""
+
 import gc
 import logging
 from typing import Optional, Tuple
@@ -21,6 +36,12 @@ from neuronx_distributed_inference.models.model_wrapper import (
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
+from neuronx_distributed_inference.utils.distributed import get_tp_group
+from neuronx_distributed.parallel_layers.mappings import (
+    _reduce_scatter_along_dim,
+    gather_from_sequence_parallel_region,
+)
+import torch_xla.core.xla_model as xm
 
 logger = logging.getLogger("Neuron")
 
@@ -212,8 +233,8 @@ class NeuronQwen3VLDecoderLayer(nn.Module):
 
 class NeuronQwen3VLTextModel(NeuronBaseModel):
 
-    @staticmethod
     def deepstack_process_xla(
+        self,
         hidden_states: torch.Tensor,
         visual_embeds: torch.Tensor,
         vision_mask_positions: torch.Tensor,
@@ -240,17 +261,39 @@ class NeuronQwen3VLTextModel(NeuronBaseModel):
                 at the specified mask positions.
                 Shape: [batch_size, seq_len, hidden_dim]
         """
+        if self.sequence_parallel_enabled:
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states,
+                self.sequence_dimension,
+                process_group=get_tp_group(self.config),
+            )
+
+        assert hidden_states.shape == visual_embeds.shape, (
+            f"Shape mismatch: hidden_states.shape={hidden_states.shape}, "
+            f"visual_embeds.shape={visual_embeds.shape}"
+        )
+
         expanded_visual_embeds = torch.zeros_like(hidden_states)
         expanded_visual_embeds = scatter_by_index_put(
             expanded_visual_embeds, visual_embeds, vision_mask_positions
         )
-        return hidden_states + expanded_visual_embeds
+        hidden_states = hidden_states + expanded_visual_embeds
+
+        if self.sequence_parallel_enabled:
+            hidden_states = _reduce_scatter_along_dim(
+                hidden_states,
+                self.sequence_dimension,
+                xm.REDUCE_MAX,
+                process_group=get_tp_group(self.config),
+            )
+
+        return hidden_states
 
     def encode_vision_to_input(self, inputs_embeds, vision_embeddings, vision_mask) -> torch.Tensor:
         # Concat vision and text embeddings during context encoding
-        # Both inputs_embeds and vision_embeddings should be of the same shape: [BS, Total tokens (image + text), Hidden]
+        # Inputs_embeds should be of the shape: [BS, Total tokens (image + text), Hidden]
         # And vision_mask should be of the shape [BS, Total tokens (image + text), 1]
-        # Entries in vision_mask with value `True` represent vision tokens and with value `False` represent text tokens
+        # Entries in vision_mask represent the index of vision tokens
         # For text-only inputs, vision_mask should be all `False`
         return scatter_by_index_put(inputs_embeds, vision_embeddings, vision_mask)
 
@@ -397,6 +440,55 @@ def convert_state_dict_to_fused_qkv(qwen_state_dict, cfg: InferenceConfig):
 
 
 class NeuronQwen3VLTextModelWrapper(ImageToTextModelWrapper):
+    def __init__(
+        self,
+        config: InferenceConfig,
+        model_cls,
+        tag="",
+        compiler_args: str = None,
+        priority_model_idx: int = None,
+        pipeline_execution: bool = True,
+        return_ranked_to_cpu: bool = True,
+        model_init_kwargs={},
+    ) -> None:
+        super().__init__(
+            config, model_cls, tag, compiler_args, priority_model_idx,
+            pipeline_execution, return_ranked_to_cpu, model_init_kwargs
+        )
+
+    _ROTARY_POSITION_IDS_INDEX = 21
+
+    def _forward_with_pad(self, *args):
+        """
+        Override to fix rotary_position_ids after parent's incorrect dim-0 batch slice.
+
+        The parent ModelWrapper.forward() slices all args along dim 0 assuming
+        it is the batch dimension. But rotary_position_ids has shape [3, B, S]
+        where dim 0 is MRoPE components (time, height, width), not batch.
+        The slice rpi[0:runtime_bs] corrupts the MRoPE dimension.
+
+        This method is called during both TKG decode and text-only CTE prefill.
+        In both cases, all 3 MRoPE components are identical absolute sequential IDs
+        We rely on this invariant to reconstruct [3, actual_B, S] from
+        the first component, then pad the batch dim.
+        """
+        args = list(args)
+        rpi = args[self._ROTARY_POSITION_IDS_INDEX]
+
+        # Reconstruct [3, actual_B, S] from the first MRoPE component.
+        # Parent sliced rpi[0:N] → [N, B, S], corrupting dim 0.
+        # Take first row and expand back to 3 MRoPE components.
+        if rpi.dim() == 3 and rpi.shape[0] != 3:
+            rpi = rpi[:1].expand(3, -1, -1)
+
+        # Pad batch dim (dim 1) from actual_B → compiled_B
+        if rpi.dim() == 3 and rpi.shape[1] < self.neuron_config.batch_size:
+            pad_size = self.neuron_config.batch_size - rpi.shape[1]
+            padding = rpi[:, :1, :].expand(-1, pad_size, -1)
+            rpi = torch.cat([rpi, padding], dim=1)
+
+        args[self._ROTARY_POSITION_IDS_INDEX] = rpi
+        return super()._forward_with_pad(*args)
 
     @staticmethod
     def get_dummy_vision_inputs(config, input_ids, n_active_tokens, fill_value):
@@ -404,7 +496,7 @@ class NeuronQwen3VLTextModelWrapper(ImageToTextModelWrapper):
         if input_sequence_len > 1:  # prefill
             vision_embeddings = torch.zeros(
                 input_batch_size,
-                n_active_tokens,
+                config.neuron_config.seq_len,
                 config.hidden_size,
                 dtype=config.neuron_config.torch_dtype,
             )
@@ -417,7 +509,7 @@ class NeuronQwen3VLTextModelWrapper(ImageToTextModelWrapper):
             deepstack_vision_embeds = [
                 torch.zeros(
                     input_batch_size,
-                    n_active_tokens,
+                    config.neuron_config.seq_len,
                     config.hidden_size,
                     dtype=config.neuron_config.torch_dtype,
                 )
@@ -471,7 +563,6 @@ class NeuronQwen3VLTextModelWrapper(ImageToTextModelWrapper):
                 (3, self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
             )  # hardcoded `3` is time, height, width. This is unique in Qwen3 VL
             # which uses an enhanced MRope with interleaved layout for better spatial-temporal modeling
-
             if self.tag == CONTEXT_ENCODING_MODEL_TAG or self.tag == TOKEN_GENERATION_MODEL_TAG:
                 inputs.append(
                     (

@@ -1,3 +1,18 @@
+# Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch Qwen3-VL model for NxD Inference."""
+
 import copy
 import logging
 import os
@@ -14,7 +29,6 @@ from neuronx_distributed_inference.models.image_to_text_model_base import (
 from neuronx_distributed_inference.models.llama4.utils.encoder_utils import (
     generate_positions_from_mask,
     pad_positions,
-    pad_vision_embeddings,
 )
 from neuronx_distributed_inference.models.model_wrapper import VISION_ENCODER_MODEL_TAG
 from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl_text import (
@@ -205,6 +219,200 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
         )
         self.rope_deltas = None
 
+    def _count_images_per_batch_line(self, input_ids, attention_mask):
+        """Count the number of images in each batch line.
+
+        The HF preprocessor inserts <vision_start><image_token>...<vision_end> for each image.
+        We count <vision_start> followed by <image_token> to get the image count per batch line.
+
+        This count is used by _split_vision_inputs_by_batch_line to split the flattened
+        pixel_values and image_grid_thw (which the HF preprocessor merges across all batch lines)
+        back into per-batch-line groups. For example:
+          - BS=2, batch_line_0 has 2 images, batch_line_1 has 1 image
+          - Returns [2, 1]
+          - image_grid_thw has 3 rows total: rows 0-1 belong to batch_line_0, row 2 to batch_line_1
+          - pixel_values patches are split by summing T*H*W for each image group
+
+        Args:
+            input_ids: [batch_size, seq_len]
+            attention_mask: [batch_size, seq_len]
+
+        Returns:
+            List[int]: number of images per batch line
+        """
+        image_token_id = self.config.image_token_id
+        vision_start_token_id = self.config.vision_start_token_id
+        images_per_batch_line = []
+
+        for i in range(input_ids.shape[0]):
+            ids = input_ids[i]
+            if attention_mask is not None:
+                ids = ids[attention_mask[i] == 1]
+            vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
+            if vision_start_indices.numel() == 0:
+                images_per_batch_line.append(0)
+            else:
+                vision_tokens = ids[vision_start_indices + 1]
+                num_images = (vision_tokens == image_token_id).sum().item()
+                images_per_batch_line.append(num_images)
+
+        return images_per_batch_line
+
+    def _split_vision_inputs_by_batch_line(self, pixel_values, image_grid_thw, images_per_batch_line):
+        """Split flattened pixel_values and image_grid_thw into per-batch-line groups.
+
+        The HF preprocessor flattens all images from all batch lines into:
+        - pixel_values: [total_patches, patch_dim] — all images concatenated
+        - image_grid_thw: [total_images, 3] — one row per image across all batch lines
+
+        This method uses the per-batch-line image counts to split them:
+          - images_per_batch_line = [2, 1] means batch_line_0 has 2 images, batch_line_1 has 1
+          - image_grid_thw rows 0:2 go to batch_line_0, row 2:3 to batch_line_1
+          - Each image's patch count = T * H * W from its grid_thw row
+          - pixel_values is split by cumulative patch counts
+
+        Args:
+            pixel_values: [total_patches, patch_dim]
+            image_grid_thw: [total_images, 3]
+            images_per_batch_line: List[int]
+
+        Returns:
+            List[Tuple[Tensor|None, Tensor|None]]: (pixel_values_i, grid_thw_i) per batch line
+        """
+        result = []
+        image_offset = 0
+        patch_offset = 0
+
+        for num_images in images_per_batch_line:
+            if num_images == 0:
+                result.append((None, None))
+                continue
+
+            grid_thw_i = image_grid_thw[image_offset : image_offset + num_images]
+            num_patches = grid_thw_i.prod(dim=1).sum().item()
+            pixel_values_i = pixel_values[patch_offset : patch_offset + num_patches]
+
+            result.append((pixel_values_i, grid_thw_i))
+
+            image_offset += num_images
+            patch_offset += num_patches
+
+        return result
+
+    def forward_atomic_prefill(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        pixel_values,
+        image_grid_thw,
+        input_capture_hook=None,
+        tensor_capture_hook=None,
+    ):
+        """Execute VE → CTE atomically for a single batch line.
+
+        Ensures vision embeddings written to the on-device buffer by VE are
+        immediately consumed by CTE before the next batch line's VE call
+        can overwrite them.
+
+        Args:
+            input_ids: [1, seq_len]
+            attention_mask: [1, seq_len]
+            position_ids: [1, seq_len]
+            seq_ids: [1]
+            sampling_params: [1, num_params]
+            pixel_values: [num_patches, patch_dim] for this batch line, or None
+            image_grid_thw: [num_images, 3] for this batch line, or None
+
+        Returns:
+            Tuple[CausalLMOutputWithPast, Tensor]: output and rope_deltas for this batch line
+        """
+        pad_limit = self.get_padding_length(input_ids)
+
+        if pixel_values is not None and pixel_values.numel() > 0:
+            # Compute vision mask for this batch line
+            vision_mask = (input_ids == self.config.image_token_id).unsqueeze(-1)
+            vision_mask = vision_mask.to(torch.bool)
+            vision_mask = generate_positions_from_mask(vision_mask.squeeze())
+            vision_mask = pad_positions(vision_mask, pad_limit, (pad_limit - 1))
+
+            # Call VE — writes vision embeddings to on-device buffer
+            vision_embeddings, deepstack_vision_embeds = self.vision_encoder_model(
+                pixel_values.to(self.vision_config.neuron_config.torch_dtype), image_grid_thw
+            )
+        else:
+            # Text-only batch line
+            vision_embeddings, vision_mask, deepstack_vision_embeds = (
+                self.text_model_wrapper.get_dummy_vision_inputs(
+                    config=self.text_config,
+                    input_ids=input_ids,
+                    n_active_tokens=pad_limit,
+                    fill_value=(pad_limit - 1),
+                )
+            )
+
+        # Compute rotary position ids for this batch line
+        rotary_position_ids, rope_deltas = self.get_rope_index(
+            input_ids,
+            image_grid_thw,
+            video_grid_thw=None,
+            attention_mask=attention_mask,
+        )
+
+        # Call CTE — immediately reads vision embeddings from on-device buffer
+        output = super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            seq_ids=seq_ids,
+            sampling_params=sampling_params,
+            input_capture_hook=input_capture_hook,
+            tensor_capture_hook=tensor_capture_hook,
+            rotary_position_ids=rotary_position_ids,
+            vision_embeddings=vision_embeddings,
+            vision_mask=vision_mask,
+            deepstack_vision_embeds=deepstack_vision_embeds,
+        )
+
+        return output, rope_deltas
+
+    @staticmethod
+    def concat_causal_lm_outputs(outputs_list):
+        """Concatenate CausalLMOutputWithPast from multiple batch lines.
+
+        Args:
+            outputs_list: List[CausalLMOutputWithPast]
+
+        Returns:
+            CausalLMOutputWithPast with concatenated logits/tokens
+        """
+        concatenated_logits = []
+        concatenated_hidden_states = []
+        concatenated_tokens = []
+
+        for output in outputs_list:
+            if isinstance(output.logits, torch.Tensor):
+                concatenated_logits.append(output.logits)
+            if isinstance(output.hidden_states, torch.Tensor):
+                concatenated_hidden_states.append(output.hidden_states)
+            elif isinstance(output.hidden_states, list):
+                concatenated_hidden_states.extend(output.hidden_states)
+            if hasattr(output, 'tokens') and isinstance(output.tokens, torch.Tensor):
+                concatenated_tokens.append(output.tokens)
+
+        concatenated_logits = torch.cat(concatenated_logits, dim=0) if len(concatenated_logits) > 0 else None
+        concatenated_tokens = torch.cat(concatenated_tokens, dim=0) if len(concatenated_tokens) > 0 else None
+
+        concatenated_output = CausalLMOutputWithPast(
+            logits=concatenated_logits,
+            hidden_states=concatenated_hidden_states,
+        )
+        if concatenated_tokens is not None:
+            concatenated_output.tokens = concatenated_tokens
+        return concatenated_output
+
     def get_vision_compiler_args(self) -> str:
         cc_pipeline_tiling_factor = self.vision_config.neuron_config.cc_pipeline_tiling_factor
         return f"--auto-cast=none --model-type=transformer \
@@ -232,9 +440,9 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
             compiler_args=self.get_vision_compiler_args(),
             model_init_kwargs=model_init_kwargs,
             priority_model_idx=(0 if enable_wlt_optimization else None),
-            # FIXME: when setting to True only return the first output hidden_states, no deepstack_feature_lists
-            pipeline_execution=False,
-            return_ranked_to_cpu=True,
+            # Enable pipeline execution for vision model
+            pipeline_execution=True,
+            return_ranked_to_cpu=False,
         )
         self.vision_models.append(self.vision_encoder_model)
 
@@ -435,46 +643,61 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
-        pad_limit = self.get_padding_length(input_ids)
-
         if (
             (pixel_values is not None)
             and input_ids.shape[-1] > 1
             and pixel_values.sum() != 0  # check empty pixel_values
-        ):  # Vision+Text Prefill phase
-            # call vision encoder
-            vision_mask = (input_ids == self.config.image_token_id).unsqueeze(-1)
-            vision_mask = vision_mask.to(torch.bool)
-            vision_mask = generate_positions_from_mask(vision_mask.squeeze())
-            vision_mask = pad_positions(vision_mask, pad_limit, (pad_limit - 1))
+        ):
+            # Vision+Text Prefill: use atomic prefill to ensure VE→CTE
+            # execute back-to-back per batch line, preventing vision embedding
+            # overwrites in the shared on-device buffer.
+            batch_size = input_ids.shape[0]
 
-            vision_embeddings, deepstack_vision_embeds = self.vision_encoder_model(
-                pixel_values.to(self.vision_config.neuron_config.torch_dtype), image_grid_thw
+            # Split flattened vision inputs into per-batch-line groups
+            images_per_batch_line = self._count_images_per_batch_line(input_ids, attention_mask)
+            vision_inputs_per_bl = self._split_vision_inputs_by_batch_line(
+                pixel_values, image_grid_thw, images_per_batch_line
             )
-            vision_embeddings = vision_embeddings.to(self.text_config.neuron_config.torch_dtype)
 
-            # flatten vision embeddings and add batch dim size 1
-            embedding_dim = vision_embeddings.shape[-1]
-            vision_embeddings = vision_embeddings.view(-1, embedding_dim).unsqueeze(0)
+            # Ensure seq_ids are available for atomic prefill.
+            # Each batch line's CTE call must write to a distinct KV cache slot.
+            # When seq_ids is None (e.g. HF generate() path), create explicit
+            # seq_ids so batch_line_0 → slot 0, batch_line_1 → slot 1, etc.
+            if seq_ids is None:
+                seq_ids = torch.arange(batch_size)
 
-            vision_embeddings = pad_vision_embeddings(vision_embeddings, pad_limit)
-
-            # flatten deepstack feature and add batch dim size 1
-            for i, feat in enumerate(deepstack_vision_embeds):
-                feat = feat.view(-1, embedding_dim).unsqueeze(0).to(self.text_config.neuron_config.torch_dtype)
-                deepstack_vision_embeds[i] = pad_vision_embeddings(feat, pad_limit)
-            # stack the list into a tensor because all traced inputs are expected to be of the same type (torch.Tensor)
-            deepstack_vision_embeds = torch.stack(deepstack_vision_embeds)
-
-        else:  # Text-only Prefill or Text-only and Vision+Text Decode phase
-            vision_embeddings, vision_mask, deepstack_vision_embeds = (
-                self.text_model_wrapper.get_dummy_vision_inputs(
-                    config=self.text_config,
-                    input_ids=input_ids,
-                    n_active_tokens=pad_limit,
-                    fill_value=(pad_limit - 1),
+            outputs = []
+            rope_deltas_list = []
+            for index in range(batch_size):
+                pv_i, grid_thw_i = vision_inputs_per_bl[index]
+                output, rope_deltas = self.forward_atomic_prefill(
+                    input_ids[index].unsqueeze(0),
+                    attention_mask[index].unsqueeze(0) if attention_mask is not None else None,
+                    position_ids[index].unsqueeze(0) if position_ids is not None else None,
+                    seq_ids[index].unsqueeze(0),
+                    sampling_params[index].unsqueeze(0) if sampling_params is not None else None,
+                    pv_i,
+                    grid_thw_i,
+                    input_capture_hook=input_capture_hook,
+                    tensor_capture_hook=tensor_capture_hook,
                 )
+                outputs.append(output)
+                rope_deltas_list.append(rope_deltas)
+
+            # Store rope_deltas for all batch lines (used in decode phase)
+            self.rope_deltas = torch.cat(rope_deltas_list, dim=0)
+            return self.concat_causal_lm_outputs(outputs)
+
+        # Text-only Prefill or Decode phase
+        pad_limit = self.get_padding_length(input_ids)
+        vision_embeddings, vision_mask, deepstack_vision_embeds = (
+            self.text_model_wrapper.get_dummy_vision_inputs(
+                config=self.text_config,
+                input_ids=input_ids,
+                n_active_tokens=pad_limit,
+                fill_value=(pad_limit - 1),
             )
+        )
 
         """
         Qwen3 VL has a new multimodal ROPE in time, height, and width.
@@ -527,10 +750,11 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
             else:
                 delta = 0
 
+            # position_ids is already [batch_size, seq_length] with correct absolute
+            # positions per batch line. Skip .view(1,-1).expand() which incorrectly
+            # merges batch and seq dims when batch_size > 1.
             rotary_position_ids = copy.deepcopy(position_ids)
-            rotary_position_ids = rotary_position_ids.view(1, -1).expand(batch_size, -1)
             rotary_position_ids = rotary_position_ids.add(delta)
-
             rotary_position_ids = rotary_position_ids.unsqueeze(0).expand(3, -1, -1)
 
         output_token = super().forward(

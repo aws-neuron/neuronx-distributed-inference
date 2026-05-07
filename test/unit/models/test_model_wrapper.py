@@ -293,8 +293,11 @@ def test_tensor_replacement_config_padding():
         
         # Check tf_tensors were padded with repeat_first_batchline
         # _pad_helper copies original data first, then fills remaining with first row
-        expected_tf1 = torch.tensor([[10, 20], [30, 40], [10, 20], [10, 20]])
-        expected_tf2 = torch.tensor([[50, 60], [70, 80], [50, 60], [50, 60]])
+        # Check tf_tensors were NOT padded (2D tensors remain unchanged)
+        # 2D tensors represent tensor replacement args like MoE router outputs
+        # which should preserve their original shape for correct replacement
+        expected_tf1 = torch.tensor([[10, 20], [30, 40]])
+        expected_tf2 = torch.tensor([[50, 60], [70, 80]])
         assert torch.equal(result[27], expected_tf1)
         assert torch.equal(result[28], expected_tf2)
         

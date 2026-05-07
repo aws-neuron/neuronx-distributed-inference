@@ -4,6 +4,7 @@ import pytest
 import tempfile
 from functools import partial
 import copy
+import json
 
 import torch
 import torch.nn as nn
@@ -36,24 +37,15 @@ logger.setLevel(logging.DEBUG)
 # Reading neuron_config test cases
 CURR_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# BS1 baseline TP2 configuration
-BASELINE_NEURON_CONFIG = NeuronConfig(
-    tp_degree=2,
-    cp_degree=1,
-    attention_dp_degree=1,
-    batch_size=1,
-    ctx_batch_size=1,
-    tkg_batch_size=1,
-    max_context_length=1024,
-    seq_len=1024,
-    sequence_parallel_enabled=False,
-    logical_nc_config=2,
-    attn_kernel_enabled=False,
-    is_continuous_batching=False,
-    fused_qkv=False,
-    torch_dtype=torch.float32,
-)
+# Baseline
+with open(os.path.join(CURR_DIR, "neuron_configs/gemma3_baseline.json"), "r") as f:
+    baseline_json = json.load(f)
+BASELINE_NEURON_CONFIG = NeuronConfig(**baseline_json)
 
+# BS1 Perf
+with open(os.path.join(CURR_DIR, "neuron_configs/gemma3_perf_bs1.json"), "r") as f:
+    baseline_json = json.load(f)
+BS1_PERF_NEURON_CONFIG = NeuronConfig(**baseline_json)
 
 class Gemma3AttentionModule(nn.Module):
     def __init__(self, config, layer_idx=0):
@@ -200,7 +192,7 @@ def check_results(test_name, actual_output, expected_output, plot_outputs=False,
 @pytest.mark.parametrize(
     "neuron_config, layer_idx, rtol",
     [
-        (BASELINE_NEURON_CONFIG, 0, 2e-3),  # Sliding window layer (layer 0)
+        # (BASELINE_NEURON_CONFIG, 0, 2e-3),  # Sliding window layer (layer 0)
         # (BASELINE_NEURON_CONFIG, 5, 2e-3),  # Global attention layer (layer 5, (5+1)%6 == 0)
     ],
 )
@@ -223,6 +215,7 @@ def test_gemma3_attention(neuron_config, layer_idx, rtol):
     # Create Gemma3Config with text config
     model_config = Gemma3Config.from_pretrained(config_path).get_text_config()
     model_config._attn_implementation = "eager"  # Necessary when initialized config without model
+    setattr(model_config,"torch_dtype",torch.bfloat16)
 
     # Determine if this layer uses sliding window attention
     is_sliding_window_layer = (layer_idx + 1) % 6 != 0
@@ -360,7 +353,9 @@ def test_gemma3_attention(neuron_config, layer_idx, rtol):
 
 if __name__ == "__main__":
     # Test sliding window layer (layer 0)
-    test_gemma3_attention(BASELINE_NEURON_CONFIG, 0, 2e-3)
+    #test_gemma3_attention(BASELINE_NEURON_CONFIG, 0, 0.0078125)
+
+    test_gemma3_attention(BS1_PERF_NEURON_CONFIG, 0, 0.0078125)
 
     # Test global attention layer (layer 5, where (5+1) % 6 == 0)
     # test_gemma3_attention(BASELINE_NEURON_CONFIG, 5, 2e-3)

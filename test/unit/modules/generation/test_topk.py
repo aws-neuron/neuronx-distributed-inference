@@ -1,3 +1,4 @@
+import os
 import unittest
 from functools import partial
 
@@ -14,6 +15,12 @@ from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
 from neuronx_distributed_inference.utils.distributed import get_tp_group
+
+
+def _setup_kernel_target_platform():
+    # setup TARGET_PLATFORM envvar, which is required by NKI Beta 2 kernels
+    if not os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+        os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
 
 
 class EmbeddingModel(nn.Module):
@@ -80,11 +87,15 @@ class EmbeddingModel(nn.Module):
     ],
 )
 def test_vocab_parallel_embedding(batch_size, sequence_length, tp_degree, dtype, stages, use_nxd_topk_kernel):
+    if use_nxd_topk_kernel:
+        _setup_kernel_target_platform()
     hardware = get_platform_target()
     if hardware == "trn1" and tp_degree == 64:
         pytest.skip("Not supported in trn1")
     if hardware == "trn2" and tp_degree == 32:
         pytest.skip("Not supported in trn2")
+    if hardware == "trn1" and use_nxd_topk_kernel:
+        pytest.skip("NKI rotational topk kernel not supported on Trn1 due to nkilib engine compatibility issue")
 
     def get_ckpt():
         model_sd = torch.load("/tmp/model.pt")

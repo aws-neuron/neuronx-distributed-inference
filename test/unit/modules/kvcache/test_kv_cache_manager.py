@@ -435,8 +435,6 @@ class TestKVCacheManager(unittest.TestCase):
         self.config.neuron_config.is_continuous_batching = False
         self.config.neuron_config.kv_cache_padding_size  = 0
         self.config.neuron_config.max_length = 16
-        self.config.neuron_config.attn_tkg_builtin_kernel_enabled = False
-        self.config.neuron_config.attn_tkg_nki_kernel_enabled = False
         self.config.neuron_config.attn_block_tkg_nki_kernel_enabled = False
 
         kv_cache_manager = KVCacheManager(config=self.config, num_kv_head=num_kv_heads, windowed_context_encoding_size=wce_size)

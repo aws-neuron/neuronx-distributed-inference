@@ -24,7 +24,9 @@ from neuronx_distributed_inference.models.mllama.utils import create_vision_mask
 from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMllamaForCausalLM
 from neuronx_distributed_inference.models.llama4.modeling_llama4_text import NeuronLlama4TextForCausalLM
 from neuronx_distributed_inference.models.llama4.modeling_llama4 import NeuronLlama4ForCausalLM
+from neuronx_distributed_inference.models.pixtral.modeling_pixtral import NeuronPixtralForCausalLM
 from neuronx_distributed_inference.models.llama4.utils.input_processor import prepare_generation_inputs_hf as llama4_prepare_generation_inputs_hf
+from neuronx_distributed_inference.models.pixtral.utils.input_processor import prepare_generation_inputs_hf as pixtral_prepare_generation_inputs_hf
 from neuronx_distributed_inference.utils.constants import *
 from neuronx_distributed_inference.utils.exceptions import LogitMatchingValidationError
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
@@ -148,7 +150,8 @@ def get_generate_outputs_from_token_ids(
     if attention_mask is None:
         logger.info("attention mask not provided, padding inputs and generating a mask")
 
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
         padding_side = "left" if is_hf else "right"
         inputs = tokenizer.pad(
@@ -200,7 +203,8 @@ def get_generate_outputs(
     input_start_offsets=None,
     **generate_kwargs,
 ):
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if is_hf:
         tokenizer.padding_side = "left"
@@ -569,6 +573,10 @@ def check_accuracy_logits(
                                                                                      [image] * num_image_per_prompt, \
                                                                                      inputs, image_processor)
 
+    elif isinstance(neuron_model, NeuronPixtralForCausalLM) and image is not None:
+        neuron_vision_input_args, hf_vision_input_args = _prepare_pixtral_vision_args(neuron_model, prompt,
+                                                                                     [image] * num_image_per_prompt, \
+                                                                                     inputs, image_processor)
     else:
         neuron_vision_input_args, hf_vision_input_args = {}, {}
 

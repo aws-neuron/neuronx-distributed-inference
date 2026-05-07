@@ -17,7 +17,7 @@ from neuronx_distributed_inference.utils.distributed import (
     get_rank_8_by_8,
     get_kv_head_group_number,
 )
-from neuronxcc.nki.language import nc
+
 
 # Tests for environment variable functions
 @pytest.mark.parametrize(
@@ -213,6 +213,10 @@ def test_split_along_dim_none_tensor():
 @pytest.mark.parametrize("lnc", [1, 2])
 @pytest.mark.parametrize("on_cpu", [True, False])
 def test_split_along_dim0_kernel(lnc, on_cpu):
+    # setup NKI envvar if not available
+    if not os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+        os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
+
     if get_platform_target() == "trn1" and lnc == 2:
         pytest.skip("LNC-2 is not supported in trn1")
 

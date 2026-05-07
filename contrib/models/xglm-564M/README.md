@@ -48,6 +48,25 @@ NeuronX Distributed Inference implementation of XGLM-564M, a 564M parameter mult
 
 **Note:** Lower token matching (47%) is acceptable for base models. The model generates coherent, factually correct text with outstanding performance.
 
+### Device Profiling Metrics
+
+**Configuration:** TP=1, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.13 | 0.00 |
+| MBU (%) | 0.43 | 0.38 |
+| HFU (%) | 0.25 | 0.10 |
+| Execution Time (us) | 0.01 | 0.01 |
+| HBM Read | 1.14 GB | 1.14 GB |
+| HBM Write | 26.47 MB | 1.17 MB |
+
+**Throughput:** 115.45 tok/s | **Compile Time:** 108.32s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -119,6 +138,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

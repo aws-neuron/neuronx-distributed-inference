@@ -42,6 +42,25 @@ NeuronX Distributed Inference implementation of llava v1.5 7b.
 
 **Status:** ✅ EXCELLENT
 
+### Device Profiling Metrics
+
+**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+**Instance:** trn1.32xlarge | **Profiled:** 2026-03-20
+
+| Metric | Context Encoding | Token Generation |
+|--------|-----------------|------------------|
+| MFU (%) | 0.17 | 0.00 |
+| MBU (%) | 0.32 | 0.33 |
+| HFU (%) | 0.18 | 0.00 |
+| Execution Time (us) | 0.05 | 0.05 |
+| HBM Read | 6.75 GB | 6.65 GB |
+| HBM Write | 140.23 MB | 2.86 MB |
+
+**Throughput:** 18.36 tok/s | **Compile Time:** 365.50s
+
+> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
+
 ## Usage
 
 ```python
@@ -106,6 +125,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-01-29

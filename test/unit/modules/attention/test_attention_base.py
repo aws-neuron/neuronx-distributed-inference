@@ -12,9 +12,6 @@ from neuronx_distributed_inference.modules.attention.attention_base import (
     GroupQueryAttention_QKV,
     NeuronAttentionBase,
 )
-from neuronx_distributed_inference.modules.sliding_window.attention import (
-    DEFAULT_SLIDING_WINDOW_SEQ_TILE_SIZE, MIN_SLIDING_WINDOW_SEQ_TILE_SIZE
-)
 from neuronx_distributed_inference.utils.testing import build_function
 
 RANDOM_SEED = 0
@@ -158,10 +155,7 @@ def test_get_flash_attention_strategy_cp(
         ("trn1", None, 1, 1, 256, False, None, FlashAttentionStrategy.NONE),  # LNC1, q_len < 512
         ("trn1", True, 1, 1, 256, False, None, FlashAttentionStrategy.NONE),  # LNC1, enabled, q_len < 512
 
-        # sliding window
         ("trn1", None, 1, 1, 256, True, 4096, FlashAttentionStrategy.NONE), # q_len < 512
-
-        ("trn1", None, 1, 1, 2048, True, 4096, FlashAttentionStrategy.SLIDING_WINDOW_KERNEL), # q_len >= 512
 
         ("trn2", None, 2, 1, 256, True, 4096, FlashAttentionStrategy.SHARDED_KERNEL), # q_len < 512
 
@@ -687,30 +681,7 @@ def test_perform_prefill_window_attn_no_flash_attn(attn_module, batch_size, seq_
     assert flash_attn_strategy == FlashAttentionStrategy.NONE
     torch.testing.assert_close(attn_output, expected_attn_output, atol=5e-5, rtol=2e-3)
 
-@pytest.mark.parametrize("batch_size, seq_len", [(1, 1024), (2, 2048)])
-@patch("neuronx_distributed_inference.modules.attention.attention_base.flash_fwd")
-def test_perform_prefill_window_attn_flash_attn(mock_flash_fwd_call, attn_module, batch_size, seq_len):
-    sliding_window = 512
 
-    grid = (batch_size, attn_module.num_heads)
-    q = torch.rand((batch_size, attn_module.num_heads, seq_len, attn_module.head_dim), dtype=torch.bfloat16)
-    k = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim), dtype=torch.bfloat16)
-    v = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim), dtype=torch.bfloat16)
-
-    attn_module.get_flash_attention_strategy = MagicMock(return_value=FlashAttentionStrategy.SLIDING_WINDOW_KERNEL)
-    mock_flash_fwd_kernel = MagicMock()
-    mock_flash_fwd_call.__getitem__.return_value = mock_flash_fwd_kernel
-
-    _, flash_attn_strategy = attn_module.perform_prefill_windowed_attn(
-        q, k, v, seq_len, batch_size, None, sliding_window
-    )
-
-    mock_flash_fwd_call.__getitem__.assert_called_once_with(grid)
-    assert flash_attn_strategy == FlashAttentionStrategy.SLIDING_WINDOW_KERNEL
-
-    _check_sliding_window_flash_attn_kernel_call(
-        mock_flash_fwd_kernel, attn_module, batch_size, seq_len, sliding_window
-    )
 
 @pytest.mark.parametrize(
     "attn_module",
@@ -722,7 +693,6 @@ def test_perform_prefill_window_attn_flash_attn(mock_flash_fwd_call, attn_module
 )
 @pytest.mark.parametrize("batch_size", [1, 2])
 @patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_call_nki")
-@patch("neuronx_distributed_inference.modules.attention.attention_base._has_new_kernel", new=True)
 @patch("neuronx_distributed_inference.modules.attention.attention_base._has_native_gqa_tp_support", new=True)
 def test_perform_prefill_unsharded_flash_attn(mock_flash_fwd_call, attn_module, batch_size):
     seq_len = 2  # Use a seq_len > 1 for prefill.
@@ -740,17 +710,11 @@ def test_perform_prefill_unsharded_flash_attn(mock_flash_fwd_call, attn_module, 
     indirect=["attn_module"]
 )
 @pytest.mark.parametrize("batch_size", [1, 2])
-@patch("neuronx_distributed_inference.modules.attention.attention_base.nc")
 @patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_call_nki")
-@patch("neuronx_distributed_inference.modules.attention.attention_base._has_new_kernel", new=True)
 @patch("neuronx_distributed_inference.modules.attention.attention_base._has_native_gqa_tp_support", new=True)
-def test_perform_prefill_sharded_flash_attn(mock_flash_fwd_call, mock_nc, attn_module, batch_size):
+def test_perform_prefill_sharded_flash_attn(mock_flash_fwd_call, attn_module, batch_size):
     seq_len = 2  # Use a seq_len > 1 for prefill.
 
-    # Mock accessing grid index.
-    nc_value = Mock()
-    mock_nc.return_value = nc_value
-    grid = (nc_value,)
     mock_flash_fwd_kernel = MagicMock()
     mock_flash_fwd_call.__getitem__.return_value = mock_flash_fwd_kernel
 
@@ -758,8 +722,7 @@ def test_perform_prefill_sharded_flash_attn(mock_flash_fwd_call, mock_nc, attn_m
         attn_module, batch_size, seq_len, seq_len, FlashAttentionStrategy.SHARDED_KERNEL
     )
 
-    mock_nc.assert_called_once_with(attn_module.logical_nc_config)
-    mock_flash_fwd_call.__getitem__.assert_called_once_with(grid)
+    mock_flash_fwd_call.__getitem__.assert_called_once_with(attn_module.logical_nc_config)
 
     _check_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size, seq_len)
 
@@ -771,9 +734,8 @@ def test_perform_prefill_sharded_flash_attn(mock_flash_fwd_call, mock_nc, attn_m
     ],
     indirect=["attn_module"]
 )
-@patch("neuronx_distributed_inference.modules.attention.attention_base._has_new_pc_kernel", True)
 @patch("neuronx_distributed_inference.modules.attention.attention_base._has_native_gqa_tp_support", True)
-@patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_pc_call_nki")
+@patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_call_nki")
 def test_perform_prefix_prefill_unsharded_flash_attn(mock_flash_fwd_call, attn_module):
     seq_len = 3  # Use a seq_len > 1 for prefill.
     seq_len_prior = 2
@@ -792,19 +754,13 @@ def test_perform_prefix_prefill_unsharded_flash_attn(mock_flash_fwd_call, attn_m
     ],
     indirect=["attn_module"]
 )
-@patch("neuronx_distributed_inference.modules.attention.attention_base._has_new_pc_kernel", True)
 @patch("neuronx_distributed_inference.modules.attention.attention_base._has_native_gqa_tp_support", True)
-@patch("neuronx_distributed_inference.modules.attention.attention_base.nc")
-@patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_pc_call_nki")
-def test_perform_prefix_prefill_sharded_flash_attn(mock_flash_fwd_call, mock_nc, attn_module):
+@patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_call_nki")
+def test_perform_prefix_prefill_sharded_flash_attn(mock_flash_fwd_call, attn_module):
     seq_len = 3  # Use a seq_len > 1 for prefill.
     seq_len_prior = 2
     batch_size = 1 # use batch size 1 for prefill
 
-    # Mock accessing grid index.
-    nc_value = Mock()
-    mock_nc.return_value = nc_value
-    grid = (nc_value,)
     mock_flash_fwd_kernel = MagicMock()
     mock_flash_fwd_call.__getitem__.return_value = mock_flash_fwd_kernel
 
@@ -812,8 +768,7 @@ def test_perform_prefix_prefill_sharded_flash_attn(mock_flash_fwd_call, mock_nc,
         attn_module, batch_size, seq_len, seq_len, seq_len_prior, FlashAttentionStrategy.SHARDED_KERNEL
     )
 
-    mock_nc.assert_called_once_with(attn_module.logical_nc_config)
-    mock_flash_fwd_call.__getitem__.assert_called_once_with(grid)
+    mock_flash_fwd_call.__getitem__.assert_called_once_with(attn_module.logical_nc_config)
 
     _check_prefix_prefill_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size, seq_len, seq_len_prior)
 
@@ -836,13 +791,11 @@ def test_perform_prefix_prefill_sharded_flash_attn(mock_flash_fwd_call, mock_nc,
     ], indirect=["attn_module"]
     # fmt: on
 )
-@patch("neuronx_distributed_inference.modules.attention.attention_base.nc")
+@patch("neuronx_distributed_inference.modules.attention.attention_base.get_cp_rank")
 @patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_call_nki")
-@patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_call_strided_context_parallel")
 @patch("neuronx_distributed_inference.modules.attention.attention_base.get_platform_target")
-@patch("neuronx_distributed_inference.modules.attention.attention_base._has_new_kernel", new=True)
 @patch("neuronx_distributed_inference.modules.attention.attention_base._has_native_gqa_tp_support", new=True)
-def test_perform_prefill_context_parallel_attn_kernel(mock_get_platform_target, mock_flash_fwd_call_strided_context_parallel, mock_flash_fwd_call, mock_nc,
+def test_perform_prefill_context_parallel_attn_kernel(mock_get_platform_target, mock_flash_fwd_call, mock_get_cp_rank,
                                                       attn_module, batch_size, flash_attention_strategy):
     # Needed to use NKI kernel for non-strided CP attention
     mock_get_platform_target.return_value = "trn2"
@@ -852,34 +805,25 @@ def test_perform_prefill_context_parallel_attn_kernel(mock_get_platform_target, 
     attn_module.cp_degree = seq_len // q_len
     attn_module.neuron_config.is_prefill_stage = True
 
-    # Mock accessing grid index.
-    nc_value = Mock()
-    mock_nc.return_value = nc_value
-
-    grid = (nc_value,)
     mock_flash_fwd_kernel = MagicMock()
     mock_flash_fwd_call.__getitem__.return_value = mock_flash_fwd_kernel
 
-    mock_flash_fwd_strided_kernel = MagicMock()
-    mock_flash_fwd_call_strided_context_parallel.__getitem__.return_value = mock_flash_fwd_strided_kernel
-
     rank_util = Mock()
-    attn_module.rank_util = rank_util
     rank_util.get_rank.return_value = torch.tensor(2) # test is running in tp = 2, cp_rank = 2 // 2 == 1
+    object.__setattr__(attn_module, 'rank_util', rank_util)
+
+    mock_get_cp_rank.return_value = torch.tensor(1)
 
     _setup_perform_prefill_flash_attn_test(
         attn_module, batch_size, q_len, seq_len, flash_attention_strategy
     )
 
-    mock_nc.assert_called_once_with(attn_module.logical_nc_config)
-
-    assert mock_flash_fwd_call_strided_context_parallel.__getitem__.called != mock_flash_fwd_call.__getitem__.called
     if flash_attention_strategy == FlashAttentionStrategy.STRIDED_CONTEXT_PARALLEL_KERNEL:
-        mock_flash_fwd_call_strided_context_parallel.__getitem__.assert_called_once_with(grid)
-        _check_strided_context_parallel_flash_attn_kernel_call(mock_flash_fwd_strided_kernel, attn_module, batch_size, q_len, seq_len, flash_attention_strategy)
+        mock_flash_fwd_call.__getitem__.assert_called_once_with(attn_module.logical_nc_config)
+        _check_context_parallel_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size, q_len, seq_len, flash_attention_strategy, strided=True)
 
     if flash_attention_strategy == FlashAttentionStrategy.CONTEXT_PARALLEL_KERNEL:
-        mock_flash_fwd_call.__getitem__.assert_called_once_with(grid)
+        mock_flash_fwd_call.__getitem__.assert_called_once_with(attn_module.logical_nc_config)
         _check_context_parallel_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size, q_len, seq_len, flash_attention_strategy)
 
 
@@ -937,8 +881,8 @@ def _check_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size
     )
 
     assert flash_fwd_args[3] == 1.0
-    assert flash_fwd_kwargs["kernel_name"] == "CausalAttentionMMSoftmaxMMWithoutSwap"
-    assert flash_fwd_kwargs["do_out_tp"]
+    assert flash_fwd_kwargs["causal_mask"]
+    assert flash_fwd_kwargs["tp_out"]
     assert flash_fwd_kwargs["tp_q"]
     assert flash_fwd_kwargs["tp_k"]
 
@@ -968,8 +912,7 @@ def _check_prefix_prefill_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_mod
     )
     assert scale_fwd_arg == 1.0
 
-    assert (len(flash_fwd_kwargs) == 7)
-    assert flash_fwd_kwargs["kernel_name"] == "CausalAttentionMMSoftmaxMMWithoutSwap"
+    assert flash_fwd_kwargs["causal_mask"]
     k_prior_fwd_arg = flash_fwd_kwargs["k_prior"]
     v_prior_fwd_arg = flash_fwd_kwargs["v_prior"]
     prior_used_len_fwd_arg = flash_fwd_kwargs["prior_used_len"]
@@ -985,80 +928,12 @@ def _check_prefix_prefill_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_mod
         attn_module.head_dim,
     )
     assert prior_used_len_fwd_arg.shape == (1,)
-    assert flash_fwd_kwargs["do_out_tp"]
+    assert flash_fwd_kwargs["tp_out"]
     assert flash_fwd_kwargs["tp_q"]
     assert flash_fwd_kwargs["tp_k"]
 
-def _check_sliding_window_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size, seq_len, sliding_window):
-    mock_flash_fwd_kernel.assert_called_once()
-    flash_fwd_args, flash_fwd_kwargs = mock_flash_fwd_kernel.call_args
-    assert len(flash_fwd_args) == 3
 
-    q_flash_fwd_arg = flash_fwd_args[0]
-    k_flash_fwd_arg = flash_fwd_args[1]
-    v_flash_fwd_arg = flash_fwd_args[2]
-    assert q_flash_fwd_arg.shape == (
-        batch_size, 
-        attn_module.num_heads,
-        attn_module.head_dim,
-        seq_len,
-    )
-    assert k_flash_fwd_arg.shape == (
-        batch_size,
-        attn_module.num_heads,
-        attn_module.head_dim,
-        seq_len,
-    )
-    assert v_flash_fwd_arg.shape == (
-        batch_size,
-        attn_module.num_heads,
-        seq_len,
-        attn_module.head_dim,
-    )
-
-    assert flash_fwd_kwargs["window_size"] == (sliding_window-1, -1)
-    assert flash_fwd_kwargs["config"].seq_tile_size == (
-        DEFAULT_SLIDING_WINDOW_SEQ_TILE_SIZE if seq_len >= DEFAULT_SLIDING_WINDOW_SEQ_TILE_SIZE else MIN_SLIDING_WINDOW_SEQ_TILE_SIZE
-    )
-
-def _check_strided_context_parallel_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size, q_len, seq_len, strategy):
-    mock_flash_fwd_kernel.assert_called_once()
-    flash_fwd_args, flash_fwd_kwargs = mock_flash_fwd_kernel.call_args
-    assert len(flash_fwd_args) == 5
-
-    q_flash_fwd_arg = flash_fwd_args[0]
-    k_flash_fwd_arg = flash_fwd_args[1]
-    v_flash_fwd_arg = flash_fwd_args[2]
-    assert q_flash_fwd_arg.shape == (
-        batch_size * attn_module.num_heads,
-        q_len,
-        attn_module.head_dim,
-    )
-    assert k_flash_fwd_arg.shape == (
-        batch_size * attn_module.num_heads,
-        attn_module.head_dim,
-        seq_len,
-    )
-    assert v_flash_fwd_arg.shape == (
-        batch_size * attn_module.num_heads,
-        seq_len,
-        attn_module.head_dim,
-    )
-
-    attn_output_flash_fwd_arg = flash_fwd_args[4]
-    assert attn_output_flash_fwd_arg.shape == (
-        batch_size * attn_module.num_heads,
-        attn_module.head_dim,
-        q_len,
-    )
-    assert flash_fwd_args[3] == 1.0
-    assert flash_fwd_kwargs["kernel_name"] == "CausalAttentionMMSoftmaxMMWithoutSwap"
-    assert flash_fwd_kwargs["global_n_tiles"] == attn_module.cp_degree
-
-    assert flash_fwd_kwargs["tile_i"] == 1 # we hardcode to global rank 1 for unit testing
-    assert flash_fwd_kwargs["strided_q_slicing"]
-
-def _check_context_parallel_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size, q_len, seq_len, strategy):
+def _check_context_parallel_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size, q_len, seq_len, strategy, strided=False):
     mock_flash_fwd_kernel.assert_called_once()
     flash_fwd_args, flash_fwd_kwargs = mock_flash_fwd_kernel.call_args
     assert len(flash_fwd_args) == 4
@@ -1071,29 +946,49 @@ def _check_context_parallel_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_m
         q_len,
         attn_module.head_dim,
     )
-    assert k_flash_fwd_arg.shape == (
-        batch_size * attn_module.num_key_value_heads,
-        seq_len,
-        attn_module.head_dim,
-    )
-    assert v_flash_fwd_arg.shape == (
-        batch_size * attn_module.num_key_value_heads,
-        seq_len,
-        attn_module.head_dim,
-    )
+    
+    if strided:
+        assert k_flash_fwd_arg.shape == (
+            batch_size * attn_module.num_heads,
+            attn_module.head_dim,
+            seq_len,
+        )
+        assert v_flash_fwd_arg.shape == (
+            batch_size * attn_module.num_heads,
+            seq_len,
+            attn_module.head_dim,
+        )
+    else:
+        assert k_flash_fwd_arg.shape == (
+            batch_size * attn_module.num_key_value_heads,
+            seq_len,
+            attn_module.head_dim,
+        )
+        assert v_flash_fwd_arg.shape == (
+            batch_size * attn_module.num_key_value_heads,
+            seq_len,
+            attn_module.head_dim,
+        )
 
     assert flash_fwd_args[3] == 1.0
-    assert flash_fwd_kwargs["kernel_name"] == "CausalAttentionMMSoftmaxMMWithoutSwap"
+    assert flash_fwd_kwargs["causal_mask"]
     assert flash_fwd_kwargs["global_cp_deg"] == attn_module.cp_degree
 
-    assert flash_fwd_kwargs["cp_offset"].item() == 1 * q_len # we hardcode to global rank 1 for unit testing
+    if strided:
+        assert flash_fwd_kwargs["cp_offset"].item() == 1
+        assert flash_fwd_kwargs["cp_strided_q_slicing"]
+    else:
+        assert flash_fwd_kwargs["cp_offset"].item() == 1 * q_len
 
     if attn_module.learned_sinks_size is not None:
         assert flash_fwd_kwargs["sink"].shape == (attn_module.num_heads, 1)
 
-    assert flash_fwd_kwargs["do_out_tp"]
+    assert flash_fwd_kwargs["tp_out"]
     assert flash_fwd_kwargs["tp_q"]
-    assert flash_fwd_kwargs["tp_k"]
+    if strided:
+        assert not flash_fwd_kwargs["tp_k"]
+    else:
+        assert flash_fwd_kwargs["tp_k"]
 
 @pytest.mark.parametrize(
     "batch_size, seq_len, expected_attn_output",
@@ -1294,11 +1189,6 @@ def _setup_token_gen_mocks(attn_module, seq_len, config):
     past_v = torch.rand((1, attn_module.num_key_value_heads, config['attn_chunk_size'], attn_module.head_dim))
     past_key_value = (past_k, past_v)
     
-    if attn_module.neuron_config.attn_block_tkg_nki_kernel_enabled:
-        attn_module.attention_block_tokengen_nki_kernel_chunked_attn = MagicMock(
-            return_value=(tkg_o_proj_output, past_key_value, None, None)
-        )
-    
     return {'output': tkg_o_proj_output, 'past_key_value': past_key_value, 'k': k, 'v': v, 'o_proj': attn_module.tkg_o_proj}
 
 def _setup_context_encode_mocks(attn_module, config, is_post_global_attn_layer, is_pre_global_attn_layer, optimize_interleave_attn, sp_enabled):
@@ -1357,10 +1247,6 @@ def _setup_sequence_parallel_mocks(mock_gather_from_sequence_parallel_region, mo
 
 def _verify_chunked_attn_assertions(attn_module, seq_len, config, sp_enabled, optimize_interleave_attn, is_pre_global_attn_layer, mock_gather_from_sequence_parallel_region, mock_gather_from_tensor_model_parallel_region, mock_split_along_dim, past_key_value, last_k, last_v, actual_output, expected_output):
     """Verify assertions for chunked attention test."""
-    if attn_module.neuron_config.attn_block_tkg_nki_kernel_enabled:
-        attn_module.attention_block_tokengen_nki_kernel_chunked_attn.assert_called_once()
-        return
-    
     if seq_len > 1:
         attn_module.rotary_emb.assert_called_once()
         assert attn_module.compute_attention_per_chunk_with_context_parallel.call_count == config['n_chunks']
@@ -1461,32 +1347,6 @@ def test_chunked_attn_forward_with_context_parallel(
         _verify_chunked_attn_assertions(attn_module, seq_len, config, sp_enabled, optimize_interleave_attn, is_pre_global_attn_layer, mock_gather_from_sequence_parallel_region, mock_gather_from_tensor_model_parallel_region, mock_split_along_dim, past_key_value, k, v, actual_output, expected_attn_output)
     else:
         _verify_chunked_attn_assertions(attn_module, seq_len, config, sp_enabled, optimize_interleave_attn, is_pre_global_attn_layer, mock_gather_from_sequence_parallel_region, mock_gather_from_tensor_model_parallel_region, mock_split_along_dim, past_key_value, last_k_chunk, last_v_chunk, actual_output, expected_attn_output)
-
-@pytest.mark.parametrize("position_ids, chunk_size, update_kv_per_layer, attn_block_tkg_nki_kernel_cache_update", [
-    (torch.tensor([20]), 10, False, False),
-    (torch.tensor([20, 10]), 10, False, True),
-    (torch.tensor([5]), 10, True, True),
-])
-def test_attention_block_tokengen_nki_kernel_chunked_attn(attn_module, position_ids, chunk_size, update_kv_per_layer, attn_block_tkg_nki_kernel_cache_update):
-    attn_module.attn_block_tkg_nki_kernel_cache_update = attn_block_tkg_nki_kernel_cache_update
-    attn_module.attention_chunk_size = chunk_size
-
-    kv_mgr = MagicMock()
-    kv_mgr._fetch_cache.return_value = None
-
-    attn_module.attention_block_tokengen_nki_kernel = MagicMock(return_value=(None, None, None, None))
-    # The None values should be real tensors, but since we don't invoke the kernel in the UT, the inputs are not important
-    attn_module.attention_block_tokengen_nki_kernel_chunked_attn(None, None, position_ids, kv_mgr, 
-                                                                None, None, None, None, None, update_kv_per_layer,
-                                                                idx=0, kvcache_buffer=None)
-
-    attn_module.attention_block_tokengen_nki_kernel.assert_called_once()
-    assert all(attn_module.attention_block_tokengen_nki_kernel.call_args.kwargs["position_ids"] == position_ids % chunk_size if attn_block_tkg_nki_kernel_cache_update else position_ids)
-    assert attn_module.attention_block_tokengen_nki_kernel.call_args.kwargs["update_kv_per_layer"] == update_kv_per_layer
-
-    if not attn_block_tkg_nki_kernel_cache_update and update_kv_per_layer:
-        kv_mgr.update_kv_by_layer_id.assert_called_once()
-        assert all(kv_mgr.update_kv_by_layer_id.call_args.kwargs["position_ids"] == position_ids)
 
 @pytest.mark.parametrize(
     "attn_module, seq_len, chunk_idx, is_post_global_attn_layer, is_pre_global_attn_layer, optimize_interleave_attn",
@@ -1666,149 +1526,6 @@ def test_forward_base_case(attn_module, batch_size, seq_len, sequence_parallel):
     o_proj_input = attn_module.o_proj.call_args.args[0]
     assert o_proj_input.shape == (batch_size, q_len, attn_module.num_heads * attn_module.head_dim)
 
-@pytest.mark.parametrize(
-    "batch_size, seq_len, is_token_gen",
-    # fmt: off
-    [
-        (1, 1, True),  # bs=1, token gen
-        (2, 1, True),  # bs=2, token gen
-        (2, 5, True),  # bs=2, token gen (SD target)
-        (1, 5, False), # bs=1, context encoding
-    ],
-    # fmt: on
-)
-def test_forward_attention_tokengen_kernel_builtin(attn_module, batch_size, seq_len, is_token_gen):
-    """Test that forward() calls attention_tokengen_kernel_builtin with expected inputs during tokengen when enabled."""
-    _enable_attn_tkg_builtin_kernel_enabled(attn_module)
-
-    # Prepare mocks
-    q = torch.rand((batch_size, attn_module.num_heads, seq_len, attn_module.head_dim))
-    k = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
-    v = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
-
-    attn_module.prep_qkv_tensors = MagicMock(return_value=(q, k, v, None, None, None))
-    attn_module.attention_tokengen_kernel_builtin = MagicMock(
-        return_value=(
-            torch.rand((batch_size, attn_module.num_heads, seq_len, attn_module.head_dim)),
-            k,
-        )
-    )
-    attn_module.attention_context_encode = MagicMock(
-        return_value=(
-            torch.rand((batch_size, seq_len, attn_module.num_heads, attn_module.head_dim)),
-            k,
-            v,
-        )
-    )
-    attn_module.o_proj = MockTorchModule(
-        return_value=torch.rand((batch_size, seq_len, attn_module.hidden_size))
-    )
-
-    # Prepare inputs
-    hidden_states = torch.rand((batch_size, seq_len, attn_module.hidden_size))
-    attention_mask = torch.full((batch_size, 1, seq_len, seq_len), True)
-    position_ids = torch.ones((batch_size, seq_len))
-    past_key_value = None
-    active_mask = None
-
-    if is_token_gen:
-        past_k = torch.rand(
-            (batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
-        )
-        past_v = torch.rand(
-            (batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
-        )
-        past_key_value = (past_k, past_v)
-
-        if seq_len > 1:
-            active_mask = torch.ones((batch_size, 1, seq_len, seq_len))
-
-    # Call function
-    actual_output, new_past_key_value, cos_cache, sin_cache = attn_module.forward(
-        hidden_states=hidden_states,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_value=past_key_value,
-        active_mask=active_mask,
-        is_for_context_encoding=not is_token_gen,
-    )
-
-    if is_token_gen:
-        attn_module.attention_tokengen_kernel_builtin.assert_called_once_with(
-            q,
-            k,
-            v,
-            position_ids,
-            past_key_value,
-            attention_mask,
-            active_mask,
-            position_ids,
-        )
-
-        attn_module.attention_context_encode.assert_not_called()
-    else:
-        attn_module.attention_tokengen_kernel_builtin.assert_not_called()
-        attn_module.attention_context_encode.assert_called_once()
-
-    attn_module.o_proj.assert_called_once()
-    o_proj_input = attn_module.o_proj.call_args.args[0]
-    assert o_proj_input.shape == (batch_size, seq_len, attn_module.num_heads * attn_module.head_dim)
-
-
-@pytest.mark.parametrize(
-    "batch_size, seq_len",
-    # fmt: off
-    [
-        (1, 1),  # bs=1, token gen
-        (2, 1),  # bs=2, token gen
-        (2, 5),  # bs=2, token gen (SD target)
-    ],
-    # fmt: on
-)
-@patch("neuronx_distributed_inference.modules.attention.attention_base.nc")
-@patch(
-    "neuronx_distributed_inference.modules.attention.attention_base._attn_builtin_token_gen_call"
-)
-def test_attention_tokengen_kernel_builtin(
-    mock_attn_builtin_token_gen_call, mock_nc, attn_module, batch_size, seq_len
-):
-    """Test attention_tokengen_kernel_builtin calls kernel with expected inputs."""
-    _enable_attn_tkg_builtin_kernel_enabled(attn_module)
-
-    nc_value = Mock()
-    mock_nc.return_value = nc_value
-    grid = (nc_value,)
-    mock_attn_builtin_token_gen_kernel = MagicMock()
-    mock_attn_builtin_token_gen_call.__getitem__.return_value = mock_attn_builtin_token_gen_kernel
-
-    q = torch.rand((batch_size, attn_module.num_heads, seq_len, attn_module.head_dim))
-    k = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
-    v = torch.rand((batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim))
-
-    attention_mask = torch.full((batch_size, 1, seq_len, seq_len), True)
-    position_ids = torch.ones((batch_size, seq_len))
-    past_k = torch.rand(
-        (batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
-    )
-    past_v = torch.rand(
-        (batch_size, attn_module.num_key_value_heads, seq_len, attn_module.head_dim)
-    )
-    past_key_value = (past_k, past_v)
-    active_mask = (
-        torch.ones(batch_size, attn_module.num_heads, seq_len, seq_len)
-        if seq_len == 1
-        else torch.ones((batch_size, 1, seq_len, seq_len))
-    )
-    rotary_position_ids = position_ids
-
-    # Act
-    attn_output, K = attn_module.attention_tokengen_kernel_builtin(
-        q, k, v, position_ids, past_key_value, attention_mask, active_mask, rotary_position_ids
-    )
-
-    # Assert
-    mock_nc.assert_called_once_with(attn_module.logical_nc_config)
-    mock_attn_builtin_token_gen_call.__getitem__.assert_called_once_with(grid)
 
 
 @pytest.mark.parametrize(
@@ -1940,63 +1657,6 @@ def test_forward_kv_cache(attn_module, batch_size, seq_len, is_for_speculation):
     o_proj_input = attn_module.o_proj.call_args.args[0]
     assert o_proj_input.shape == (batch_size, q_len, attn_module.num_heads * attn_module.head_dim)
 
-
-
-@pytest.mark.parametrize(
-    "attn_module, batch_size, seq_len",
-    # fmt: off
-    [
-        ({"tp_degree": 2}, 1, 256),   # bs=1, context encoding, seqlen=256
-    ], indirect=["attn_module"],
-    # fmt: on
-)
-@patch("neuronx_distributed_inference.modules.attention.attention_base.nc")
-@patch(
-    "neuronx_distributed_inference.modules.attention.attention_base.llama3_nki_attention_block_cte_kernel"
-)
-@patch(
-    "neuronx_distributed_inference.modules.attention.attention_base.reduce_from_tensor_model_parallel_region"
-)
-def test_nki_attention_block_cte_kernel(
-    mock_reduce_from_tensor_model_parallel_region, mock_llama3_nki_attention_block_cte_kernel, mock_nc, attn_module: NeuronAttentionBase, batch_size, seq_len
-):
-    """Test attention_tokengen_kernel_builtin calls kernel with expected inputs."""
-
-    _enable_nki_attention_block_cte_kernel(attn_module)
-
-    nc_value = Mock()
-    mock_nc.return_value = nc_value
-    grid = (nc_value,)
-
-    mock_llama3_nki_attention_block_cte_kernel.__getitem__.return_value = MagicMock(return_value=(MagicMock(), MagicMock(), MagicMock(), MagicMock()))
-
-    hidden_states = torch.rand((batch_size, seq_len, attn_module.hidden_size))
-
-    cos_cache = torch.rand((batch_size, seq_len, attn_module.head_dim))
-    sin_cache = torch.rand((batch_size, seq_len, attn_module.head_dim))
-    attn_module.rotary_emb = MagicMock(return_value=(cos_cache, sin_cache))
-
-    rmsnorm = Mock()
-    rmsnorm.weight = torch.rand((1, attn_module.hidden_size))
-
-    # assert out_proj kernel is enabled - weight should be transpoed on CPU
-    assert attn_module.o_proj.out_proj_kernel_enabled
-    attn_module.o_proj = MockTorchModule()
-    attn_module.o_proj.o_proj.weight = torch.rand((attn_module.num_heads * attn_module.head_dim, 
-                                                    attn_module.hidden_size))
-    position_ids = torch.ones((batch_size, seq_len))
-    rotary_position_ids = position_ids
-
-    # Act
-    attn_module.forward(
-        hidden_states, rmsnorm=rmsnorm, rotary_position_ids=rotary_position_ids,
-        residual=hidden_states, 
-    )
-
-
-    # Assert
-    mock_nc.assert_called_once_with(attn_module.logical_nc_config)
-    mock_llama3_nki_attention_block_cte_kernel.__getitem__.assert_called_once_with(grid)
 
 
 @pytest.mark.parametrize(
@@ -2182,17 +1842,6 @@ def _enable_sequence_parallel_chunked_attn(attn_module, tp_degree, optimize_inte
     attn_module.is_post_global_attn_layer = is_post_global_attn_layer
     attn_module.o_proj_sp_enabled = False if is_pre_global_attn_layer or optimize_interleave_attn else True 
 
-
-
-def _enable_attn_tkg_builtin_kernel_enabled(attn_module):
-    attn_module.attn_tkg_builtin_kernel_enabled = True
-    attn_module.inv_freqs = torch.rand(
-        (
-            attn_module.head_dim // 2,
-            1,
-        ),
-        dtype=torch.float32,
-    )
 
 def _enable_nki_attention_block_cte_kernel(attn_module: NeuronAttentionBase):
     attn_module.attn_block_cte_nki_kernel_enabled = True

@@ -53,7 +53,7 @@ class BlockKVCacheManager(KVCacheManager):
         block_size = config.neuron_config.pa_block_size
         max_num_blocks_per_seq = (config.neuron_config.max_length + block_size - 1) // block_size
         if config.neuron_config.is_prefix_caching and max_num_blocks_per_seq < 128 and \
-                not (config.neuron_config.attn_tkg_nki_kernel_enabled or config.neuron_config.attn_block_tkg_nki_kernel_enabled):
+                not config.neuron_config.attn_block_tkg_nki_kernel_enabled:
             # Enable tiling on block_size dimension to avoid V cache transpose.
             # The tiling factor is the smallest power of 2 that's larger than or equal to
             # 128 / max_num_blocks_per_seq, so that the block_size dimension can be
