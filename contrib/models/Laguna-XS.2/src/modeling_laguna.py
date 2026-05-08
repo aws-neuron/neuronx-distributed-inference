@@ -579,6 +579,17 @@ class NeuronLagunaAttention(NeuronAttentionBase):
                     rotary_position_ids,
                 )
             else:
+                # Pad attention_mask to match KV cache sequence length.
+                # In vLLM continuous-batching mode, the mask may be bucket-sized
+                # (e.g., 128) while the KV cache is max_length-sized (e.g., 4096).
+                # The TKG NKI kernel handles this internally, but since we use
+                # compute_for_token_gen (softplus gating prevents NKI kernel use),
+                # we must pad manually. Padding with False masks out positions
+                # beyond the current context length.
+                kv_seq_len = past_key_value[1].shape[2]  # V cache: (B, H, S, D)
+                if attention_mask.shape[-1] < kv_seq_len:
+                    pad_len = kv_seq_len - attention_mask.shape[-1]
+                    attention_mask = F.pad(attention_mask, (0, pad_len), value=False)
                 attn_output = self.attention_tokengen(
                     Q,
                     K,
