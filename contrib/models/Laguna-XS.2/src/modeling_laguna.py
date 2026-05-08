@@ -412,6 +412,263 @@ class NeuronLagunaAttention(NeuronAttentionBase):
         attn_output = attn_output * gate_values
         return self.get_o_proj()(attn_output, adapter_ids=adapter_ids)
 
+    def attention_block_tokengen_nki_kernel(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        active_mask=None,
+        cos_cache=None,
+        sin_cache=None,
+        rmsnorm=None,
+        rotary_position_ids=None,
+        update_kv_per_layer=True,
+        active_block_table=None,
+        use_polar_compatible_rope=False,
+    ):
+        """Override base mega-kernel to insert softplus gating before o_proj.
+
+        Calls the NKI attention_block_tkg kernel with W_out=None (skip fused
+        output projection), then applies softplus gating and o_proj in PyTorch.
+        This enables the mega-kernel's SBUF fusion benefits (RMSNorm + QKV +
+        RoPE + Attention all in SBUF) while correctly applying Laguna's
+        per-head softplus gating before the output projection.
+
+        Multi-KV-head GQA support: The kernel supports kv_heads > 1 via
+        batch-folding. The caller reshapes mask and kv_cache_update_idx
+        to match the batch-folded layout expected by the kernel.
+        """
+        from neuronx_distributed_inference.modules.attention.attention_base import (
+            gather_from_sequence_parallel_region,
+        )
+        from nkilib.experimental.transformer.attention_block_tkg import (
+            attention_block_tkg,
+        )
+        from nkilib.core.utils.common_types import QuantizationType
+
+        if (
+            self.sequence_parallel_enabled
+            and self.tensor_model_parallel_group is not None
+        ):
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states,
+                self.sequence_dimension,
+                process_group=self.tensor_model_parallel_group,
+            )
+
+        # Get shapes
+        bsz, s_tkg, h = hidden_states.shape
+        num_q_heads = self.num_heads
+
+        # Prepare rmsnorm params
+        rmsnorm_enabled = rmsnorm is not None
+        W_gamma = rmsnorm.weight.data.unsqueeze(0) if rmsnorm is not None else None
+
+        # Prepare RoPE params
+        rope_contiguous_layout = not use_polar_compatible_rope
+        if self.rotary_emb is not None:
+            if cos_cache is None or sin_cache is None:
+                cos_cache, sin_cache = self.rotary_emb(
+                    hidden_states, rotary_position_ids
+                )
+                cos_cache = cos_cache[..., : cos_cache.shape[-1] // 2].permute(2, 0, 1)
+                sin_cache = sin_cache[..., : sin_cache.shape[-1] // 2].permute(2, 0, 1)
+            # Pad cos/sin to full d_head//2 for partial rotary.
+            # The kernel expects shape (d_head//2, B, S_tkg). For partial rotary
+            # (rotary_dim < d_head), pad with cos=1.0, sin=0.0 so non-rotated
+            # dimensions pass through unchanged.
+            half_d = self._head_dim // 2  # 64
+            if cos_cache.shape[0] < half_d:
+                pad_size = half_d - cos_cache.shape[0]
+                cos_pad = torch.ones(
+                    pad_size,
+                    cos_cache.shape[1],
+                    cos_cache.shape[2],
+                    dtype=cos_cache.dtype,
+                    device=cos_cache.device,
+                )
+                sin_pad = torch.zeros(
+                    pad_size,
+                    sin_cache.shape[1],
+                    sin_cache.shape[2],
+                    dtype=sin_cache.dtype,
+                    device=sin_cache.device,
+                )
+                cos_cache = torch.cat([cos_cache, cos_pad], dim=0)
+                sin_cache = torch.cat([sin_cache, sin_pad], dim=0)
+        else:
+            cos_cache = None
+            sin_cache = None
+
+        # Prepare attention mask
+        attention_mask = attention_mask.expand(-1, num_q_heads, -1, -1)
+        expected_active_mask_shape = (bsz, 1, s_tkg, s_tkg)
+        if s_tkg == 1:
+            active_mask = torch.ones(
+                expected_active_mask_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        else:
+            assert active_mask.shape == expected_active_mask_shape
+        active_mask = active_mask.expand(-1, num_q_heads, -1, -1)
+        attention_mask[:, :, :, -s_tkg:] = active_mask
+        attention_mask = attention_mask.permute(3, 0, 1, 2)
+        # Shape is now [S_ctx, B, q_heads, S_tkg]
+        # Reshape for multi-KV-head batch-folding:
+        # [S_ctx, B, q_heads, S_tkg] -> [S_ctx, B, kv_heads, q_per_kv, S_tkg]
+        # -> [S_ctx, B*kv_heads, q_per_kv, S_tkg]
+        kv_heads_per_rank = self.num_key_value_heads
+        q_per_kv = num_q_heads // kv_heads_per_rank
+        S_ctx = attention_mask.shape[0]
+        attention_mask = attention_mask.reshape(
+            S_ctx, bsz, kv_heads_per_rank, q_per_kv, s_tkg
+        )
+        attention_mask = attention_mask.reshape(
+            S_ctx, bsz * kv_heads_per_rank, q_per_kv, s_tkg
+        )
+
+        # Prepare KV cache
+        K_prior, V_prior = past_key_value[:2]
+        K_prior = K_prior.data
+        V_prior = V_prior.data
+        update_cache_in_kernel = (
+            update_kv_per_layer and self.attn_block_tkg_nki_kernel_cache_update
+        )
+        sink = (
+            self.get_learned_sinks().data.unsqueeze(-1)
+            if self.learned_sinks_size is not None
+            else None
+        )
+        kv_cache_update_idx = position_ids[:, :1].to(torch.int32)
+        # Repeat kv_cache_update_idx for each KV head (batch-folded layout)
+        # [B, 1] -> [B*kv_heads, 1] where each batch index is repeated kv_heads times
+        kv_cache_update_idx = kv_cache_update_idx.repeat_interleave(
+            kv_heads_per_rank, dim=0
+        )
+
+        # QK norm (pre-RoPE) — Laguna uses pre-RoPE QK norms
+        has_qk_layernorm = self.q_layernorm is not None and self.k_layernorm is not None
+        qk_norm_eps = self.rms_norm_eps if self.rms_norm_eps else 1e-6
+        is_pre_rope_qk_norm = has_qk_layernorm
+        rmsnorm_QK_pre_rope_W_Q = (
+            self.q_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
+        )
+        rmsnorm_QK_pre_rope_W_K = (
+            self.k_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
+        )
+
+        # Call mega-kernel WITHOUT output projection (W_out=None)
+        # This fuses: RMSNorm → QKV → RoPE → Attention in SBUF
+        # Returns: attn_output [B, q_heads, d_head, S_tkg], K, V
+        attn_output, K, V = attention_block_tkg[self.logical_nc_config](
+            # -- input
+            X=hidden_states,
+            X_hidden_dim_actual=getattr(self.config, "original_hidden_size", None),
+            # -- rmsnorm X
+            rmsnorm_X_enabled=rmsnorm_enabled,
+            rmsnorm_X_eps=self.rms_norm_eps,
+            rmsnorm_X_gamma=W_gamma,
+            # -- qkv projections
+            W_qkv=self.get_qkv_proj().Wqkv.weight.data,
+            bias_qkv=self.get_qkv_proj().Wqkv.bias.data.unsqueeze(0)
+            if self.qkv_bias
+            else None,
+            quantization_type_qkv=QuantizationType.NONE,
+            weight_dequant_scale_qkv=None,
+            input_dequant_scale_qkv=None,
+            # -- Q/K processing: flat QK RMSNorm (not used by Laguna)
+            rmsnorm_QK_flat_enabled=False,
+            rmsnorm_QK_flat_eps=0.0,
+            rmsnorm_QK_flat_W_Q=None,
+            rmsnorm_QK_flat_W_K=None,
+            # -- Q/K processing: pre-RoPE RMSNorm
+            rmsnorm_QK_pre_rope_enabled=is_pre_rope_qk_norm,
+            rmsnorm_QK_pre_rope_eps=qk_norm_eps if is_pre_rope_qk_norm else 0.0,
+            rmsnorm_QK_pre_rope_W_Q=rmsnorm_QK_pre_rope_W_Q,
+            rmsnorm_QK_pre_rope_W_K=rmsnorm_QK_pre_rope_W_K,
+            # -- Q/K processing: RoPE
+            cos=cos_cache,
+            sin=sin_cache,
+            rope_contiguous_layout=rope_contiguous_layout,
+            rotary_dim=None,  # cos/sin pre-padded to full d_head//2
+            # -- Q/K processing: post-RoPE RMSNorm (Laguna: not used)
+            rmsnorm_QK_post_rope_enabled=False,
+            rmsnorm_QK_post_rope_eps=0.0,
+            rmsnorm_QK_post_rope_W_Q=None,
+            rmsnorm_QK_post_rope_W_K=None,
+            # -- attention
+            K_cache_transposed=self.k_cache_transposed,
+            active_blocks_table=active_block_table.to(torch.uint32)
+            if active_block_table is not None
+            else None,
+            K_cache=K_prior,
+            V_cache=V_prior,
+            attention_mask=attention_mask,
+            sink=sink,
+            softmax_scale=None
+            if self.softmax_scale is None
+            else (1 / self.softmax_scale),
+            # -- KV cache update
+            update_cache=update_cache_in_kernel,
+            kv_cache_update_idx=kv_cache_update_idx,
+            # -- output projection: DISABLED (gating applied before o_proj)
+            W_out=None,
+            bias_out=None,
+            quantization_type_out=QuantizationType.NONE,
+            weight_dequant_scale_out=None,
+            input_dequant_scale_out=None,
+            transposed_out=False,
+            # -- output
+            out_in_sb=False,
+        )
+
+        # Kernel output without o_proj: [B*kv_heads, q_per_kv, d_head, S_tkg]
+        # Unfold batch-folded KV heads back to Q heads:
+        # [B*kv_heads, q_per_kv, d_head, S_tkg] -> [B, kv_heads, q_per_kv, d_head, S_tkg]
+        # -> [B, q_heads, d_head, S_tkg] -> [B, S_tkg, q_heads * d_head]
+        attn_output = attn_output.reshape(
+            bsz, kv_heads_per_rank, q_per_kv, self.head_dim, s_tkg
+        )
+        attn_output = attn_output.reshape(bsz, num_q_heads, self.head_dim, s_tkg)
+        attn_output = attn_output.permute(0, 3, 1, 2).reshape(
+            bsz, s_tkg, num_q_heads * self.head_dim
+        )
+
+        # Apply softplus gating: gate = softplus(attn_gate_proj(hidden_states))
+        gate_values = F.softplus(self.attn_gate_proj(hidden_states).float())
+        gate_values = gate_values.to(attn_output.dtype)
+        # Expand per-head gate to per-dim: [B, S, heads_per_rank, 1] -> [B, S, heads_per_rank * d]
+        heads_per_rank = gate_values.shape[-1]
+        gate_values = (
+            gate_values.unsqueeze(-1)
+            .expand(bsz, s_tkg, heads_per_rank, self._head_dim)
+            .reshape(bsz, s_tkg, heads_per_rank * self._head_dim)
+        )
+        attn_output = attn_output * gate_values
+
+        # Apply output projection (includes TP all-reduce)
+        attn_output = self.get_o_proj()(attn_output)
+
+        # Handle KV cache return
+        if not update_cache_in_kernel:
+            # K: (d_head, B*kv_heads, S_tkg) -> reshape to (B, kv_heads, ...) for cache
+            if self.k_cache_transposed:
+                # K -> (B*kv_heads, d_head, S_tkg) -> (B, kv_heads, d_head, S_tkg)
+                K = K.permute(1, 0, 2).reshape(
+                    bsz, kv_heads_per_rank, self.head_dim, s_tkg
+                )
+            else:
+                # K -> (B*kv_heads, S_tkg, d_head) -> (B, kv_heads, S_tkg, d_head)
+                K = K.permute(1, 2, 0).reshape(
+                    bsz, kv_heads_per_rank, s_tkg, self.head_dim
+                )
+            # V: (B*kv_heads, 1, S_tkg, d_head) -> (B, kv_heads, S_tkg, d_head)
+            V = V.reshape(bsz, kv_heads_per_rank, s_tkg, self.head_dim)
+
+        return attn_output, (K, V), cos_cache, sin_cache
+
     def standard_causal_attention_forward(
         self,
         hidden_states,
@@ -500,7 +757,7 @@ class NeuronLagunaAttention(NeuronAttentionBase):
         if self.neuron_config.is_prefix_caching:
             is_token_gen = is_token_gen and q_len < 128
 
-        # NKI kernel paths -- delegate to base (gating not fused in NKI kernels)
+        # NKI mega-kernel path -- gating handled in attention_block_tokengen_nki_kernel override
         if self.attn_block_tkg_nki_kernel_enabled and is_token_gen:
             return super().standard_causal_attention_forward(
                 gate_hidden_states.to(self.torch_dtype)
@@ -1173,6 +1430,32 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
             )
 
             new_state_dict[new_key] = weight.detach().clone().to(target_dtype)
+
+        # --- Pass 1b: Fuse QKV weights when fused_qkv=True ---
+        if getattr(neuron_config, "fused_qkv", False):
+            num_heads_per_layer = config.num_attention_heads_per_layer
+            kv_heads = config.num_key_value_heads
+            head_dim = config.head_dim
+            for layer_idx in range(config.num_hidden_layers):
+                prefix_l = f"layers.{layer_idx}.self_attn"
+                q_key = f"{prefix_l}.q_proj.weight"
+                k_key = f"{prefix_l}.k_proj.weight"
+                v_key = f"{prefix_l}.v_proj.weight"
+                if (
+                    q_key in new_state_dict
+                    and k_key in new_state_dict
+                    and v_key in new_state_dict
+                ):
+                    # Concatenate Q, K, V along dim 0: [num_heads*d + kv*d + kv*d, H]
+                    fused = torch.cat(
+                        [
+                            new_state_dict.pop(q_key),
+                            new_state_dict.pop(k_key),
+                            new_state_dict.pop(v_key),
+                        ],
+                        dim=0,
+                    )
+                    new_state_dict[f"{prefix_l}.Wqkv.weight"] = fused
 
         # --- Pass 2: Stack MoE expert weights per layer ---
         num_experts = config.num_experts  # 256
