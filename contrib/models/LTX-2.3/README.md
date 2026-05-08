@@ -132,8 +132,8 @@ Both the DiT backbone and Gemma3 encoder are compiled for TP=4 and share the sam
 ### Prerequisites
 
 ```bash
-# On trn2.3xlarge with Deep Learning AMI Neuron (Ubuntu 24.04) 20260227
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+# On trn2.3xlarge with Deep Learning AMI Neuron (Ubuntu 24.04) 20260410
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
 # Install ltx-core
 pip install git+https://github.com/Lightricks/LTX-2.git#subdirectory=packages/ltx-core
@@ -158,7 +158,7 @@ huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-temporal-upscaler-x2-1.0.saf
 ```bash
 # Full-resolution backbone (384x512, VIDEO_SEQ=768)
 NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
-  torchrun --nproc_per_node=4 src/compile_transformer.py
+  torchrun --nproc_per_node=4 src/compile.py transformer
 ```
 
 Compilation takes approximately 60 seconds. The compiled model is saved to `compiler_workdir_tp4_lnc2_v2/tp_0.pt` (8.7 GB).
@@ -168,7 +168,7 @@ For two-stage mode, also compile the half-resolution backbone:
 ```bash
 # Half-resolution backbone (192x256, VIDEO_SEQ=192) — for two-stage mode
 NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
-  torchrun --nproc_per_node=4 src/compile_transformer_halfres.py
+  torchrun --nproc_per_node=4 src/compile.py transformer --halfres
 ```
 
 This compiles the same architecture at the half-res latent shape (4×6×8 instead of 4×12×16). Output: `compiler_workdir_tp4_lnc2_halfres/tp_0.pt` (~8.7 GB).
@@ -178,7 +178,7 @@ This compiles the same architecture at the half-res latent shape (4×6×8 instea
 Pre-sharding avoids loading the full 41 GB safetensors file during generation:
 
 ```bash
-python3 src/shard_backbone_weights.py \
+python3 src/shard_weights.py backbone \
   --model-path /home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
   --output-dir /home/ubuntu/backbone_sharded
 ```
@@ -192,11 +192,11 @@ Compiling Gemma3 for Neuron eliminates the ~162s CPU text encoding bottleneck:
 ```bash
 # Compile the encoder graph
 NEURON_FUSE_SOFTMAX=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
-  python3 src/compile_gemma3.py \
+  python3 src/compile.py encoder \
     --compile-dir /home/ubuntu/gemma3_encoder_compiled
 
 # Pre-shard weights for fast loading (~5.9 GB per rank)
-python3 src/shard_gemma3_weights.py \
+python3 src/shard_weights.py encoder \
   --gemma-path /home/ubuntu/models/gemma-3-12b \
   --output-dir /home/ubuntu/gemma3_encoder_sharded
 ```
@@ -276,10 +276,10 @@ Output: PNG frames, MP4 video (if ffmpeg available), WAV audio.
 
 ## Compatibility Matrix
 
-| Instance/Version | SDK 2.27 | SDK 2.28 |
-|------------------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | — | VALIDATED |
-| trn2.48xlarge (TP=4/16, LNC=2) | VALIDATED | — |
+| Instance/Version | SDK 2.27 | SDK 2.28 | SDK 2.29 |
+|------------------|----------|----------|----------|
+| trn2.3xlarge (TP=4, LNC=2) | — | VALIDATED | PENDING |
+| trn2.48xlarge (TP=4/16, LNC=2) | VALIDATED | — | — |
 
 ## Example Checkpoints
 
@@ -364,16 +364,12 @@ Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHAS
 | `src/modeling_ltx23.py` | Core backbone: TP sharding, DistributedRMSNorm, SDPA replacement, TransformerArgs construction |
 | `src/modeling_gemma3_encoder.py` | Custom Gemma3 encoder-only model: returns all 49 hidden states stacked, no KV cache |
 | `src/pipeline.py` | NeuronTransformerWrapper: CPU preprocessing, backbone routing, mask handling, AdaLN deduplication, step-invariant caching |
-| `src/compile_transformer.py` | DiT backbone compilation script — full-res 384×512 (torchrun --nproc_per_node=4) |
-| `src/compile_transformer_halfres.py` | DiT backbone compilation script — half-res 192×256 for two-stage mode |
-| `src/compile_gemma3.py` | Gemma3 encoder compilation script (parallel_model_trace) |
-| `src/shard_gemma3_weights.py` | Pre-shard Gemma3 weights to per-rank files for fast loading |
-| `src/shard_backbone_weights.py` | Pre-shard DiT backbone weights to per-rank files for fast loading |
+| `src/compile.py` | Unified compilation script: `compile.py transformer [--halfres]`, `compile.py encoder`, `compile.py vae` |
+| `src/shard_weights.py` | Unified weight sharding: `shard_weights.py backbone`, `shard_weights.py encoder` |
 | `src/load_with_weights.py` | DiT backbone weight sharding and injection utilities |
 | `src/generate_ltx23.py` | E2E generation pipeline (text encoding, single/two-stage denoising, VAE decode, upscaling, image-to-video) |
 | `src/run_phase2.py` | Phase 2 standalone script: spatial upsample + S2 denoising + Neuron/CPU VAE decode |
 | `src/modeling_vae_23.py` | TP-sharded LTX-2.3 VAE decoder (~560 lines), ColumnRowParallelConv3d, CausalConv3d |
-| `src/compile_vae_23.py` | VAE decoder compilation script (TP=4, 4×16 tile, 121 frames) |
 | `src/tiled_vae_decode_23.py` | Tiled decode with overlap blending for arbitrary resolutions |
-| `src/compile_benchmark.py` | Full benchmark compilation script (encoder + S1 + S2 backbone) |
+| `src/compile_benchmark.py` | Full benchmark compilation script for trn2.48xlarge (encoder + S1 + S2 backbone via Application path) |
 | `src/application.py` | NeuronLTX23Application compositor for NxDI Application path |
