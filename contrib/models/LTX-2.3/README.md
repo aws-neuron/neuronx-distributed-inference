@@ -278,8 +278,16 @@ Output: PNG frames, MP4 video (if ffmpeg available), WAV audio.
 
 | Instance/Version | SDK 2.27 | SDK 2.28 | SDK 2.29 |
 |------------------|----------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | — | VALIDATED | PENDING |
+| trn2.3xlarge (TP=4, LNC=2) | — | VALIDATED | VALIDATED |
 | trn2.48xlarge (TP=4/16, LNC=2) | VALIDATED | — | — |
+
+### SDK 2.29 Notes
+
+- **Venv**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate` (different path from 2.28)
+- **torchaudio**: Install `torchaudio==2.9.1 --no-deps` separately (ltx-core dependency, not pre-installed)
+- **Performance**: Denoising step latency unchanged (0.3s/step warm, identical to SDK 2.28)
+- **Compilation**: 67.7s for full-res backbone (vs ~60s on 2.28, within variance)
+- **ltx-core**: v1.1.2 compatible (API change: `decode_video` moved to `VideoDecoder.decode_video()` method)
 
 ## Example Checkpoints
 
