@@ -254,7 +254,6 @@ def compile_transformer(args):
     global _CONFIG, _TP_DEGREE
 
     import torch_neuronx
-    import torch_xla.core.xla_model as xm
     from neuronx_distributed.parallel_layers import parallel_state
     from neuronx_distributed.parallel_layers.checkpointing import NXD_SKIP_RENDEZVOUS
     from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
@@ -345,10 +344,11 @@ def compile_transformer(args):
         size_gb = os.path.getsize(tp_0_path) / 1e9
         print(f"  Compiled and saved in {elapsed:.1f}s", flush=True)
         print(f"  Output: {tp_0_path} ({size_gb:.1f} GB)", flush=True)
+        print("\nCompilation complete!", flush=True)
 
-    xm.rendezvous("done-compilation")
-    if rank == 0:
-        print("\nAll ranks rendezvous'd. Compilation complete!", flush=True)
+    # Non-rank-0 processes just exit cleanly (compilation is rank-0 only)
+    if rank != 0:
+        return
 
 
 # ============================================================================
