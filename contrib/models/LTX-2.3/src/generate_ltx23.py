@@ -1725,12 +1725,19 @@ def generate(args):
         os.makedirs(args.output_dir, exist_ok=True)
         logger.info("  Decoding video...")
         t0 = time.time()
-        from ltx_core.model.video_vae.video_vae import decode_video
+        try:
+            from ltx_core.model.video_vae.video_vae import decode_video
 
-        video_chunks = []
-        with torch.no_grad():
-            for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
-                video_chunks.append(chunk)
+            video_chunks = []
+            with torch.no_grad():
+                for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
+                    video_chunks.append(chunk)
+        except ImportError:
+            # ltx-core >= 1.1: decode_video is a method on VideoDecoder instance
+            video_chunks = []
+            with torch.no_grad():
+                for chunk in cpu["video_decoder"].decode_video(video_latent_4d):
+                    video_chunks.append(chunk)
         video_frames = torch.cat(video_chunks, dim=0)
         logger.info(
             "  Video decoded: %s in %.1fs", video_frames.shape, time.time() - t0
@@ -2103,12 +2110,19 @@ def generate(args):
 
     logger.info("  Decoding video...")
     t0 = time.time()
-    from ltx_core.model.video_vae.video_vae import decode_video
+    try:
+        from ltx_core.model.video_vae.video_vae import decode_video
 
-    video_chunks = []
-    with torch.no_grad():
-        for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
-            video_chunks.append(chunk)
+        video_chunks = []
+        with torch.no_grad():
+            for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
+                video_chunks.append(chunk)
+    except ImportError:
+        # ltx-core >= 1.1: decode_video is a method on VideoDecoder instance
+        video_chunks = []
+        with torch.no_grad():
+            for chunk in cpu["video_decoder"].decode_video(video_latent_4d):
+                video_chunks.append(chunk)
     video_frames = torch.cat(video_chunks, dim=0)  # (F, H, W, 3) uint8
     logger.info("  Video decoded: %s in %.1fs", video_frames.shape, time.time() - t0)
 
