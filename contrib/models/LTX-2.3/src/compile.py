@@ -331,33 +331,12 @@ def compile_transformer(args):
         ]
 
         t0 = time.time()
-        neff_filename, metaneff, flattener, packer, weights = (
-            torch_neuronx.xla_impl.trace._trace(
-                model,
-                example_inputs,
-                None,
-                input_output_alias,
-                rank_workdir,
-                compiler_args,
-                False,
-            )
-        )
-
-        from torch_neuronx.xla_impl.structure import extract as struct_extract
-
-        print(f"  Flattener layout: {flattener.layout}", flush=True)
-        test_layout, test_uniques, test_constants = struct_extract(example_inputs)
-        print(f"  Input layout:     {test_layout}", flush=True)
-        print(f"  Match: {flattener.layout == test_layout}", flush=True)
-
-        traced_model = torch_neuronx.xla_impl.trace.create_neuron_model(
-            neff_filename,
-            metaneff,
-            flattener,
-            packer,
+        traced_model = torch_neuronx.trace(
+            model,
             example_inputs,
-            input_output_alias,
-            weights,
+            compiler_workdir=rank_workdir,
+            compiler_args=compiler_args,
+            inline_weights_to_neff=False,
         )
 
         tp_0_path = os.path.join(compile_dir, "tp_0.pt")
