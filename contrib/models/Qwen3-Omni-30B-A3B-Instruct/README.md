@@ -184,8 +184,8 @@ Config knobs: `CHUNK_SIZE=50`, `LEFT_CTX=10` in `test_audio_streaming.py`.
 See [`BENCHMARK_OMNI2_TTFB.md`](BENCHMARK_OMNI2_TTFB.md) for a detailed TTFB
 / RTF benchmark on 100 real multi-turn audio-in conversations (prompts
 1164–1494 tokens). Covers the progressive optimizations that took TTFB from
-**2727 ms → 2000 ms** (−27 %) and the talker max-token truncation rate from
-100 % → 12 %:
+**2727 ms → 1759 ms** (−35 %, p95 from 3564 → 1822 ms / −49 %) and the
+talker max-token truncation rate from 100 % → 12 %:
 
 1. Patched `TensorRegistry.clear()` so `layers.23` capture survives across
    all bucket traces (prompts ≥ 512 tokens previously hit a zero fallback).
@@ -198,9 +198,12 @@ See [`BENCHMARK_OMNI2_TTFB.md`](BENCHMARK_OMNI2_TTFB.md) for a detailed TTFB
 4. `CHUNK_SIZE=25` / `LEFT_CTX=5` (was 50 / 10): TTFB −487 ms.
 5. Ported `code2wav` to Neuron (bit-exact vs CPU): first-chunk c2w 387 ms →
    122 ms.
+6. Pipelined thinker ↔ talker — talker starts as soon as 4 thinker tokens
+   are buffered and reads `trailing_text_hidden[k]` on demand. Mean TTFB
+   2000 → 1759 ms; p95 cut nearly in half (3316 → 1822 ms).
 
 Best configuration: `NEURON_RT_VISIBLE_CORES=0-7 CHUNK_SIZE=25 LEFT_CTX=5
-python test_ttfb_rtf_bench.py --num 100 --neuron-c2w`.
+python test_ttfb_pipelined_bench.py --num 100 --neuron-c2w`.
 
 ---
 
@@ -236,7 +239,8 @@ contrib/models/Qwen3-Omni-30B-A3B-Instruct/
 | File | Purpose |
 |---|---|
 | `test_thinker_ttft_bench.py` | Thinker-only TTFT / ITL / throughput on the omni2 100-conv dataset. |
-| `test_ttfb_rtf_bench.py` | Full streaming TTFB / RTF on the omni2 100-conv dataset. `--neuron-c2w` routes code2wav through Neuron. |
+| `test_ttfb_rtf_bench.py` | Full streaming TTFB / RTF on the omni2 100-conv dataset (serial thinker→talker). `--neuron-c2w` routes code2wav through Neuron. |
+| `test_ttfb_pipelined_bench.py` | Same dataset, but thinker and talker overlap: thinker streams tokens to a bg thread, talker reads `trailing_text_hidden[k]` on demand. Lowest TTFB and tightest tail latency. |
 | `compile_talker.py` | Recompile the talker with `TensorCaptureConfig(["norm"])` so the NEFF exposes the real post-RMSNorm hidden (needed by the `code_predictor` path). Output: `talker_tp8_capnorm/`. |
 | `compile_code2wav.py` | Compile the vocoder at fixed input buckets (default `{30, 50, 128}`). Output: `code2wav_buckets/`. |
 | `code2wav_neuron.py` | Runtime shim that replaces `hf_model.code2wav` with a bucket-dispatching Neuron wrapper. |

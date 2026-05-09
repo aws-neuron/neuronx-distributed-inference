@@ -53,20 +53,26 @@ Streaming pipeline: thinker (Neuron) → talker (Neuron) → UCP (Neuron) →
 code2wav. `code2wav` fires inline every `CHUNK_SIZE` codec tokens. TTFB =
 request arrival → first audio chunk delivered to the host.
 
-### TTFB progression across five configurations
+### TTFB progression across configurations
 
 | configuration | TTFB mean | TTFB p50 | TTFB p90 | TTFB p95 | hit-max / 100 |
 |---|---:|---:|---:|---:|---:|
 | 1. baseline streaming (broken talker) | 2727 | 2666 | 3113 | 3564 | **100** |
 | 2. + TensorRegistry fix + norm capture + HF sampling | 2763 | 2698 | 3140 | 4128 | 15 |
 | 3. + CHUNK_SIZE=25 / LEFT_CTX=5 | 2276 | 2193 | 2670 | 3581 | 14 |
-| 4. + Neuron `code2wav` | **2000** | **1915** | **2389** | **3316** | **12** |
+| 4. + Neuron `code2wav` | 2000 | 1915 | 2389 | 3316 | 12 |
+| 5. + thinker↔talker pipelining | **1759** | **1778** | **1811** | **1822** | **12** |
 
 All milliseconds. "hit-max" counts samples where the talker reached
 `max_new_tokens=500` instead of naturally emitting `codec_eos_token_id` —
 smaller is better.
 
-### TTFB breakdown (best configuration — step 4)
+The **biggest tail-latency win** from step 5: p95 dropped from 3316 → 1822 ms
+(−45 %). With pipelining, TTFB no longer scales with thinker output length —
+the user gets first audio in a near-constant window regardless of whether the
+thinker reply is 50 or 200 tokens.
+
+### TTFB breakdown (step 4 — fully serial pipeline)
 
 | stage | mean | p50 | p90 | note |
 |---|---:|---:|---:|---|
@@ -74,6 +80,18 @@ smaller is better.
 | build talker inputs + 25 talker steps + UCP | 532 | 543 | 553 | 25 × ~21 ms decode |
 | first `code2wav` chunk | **122** | **122** | **122** | Neuron NEFF, T=30 bucket |
 | **TTFB total** | **2000** | **1915** | **2389** | |
+
+### TTFB breakdown (step 5 — pipelined)
+
+In the pipelined run thinker and talker overlap, so the breakdown is no
+longer a sum of stages. The dominant component is "wait for first 4 thinker
+tokens", measured as `build_talker_blocked_ms`:
+
+| stage | mean | p50 | note |
+|---|---:|---:|---|
+| wait for first 4 thinker tokens | 765 | 762 | thinker prefill (~668 ms) + a few decode steps + bg-thread overhead |
+| talker prefill + 25 decode steps + first `code2wav` chunk | ~990 | ~1015 | running concurrently with the rest of thinker decode; sometimes blocks on get_trailing_slice waiting for the next thinker token |
+| **TTFB total** | **1759** | **1778** | |
 
 #### Why "thinker" is 1346 ms, not the 668 ms TTFT number
 
@@ -282,6 +300,72 @@ Enable with the new flag on the bench:
 python test_ttfb_rtf_bench.py --num 100 --neuron-c2w
 ```
 
+### 6. Thinker ↔ talker pipelining
+
+With everything on Neuron, the talker still waited for the **complete**
+thinker output before starting. That's because HF's `_build_talker_inputs`
+takes the full token sequence + full layer-23 hidden, then `talker.generate`
+is called once with a pre-built `trailing_text_hidden` tensor.
+
+But HF's talker `prepare_inputs_for_generation` only reads
+`trailing_text_hidden[:, generation_step]` at decode step `k`, which
+corresponds to the `(k+4)`-th thinker assistant token. So the talker can in
+principle start as soon as **4 thinker tokens** are available, and consume
+the rest one-by-one as they stream in.
+
+**Implementation (`test_ttfb_pipelined_bench.py`).**
+
+1. **Background thread runs the thinker.** A custom
+   `StoppingCriteria` is installed (NxDI's `_sample` ignores HF's
+   `streamer` arg, but it does call `stopping_criteria(input_ids, ...)` on
+   every decode step — perfect tap point) that pushes each newly-appended
+   token into a `PipelineState` condition-variable buffer. The
+   `tensor_capture_hook` for layer-23 captures the hidden tensor in the
+   same callback path.
+
+2. **Main thread builds the talker prefill incrementally.**
+   `StreamingTalkerInputs.build_prefill()` blocks until (a) the prefill's
+   layer-23 hidden is captured (one Neuron forward), and (b) the first 4
+   assistant tokens are in the buffer. Then it assembles only the prefill
+   slice that HF's `_get_talker_assistant_parts` would build — using
+   `assistant_hidden[:, :4]` plus the codec specials.
+
+3. **Talker decode reads the trailing buffer on demand.**
+   `Qwen3OmniMoeTalkerForConditionalGeneration.prepare_inputs_for_generation`
+   is wrapped (layered on top of the existing streaming-c2w wrapper) so
+   that, for each decode step `k`, it overwrites `kwargs["trailing_text_hidden"]`
+   with a tensor whose row `k` is `text_projection(embed(thinker_tokens[k+4]))`,
+   pulled from the streaming buffer. If the (k+4)-th token isn't out yet,
+   the call blocks on the condition variable until it arrives. Past the end
+   of the thinker output, the slice falls back to `tts_eos_embed`.
+
+**Result.** TTFB: 2000 → **1759 ms** (mean), and crucially p95: 3316 →
+**1822 ms** (−45 %). The big tail-latency win is because TTFB no longer
+scales with thinker output length — the user gets first audio within
+~1800 ms whether the assistant reply is 50 or 200 tokens long.
+
+The mean improvement is more modest (~12 %) than the naive "subtract all
+thinker decode" estimate (~600 ms) for two reasons:
+
+- **Neuron device queue serializes.** Both thinker and talker NEFFs are
+  compiled at TP=8 and run on the same 8 cores. They interleave on the
+  Neuron driver instead of running truly in parallel. The talker can start
+  earlier, but its forwards still queue behind in-flight thinker forwards.
+- **Per-step CPU overhead.** Each talker decode step now does an extra
+  `text_projection` on a single token (~3 ms) plus condition-variable
+  signal/wait (~1 ms). Across 25 steps that's ~100 ms of extra serial work.
+
+A real ~600 ms win would require running the thinker and talker on
+**different** Neuron core groups (e.g. cores 0-7 and 8-15 on a trn2
+instance) so that they can dispatch in parallel. That's a separate
+compile-and-deploy change.
+
+Enable with the new bench script:
+
+```bash
+python test_ttfb_pipelined_bench.py --num 100 --neuron-c2w
+```
+
 ---
 
 ## New files
@@ -289,7 +373,8 @@ python test_ttfb_rtf_bench.py --num 100 --neuron-c2w
 | Path | Purpose |
 |---|---|
 | `test_thinker_ttft_bench.py` | Thinker-only TTFT / ITL / throughput on 100 convs |
-| `test_ttfb_rtf_bench.py` | Full streaming TTFB / RTF on 100 convs. `--neuron-c2w` for Neuron-backed code2wav. |
+| `test_ttfb_rtf_bench.py` | Full streaming TTFB / RTF on 100 convs (serial). `--neuron-c2w` for Neuron-backed code2wav. |
+| `test_ttfb_pipelined_bench.py` | Full streaming TTFB / RTF on 100 convs with thinker↔talker pipelining (background thread + on-demand `trailing_text_hidden`). |
 | `compile_talker.py` | Compile talker with `TensorCaptureConfig(["norm"])` |
 | `compile_code2wav.py` | Compile code2wav at fixed T buckets |
 | `code2wav_neuron.py` | Runtime shim that routes code2wav through the compiled NEFFs |
@@ -310,56 +395,59 @@ Compiled artifacts:
 | `test_audio_out_full_neuron.py` | Point `TALKER_COMPILED` at `talker_tp8_capnorm`; shim now reads `out[2]` (captured norm) as the real hidden |
 | `test_audio_streaming.py` | `CHUNK_SIZE` / `LEFT_CTX` read from env vars |
 
-## Remaining TTFB cost
+## Remaining TTFB cost (after step 5 — pipelined)
 
-Breakdown at TTFB = 2000 ms (see "Why thinker is 1346 ms, not 668 ms" above
-for the math on the first row):
+At the pipelined config (TTFB mean 1759 ms / p50 1778 ms):
 
-- **thinker full generate** (Neuron) — 1346 ms (67 %)
-  - ≈ prefill (668 ms) + 68 × ITL (680 ms)
-  - decode accounts for ~half of this; prefill itself is only 668 ms
-- **talker + UCP 25 steps** (Neuron) — 532 ms (27 %)
-  - 25 × ~21 ms; each step is one talker forward + one UCP forward
-- **first code2wav chunk** (Neuron) — 122 ms (6 %)
-  - T=30 bucket; bit-exact vs CPU
+- **wait for first 4 thinker tokens** — ~765 ms
+  - thinker prefill 668 + 4 × ITL (40) + bg-thread overhead (~60)
+  - this is the floor the talker can't start before
+- **talker prefill + 25 decode steps (overlapped with thinker decode)** — ~870 ms
+  - 25 × ~21 ms talker, plus startup, plus a few cv-blocks waiting for the next thinker token
+- **first code2wav chunk** — 122 ms
+- **TTFB total** — 1759 ms
 
-Everything in the critical path now runs on Neuron.
+Everything is on Neuron and overlapped where possible.
 
-### Options to go below 2000 ms
+### Options to go below 1759 ms
 
-1. **Thinker → talker pipelining (largest win, ~600 ms headroom).**
-   Today the talker waits for the entire thinker output. If the talker starts
-   consuming thinker tokens as soon as ~30 of them are buffered, TTFB drops
-   from `prefill + 68·ITL + talker + c2w` to roughly `prefill + K·ITL +
-   talker_startup + 25·talker_ITL + c2w`. Estimated TTFB floor ≈ 1400 ms.
-   Requires making `_build_talker_inputs` incremental and running the two
-   decode loops on separate host threads / queues. No device contention —
-   thinker and talker live on disjoint NEFFs.
+1. **Run thinker and talker on disjoint Neuron core groups** (~250-500 ms
+   headroom). Today both NEFFs are TP=8 and share cores 0-7, so the Neuron
+   driver serializes their forwards. On a trn2 instance with 16 cores, we
+   could compile a second copy of the talker on cores 8-15 and dispatch in
+   true parallel. The talker's 25 × 21 ms then overlaps the thinker decode
+   end-to-end; TTFB would drop toward `max(thinker_full, prefill +
+   4·ITL + 25·talker_ITL + c2w)` ≈ 1300-1400 ms.
 
 2. **Shorter thinker replies (task-dependent).** The 68-token mean is set by
-   the dataset's average assistant reply length; prompting the thinker to be
-   more concise (or truncating earlier via a stop sequence) cuts decode time
-   linearly. 30-token replies would save ~380 ms.
+   the dataset's average assistant reply length. Prompting the thinker to be
+   more concise (or truncating via a stop sequence) cuts decode time
+   linearly. With pipelining, this matters less than before — the talker
+   hides most of the decode — but on samples where the talker happens to
+   catch up to the thinker's output, fewer thinker tokens still helps.
 
 3. **Thinker speculative decoding.** NxDI supports EAGLE-style speculation.
-   If a lightweight draft model proposes 2-3 thinker tokens per target step,
-   the 10 ms ITL could drop toward 4-5 ms. Non-trivial compile work but
-   directly attacks the 680 ms decode contribution.
+   A draft model that proposes 2-3 thinker tokens per target step pushes the
+   effective ITL toward 4-5 ms, narrowing both the "wait for first 4 tokens"
+   window and the per-step talker stall window.
 
-4. **Thinker prefill bucketing.** All 100 prompts here land in bucket 2048
+4. **Thinker prefill bucketing.** All 100 prompts land in bucket 2048
    because the system prompt is ~800 tokens. Splitting the system prompt
-   into a separate prefill that is cached, and only running bucket-512 on
-   the delta, could shave the 668 ms prefill to ~250 ms. Needs
-   prefix-caching wiring into the custom thinker compile.
+   into a separately-cached prefix and running bucket-512 on the delta could
+   shave the 668 ms prefill to ~250 ms — directly reducing the
+   "wait for first 4 tokens" floor.
 
-5. **Talker + UCP fusion.** The 25 × 21 ms today is 10 ms talker + 11 ms UCP
-   per step, back-to-back. Merging them into a single traced op per step
-   should save the cross-NEFF dispatch overhead (~3 ms/step → ~75 ms total
-   at CHUNK_SIZE=25). Small relative win, but essentially free once the
-   tracer supports it.
+5. **Talker + UCP fusion.** The 25 × ~21 ms today is one talker forward + one
+   UCP forward, both via separate NEFFs. Merging them into a single traced
+   op per step would save ~3 ms/step on cross-NEFF dispatch, ~75 ms total
+   at CHUNK_SIZE=25.
 
 6. **Smaller CHUNK_SIZE.** 25 is already aggressive. Going to 15 would save
-   another ~200 ms on the talker phase but increases left-context recompute
-   overhead in code2wav — the per-chunk c2w cost is ~flat from T=15 up to
-   T=50, so the trade-off tilts favorably. Worth measuring if a lower floor
-   is needed.
+   ~200 ms on the talker portion but increases left-context recompute
+   overhead in code2wav. Worth measuring if a lower floor is needed.
+
+7. **Pure-C++ orchestration / GIL elimination.** ~100 ms of the pipelined
+   TTFB is Python overhead from the bg-thread / cv-block / per-step
+   `text_projection` glue. A C++ inference server that drives both Neuron
+   models via the runtime API directly (no Python in the hot loop) would
+   shed that.
