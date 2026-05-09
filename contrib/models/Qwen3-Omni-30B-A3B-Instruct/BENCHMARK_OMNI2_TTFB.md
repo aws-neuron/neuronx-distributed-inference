@@ -70,10 +70,72 @@ smaller is better.
 
 | stage | mean | p50 | p90 | note |
 |---|---:|---:|---:|---|
-| thinker (Neuron) | 1346 | 1263 | 1485 | bucket-2048 MoE prefill |
+| thinker full generate (Neuron) | 1346 | 1263 | 1485 | prefill 668 + ~68 × 10 ms decode |
 | build talker inputs + 25 talker steps + UCP | 532 | 543 | 553 | 25 × ~21 ms decode |
 | first `code2wav` chunk | **122** | **122** | **122** | Neuron NEFF, T=30 bucket |
 | **TTFB total** | **2000** | **1915** | **2389** | |
+
+#### Why "thinker" is 1346 ms, not the 668 ms TTFT number
+
+The `test_thinker_ttft_bench.py` table reports **TTFT = 668 ms** (time to first
+token = prefill) and **ITL = 10 ms** (per decode step). In the streaming TTFB
+pipeline, though, the talker cannot start until the thinker has generated the
+**entire** assistant reply — HF's `_build_talker_inputs` needs the full token
+sequence and the full layer-23 hidden tensor to assemble the talker's prompt.
+
+So the "thinker" row in the TTFB breakdown covers **prefill + all decode
+steps** of the thinker, not just TTFT. With mean 68 new tokens:
+
+```
+thinker_ms ≈ prefill + new_tokens × ITL
+           ≈ 668 + 68 × 10
+           ≈ 1348 ms   (measured: 1346 ms)
+```
+
+Concretely, this is the serial pipeline the bench runs today:
+
+```
+t=0          request arrives
+t=668        thinker prefill done   (first thinker token available — TTFT)
+t=1346       thinker done           (68 decode steps @ 10 ms, all tokens + hiddens ready)
+t=~1400      talker prefill done    (~50 ms build + 1 prefill forward on talker)
+t=1878       25 talker decode steps done (25 × ~21 ms, each pairs with one UCP call)
+t=2000       first code2wav chunk returned → first audio delivered
+```
+
+The 1346 ms thinker cost is what dominates TTFB now, and it's mostly **not**
+prefill (bucket 2048) — it's the 68 serial decode steps after prefill.
+
+#### What the ceiling looks like if we pipeline
+
+If we were willing to change architecture and let the talker consume thinker
+tokens as they stream out (instead of waiting for the full thinker sequence),
+TTFB could in principle drop to roughly the thinker-prefill time + a short
+warmup before the talker finds enough context to emit codec tokens:
+
+```
+t=0          request arrives
+t=~668       thinker prefill done, thinker begins streaming tokens
+t=~668+K*10  K additional thinker tokens buffered so talker has enough context
+             to start (K is small — tens of tokens)
+             (in parallel: talker prefill + first few decode steps)
+t=TTFB       first 25 codec tokens produced, first c2w chunk returned
+```
+
+Ballpark with K ≈ 30: `668 + 30 × 10 + talker_prefill + 25 × 21 + 122 ≈
+1400 ms` — a ~600 ms reduction from the current 2000 ms. This requires:
+
+1. Making `_build_talker_inputs` incremental so it can extend the talker
+   context one thinker token at a time (today it's a single batched
+   assemble).
+2. Running thinker decode and talker decode concurrently — either two Python
+   threads with separate Neuron queues, or a host-side coroutine that
+   alternates `thinker_step()` / `talker_step()` calls.
+3. Deciding when K is large enough to start the talker (static threshold
+   sufficient; adaptive would be nicer).
+
+The thinker and talker run on disjoint NEFFs, so there's no device-level
+conflict; the work is "just" in the orchestration.
 
 ### Full-run stats at best configuration
 
@@ -250,12 +312,54 @@ Compiled artifacts:
 
 ## Remaining TTFB cost
 
-Breakdown at TTFB = 2000 ms:
+Breakdown at TTFB = 2000 ms (see "Why thinker is 1346 ms, not 668 ms" above
+for the math on the first row):
 
-- thinker prefill (Neuron) — 1346 ms (67 %)
-- talker + UCP 25 steps (Neuron) — 532 ms (27 %)
-- first code2wav chunk (Neuron) — 122 ms (6 %)
+- **thinker full generate** (Neuron) — 1346 ms (67 %)
+  - ≈ prefill (668 ms) + 68 × ITL (680 ms)
+  - decode accounts for ~half of this; prefill itself is only 668 ms
+- **talker + UCP 25 steps** (Neuron) — 532 ms (27 %)
+  - 25 × ~21 ms; each step is one talker forward + one UCP forward
+- **first code2wav chunk** (Neuron) — 122 ms (6 %)
+  - T=30 bucket; bit-exact vs CPU
 
-Everything in the critical path runs on Neuron. Further wins would require
-compressing the bucket-2048 thinker prefill (unlikely without architectural
-changes) or speculating / batching talker decode steps.
+Everything in the critical path now runs on Neuron.
+
+### Options to go below 2000 ms
+
+1. **Thinker → talker pipelining (largest win, ~600 ms headroom).**
+   Today the talker waits for the entire thinker output. If the talker starts
+   consuming thinker tokens as soon as ~30 of them are buffered, TTFB drops
+   from `prefill + 68·ITL + talker + c2w` to roughly `prefill + K·ITL +
+   talker_startup + 25·talker_ITL + c2w`. Estimated TTFB floor ≈ 1400 ms.
+   Requires making `_build_talker_inputs` incremental and running the two
+   decode loops on separate host threads / queues. No device contention —
+   thinker and talker live on disjoint NEFFs.
+
+2. **Shorter thinker replies (task-dependent).** The 68-token mean is set by
+   the dataset's average assistant reply length; prompting the thinker to be
+   more concise (or truncating earlier via a stop sequence) cuts decode time
+   linearly. 30-token replies would save ~380 ms.
+
+3. **Thinker speculative decoding.** NxDI supports EAGLE-style speculation.
+   If a lightweight draft model proposes 2-3 thinker tokens per target step,
+   the 10 ms ITL could drop toward 4-5 ms. Non-trivial compile work but
+   directly attacks the 680 ms decode contribution.
+
+4. **Thinker prefill bucketing.** All 100 prompts here land in bucket 2048
+   because the system prompt is ~800 tokens. Splitting the system prompt
+   into a separate prefill that is cached, and only running bucket-512 on
+   the delta, could shave the 668 ms prefill to ~250 ms. Needs
+   prefix-caching wiring into the custom thinker compile.
+
+5. **Talker + UCP fusion.** The 25 × 21 ms today is 10 ms talker + 11 ms UCP
+   per step, back-to-back. Merging them into a single traced op per step
+   should save the cross-NEFF dispatch overhead (~3 ms/step → ~75 ms total
+   at CHUNK_SIZE=25). Small relative win, but essentially free once the
+   tracer supports it.
+
+6. **Smaller CHUNK_SIZE.** 25 is already aggressive. Going to 15 would save
+   another ~200 ms on the talker phase but increases left-context recompute
+   overhead in code2wav — the per-chunk c2w cost is ~flat from T=15 up to
+   T=50, so the trade-off tilts favorably. Worth measuring if a lower floor
+   is needed.
