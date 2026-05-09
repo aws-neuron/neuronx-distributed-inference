@@ -14,10 +14,12 @@ This script handles the full weight loading pipeline:
 6. Run forward pass
 
 Usage:
-  source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
-  python3 load_with_weights.py
+  source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+  python3 load_with_weights.py --model-path /path/to/model.safetensors \
+    --compile-dir /path/to/compiled_model
 """
 
+import argparse
 import os
 import sys
 import time
@@ -26,13 +28,11 @@ import gc
 import torch
 import numpy as np
 
-os.environ["NEURON_FUSE_SOFTMAX"] = "1"
-os.environ["NEURON_CUSTOM_SILU"] = "1"
-os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.setdefault("NEURON_FUSE_SOFTMAX", "1")
+os.environ.setdefault("NEURON_CUSTOM_SILU", "1")
+os.environ.setdefault("NEURON_RT_STOCHASTIC_ROUNDING_EN", "0")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-MODEL_PATH = "/home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors"
-COMPILE_DIR = "/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_v2"
 TP_DEGREE = 4
 BATCH = 1
 VIDEO_SEQ = 768
@@ -40,17 +40,23 @@ AUDIO_SEQ = 26
 TEXT_SEQ = 256
 
 
-def load_config():
+def load_config(model_path):
     from safetensors import safe_open
 
-    with safe_open(MODEL_PATH, framework="pt") as f:
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    with safe_open(model_path, framework="pt") as f:
         metadata = f.metadata()
     return json.loads(metadata["config"])
 
 
 def precompute_inputs(config):
     """Build example inputs using native ltx-core preprocessors."""
-    sys.path.insert(0, "/home/ubuntu/ltx23_nxdi")
+    # Ensure the src directory is importable for modeling_ltx23
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
     from modeling_ltx23 import replace_sdpa_with_bmm
 
     replace_sdpa_with_bmm()
@@ -258,13 +264,16 @@ def shard_weight(full_weight, jit_param_name, tp_rank, tp_size):
         return full_weight.clone()
 
 
-def load_and_shard_weights():
+def load_and_shard_weights(model_path):
     """Load safetensors and create per-rank state dicts."""
     from safetensors.torch import load_file
 
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
     print("  Loading safetensors...", flush=True)
     t0 = time.time()
-    full_sd = load_file(MODEL_PATH)
+    full_sd = load_file(model_path)
     print(f"  Loaded {len(full_sd)} tensors in {time.time() - t0:.1f}s", flush=True)
 
     # Strip ComfyUI prefix
@@ -320,13 +329,52 @@ def load_and_shard_weights():
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="LTX-2.3 Load with Real Weights & Forward Test"
+    )
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        help="Path to LTX-2.3 safetensors model file",
+    )
+    parser.add_argument(
+        "--compile-dir",
+        required=True,
+        help="Directory containing compiled model (tp_0.pt)",
+    )
+    parser.add_argument(
+        "--output-path",
+        default=None,
+        help="Path to save test outputs (default: <compile-dir>/test_outputs_real_weights.pt)",
+    )
+    parser.add_argument(
+        "--tp-degree", type=int, default=TP_DEGREE, help="Tensor parallelism degree"
+    )
+    args = parser.parse_args()
+
+    model_path = args.model_path
+    compile_dir = args.compile_dir
+    tp_degree = args.tp_degree
+    output_path = args.output_path or os.path.join(
+        compile_dir, "test_outputs_real_weights.pt"
+    )
+
+    # Validate paths
+    if not os.path.isfile(model_path):
+        print(f"ERROR: Model file not found: {model_path}", flush=True)
+        return 1
+    tp_0_path = os.path.join(compile_dir, "tp_0.pt")
+    if not os.path.isfile(tp_0_path):
+        print(f"ERROR: Compiled model not found: {tp_0_path}", flush=True)
+        return 1
+
     print("=" * 60, flush=True)
     print("LTX-2.3 Load with Real Weights & Forward Test", flush=True)
     print("=" * 60, flush=True)
 
     # 1. Load config
     print("\n[1/5] Loading config...", flush=True)
-    config = load_config()
+    config = load_config(model_path)
     tc = config["transformer"]
     print(f"  {tc['num_layers']} layers, {tc['num_attention_heads']} heads", flush=True)
 
@@ -337,7 +385,7 @@ def main():
 
     # 3. Load and shard weights
     print("\n[3/5] Loading and sharding weights...", flush=True)
-    rank_sds = load_and_shard_weights()
+    rank_sds = load_and_shard_weights(model_path)
     for rank, sd in enumerate(rank_sds):
         print(f"  Rank {rank}: {len(sd)} parameters", flush=True)
 
@@ -346,11 +394,9 @@ def main():
     import torch_neuronx
     from neuronx_distributed.trace.trace import TensorParallelNeuronModel
 
-    tp_0_path = os.path.join(COMPILE_DIR, "tp_0.pt")
-
     models = []
     t0 = time.time()
-    for rank in range(TP_DEGREE):
+    for rank in range(tp_degree):
         print(f"  Loading rank {rank}...", flush=True)
         with torch_neuronx.contexts.disable_nrt_load():
             model = torch.jit.load(tp_0_path)
@@ -422,7 +468,7 @@ def main():
     print(f"\n  NaN: {has_nan}, Inf: {has_inf}", flush=True)
 
     # Save outputs
-    output_path = "/home/ubuntu/ltx23_neuron/test_outputs_real_weights.pt"
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     torch.save(
         {
             "video_output": video_out.cpu(),

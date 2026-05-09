@@ -57,10 +57,10 @@ import time
 import torch
 import numpy as np
 
-os.environ["NEURON_FUSE_SOFTMAX"] = "1"
-os.environ["NEURON_CUSTOM_SILU"] = "1"
-os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.setdefault("NEURON_FUSE_SOFTMAX", "1")
+os.environ.setdefault("NEURON_CUSTOM_SILU", "1")
+os.environ.setdefault("NEURON_RT_STOCHASTIC_ROUNDING_EN", "0")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
