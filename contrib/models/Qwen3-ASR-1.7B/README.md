@@ -135,6 +135,27 @@ input_ids = torch.tensor([prefix + audio_ids + suffix], dtype=torch.long)
 # Output format: "language English<asr_text>transcription text<|im_end|>"
 ```
 
+### 3. vLLM Serving (OpenAI-compatible API)
+
+See [`vllm/README.md`](./vllm/README.md) for full setup instructions including patches to vllm-neuron.
+
+Quick start (after applying patches):
+
+```bash
+export NEURON_COMPILED_ARTIFACTS='/path/to/compiled/qwen3_asr_vl_text_tp4'
+export NEURON_ENCODER_PATH='/path/to/compiled/qwen3_asr_encoder'
+export NEURON_RT_VISIBLE_CORES='0-3'
+bash vllm/start-vllm-server.sh
+```
+
+Then transcribe via API:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3-ASR-1.7B", "messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "<base64_wav>", "format": "wav"}}]}], "max_tokens": 256}'
+```
+
 ## Key Implementation Notes
 
 1. **rope_scaling must use "rope_type": "default"** (NOT "mrope") - mRoPE is applied externally via `rotary_position_ids`
