@@ -179,6 +179,29 @@ streaming is still a clear win for interactive use.
 
 Config knobs: `CHUNK_SIZE=50`, `LEFT_CTX=10` in `test_audio_streaming.py`.
 
+### Conversational audio-in benchmark (omni2, 100 convs)
+
+See [`BENCHMARK_OMNI2_TTFB.md`](BENCHMARK_OMNI2_TTFB.md) for a detailed TTFB
+/ RTF benchmark on 100 real multi-turn audio-in conversations (prompts
+1164–1494 tokens). Covers the progressive optimizations that took TTFB from
+**2727 ms → 2000 ms** (−27 %) and the talker max-token truncation rate from
+100 % → 12 %:
+
+1. Patched `TensorRegistry.clear()` so `layers.23` capture survives across
+   all bucket traces (prompts ≥ 512 tokens previously hit a zero fallback).
+2. Recompiled the talker with `TensorCaptureConfig(["norm"])` and wired the
+   shim to use the real post-RMSNorm hidden — greedy decoding now reaches
+   `codec_eos` instead of looping on `[318, 318, …]`.
+3. Switched talker `generate()` to HF's reference settings
+   (`do_sample=True, top_k=50, top_p=0.8, temperature=0.9,
+   repetition_penalty=1.1, suppress_tokens=<non-codec range>`).
+4. `CHUNK_SIZE=25` / `LEFT_CTX=5` (was 50 / 10): TTFB −487 ms.
+5. Ported `code2wav` to Neuron (bit-exact vs CPU): first-chunk c2w 387 ms →
+   122 ms.
+
+Best configuration: `NEURON_RT_VISIBLE_CORES=0-7 CHUNK_SIZE=25 LEFT_CTX=5
+python test_ttfb_rtf_bench.py --num 100 --neuron-c2w`.
+
 ---
 
 ## Repository layout
@@ -206,7 +229,17 @@ contrib/models/Qwen3-Omni-30B-A3B-Instruct/
 | `test_audio_out_full_neuron.py` | Full Neuron pipeline (thinker + talker + unified CP + code2wav-CPU). |
 | `test_audio_bench.py` | Four-benchmark audio suite (multi-length, multi-speaker, audio-in→audio-out, long TTS). Dumps JSON + wavs. |
 | `test_ttft.py` | TTFT / ITL micro-benchmark — records per-token timestamps for thinker + talker and computes end-to-end TTFB. |
-| `test_audio_streaming.py` | Streaming code2wav — emits 50-codec-token audio chunks inline for low TTFB. |
+| `test_audio_streaming.py` | Streaming code2wav — emits 50-codec-token audio chunks inline for low TTFB. `CHUNK_SIZE` / `LEFT_CTX` overridable via env. |
+
+### Benchmark scripts (in the contrib dir)
+
+| File | Purpose |
+|---|---|
+| `test_thinker_ttft_bench.py` | Thinker-only TTFT / ITL / throughput on the omni2 100-conv dataset. |
+| `test_ttfb_rtf_bench.py` | Full streaming TTFB / RTF on the omni2 100-conv dataset. `--neuron-c2w` routes code2wav through Neuron. |
+| `compile_talker.py` | Recompile the talker with `TensorCaptureConfig(["norm"])` so the NEFF exposes the real post-RMSNorm hidden (needed by the `code_predictor` path). Output: `talker_tp8_capnorm/`. |
+| `compile_code2wav.py` | Compile the vocoder at fixed input buckets (default `{30, 50, 128}`). Output: `code2wav_buckets/`. |
+| `code2wav_neuron.py` | Runtime shim that replaces `hf_model.code2wav` with a bucket-dispatching Neuron wrapper. |
 
 ---
 
@@ -224,8 +257,10 @@ Expected compiled artifacts in `/tmp/qwen3_omni_compiled/`:
 |---|---|---|
 | `multimodal_tp8_cap23/` | Thinker (48L MoE) + vision, with layer-24 hidden capture | ~3 GB |
 | `audio_encoder_tp8/` | 32-layer audio transformer | ~200 MB |
-| `talker_tp8/` | Talker (20L MoE) | ~1.2 GB |
+| `talker_tp8/` | Talker (20L MoE), no capture | ~1.2 GB |
+| `talker_tp8_capnorm/` | Talker (20L MoE) with `norm` capture (needed by the audio-output pipeline; see `BENCHMARK_OMNI2_TTFB.md`) | ~1.2 GB |
 | `code_predictor_unified_tp8/` | Unified CP (5L dense, 15-step unrolled) | ~150 MB |
+| `code2wav_buckets/` | Optional Neuron code2wav, one NEFF per bucket size | ~500 MB total |
 
 ---
 
@@ -355,9 +390,12 @@ the trace.
 - **bf16 numerical drift** — occasionally one out of 15 residual codes
   diverges by one unit (e.g., step 13 may pick code 293 vs golden 1025 when
   the top-2 logits are separated by <0.002). Audio quality is unaffected.
-- **Code2Wav stays on CPU** — ~1 s per utterance. Porting BigVGAN's
-  SnakeBeta + causal convs to Neuron is possible but gives maybe 0.8 s back,
-  not worth it.
+- **Code2Wav on Neuron (opt-in)** — `compile_code2wav.py` traces the
+  vocoder at a handful of fixed input lengths; `code2wav_neuron.py`
+  dispatches by chunk size at runtime. Bit-exact vs CPU and ~3× faster on
+  the per-chunk streaming call. Enable via `--neuron-c2w` in
+  `test_ttfb_rtf_bench.py`. Compile `/tmp/qwen3_omni_compiled/code2wav_buckets/`
+  once with the expected chunk sizes (defaults cover `CHUNK_SIZE=25`).
 - **Talker compilation time** — ~10 min for the 20-layer MoE.
 - **CPU HF model required at inference time** — for the `_get_talker_user_parts`
   / `_get_talker_assistant_parts` helpers and `text_projection`/`hidden_projection`

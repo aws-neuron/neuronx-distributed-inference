@@ -140,3 +140,58 @@ def _patch_vision_wrapper_load_state_dict():
 
 
 _patch_vision_wrapper_load_state_dict()
+
+
+def _patch_tensor_registry_clear():
+    """Fix upstream NxD bug: TensorRegistry.clear() wipes modules_to_capture.
+
+    Inside ``NeuronBaseModel._get_captured_tensors`` (called once per HLO
+    trace, once per bucket), the final line is ``registry.clear()``. Upstream
+    ``clear()`` replaces ``model_info`` with a fresh
+    ``CapturedModelInfo([], 10, False)`` — resetting ``modules_to_capture``.
+    The forward hooks installed by ``enable_tensor_capture`` still fire on
+    the next bucket's trace, but ``register_tensor`` now falls through to
+    the "manual" branch (module name no longer in ``modules_to_capture``).
+
+    Net effect: only the FIRST bucket to trace captures a real tensor; every
+    subsequent bucket emits the empty fallback ``torch.zeros(1, dtype=bf16)``,
+    making layer-hidden-state capture (``layers.23`` for the talker pipeline)
+    unusable for any prompt that doesn't fit the first bucket.
+
+    Fix: preserve the configured modules/flags through clear() by stashing
+    them on the singleton.
+    """
+    from neuronx_distributed.utils.tensor_capture.registry import (
+        CapturedModelInfo, TensorRegistry,
+    )
+
+    if getattr(TensorRegistry, "_nxdi_clear_patched", False):
+        return
+
+    _orig_configure = TensorRegistry.configure
+
+    def configure(self, enabled=False, modules=None, max_tensors=None, capture_inputs=False):
+        cfg_modules = list(modules or [])
+        if cfg_modules:
+            self._nxdi_last_modules = cfg_modules
+            self._nxdi_last_max_tensors = max_tensors
+            self._nxdi_last_capture_inputs = capture_inputs
+        _orig_configure(self, enabled=enabled, modules=modules,
+                        max_tensors=max_tensors, capture_inputs=capture_inputs)
+
+    def clear(self):
+        modules = getattr(self, "_nxdi_last_modules", [])
+        max_tensors = getattr(self, "_nxdi_last_max_tensors", 10)
+        capture_inputs = getattr(self, "_nxdi_last_capture_inputs", False)
+        self.model_info = CapturedModelInfo(modules, max_tensors, capture_inputs)
+
+    TensorRegistry.configure = configure
+    TensorRegistry.clear = clear
+    TensorRegistry._nxdi_clear_patched = True
+    logger.info(
+        "Qwen3-Omni contrib: patched TensorRegistry.clear to preserve "
+        "modules_to_capture across bucket traces."
+    )
+
+
+_patch_tensor_registry_clear()
