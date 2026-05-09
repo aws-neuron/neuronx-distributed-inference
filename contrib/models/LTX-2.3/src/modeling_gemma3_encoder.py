@@ -771,9 +771,9 @@ class NeuronGemma3EncoderApplication(
             "--enable-scalar-dge-vectorization'"
         )
 
-        _os.environ["NEURON_FUSE_SOFTMAX"] = "1"
-        _os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0"
-        _os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
+        _os.environ.setdefault("NEURON_FUSE_SOFTMAX", "1")
+        _os.environ.setdefault("NEURON_RT_STOCHASTIC_ROUNDING_EN", "0")
+        _os.environ.setdefault("NEURON_RT_VIRTUAL_CORE_SIZE", "2")
 
         return compiler_args
 

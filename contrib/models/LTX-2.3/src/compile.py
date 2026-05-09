@@ -12,18 +12,24 @@ Usage:
 
   # Compile full-resolution DiT backbone (384x512, VIDEO_SEQ=768)
   NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \\
-    torchrun --nproc_per_node=4 compile.py transformer
+    torchrun --nproc_per_node=4 compile.py transformer \\
+      --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \\
+      --compile-dir ./compiled/backbone
 
   # Compile half-resolution DiT backbone (192x256, VIDEO_SEQ=192) for two-stage mode
   NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \\
-    torchrun --nproc_per_node=4 compile.py transformer --halfres
+    torchrun --nproc_per_node=4 compile.py transformer --halfres \\
+      --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \\
+      --compile-dir ./compiled/backbone_halfres
 
   # Compile Gemma3 encoder (uses parallel_model_trace, no torchrun needed)
   NEURON_FUSE_SOFTMAX=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \\
-    python3 compile.py encoder
+    python3 compile.py encoder --compile-dir ./compiled/gemma3_encoder
 
   # Compile VAE decoder (TP=4, tiled)
-  NEURON_RT_VISIBLE_CORES=0-3 python3 compile.py vae
+  NEURON_RT_VISIBLE_CORES=0-3 python3 compile.py vae \\
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \\
+    --compile-dir ./compiled/vae_tp4
 """
 
 import argparse
@@ -38,6 +44,12 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def _check_file_exists(path, description="file"):
+    """Exit with error if a required file/directory does not exist."""
+    if not os.path.exists(path):
+        sys.exit(f"ERROR: {description} not found: {path}")
 
 
 # ============================================================================
@@ -266,17 +278,15 @@ def compile_transformer(args):
         latent_w = 8  # 256 / 32
         video_seq = 192  # 4 * 6 * 8
         res_label = "half-res (192x256)"
-        default_compile_dir = (
-            "/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_halfres"
-        )
     else:
         latent_h = args.latent_h
         latent_w = args.latent_w
         video_seq = 4 * latent_h * latent_w
         res_label = f"full-res ({latent_h * 32}x{latent_w * 32})"
-        default_compile_dir = "/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_v2"
 
-    compile_dir = args.compile_dir or default_compile_dir
+    compile_dir = args.compile_dir
+
+    _check_file_exists(args.model_path, "model safetensors")
 
     rank = int(os.environ.get("RANK", "0"))
 
@@ -363,7 +373,7 @@ def compile_encoder(args):
 
     tp_degree = args.tp_degree
     seq_len = args.seq_len
-    compile_dir = args.compile_dir or "/home/ubuntu/gemma3_encoder_compiled"
+    compile_dir = args.compile_dir
 
     print("=" * 60)
     print(f"Compiling Gemma3 encoder (TP={tp_degree}, seq={seq_len})")
@@ -488,7 +498,8 @@ def compile_vae(args):
     """Compile the TP-sharded VAE decoder."""
     from modeling_vae_23 import compile_vae_decoder
 
-    compile_dir = args.compile_dir or "/home/ubuntu/ltx23_vae_tp4"
+    compile_dir = args.compile_dir
+    _check_file_exists(args.model_path, "model safetensors")
 
     # Verify tile area constraint
     latent_h = args.height // 32
@@ -508,7 +519,7 @@ def compile_vae(args):
         tile_width=args.width,
         num_frames=args.num_frames,
         output_dir=compile_dir,
-        compiler_workdir=args.compiler_workdir or "/home/ubuntu/compiler_workdir_vae23",
+        compiler_workdir=args.compiler_workdir,
         model_path=args.model_path,
     )
 
@@ -525,16 +536,22 @@ def main():
         epilog="""
 Examples:
   # Full-res transformer (requires torchrun)
-  torchrun --nproc_per_node=4 compile.py transformer
+  torchrun --nproc_per_node=4 compile.py transformer \\
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \\
+    --compile-dir ./compiled/backbone
 
   # Half-res transformer for two-stage mode
-  torchrun --nproc_per_node=4 compile.py transformer --halfres
+  torchrun --nproc_per_node=4 compile.py transformer --halfres \\
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \\
+    --compile-dir ./compiled/backbone_halfres
 
   # Gemma3 encoder (no torchrun needed)
-  python3 compile.py encoder
+  python3 compile.py encoder --compile-dir ./compiled/gemma3_encoder
 
   # VAE decoder
-  python3 compile.py vae
+  python3 compile.py vae \\
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \\
+    --compile-dir ./compiled/vae_tp4
 """,
     )
     subparsers = parser.add_subparsers(dest="component", help="Component to compile")
@@ -558,10 +575,10 @@ Examples:
     )
     p_trans.add_argument(
         "--model-path",
-        default="/home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors",
+        required=True,
         help="Path to LTX-2.3 safetensors file",
     )
-    p_trans.add_argument("--compile-dir", default=None, help="Output directory")
+    p_trans.add_argument("--compile-dir", required=True, help="Output directory")
     p_trans.set_defaults(func=compile_transformer)
 
     # --- encoder subcommand ---
@@ -570,7 +587,7 @@ Examples:
         "--tp-degree", type=int, default=4, help="TP degree (default: 4)"
     )
     p_enc.add_argument("--seq-len", type=int, default=1024, help="Sequence length")
-    p_enc.add_argument("--compile-dir", default=None, help="Output directory")
+    p_enc.add_argument("--compile-dir", required=True, help="Output directory")
     p_enc.set_defaults(func=compile_encoder)
 
     # --- vae subcommand ---
@@ -585,11 +602,11 @@ Examples:
     p_vae.add_argument(
         "--tp-degree", type=int, default=4, help="TP degree (default: 4)"
     )
-    p_vae.add_argument("--compile-dir", default=None, help="Output directory")
+    p_vae.add_argument("--compile-dir", required=True, help="Output directory")
     p_vae.add_argument("--compiler-workdir", default=None, help="Compiler working dir")
     p_vae.add_argument(
         "--model-path",
-        default="/home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors",
+        required=True,
         help="Path to LTX-2.3 safetensors file",
     )
     p_vae.set_defaults(func=compile_vae)

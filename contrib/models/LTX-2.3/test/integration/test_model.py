@@ -14,8 +14,8 @@ Environment variables:
 
 Usage:
   source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
-  MODEL_PATH=/home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
-  COMPILED_MODEL_PATH=/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2 \
+  MODEL_PATH=./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+  COMPILED_MODEL_PATH=./compiled/backbone \
     pytest test_model.py -v -s
 """
 
@@ -33,14 +33,15 @@ SRC_DIR = str(Path(__file__).parent.parent.parent / "src")
 sys.path.insert(0, SRC_DIR)
 
 # Required environment variables
-MODEL_PATH = os.environ.get(
-    "MODEL_PATH",
-    "/home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors",
-)
-COMPILED_MODEL_PATH = os.environ.get(
-    "COMPILED_MODEL_PATH",
-    "/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_v2",
-)
+MODEL_PATH = os.environ.get("MODEL_PATH")
+COMPILED_MODEL_PATH = os.environ.get("COMPILED_MODEL_PATH")
+
+if not MODEL_PATH or not COMPILED_MODEL_PATH:
+    raise RuntimeError(
+        "MODEL_PATH and COMPILED_MODEL_PATH environment variables must be set. "
+        "Example: MODEL_PATH=./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors "
+        "COMPILED_MODEL_PATH=./compiled/backbone pytest test_model.py -v -s"
+    )
 
 TP_DEGREE = 4
 BATCH = 1

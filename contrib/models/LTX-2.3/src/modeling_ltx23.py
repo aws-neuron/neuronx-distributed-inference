@@ -727,10 +727,10 @@ class NeuronLTX23BackboneApplication(
         compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap'"
 
         os.environ["LOCAL_WORLD_SIZE"] = str(self.config.neuron_config.world_size)
-        os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
-        os.environ["NEURON_FUSE_SOFTMAX"] = "1"
-        os.environ["NEURON_CUSTOM_SILU"] = "1"
-        os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0"
+        os.environ.setdefault("NEURON_RT_VIRTUAL_CORE_SIZE", "2")
+        os.environ.setdefault("NEURON_FUSE_SOFTMAX", "1")
+        os.environ.setdefault("NEURON_CUSTOM_SILU", "1")
+        os.environ.setdefault("NEURON_RT_STOCHASTIC_ROUNDING_EN", "0")
 
         return compiler_args
 

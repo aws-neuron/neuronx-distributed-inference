@@ -709,9 +709,9 @@ def compile_vae_decoder(
     tile_height=128,
     tile_width=512,
     num_frames=121,
-    output_dir="/home/ubuntu/ltx23_vae_tp4",
-    compiler_workdir="/home/ubuntu/compiler_workdir_vae23",
-    model_path="/home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors",
+    output_dir=None,
+    compiler_workdir=None,
+    model_path=None,
     config=None,
     timestep_conditioning=True,
 ):
@@ -722,9 +722,9 @@ def compile_vae_decoder(
         tile_height: Tile height in pixels (default 128 for 4-latent)
         tile_width: Tile width in pixels (default 512 for 16-latent)
         num_frames: Number of video frames (default 121)
-        output_dir: Directory to save compiled model
+        output_dir: Directory to save compiled model (required)
         compiler_workdir: Directory for compiler intermediate files
-        model_path: Path to LTX-2.3 safetensors
+        model_path: Path to LTX-2.3 safetensors (required if config is None)
         config: Parsed config dict (loaded from safetensors metadata if None)
         timestep_conditioning: Whether the decoder uses timestep conditioning
 
@@ -735,6 +735,13 @@ def compile_vae_decoder(
     import time
 
     import neuronx_distributed
+
+    if output_dir is None:
+        raise ValueError("output_dir is required")
+    if config is None and model_path is None:
+        raise ValueError("Either model_path or config must be provided")
+    if model_path is not None and not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
 
     if config is None:
         from safetensors import safe_open

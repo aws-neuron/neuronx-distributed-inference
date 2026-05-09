@@ -13,37 +13,40 @@ Full end-to-end video+audio generation pipeline:
 Outputs: video frames (PNG), MP4 video, WAV audio.
 
 Usage:
-  source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+  source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
   # Recommended: Application path (fastest, ~21% E2E speedup):
   python3 generate_ltx23.py --use-app \
-    --gemma-path /mnt/models/gemma-3-12b \
-    --app-compiled-dir /mnt/models/compiled/e2e \
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+    --compile-dir ./compiled/backbone \
+    --backbone-sharded-dir ./backbone_sharded \
+    --gemma-path ./models/gemma-3-12b \
+    --app-compiled-dir ./compiled/e2e \
     --prompt "A dog plays in a meadow"
 
   # Text-to-Video with random embeddings (no Gemma required):
-  python3 generate_ltx23.py --no-text-encoder
+  python3 generate_ltx23.py --no-text-encoder \
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+    --compile-dir ./compiled/backbone \
+    --backbone-sharded-dir ./backbone_sharded
 
-  # Text-to-Video with Neuron-compiled Gemma3 (fastest, recommended):
+  # Text-to-Video with Neuron-compiled Gemma3:
   python3 generate_ltx23.py --neuron-gemma \
-    --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
-    --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
-    --gemma-path /home/ubuntu/models/gemma-3-12b \
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+    --compile-dir ./compiled/backbone \
+    --backbone-sharded-dir ./backbone_sharded \
+    --gemma-compiled-dir ./compiled/gemma3_encoder \
+    --gemma-sharded-dir ./gemma3_encoder_sharded \
+    --gemma-path ./models/gemma-3-12b \
     --prompt "A dog plays in a meadow"
 
-  # Image-to-Video with Neuron Gemma3:
-  python3 generate_ltx23.py --neuron-gemma \
-    --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
-    --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
-    --gemma-path /home/ubuntu/models/gemma-3-12b \
-    --prompt "The woman turns and smiles at the camera" \
-    --image /path/to/photo.png
-
   # With CPU Gemma3 (slow, no compilation needed):
-  python3 generate_ltx23.py --gemma-path /path/to/gemma-3-12b --prompt "A dog plays in a meadow"
-
-  # With upscaling (384x512 @ 25 frames -> 768x1024 @ 49 frames):
-  python3 generate_ltx23.py --gemma-path /path/to/gemma-3-12b --prompt "A dog plays in a meadow" --upscale
+  python3 generate_ltx23.py \
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+    --compile-dir ./compiled/backbone \
+    --backbone-sharded-dir ./backbone_sharded \
+    --gemma-path ./models/gemma-3-12b \
+    --prompt "A dog plays in a meadow"
 """
 
 import argparse
@@ -65,25 +68,21 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Defaults
-MODEL_PATH = "/home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors"
-COMPILE_DIR = "/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_v2"
-OUTPUT_DIR = "/home/ubuntu/ltx23_output"
+# Defaults (override via CLI args)
+MODEL_PATH = None
+COMPILE_DIR = None
+OUTPUT_DIR = "./ltx23_output"
 TP_DEGREE = 4
 TEXT_SEQ = 256
 
 # Gemma3 Neuron defaults
-GEMMA3_COMPILED_DIR = "/home/ubuntu/gemma3_encoder_compiled"
-GEMMA3_SHARDED_DIR = "/home/ubuntu/gemma3_encoder_sharded"
+GEMMA3_COMPILED_DIR = None
+GEMMA3_SHARDED_DIR = None
 GEMMA3_SEQ_LEN = 1024
 
 # Default upscaler paths
-SPATIAL_UPSCALER_PATH = (
-    "/home/ubuntu/models/LTX-2.3/upscalers/ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
-)
-TEMPORAL_UPSCALER_PATH = (
-    "/home/ubuntu/models/LTX-2.3/upscalers/ltx-2.3-temporal-upscaler-x2-1.0.safetensors"
-)
+SPATIAL_UPSCALER_PATH = None
+TEMPORAL_UPSCALER_PATH = None
 
 # Distilled sigma values from the reference LTX-2.3 pipeline
 # See: ltx_pipelines/utils/constants.py DISTILLED_SIGMA_VALUES
@@ -101,18 +100,18 @@ DISTILLED_SIGMA_VALUES = [
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
 # Default half-res compilation paths (for two-stage mode)
-HALFRES_COMPILE_DIR = "/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_halfres"
-HALFRES_SHARDED_DIR = "/home/ubuntu/backbone_sharded_halfres"
+HALFRES_COMPILE_DIR = None
+HALFRES_SHARDED_DIR = None
 
 # Default backbone text_seq for Application-compiled NEFFs
 APP_BACKBONE_TEXT_SEQ = 256  # DiT backbone text_seq for Application-compiled NEFF
-APP_COMPILED_DIR = "/mnt/models/compiled/e2e_v2"
+APP_COMPILED_DIR = None
 APP_ENCODER_SEQ_LEN = 512  # Gemma3 encoder seq_len for Application-compiled NEFF
 APP_BACKBONE_AUDIO_SEQ = (
     26  # Audio latent frames (AudioLatentShape frames=26, mel_bins=16, patch=16)
 )
-APP_HALFRES_COMPILED_DIR = "/mnt/models/compiled/e2e_v2_halfres"
-GEMMA3_MODEL_PATH = "/mnt/models/gemma-3-12b"
+APP_HALFRES_COMPILED_DIR = None
+GEMMA3_MODEL_PATH = None
 
 
 def encode_image(image_path, model_path, height, width, dtype=torch.bfloat16):
@@ -2213,18 +2212,17 @@ def generate(args):
 def main():
     parser = argparse.ArgumentParser(description="LTX-2.3 E2E Generation on Neuron")
     parser.add_argument(
-        "--model-path", default=MODEL_PATH, help="Safetensors model path"
+        "--model-path", required=True, help="Path to LTX-2.3 safetensors file"
     )
-    parser.add_argument(
-        "--compile-dir", default=COMPILE_DIR, help="Compiled model directory"
-    )
+    parser.add_argument("--compile-dir", required=True, help="Compiled model directory")
     parser.add_argument(
         "--backbone-sharded-dir",
-        default="/home/ubuntu/backbone_sharded",
-        help="Directory with pre-sharded backbone weights (from shard_backbone_weights.py). "
-        "Falls back to safetensors loading if not found.",
+        required=True,
+        help="Directory with pre-sharded backbone weights (from shard_weights.py backbone).",
     )
-    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Output directory")
+    parser.add_argument(
+        "--output-dir", default="./ltx23_output", help="Output directory"
+    )
     parser.add_argument(
         "--prompt",
         default="A golden retriever puppy runs across a sunny green meadow",
@@ -2239,17 +2237,17 @@ def main():
     parser.add_argument(
         "--neuron-gemma",
         action="store_true",
-        help="Use Neuron-compiled Gemma3 encoder (requires compile_gemma3.py + shard_gemma3_weights.py)",
+        help="Use Neuron-compiled Gemma3 encoder (requires compile.py encoder + shard_weights.py encoder)",
     )
     parser.add_argument(
         "--gemma-compiled-dir",
-        default=GEMMA3_COMPILED_DIR,
-        help="Directory with compiled Gemma3 encoder (from compile_gemma3.py)",
+        default=None,
+        help="Directory with compiled Gemma3 encoder (from compile.py encoder)",
     )
     parser.add_argument(
         "--gemma-sharded-dir",
-        default=GEMMA3_SHARDED_DIR,
-        help="Directory with pre-sharded Gemma3 weights (from shard_gemma3_weights.py)",
+        default=None,
+        help="Directory with pre-sharded Gemma3 weights (from shard_weights.py encoder)",
     )
     parser.add_argument("--height", type=int, default=384, help="Video height")
     parser.add_argument("--width", type=int, default=512, help="Video width")
@@ -2281,12 +2279,12 @@ def main():
     )
     parser.add_argument(
         "--spatial-upscaler-path",
-        default=SPATIAL_UPSCALER_PATH,
+        default=None,
         help="Path to spatial upscaler x2 safetensors",
     )
     parser.add_argument(
         "--temporal-upscaler-path",
-        default=TEMPORAL_UPSCALER_PATH,
+        default=None,
         help="Path to temporal upscaler x2 safetensors",
     )
     parser.add_argument(
@@ -2305,12 +2303,12 @@ def main():
     )
     parser.add_argument(
         "--halfres-compiled-dir",
-        default=HALFRES_COMPILE_DIR,
-        help="Directory with half-res compiled backbone (from compile_transformer_halfres.py)",
+        default=None,
+        help="Directory with half-res compiled backbone (from compile.py transformer --halfres)",
     )
     parser.add_argument(
         "--halfres-sharded-dir",
-        default=HALFRES_SHARDED_DIR,
+        default=None,
         help="Directory with pre-sharded backbone weights for half-res model "
         "(same weights, different compiled shape)",
     )
@@ -2323,13 +2321,13 @@ def main():
     )
     parser.add_argument(
         "--app-compiled-dir",
-        default=APP_COMPILED_DIR,
+        default=None,
         help="Base directory with Application-compiled artifacts. "
         "Must contain backbone/ and text_encoder/ subdirs (from NeuronLTX23Application.compile()).",
     )
     parser.add_argument(
         "--app-halfres-compiled-dir",
-        default=APP_HALFRES_COMPILED_DIR,
+        default=None,
         help="Base directory with half-res Application-compiled backbone. "
         "Used for Stage 1 of --two-stage --use-app. Must contain backbone/ subdir.",
     )
@@ -2362,7 +2360,9 @@ def main():
 
     if args.use_app:
         if args.gemma_path is None:
-            args.gemma_path = GEMMA3_MODEL_PATH
+            parser.error("--gemma-path is required when using --use-app")
+        if args.app_compiled_dir is None:
+            parser.error("--app-compiled-dir is required when using --use-app")
     elif not args.no_text_encoder and not args.neuron_gemma and args.gemma_path is None:
         parser.error(
             "Either --no-text-encoder, --neuron-gemma, --use-app, or --gemma-path must be specified. "

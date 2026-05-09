@@ -14,13 +14,13 @@ Usage:
 
   # Shard DiT backbone weights
   python3 shard_weights.py backbone \\
-    --model-path /home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \\
-    --output-dir /home/ubuntu/backbone_sharded
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \\
+    --output-dir ./backbone_sharded
 
   # Shard Gemma3 encoder weights
   python3 shard_weights.py encoder \\
-    --gemma-path /home/ubuntu/models/gemma-3-12b \\
-    --output-dir /home/ubuntu/gemma3_encoder_sharded
+    --gemma-path ./models/gemma-3-12b \\
+    --output-dir ./gemma3_encoder_sharded
 """
 
 import argparse
@@ -37,6 +37,95 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 TP_DEGREE = 4
 
 
+def _check_file_exists(path, description="file"):
+    """Exit with error if a required file/directory does not exist."""
+    if not os.path.exists(path):
+        sys.exit(f"ERROR: {description} not found: {path}")
+
+
+def shard_weight(full_weight, jit_param_name, tp_rank, tp_size):
+    """Shard a full weight tensor for the given TP rank.
+
+    Determines the sharding pattern from the JIT parameter name:
+    - ColumnParallelLinear (to_q, to_k, to_v, to_gate_logits, GEGLU proj):
+        weight sharded on dim 0, bias sharded on dim 0
+    - RowParallelLinear (to_out->0, ff->net->2):
+        weight sharded on dim 1, bias NOT sharded
+    - DistributedRMSNorm (q_norm, k_norm):
+        weight sharded on dim 0
+    - SPMDRank: rank tensor, select element for this rank
+    - Unsharded (scale_shift_table, norm_out, proj_out, etc.):
+        return full weight unchanged
+    """
+    name = jit_param_name
+
+    # SPMDRank: select this rank's value
+    if "spmd_rank" in name:
+        return torch.tensor([tp_rank], dtype=torch.int32)
+
+    # Check if this is a sharded parameter
+    is_column_weight = False
+    is_column_bias = False
+    is_row_weight = False
+    is_row_bias = False
+    is_norm_weight = False
+
+    # Column-parallel: to_q, to_k, to_v, to_gate_logits
+    # Use delimited patterns (->X->) to avoid false matches like
+    # "to_v" matching "audio_to_video_attn"
+    for col_name in ["->to_q->", "->to_k->", "->to_v->", "->to_gate_logits->"]:
+        if col_name in name:
+            if name.endswith("weight"):
+                is_column_weight = True
+            elif name.endswith("bias"):
+                is_column_bias = True
+            break
+
+    # Column-parallel: GEGLU gate proj (ff->net->0->proj)
+    if "ff->net->0->proj" in name:
+        if name.endswith("weight"):
+            is_column_weight = True
+        elif name.endswith("bias"):
+            is_column_bias = True
+
+    # Row-parallel: output projection (to_out->0)
+    if "to_out->0" in name:
+        if name.endswith("weight"):
+            is_row_weight = True
+        elif name.endswith("bias"):
+            is_row_bias = True  # Bias not sharded for RowParallel
+
+    # Row-parallel: FFN down projection (ff->net->2)
+    if "ff->net->2" in name:
+        if name.endswith("weight"):
+            is_row_weight = True
+        elif name.endswith("bias"):
+            is_row_bias = True  # Bias not sharded
+
+    # DistributedRMSNorm: q_norm, k_norm
+    if ("q_norm" in name or "k_norm" in name) and name.endswith("weight"):
+        is_norm_weight = True
+
+    # Apply sharding
+    if is_column_weight or is_column_bias or is_norm_weight:
+        # Shard on dim 0
+        shard_size = full_weight.shape[0] // tp_size
+        return full_weight[shard_size * tp_rank : shard_size * (tp_rank + 1)].clone()
+
+    elif is_row_weight:
+        # Shard on dim 1
+        shard_size = full_weight.shape[1] // tp_size
+        return full_weight[:, shard_size * tp_rank : shard_size * (tp_rank + 1)].clone()
+
+    elif is_row_bias:
+        # Not sharded — full copy
+        return full_weight.clone()
+
+    else:
+        # Unsharded (scale_shift_table, norm_out, proj_out, audio variants)
+        return full_weight.clone()
+
+
 # ============================================================================
 # Backbone weight sharding
 # ============================================================================
@@ -45,8 +134,8 @@ TP_DEGREE = 4
 def shard_backbone(args):
     """Pre-shard LTX-2.3 DiT backbone weights for Neuron TP."""
     from safetensors import safe_open
-    from load_with_weights import shard_weight
 
+    _check_file_exists(args.model_path, "model safetensors")
     tp_degree = args.tp_degree
 
     print("=" * 60)
@@ -148,6 +237,7 @@ def shard_encoder(args):
         get_sharded_checkpoint,
     )
 
+    _check_file_exists(args.gemma_path, "Gemma 3 model directory")
     tp_degree = args.tp_degree
 
     print("=" * 60)
@@ -259,11 +349,11 @@ def main():
 Examples:
   # Shard DiT backbone weights
   python3 shard_weights.py backbone \\
-    --model-path /home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors
+    --model-path ./models/LTX-2.3/ltx-2.3-22b-distilled.safetensors
 
   # Shard Gemma3 encoder weights
   python3 shard_weights.py encoder \\
-    --gemma-path /home/ubuntu/models/gemma-3-12b
+    --gemma-path ./models/gemma-3-12b
 """,
     )
     subparsers = parser.add_subparsers(dest="component", help="Component to shard")
@@ -273,13 +363,13 @@ Examples:
     p_bb = subparsers.add_parser("backbone", help="Shard DiT backbone weights")
     p_bb.add_argument(
         "--model-path",
-        default="/home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors",
+        required=True,
         help="Path to LTX-2.3 safetensors file",
     )
     p_bb.add_argument(
         "--output-dir",
-        default="/home/ubuntu/backbone_sharded",
-        help="Output directory for sharded weights",
+        default="./backbone_sharded",
+        help="Output directory for sharded weights (default: ./backbone_sharded)",
     )
     p_bb.add_argument("--tp-degree", type=int, default=4, help="TP degree")
     p_bb.set_defaults(func=shard_backbone)
@@ -288,13 +378,13 @@ Examples:
     p_enc = subparsers.add_parser("encoder", help="Shard Gemma3 encoder weights")
     p_enc.add_argument(
         "--gemma-path",
-        default="/home/ubuntu/models/gemma-3-12b",
+        required=True,
         help="Path to HuggingFace Gemma 3 model directory",
     )
     p_enc.add_argument(
         "--output-dir",
-        default="/home/ubuntu/gemma3_encoder_sharded",
-        help="Output directory for sharded weights",
+        default="./gemma3_encoder_sharded",
+        help="Output directory for sharded weights (default: ./gemma3_encoder_sharded)",
     )
     p_enc.add_argument("--tp-degree", type=int, default=4, help="TP degree")
     p_enc.set_defaults(func=shard_encoder)
