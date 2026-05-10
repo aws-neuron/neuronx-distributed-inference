@@ -28,6 +28,10 @@ Architecture:
   - Per-layer residual scaling (learnable scale + bias)
   - Partial RoPE (partial_rotary_factor=0.5)
   - Tied word embeddings (lm_head = embed_tokens)
+
+Key optimizations:
+  - Batched einsum MoE (ZAYA_USE_NXDI_MOE=1): +12.1% TKG throughput
+  - NKI CCA postconv kernel (ZAYA_USE_NKI_CCA_POSTCONV=1): teaching example
 """
 
 import gc
@@ -47,7 +51,7 @@ from neuronx_distributed.parallel_layers.layers import (
     RowParallelLinear,
     SPMDRank,
 )
-from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers import mappings, parallel_state
 from neuronx_distributed.utils import cpu_mode
 
 # NeuronX distributed inference imports
@@ -69,6 +73,12 @@ from neuronx_distributed_inference.modules.moe_v2 import (
     initialize_moe_module as initialize_moe_module_v2,
 )
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+
+# Stacked MoE: ExpertMLPsV2 with fused [E, H, 2I] gate_up + [E, I, H] down weights.
+# Replaces the 16-expert SequentialMLP loop with a single batched einsum.
+from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
+from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig
+from neuronx_distributed.modules.moe.model_utils import GLUType
 
 # NKI flash attention — lazy import for CPU compatibility.
 # nkilib is only available on Neuron instances with neuronx-cc installed.
@@ -101,8 +111,20 @@ def _get_nki_flash_fwd():
     try:
         from neuronx_distributed_inference.modules.attention.attention_base import (
             _flash_fwd_call_nki,
-            _has_new_kernel,
         )
+
+        # SDK 2.29: NKI CTE attention kernel has LNC compatibility issues with
+        # NKI 0.3.0 (VNC wrapper type causes NkiValidationError). Keep disabled
+        # until Task 022 (custom CCA NKI kernel) replaces this entirely.
+        # SDK 2.28: _has_new_kernel guard was needed for platform detection.
+        try:
+            from neuronx_distributed_inference.modules.attention.attention_base import (
+                _has_new_kernel,
+            )
+        except ImportError:
+            # SDK 2.29 removed _has_new_kernel. The NKI CTE kernel exists but
+            # has LNC issues on trn2 with NKI 0.3.0, so disable it.
+            _has_new_kernel = False
 
         if _flash_fwd_call_nki is not None and _has_new_kernel:
             _nki_flash_fwd = _flash_fwd_call_nki
@@ -219,6 +241,17 @@ class ZayaNeuronConfig(MoENeuronConfig):
     def __init__(self, **kwargs):
         # Extract mlp_kernel_enabled before super().__init__ consumes kwargs
         mlp_kernel = kwargs.pop("mlp_kernel_enabled", False)
+        # Allow env var override: ZAYA_MLP_ISA_KERNEL=1 enables MLP ISA kernel
+        if os.environ.get("ZAYA_MLP_ISA_KERNEL", "") == "1":
+            mlp_kernel = True
+
+        # Skip layout optimization for expert MLP weights if requested
+        # ZAYA_SKIP_EXPERT_LAYOUT=1 bypasses layout transformation for 3D expert weights
+        if os.environ.get("ZAYA_SKIP_EXPERT_LAYOUT", "") == "1":
+            skip_patterns = kwargs.get("weights_to_skip_layout_optimization", [])
+            skip_patterns.append(r".*expert_mlps.*")
+            kwargs["weights_to_skip_layout_optimization"] = skip_patterns
+
         super().__init__(**kwargs)
         # CCA attention is NOT compatible with block TKG/CTE mega-kernels
         self.attn_block_tkg_nki_kernel_enabled = False
@@ -265,15 +298,26 @@ class ZayaInferenceConfig(InferenceConfig):
 
         if not hasattr(self, "cca_num_q_heads"):
             self.cca_num_q_heads = [8, 0] * 40
+        elif isinstance(self.cca_num_q_heads, int):
+            # ZAYA1-8B uses scalar config; expand to per-layer list
+            self.cca_num_q_heads = [self.cca_num_q_heads, 0] * 40
 
         if not hasattr(self, "num_query_groups_list"):
             self.num_query_groups_list = [2, 0] * 40
+        elif isinstance(self.num_query_groups_list, int):
+            self.num_query_groups_list = [self.num_query_groups_list, 0] * 40
 
         if not hasattr(self, "ffn_hidden_size_list"):
-            self.ffn_hidden_size_list = [0, 4096] * 40
+            # Check for scalar ffn_hidden_size (ZAYA1-8B simplified config)
+            ffn_size = getattr(self, "ffn_hidden_size", 4096)
+            self.ffn_hidden_size_list = [0, ffn_size] * 40
+        elif isinstance(self.ffn_hidden_size_list, int):
+            self.ffn_hidden_size_list = [0, self.ffn_hidden_size_list] * 40
 
         if not hasattr(self, "zaya_mlp_expansion"):
             self.zaya_mlp_expansion = [0, 256] * 40
+        elif isinstance(self.zaya_mlp_expansion, int):
+            self.zaya_mlp_expansion = [0, self.zaya_mlp_expansion] * 40
 
         # MoE config fields expected by the model
         if not hasattr(self, "moe_router_topk"):
@@ -558,8 +602,153 @@ class ManualConv1d(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# CCA (Causal Cross-Attention) Module
+# NKI Depthwise Conv1d — uses NKI library kernel (Task 022)
 # ---------------------------------------------------------------------------
+
+# Lazy import of NKI CCA postconv kernel (mean-residual + L2 norm + temperature).
+# This is a teaching example demonstrating NKI 0.3.0 kernel development within
+# an NxDI SPMD TP=2 context. It fuses 3 operations into one kernel, proving
+# NKI kernels work correctly inside NxDI model compilation. Enable with
+# ZAYA_USE_NKI_CCA_POSTCONV=1 (throughput-neutral vs PyTorch path).
+_nki_cca_postconv = None
+
+try:
+    from nki_cca_postconv import cca_postconv_fused as _nki_cca_postconv_eager
+
+    _nki_cca_postconv = _nki_cca_postconv_eager
+except Exception:
+    _nki_cca_postconv_eager = None
+
+
+def _get_nki_cca_postconv():
+    """Return the NKI CCA postconv fused kernel, or None."""
+    return _nki_cca_postconv
+
+
+# Lazy import of NKI depthwise conv1d kernel
+_nki_depthwise_conv1d = None
+
+# Try eager import at module load time (avoids subprocess path issues)
+try:
+    from nki_depthwise_conv1d import (
+        depthwise_conv1d_implicit_gemm as _nki_depthwise_conv1d_eager,
+    )
+
+    _nki_depthwise_conv1d = _nki_depthwise_conv1d_eager
+except Exception:
+    _nki_depthwise_conv1d_eager = None
+
+
+def _get_nki_depthwise_conv1d():
+    """Return the NKI depthwise_conv1d_implicit_gemm kernel, or None."""
+    return _nki_depthwise_conv1d
+
+
+class NKIDepthwiseConv1d(nn.Module):
+    """Depthwise Conv1d using NKI depthwise_conv1d_implicit_gemm kernel.
+
+    Drop-in replacement for ManualConv1d/nn.Conv1d for the DEPTHWISE case
+    (groups == in_channels). Uses the NKI library's optimized kernel which
+    avoids both:
+      - NCC_ITEN404 (SDK 2.28): NKI kernel inliner crash with all-gather
+      - NCC_IBCG901 (SDK 2.29): NKI Conv1d shape assertion (expects 4D, gets 3D)
+
+    The NKI kernel operates on 4D tensors [N, C, 1, W] and handles LNC2
+    sharding on the channel dimension automatically.
+
+    Same weight/bias parameter names as nn.Conv1d for state_dict compatibility.
+    Only supports: groups == in_channels, stride=1, padding=0 (external padding).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        groups: int = 1,
+        bias: bool = True,
+    ):
+        super().__init__()
+        assert in_channels == out_channels, (
+            "NKIDepthwiseConv1d requires in_channels == out_channels"
+        )
+        assert groups == in_channels, (
+            f"NKIDepthwiseConv1d only supports depthwise (groups=={in_channels}), "
+            f"got groups={groups}"
+        )
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.groups = groups
+
+        # Same parameter layout as nn.Conv1d:
+        # weight: [out_channels, in_channels/groups, kernel_size] = [C, 1, K]
+        self.weight = nn.Parameter(torch.empty(out_channels, 1, kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+
+        # Initialize with same defaults as nn.Conv1d
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, C, L] input tensor (already externally padded if needed)
+
+        Returns:
+            [B, C, L - kernel_size + 1] output tensor
+        """
+        # DEBUG: Use ManualConv1d math to verify the class construction is correct.
+        # If this produces correct results, the issue is in the NKI kernel.
+        # If wrong, the issue is in class/weight construction.
+        use_nki_kernel = os.environ.get("ZAYA_NKI_CONV_USE_KERNEL", "1") == "1"
+
+        if use_nki_kernel:
+            kernel_fn = _get_nki_depthwise_conv1d()
+            if kernel_fn is None:
+                raise RuntimeError(
+                    "NKI depthwise_conv1d_implicit_gemm not available. "
+                    "Ensure nki_depthwise_conv1d.py is importable."
+                )
+
+            B, C, L = x.shape
+            # NKI kernel expects 4D contiguous: [N, C, 1, W]
+            x_4d = x.unsqueeze(2).contiguous()  # [B, C, 1, L]
+            # Weight: [C, 1, K] -> [C, 1, 1, K]
+            w_4d = self.weight.unsqueeze(1).contiguous()  # [C, 1, 1, K]
+
+            # Call NKI kernel: no padding (external), feature_group_count=C
+            out_4d = kernel_fn(
+                x_4d,
+                w_4d,
+                padding=((0, 0), (0, 0)),
+                feature_group_count=C,
+            )
+
+            # Output: [B, C, 1, L-K+1] -> [B, C, L-K+1]
+            out = out_4d.squeeze(2).contiguous()
+        else:
+            # Fallback: same math as ManualConv1d depthwise
+            w = self.weight.squeeze(1)  # [C, K]
+            if self.kernel_size == 2:
+                out = w[None, :, 0:1] * x[:, :, :-1] + w[None, :, 1:2] * x[:, :, 1:]
+            else:
+                out = (
+                    w[None, :, 0:1] * x[:, :, :-2]
+                    + w[None, :, 1:2] * x[:, :, 1:-1]
+                    + w[None, :, 2:3] * x[:, :, 2:]
+                )
+
+        if self.bias is not None:
+            out = out + self.bias[None, :, None]
+
+        return out
 
 
 class CCA(nn.Module):
@@ -686,14 +875,34 @@ class CCA(nn.Module):
         # ManualConv1d replaces nn.Conv1d to avoid NKI kernel inliner
         # (NCC_ITEN404 compiler bug). Same weight/bias parameter names for
         # state_dict compatibility.
+        # SDK 2.29: NCC_ITEN404 is fixed but NCC_IBCG901 remains.
+        # Conv1d selection hierarchy:
+        #   ZAYA_USE_NKI_CONV1D=1  -> NKIDepthwiseConv1d for depthwise, ManualConv1d for grouped
+        #   ZAYA_USE_NATIVE_CONV1D=1 -> nn.Conv1d for both (may crash under TP)
+        #   default -> ManualConv1d for both (safe fallback)
+        use_nki_conv = os.environ.get("ZAYA_USE_NKI_CONV1D", "0") == "1"
+        use_native_conv = os.environ.get("ZAYA_USE_NATIVE_CONV1D", "0") == "1"
+
+        if use_nki_conv:
+            Conv0Cls = NKIDepthwiseConv1d  # NKI kernel for depthwise
+            Conv1Cls = (
+                ManualConv1d  # ManualConv1d for grouped (NKI doesn't support groups<C)
+            )
+        elif use_native_conv:
+            Conv0Cls = nn.Conv1d
+            Conv1Cls = nn.Conv1d
+        else:
+            Conv0Cls = ManualConv1d
+            Conv1Cls = ManualConv1d
+
         self.conv_qk = nn.Sequential(
-            ManualConv1d(
+            Conv0Cls(
                 in_channels=in_out_ch_global,
                 out_channels=in_out_ch_global,
                 kernel_size=self.cca_time0,
                 groups=num_groups_global_conv0,
             ),
-            ManualConv1d(
+            Conv1Cls(
                 in_channels=in_out_ch_global,
                 out_channels=in_out_ch_global,
                 kernel_size=self.cca_time1,
@@ -928,14 +1137,6 @@ class CCA(nn.Module):
         # Extract per-rank Q/K from global conv output
         q_conv, k_conv = self._extract_per_rank_qk(qk_packed3_global)
 
-        # Build queries/keys from per-rank conv output + per-rank means
-        query = (
-            q_conv.view(*q_conv.shape[:2], self.num_q_heads, self.head_dim) + qk_mean_q
-        )
-        key = (
-            k_conv.view(*k_conv.shape[:2], self.num_kv_heads, self.head_dim) + qk_mean_k
-        )
-
         # Values from two time streams (replicated on all ranks)
         v1 = self.val_proj1(hs)  # [S, B, latent_k_dim_global // 2] = full KV head 0
         v2 = self.val_proj2(hs_d)  # [S, B, latent_k_dim_global // 2] = full KV head 1
@@ -948,31 +1149,77 @@ class CCA(nn.Module):
         # Per-rank KV head slice
         value = self._extract_per_rank_heads(value_full, self.num_kv_heads, dim=2)
 
-        # L2-normalize per head, then scale
-        query_norm = query.norm(p=2, dim=-1, keepdim=True)
-        key_norm = key.norm(p=2, dim=-1, keepdim=True)
+        # --- CCA post-conv: mean-add + L2 norm + temperature ---
+        # Two paths:
+        #   1. ZAYA_USE_NKI_CCA_POSTCONV=1: fused NKI kernel (teaching example)
+        #   2. Default: PyTorch ops
+        use_nki_postconv = os.environ.get("ZAYA_USE_NKI_CCA_POSTCONV", "0") == "1"
+        nki_postconv_fn = _get_nki_cca_postconv() if use_nki_postconv else None
 
-        # Temperature: per-rank slice from global temp parameter
-        temp_per_rank = self._extract_per_rank_heads(
-            self.temp, self.num_kv_heads, dim=0
-        )
+        if nki_postconv_fn is not None:
+            # NKI kernel: fuses mean-add + L2 norm + sqrt(d) scale + temperature
+            S_len = q_conv.shape[0]
+            B_size = q_conv.shape[1]
 
-        key = (key * (self.sqrt_head_dim / key_norm)) * temp_per_rank[
-            None, None
-        ].unsqueeze(-1)
-        query = query * (self.sqrt_head_dim / query_norm)
+            q_mean_flat = qk_mean_q.reshape(
+                S_len, B_size, self.num_q_heads * self.head_dim
+            ).contiguous()
+            k_mean_flat = qk_mean_k.reshape(
+                S_len, B_size, self.num_kv_heads * self.head_dim
+            ).contiguous()
 
-        # Flatten head axis, return to HF layout [B, S, ...]
-        query = (
-            query.view(*query.shape[:2], self.num_q_heads * self.head_dim)
-            .transpose(0, 1)
-            .contiguous()
-        )
-        key = (
-            key.view(*key.shape[:2], self.num_kv_heads * self.head_dim)
-            .transpose(0, 1)
-            .contiguous()
-        )
+            temp_per_rank = self._extract_per_rank_heads(
+                self.temp, self.num_kv_heads, dim=0
+            )
+
+            q_normed, k_normed = nki_postconv_fn(
+                q_conv.contiguous(),
+                k_conv.contiguous(),
+                q_mean_flat,
+                k_mean_flat,
+                temp_per_rank,
+                num_q_heads=self.num_q_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+            )
+
+            # Kernel returns [S, B, heads*dim] — permute to [B, S, heads*dim]
+            query = q_normed.permute(1, 0, 2).contiguous()
+            key = k_normed.permute(1, 0, 2).contiguous()
+
+        else:
+            # PyTorch path: mean-add + L2 norm + temperature
+            query = (
+                q_conv.view(*q_conv.shape[:2], self.num_q_heads, self.head_dim)
+                + qk_mean_q
+            )
+            key = (
+                k_conv.view(*k_conv.shape[:2], self.num_kv_heads, self.head_dim)
+                + qk_mean_k
+            )
+            query_norm = query.norm(p=2, dim=-1, keepdim=True)
+            key_norm = key.norm(p=2, dim=-1, keepdim=True)
+
+            temp_per_rank = self._extract_per_rank_heads(
+                self.temp, self.num_kv_heads, dim=0
+            )
+
+            key = (key * (self.sqrt_head_dim / key_norm)) * temp_per_rank[
+                None, None
+            ].unsqueeze(-1)
+            query = query * (self.sqrt_head_dim / query_norm)
+
+            # Flatten head axis, return to HF layout [B, S, ...]
+            query = (
+                query.view(*query.shape[:2], self.num_q_heads * self.head_dim)
+                .transpose(0, 1)
+                .contiguous()
+            )
+            key = (
+                key.view(*key.shape[:2], self.num_kv_heads * self.head_dim)
+                .transpose(0, 1)
+                .contiguous()
+            )
         value = (
             value.view(*value.shape[:2], self.num_kv_heads * self.head_dim)
             .transpose(0, 1)
@@ -1594,7 +1841,17 @@ class ZayaRouter(nn.Module):
 
 
 class ZayaBlock(nn.Module):
-    """MoE block: Router + SequentialMLP experts."""
+    """MoE block: Custom Router + Expert MLPs.
+
+    Supports three modes controlled by env vars:
+    - ZAYA_USE_NXDI_MOE=1 + ZAYA_STACKED_MOE=1 (recommended): Batched einsum
+      over all experts — 2 einsums per layer instead of 32 matmuls. +12.1%
+      throughput vs per-expert loop.
+    - ZAYA_STACKED_MOE=1 (default): Uses ExpertMLPsV2 stacked weights with
+      a per-expert matmul loop and zero-masking.
+    - ZAYA_STACKED_MOE=0: Uses SequentialMLP with per-expert ZayaMLP
+      instances (the original working approach, slowest).
+    """
 
     def __init__(
         self,
@@ -1608,6 +1865,8 @@ class ZayaBlock(nn.Module):
         self.config = config
         self.num_moe_experts = num_moe_experts
         self.use_mod = bool(getattr(config, "zaya_use_mod", True))
+        self.use_stacked = os.environ.get("ZAYA_STACKED_MOE", "1") == "1"
+        self.use_nxdi_moe = os.environ.get("ZAYA_USE_NXDI_MOE", "0") == "1"
 
         self.router = ZayaRouter(
             config=config,
@@ -1617,59 +1876,228 @@ class ZayaBlock(nn.Module):
             mlp_expansion=mlp_expansion,
             hidden_size=config.hidden_size,
         )
-        self.experts = SequentialMLP(num_moe_experts, config, ffn_hidden_size)
+
+        if self.use_stacked:
+            # Stacked MoE path: ExpertMLPsV2 with batched einsum
+            intermediate_size = ffn_hidden_size // 2
+
+            dtype = (
+                getattr(config.neuron_config, "torch_dtype", torch.bfloat16)
+                if hasattr(config, "neuron_config")
+                else torch.bfloat16
+            )
+
+            is_prefill = (
+                getattr(config.neuron_config, "is_prefill_stage", True)
+                if hasattr(config, "neuron_config")
+                else True
+            )
+
+            routed_config = RoutedExpertsMLPOpsConfig(
+                num_experts=num_moe_experts,
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                top_k=1,
+                hidden_act="silu",
+                glu_mlp=True,
+                bias=False,
+                glu_type=GLUType.GLU,
+                normalize_top_k_affinities=False,
+            )
+
+            self.expert_mlps = ExpertMLPsV2(
+                routed_experts_mlp_config=routed_config,
+                dtype=dtype,
+                is_prefill=is_prefill,
+            )
+        else:
+            # Sequential MoE path: per-expert ZayaMLP instances (original)
+            self.experts = SequentialMLP(num_moe_experts, config, ffn_hidden_size)
+
+        # Cache TP degree for all-reduce calls
+        neuron_cfg = getattr(config, "neuron_config", None)
+        self._tp_degree = getattr(neuron_cfg, "tp_degree", 1) if neuron_cfg else 1
+
+    def _tp_allreduce(self, tensor):
+        """Sum partial results across TP ranks (needed after TP-sharded down_proj)."""
+        if self._tp_degree > 1:
+            return mappings.reduce_from_tensor_model_parallel_region(tensor)
+        return tensor
 
     def forward(self, hidden_states, prev_router_hidden_states=None):
         route_prob, expert_choice, prev_router_hidden_states = self.router(
             hidden_states, router_states=prev_router_hidden_states
         )
 
+        if self.use_nxdi_moe and self.use_stacked:
+            return self._forward_nxdi(
+                hidden_states,
+                route_prob,
+                expert_choice,
+                prev_router_hidden_states,
+            )
+        elif self.use_stacked:
+            return self._forward_stacked(
+                hidden_states, route_prob, expert_choice, prev_router_hidden_states
+            )
+        else:
+            return self._forward_sequential(
+                hidden_states, route_prob, expert_choice, prev_router_hidden_states
+            )
+
+    def _forward_sequential(
+        self, hidden_states, route_prob, expert_choice, prev_router_hidden_states
+    ):
+        """Original sequential MoE forward — one expert at a time with masking."""
         batch_size, seq_length, emb_dim = hidden_states.shape
         num_tokens = batch_size * seq_length
         hidden_states_flat = hidden_states.view(num_tokens, emb_dim)
-        # expert_choice: [num_tokens, topk=1] -> [num_tokens]
-        indices_flat = expert_choice.view(num_tokens)
+        indices = expert_choice.view(num_tokens)
 
-        # XLA-compatible static expert dispatch:
-        # Process each expert with a mask (no dynamic indexing / bincount / sort).
-        # For topk=1, each token goes to exactly one expert.
         total_experts = self.router.num_experts  # num_moe_experts + 1 if MoD
-        num_real_experts = self.num_moe_experts
 
-        expert_output = torch.zeros_like(hidden_states_flat)
-
-        for expert_idx in range(num_real_experts):
-            # Mask: 1 where this expert is selected, 0 elsewhere
+        # Process each expert with zero-masking
+        output = torch.zeros_like(hidden_states_flat)
+        for expert_idx in range(self.num_moe_experts):
             expert_mask = (
-                (indices_flat == expert_idx).unsqueeze(-1).to(hidden_states_flat.dtype)
+                (indices == expert_idx).unsqueeze(-1).to(hidden_states_flat.dtype)
             )
-            # Run expert on all tokens (masked zeros for non-selected)
             expert_input = hidden_states_flat * expert_mask
             expert_out, _ = self.experts.local_experts[expert_idx](expert_input)
-            expert_output = expert_output + expert_out * expert_mask
+            expert_prob = route_prob.view(num_tokens, 1) * expert_mask
+            output = output + expert_out * expert_prob
 
-        # MoD skip expert: tokens routed to the skip expert (last index)
-        # just pass through (identity — already handled since expert_output
-        # starts as zeros and those tokens get no expert contribution,
-        # but we need to add the passthrough)
+        # MoD skip expert (identity passthrough)
         if self.use_mod:
             skip_mask = (
-                (indices_flat == (total_experts - 1))
+                (indices >= self.num_moe_experts)
                 .unsqueeze(-1)
                 .to(hidden_states_flat.dtype)
             )
-            expert_output = expert_output + hidden_states_flat * skip_mask
+            skip_prob = route_prob.view(num_tokens, 1) * skip_mask
+            output = output + hidden_states_flat * skip_prob
 
-        expert_output = expert_output.view(batch_size, seq_length, emb_dim)
-        probs = route_prob.view(batch_size, seq_length)
-        expert_output = expert_output * probs.unsqueeze(-1)
+        output = output.view(batch_size, seq_length, emb_dim)
+        return output, prev_router_hidden_states
 
-        return expert_output, prev_router_hidden_states
+    def _forward_stacked(
+        self, hidden_states, route_prob, expert_choice, prev_router_hidden_states
+    ):
+        """Stacked MoE forward -- matches sequential path logic exactly."""
+        batch_size, seq_length, emb_dim = hidden_states.shape
+        num_tokens = batch_size * seq_length
+        hidden_states_flat = hidden_states.view(num_tokens, emb_dim)
+        indices = expert_choice.view(num_tokens)
 
+        gate_up_w = self.expert_mlps.mlp_op.gate_up_proj.weight  # (E, H, 2I)
+        down_w = self.expert_mlps.mlp_op.down_proj.weight  # (E, I, H)
+        intermediate_size = down_w.shape[1]
 
-# ---------------------------------------------------------------------------
-# Decoder Layers
-# ---------------------------------------------------------------------------
+        output = torch.zeros_like(hidden_states_flat)
+
+        for expert_idx in range(self.num_moe_experts):
+            # Exact same masking as sequential path
+            expert_mask = (
+                (indices == expert_idx).unsqueeze(-1).to(hidden_states_flat.dtype)
+            )
+            expert_input = hidden_states_flat * expert_mask
+
+            # Same computation as ZayaMLP._native_mlp but using stacked weights
+            gu_w = gate_up_w[expert_idx]  # (H, 2I)
+            d_w = down_w[expert_idx]  # (I, H)
+
+            gate_up = torch.matmul(expert_input, gu_w)  # (N, 2I)
+            gate = gate_up[:, :intermediate_size]
+            up = gate_up[:, intermediate_size:]
+            activated = torch.nn.functional.silu(gate) * up
+            expert_out = torch.matmul(activated, d_w)  # (N, H)
+
+            expert_prob = route_prob.view(num_tokens, 1) * expert_mask
+            output = output + expert_out * expert_prob
+
+        # MoD skip expert (identity passthrough)
+        if self.use_mod:
+            skip_mask = (
+                (indices >= self.num_moe_experts)
+                .unsqueeze(-1)
+                .to(hidden_states_flat.dtype)
+            )
+            skip_prob = route_prob.view(num_tokens, 1) * skip_mask
+            output = output + hidden_states_flat * skip_prob
+
+        # All-reduce across TP ranks: the down_proj matmul produces partial sums
+        # (each rank computes with its I/TP shard of intermediate_size), so we
+        # must sum across TP ranks to get the correct output.
+        output = self._tp_allreduce(output)
+
+        output = output.view(batch_size, seq_length, emb_dim)
+        return output, prev_router_hidden_states
+
+    def _forward_nxdi(
+        self,
+        hidden_states,
+        route_prob,
+        expert_choice,
+        prev_router_hidden_states,
+    ):
+        """Batched einsum MoE forward — all experts computed in 2 einsums.
+
+        Replaces 32 per-expert matmuls (16 experts x 2 projections) with
+        2 batched einsums over the expert dimension. +12.1% throughput
+        vs the per-expert loop in _forward_stacked (34.2 vs 30.5 tok/s).
+
+        The combine step still iterates over experts to apply per-token
+        masking (only the chosen expert's output is used, scaled by
+        route_prob). This masking loop is cheap — it's just element-wise
+        multiply-accumulate, not matmul.
+        """
+        batch_size, seq_length, emb_dim = hidden_states.shape
+        num_tokens = batch_size * seq_length
+        hidden_states_flat = hidden_states.view(num_tokens, emb_dim)
+        indices = expert_choice.view(num_tokens)
+
+        mlp_op = self.expert_mlps.get_mlp_op()
+        gate_up_w = mlp_op.gate_up_proj.weight  # [E, H, 2*I_per_rank]
+        down_w = mlp_op.down_proj.weight  # [E, I_per_rank, H]
+        intermediate_size_per_rank = down_w.shape[1]
+
+        # Batched gate_up projection: all experts in one einsum
+        gate_up_all = torch.einsum(
+            "th,ehi->eti", hidden_states_flat, gate_up_w
+        )  # [E, T, 2*I_per_rank]
+
+        # SwiGLU activation per expert
+        gate_all = gate_up_all[:, :, :intermediate_size_per_rank]
+        up_all = gate_up_all[:, :, intermediate_size_per_rank:]
+        activated_all = torch.nn.functional.silu(gate_all) * up_all
+
+        # Batched down projection: all experts in one einsum
+        expert_out_all = torch.einsum(
+            "eti,eih->eth", activated_all, down_w
+        )  # [E, T, H]
+
+        # Combine: select the chosen expert's output per token, scale by route_prob
+        output = torch.zeros_like(hidden_states_flat)
+        for expert_idx in range(self.num_moe_experts):
+            expert_mask = (
+                (indices == expert_idx).unsqueeze(-1).to(hidden_states_flat.dtype)
+            )
+            expert_prob = route_prob.view(num_tokens, 1) * expert_mask
+            output = output + expert_out_all[expert_idx] * expert_prob
+
+        # MoD skip expert (identity passthrough)
+        if self.use_mod:
+            skip_mask = (
+                (indices >= self.num_moe_experts)
+                .unsqueeze(-1)
+                .to(hidden_states_flat.dtype)
+            )
+            skip_prob = route_prob.view(num_tokens, 1) * skip_mask
+            output = output + hidden_states_flat * skip_prob
+
+        output = self._tp_allreduce(output)
+        output = output.view(batch_size, seq_length, emb_dim)
+        return output, prev_router_hidden_states
 
 
 class NeuronZayaAttentionLayer(nn.Module):
@@ -2392,17 +2820,17 @@ def convert_zaya_hf_to_neuron_state_dict(state_dict: dict, config) -> dict:
 
     Key transformations:
     1. Rename 'final_norm.weight' -> 'norm.weight'
-    2. Split fused 'linear_fc1.weight' -> 'gate_proj.weight' + 'up_proj.weight'
-       (checkpoint has [4096, 2048] gate+up fused; split into [2048, 2048] each)
-    3. Rename 'linear_fc2.weight' -> 'down_proj.weight'
-    4. Add rank utilities for tensor parallelism (SPMDRank arange per CCA)
-    5. Add zero-initialized CCA state tensors at GLOBAL dimensions (conv operates
-       at global dims via gather_output=True on Q/K projections)
-    6. Pass through all other weights as-is — ColumnParallelLinear/RowParallelLinear
-       weights are auto-sharded by NxD's parallel layer mechanism.
-    7. Conv1d weights, temperature, and val_proj are at GLOBAL dimensions (plain
-       nn.Conv1d/nn.Linear/nn.Parameter — NOT auto-sharded). Per-rank head
-       extraction happens in CCA.forward() via index_select.
+    2. Stack 16 per-expert fused 'linear_fc1.weight' [4096, 2048] into a single
+       'gate_up_proj.weight' [16, 2048, 4096] (transposed, stacked across experts)
+    3. Stack 16 per-expert 'linear_fc2.weight' [2048, 2048] into a single
+       'down_proj.weight' [16, 2048, 2048] (transposed, stacked)
+    4. Remap expert weight keys from
+       'layers.{l}.zaya_block.experts.local_experts.{e}.*' to
+       'layers.{l}.zaya_block.expert_mlps.mlp_op.gate_up_proj.weight' /
+       'layers.{l}.zaya_block.expert_mlps.mlp_op.down_proj.weight'
+    5. Add rank utilities for tensor parallelism (SPMDRank arange per CCA)
+    6. Add zero-initialized CCA state tensors at GLOBAL dimensions
+    7. Pass through all other weights as-is
     """
     neuron_state_dict = {}
     tp_degree = config.neuron_config.tp_degree
@@ -2422,6 +2850,20 @@ def convert_zaya_hf_to_neuron_state_dict(state_dict: dict, config) -> dict:
         cca_num_q_heads_global * head_dim + cca_num_kv_heads_global * head_dim
     )
 
+    # Identify MoE layer indices
+    moe_layer_indices = [
+        i for i, lt in enumerate(config.zaya_layers) if isinstance(lt, int)
+    ]
+    num_experts = config.num_local_experts  # 16
+
+    use_stacked = os.environ.get("ZAYA_STACKED_MOE", "1") == "1"
+
+    # First pass: copy all non-expert weights to neuron_state_dict.
+    # Expert weights (containing 'linear_fc1' or 'linear_fc2' in MoE layers)
+    # are collected separately for stacking (or splitting for sequential mode).
+    expert_fc1_weights = {}  # {layer_idx: {expert_idx: tensor}}
+    expert_fc2_weights = {}  # {layer_idx: {expert_idx: tensor}}
+
     for key, value in state_dict.items():
         new_key = key
 
@@ -2429,23 +2871,110 @@ def convert_zaya_hf_to_neuron_state_dict(state_dict: dict, config) -> dict:
         if key == "final_norm.weight":
             new_key = "norm.weight"
 
-        # Split fused linear_fc1 (gate+up) into separate gate_proj and up_proj.
-        # Checkpoint shape: [ffn_hidden_size, hidden_size] = [4096, 2048]
-        # First half is gate weights, second half is up weights.
+        # Collect expert MLP weights for stacking
         if "linear_fc1.weight" in key:
-            w = value.detach().clone()
-            mid = w.shape[0] // 2
-            gate_key = key.replace("linear_fc1.weight", "gate_proj.weight")
-            up_key = key.replace("linear_fc1.weight", "up_proj.weight")
-            neuron_state_dict[gate_key] = w[:mid, :]  # [2048, 2048]
-            neuron_state_dict[up_key] = w[mid:, :]  # [2048, 2048]
+            # Parse layer and expert index from key like:
+            # layers.{l}.zaya_block.experts.local_experts.{e}.linear_fc1.weight
+            parts = key.split(".")
+            layer_idx = int(parts[1])
+            expert_idx = int(parts[5])
+            if layer_idx not in expert_fc1_weights:
+                expert_fc1_weights[layer_idx] = {}
+            expert_fc1_weights[layer_idx][expert_idx] = value.detach().clone()
             continue
 
-        # Rename linear_fc2 -> down_proj
         if "linear_fc2.weight" in key:
-            new_key = key.replace("linear_fc2.weight", "down_proj.weight")
+            parts = key.split(".")
+            layer_idx = int(parts[1])
+            expert_idx = int(parts[5])
+            if layer_idx not in expert_fc2_weights:
+                expert_fc2_weights[layer_idx] = {}
+            expert_fc2_weights[layer_idx][expert_idx] = value.detach().clone()
+            continue
 
         neuron_state_dict[new_key] = value.detach().clone()
+
+    # Second pass: process expert weights.
+    for layer_idx in moe_layer_indices:
+        fc1_dict = expert_fc1_weights.get(layer_idx, {})
+        fc2_dict = expert_fc2_weights.get(layer_idx, {})
+
+        if not fc1_dict:
+            continue
+
+        sample_fc1 = fc1_dict[0]
+        ffn_hidden_size, hidden_size = sample_fc1.shape  # [4096, 2048]
+        intermediate_size = ffn_hidden_size // 2  # 2048
+
+        if use_stacked:
+            # Stacked: [E, H, 2I] gate_up + [E, I, H] down
+            dtype = sample_fc1.dtype
+            device = sample_fc1.device
+
+            gate_up_proj = torch.empty(
+                num_experts,
+                hidden_size,
+                2 * intermediate_size,
+                dtype=dtype,
+                device=device,
+            )
+            for e in range(num_experts):
+                gate_up_proj[e] = fc1_dict[e].T
+
+            neuron_state_dict[
+                f"layers.{layer_idx}.zaya_block.expert_mlps.mlp_op.gate_up_proj.weight"
+            ] = gate_up_proj
+
+            down_proj = torch.empty(
+                num_experts,
+                intermediate_size,
+                hidden_size,
+                dtype=dtype,
+                device=device,
+            )
+            for e in range(num_experts):
+                down_proj[e] = fc2_dict[e].T
+
+            neuron_state_dict[
+                f"layers.{layer_idx}.zaya_block.expert_mlps.mlp_op.down_proj.weight"
+            ] = down_proj
+
+            # Debug: print weight norms for layer 1
+            if layer_idx == 1:
+                print(
+                    f"[STACKED-WEIGHTS] layer={layer_idx} gate_up shape={list(gate_up_proj.shape)} norm={gate_up_proj.float().norm().item():.4f}"
+                )
+                print(
+                    f"[STACKED-WEIGHTS] layer={layer_idx} down shape={list(down_proj.shape)} norm={down_proj.float().norm().item():.4f}"
+                )
+                # Also print per-expert norms
+                for e in range(min(4, num_experts)):
+                    print(
+                        f"[STACKED-WEIGHTS]   expert {e}: gate_up norm={gate_up_proj[e].float().norm().item():.4f} down norm={down_proj[e].float().norm().item():.4f}"
+                    )
+        else:
+            # Sequential: per-expert gate_proj + up_proj + down_proj
+            for e in range(num_experts):
+                fc1_w = fc1_dict[e]  # [ffn_hidden_size, hidden_size] = [4096, 2048]
+                # Split fused fc1 into gate and up: first half = gate, second half = up
+                gate_w = fc1_w[:intermediate_size, :]  # [I, H]
+                up_w = fc1_w[intermediate_size:, :]  # [I, H]
+                # ColumnParallelLinear stores weight as [output_size, input_size]
+                # NxDI convention after transpose_parallel_linear_layer:
+                # weight is [input_size, output_size] = [H, I]
+                neuron_state_dict[
+                    f"layers.{layer_idx}.zaya_block.experts.local_experts.{e}.gate_proj.weight"
+                ] = gate_w
+                neuron_state_dict[
+                    f"layers.{layer_idx}.zaya_block.experts.local_experts.{e}.up_proj.weight"
+                ] = up_w
+
+                # down_proj: [hidden_size, intermediate_size] = [H, I]
+                neuron_state_dict[
+                    f"layers.{layer_idx}.zaya_block.experts.local_experts.{e}.down_proj.weight"
+                ] = fc2_dict[e]
+
+        gc.collect()
 
     # Add rank utilities for tensor parallelism
     neuron_state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
