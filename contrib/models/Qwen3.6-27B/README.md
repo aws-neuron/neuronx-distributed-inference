@@ -130,6 +130,17 @@ with the vLLM Neuron plugin, Qwen chunked prefill, and native vLLM APC enabled.
 | State reset | repeated short-after-long validation passed after 32K and 64K requests |
 | Peak Neuron device memory | ~53.25 GB decimal during the 64K eval |
 
+TTFT/TPOT details for the same 128K FP8/vLLM artifact:
+
+| Metric | Result | Notes |
+|--------|--------|-------|
+| Decode TPOT | ~37.6-38.0 ms/token | Derived from 26.3-26.6 tok/s decode |
+| Cold 512-token TTFT | ~1.2-1.3s | Derived from measured prefill throughput plus one decode step |
+| Cold 32K-token TTFT | ~76.6-81.1s | Derived from measured prefill throughput plus one decode step |
+| Cold 64K-token TTFT | ~153-162s | Derived from measured prefill throughput plus one decode step |
+| Warm APC latency, ~10.8K prompt | 1.36-2.38s | Exact-repeat, partial-prefix, and cross-prefix validation runs |
+| Cold APC baseline, ~10.8K prompt | 25.17-26.68s | Same prompts with prefix cache disabled or cold |
+
 Native vLLM prefix caching/APC was also validated with exact greedy output
 matches:
 
