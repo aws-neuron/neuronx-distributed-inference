@@ -95,11 +95,13 @@ print(f"CosSim: {metrics['cosine_similarity']}")
 
 ### Known Issues
 
-1. **`topk` not supported on Neuron.** Models must be traced with `end2end=False`. Postprocessing (topk, NMS) runs on CPU with ~0.1ms overhead.
-2. **FP32 fails for m/l/x variants.** Use BF16 (`torch.bfloat16`) for these variants. FP32 for n/s only.
-3. **`--auto-cast=matmult` produces NaN.** Do not use autocast flags with YOLO26.
-4. **LNC=1 requires `--lnc 1` compiler flag.** NEFFs compiled without this flag cannot run on LNC=1 runtime.
-5. **Classification variant has precision issue.** Narrow logit range + softmax amplification causes CosSim 0.257. Detection, pose, and OBB are unaffected.
+1. **C2PSA attention block produces incorrect output on NCv2 (inf2/trn2).** The C2PSA self-attention module (layer 10 in yolo26l/m/x) is numerically incorrect when compiled for NeuronCore-v2. Isolated C2PSA module CosSim is ~0.46 vs CPU reference (should be >0.99). This is a compiler lowering issue affecting the `transpose`+`@`+`softmax`+`reshape` pattern in `Attention.forward`. Full-model CosSim (0.99+) masks this because the C2PSA output is diluted by correct backbone/neck outputs. **Impact:** Detection-level accuracy for variants with C2PSA (l, m, x) may have missing or incorrect detections at production confidence thresholds. The n and s variants (which have smaller C2PSA blocks) show high overall CosSim but may exhibit similar detection-level inaccuracies. **Workaround:** For production detection deployments requiring high recall, either (a) bypass C2PSA by setting `model.model[10].m = nn.Identity()` before tracing (loses some architectural detection capability), or (b) use `yolo26n`/`yolo26s` which are less affected at the full-model level. Tracked in [aws-neuron-sdk#1323](https://github.com/aws-neuron/aws-neuron-sdk/issues/1323).
+2. **`topk` not supported on Neuron.** Models must be traced with `end2end=False`. Use `postprocess_detections()` for CPU NMS postprocessing (~0.1ms overhead).
+3. **FP32 fails for m/l/x variants.** Use BF16 (`torch.bfloat16`) for these variants. FP32 for n/s only.
+4. **`--auto-cast=matmult` produces NaN.** Do not use autocast flags with YOLO26.
+5. **LNC=1 requires `--lnc 1` compiler flag.** NEFFs compiled without this flag cannot run on LNC=1 runtime.
+6. **Backbone compilation fails at batch size >= 4 at non-square resolutions.** Compiling layers 0-9 at batch sizes 4+ with rectangular input (e.g., 384x640) triggers an internal compiler error (`NCC_IPCC901`). Batch sizes 1-3 compile successfully. At 640x640 (square), larger batch sizes compile fine.
+7. **Classification variant has precision issue.** Narrow logit range + softmax amplification causes CosSim 0.257. Detection, pose, and OBB are unaffected.
 
 ## Compatibility Matrix
 
