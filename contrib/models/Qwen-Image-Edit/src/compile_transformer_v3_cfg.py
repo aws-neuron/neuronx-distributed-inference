@@ -122,11 +122,18 @@ def nki_flash_attention(query, key, value):
         # QIE joint attention: no causal mask.
         # Use [vc_size] bracket syntax to set LNC; kernel internally shards
         # across LNC2 on batch (and on seqlen_q when batch is odd).
+        #
+        # softmax_dtype can be lowered to bf16 via QIE_SOFTMAX_DTYPE env, but
+        # we measured no speedup on Trn2 for QIE (1249ms both fp32 and bf16)
+        # because mm_out_dtype must stay float32 on Gen3 hardware. Default fp32.
+        softmax_dtype = os.getenv("QIE_SOFTMAX_DTYPE", "float32")
         kernel = _attention_cte_call[vc_size]
         attn_output = kernel(
             q, k, v,
             scale=scale, causal_mask=False,
             tp_q=True, tp_k=True, tp_out=False,
+            softmax_dtype=softmax_dtype,
+            mm_out_dtype="float32",
         )
         # attention_cte with tp_out=False returns [B, seqlen_q, d]
         return attn_output.reshape(bs, n_head, q_len, d_head)
