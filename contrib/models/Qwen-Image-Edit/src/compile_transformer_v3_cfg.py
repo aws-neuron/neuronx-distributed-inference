@@ -60,18 +60,28 @@ from neuron_parallel_utils import (
     get_sharded_data,
 )
 
-# Import NKI Flash Attention
+# Import NKI Flash Attention (production-grade nkilib kernel)
+from nkilib.core.attention.attention_cte import attention_cte as _nkilib_attention_cte
+from neuronxcc.nki.language import nc
+from torch_neuronx.xla_impl.ops import nki_jit
+
+# Keep the legacy private kernel as a fallback in case nkilib is missing
 try:
     from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
 except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel
+_legacy_flash_fwd_call = nki_jit()(attention_isa_kernel)
 
-from neuronxcc.nki.language import nc
-from torch_neuronx.xla_impl.ops import nki_jit
+# attention_cte is already wrapped with @nki.jit. In XLA venv we don't have
+# torch_neuronx.nki_op/wrap_nki, so call it directly without re-wrapping
+# and without [grid] subscript — let the kernel handle LNC internally.
+_attention_cte_call = _nkilib_attention_cte
 
-_flash_fwd_call = nki_jit()(attention_isa_kernel)
+# Toggle between the two via env var (easy rollback during testing)
+USE_NKILIB_ATTENTION = os.getenv("QIE_USE_NKILIB_ATTENTION", "1") == "1"
 
-print("NKI Flash Attention kernel loaded successfully")
+print(f"NKI Flash Attention kernel loaded: "
+      f"{'nkilib.core.attention.attention_cte' if USE_NKILIB_ATTENTION else 'attention_isa_kernel (legacy)'}")
 
 CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
@@ -83,30 +93,54 @@ def nki_flash_attention(query, key, value):
 
     Args:
         query: [B, H, S, D]
-        key: [B, H, S, D]
+        key:   [B, H, S, D]
         value: [B, H, S, D]
 
     Returns:
         attention output [B, H, S, D]
+
+    Uses nkilib.core.attention.attention_cte by default (production-grade
+    kernel with controllable softmax/matmul dtype, causal_mask, sliding_window,
+    and KV-cache support). Set QIE_USE_NKILIB_ATTENTION=0 to fall back to the
+    legacy attention_isa_kernel.
     """
     bs, n_head, q_len, d_head = query.shape
     k_len = key.shape[2]
     v_len = value.shape[2]
+    scale = 1 / math.sqrt(d_head)
+    vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
 
+    if USE_NKILIB_ATTENTION:
+        # attention_cte expects:
+        #   q: [B, seqlen_q, d]  (tp_q=True, default)
+        #   k: [B, seqlen_kv, d] (tp_k=True)
+        #   v: [B, seqlen_kv, d]
+        # Collapse B and H into the leading dim.
+        q = query.reshape(bs * n_head, q_len, d_head)
+        k = key.reshape(bs * n_head, k_len, d_head)
+        v = value.reshape(bs * n_head, v_len, d_head)
+        # QIE joint attention: no causal mask.
+        # Use [vc_size] bracket syntax to set LNC; kernel internally shards
+        # across LNC2 on batch (and on seqlen_q when batch is odd).
+        kernel = _attention_cte_call[vc_size]
+        attn_output = kernel(
+            q, k, v,
+            scale=scale, causal_mask=False,
+            tp_q=True, tp_k=True, tp_out=False,
+        )
+        # attention_cte with tp_out=False returns [B, seqlen_q, d]
+        return attn_output.reshape(bs, n_head, q_len, d_head)
+
+    # Legacy path: attention_isa_kernel
     q = query.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, q_len))
     k = key.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, k_len))
     v = value.clone().reshape((bs * n_head, v_len, d_head))
-
     attn_output = torch.zeros((bs * n_head, q_len, d_head), dtype=torch.bfloat16, device=q.device)
-    scale = 1 / math.sqrt(d_head)
-
-    vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
     if vc_size == 2:
         grid = (nc(2),)
-        _flash_fwd_call[grid](q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
+        _legacy_flash_fwd_call[grid](q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
     else:
-        _flash_fwd_call(q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
-
+        _legacy_flash_fwd_call(q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
     return attn_output.reshape((bs, n_head, q_len, d_head))
 
 
