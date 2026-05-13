@@ -41,6 +41,11 @@ except ImportError:
 from ultralytics import YOLO
 from ultralytics.nn.modules.block import C2f
 
+try:
+    from ultralytics.nn.modules.block import Attention as UltralyticsAttention
+except ImportError:
+    UltralyticsAttention = None
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -72,6 +77,35 @@ COSINE_SIM_THRESHOLDS = {
 # ---------------------------------------------------------------------------
 
 
+def _attention_forward_fixed(self, x: torch.Tensor) -> torch.Tensor:
+    """Fixed Attention.forward that uses slicing instead of .split().
+
+    The Neuron compiler (neuronx-cc) has a bug lowering torch.Tensor.split()
+    with unequal split sizes on dim=2 of a 4D tensor after a view/reshape.
+    This produces numerically incorrect output (CosSim ~0.45 vs CPU reference).
+
+    Workaround: replace .split([key_dim, key_dim, head_dim], dim=2) with
+    explicit tensor slicing, which compiles correctly.
+
+    See: https://github.com/aws-neuron/aws-neuron-sdk/issues/1323
+    """
+    B, C, H, W = x.shape
+    N = H * W
+    qkv = self.qkv(x)
+    qkv_reshaped = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N)
+
+    # Use slicing instead of .split() — works around neuronx-cc bug
+    q = qkv_reshaped[:, :, : self.key_dim, :]
+    k = qkv_reshaped[:, :, self.key_dim : self.key_dim * 2, :]
+    v = qkv_reshaped[:, :, self.key_dim * 2 :, :]
+
+    attn = (q.transpose(-2, -1) @ k) * self.scale
+    attn = attn.softmax(dim=-1)
+    x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
+    x = self.proj(x)
+    return x
+
+
 def prepare_yolo26(weight_path: str, dtype: torch.dtype = torch.float32) -> nn.Module:
     """Load and prepare a YOLO26 model for Neuron tracing.
 
@@ -80,7 +114,9 @@ def prepare_yolo26(weight_path: str, dtype: torch.dtype = torch.float32) -> nn.M
     2. ``fuse()`` merges BatchNorm into Conv2d, removes training branches
     3. Set ``export=True``, ``dynamic=False`` for clean single-tensor output
     4. Replace ``C2f.forward`` with ``C2f.forward_split`` (split vs chunk)
-    5. Convert to target dtype if not FP32
+    5. Patch ``Attention.forward`` to use slicing instead of ``.split()``
+       (works around neuronx-cc compiler bug with unequal split sizes)
+    6. Convert to target dtype if not FP32
 
     Parameters
     ----------
@@ -114,6 +150,10 @@ def prepare_yolo26(weight_path: str, dtype: torch.dtype = torch.float32) -> nn.M
             m.shape = None
         if isinstance(m, C2f):
             m.forward = m.forward_split
+        # Fix C2PSA Attention: replace .split() with slicing to work around
+        # neuronx-cc compiler bug with unequal split sizes on dim=2
+        if UltralyticsAttention is not None and isinstance(m, UltralyticsAttention):
+            m.forward = _attention_forward_fixed.__get__(m, type(m))
 
     if dtype != torch.float32:
         pytorch_model = pytorch_model.to(dtype)
