@@ -22,7 +22,7 @@ IBM Granite 4.0-H-Small is a hybrid Mamba2/Attention architecture with MoE:
 Key implementation details:
 - Mamba state persistence via nn.ParameterList + input_output_aliases
   (same mechanism as KV cache, following MLlama vision_key_values pattern)
-- Manual depthwise conv1d to avoid TEN404 NKI kernel bug on seq_len=1
+- nn.Conv1d depthwise convolution (TEN404 fixed in SDK 2.29.1)
   (optional nki-lib depthwise_conv1d_implicit_gemm for prefill acceleration)
 - Full-sequence parallel scan for prefill, O(1) recurrence for decode
 - GraniteRMSNormGated: gate applied BEFORE norm (norm_before_gate=False)
@@ -134,22 +134,47 @@ if HAS_NKI and USE_NKI_SCAN:
         hd_range,  # (HD,) — dummy tensor for head_dim
         ss_range,  # (SS,) — dummy tensor for ssm_state_size
     ):
-        """NKI O(L) selective scan using tensor_tensor_scan."""
+        """
+        NKI O(L) selective scan using tensor_tensor_scan — packed partition variant.
+
+        Packs multiple (d,s) state combinations into the partition dimension to
+        maximize utilization. With NH=32 and P_MAX=128, we fit 4 state dims per
+        scan invocation, reducing total scans from HD*SS=8192 to HD*SS/4=2048.
+
+        The dA_exp tensor (which only varies by head, not by d or s) is replicated
+        4× in the partition dimension so each packed slot sees its correct decay.
+        """
         NH = dA_exp_t.shape[0]
         SL = dA_exp_t.shape[1]
         HD = hd_range.shape[0]
         SS = ss_range.shape[0]
+
+        # How many (d,s) pairs we can pack per scan invocation
+        # Requires: SS % PACK == 0 (Granite: 128 % 4 == 0 ✓)
+        # Reduces tensor_tensor_scan calls from HD*SS=8192 to HD*(SS/PACK)=2048
+        PACK = P_MAX // NH  # 128 // 32 = 4
 
         y_out = nl.ndarray((NH * HD, SL), dtype=nl.float32, buffer=nl.shared_hbm)
         final_state_out = nl.ndarray(
             (NH * HD * SS, 1), dtype=nl.float32, buffer=nl.shared_hbm
         )
 
-        dA_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=dA_sb, value=0.0)
-        nisa.dma_copy(dst=dA_sb[0:NH, 0:SL], src=dA_exp_t[0:NH, 0:SL])
+        # Load dA_exp and replicate PACK times in partition dim
+        # dA_packed[0:NH] = dA_packed[NH:2*NH] = ... = dA_exp_t
+        dA_packed_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=dA_packed_sb, value=0.0)
+        dA_single_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=dA_single_sb, value=0.0)
+        nisa.dma_copy(dst=dA_single_sb[0:NH, 0:SL], src=dA_exp_t[0:NH, 0:SL])
+        # Replicate NH-sized block PACK times into packed buffer
+        for p in nl.affine_range(PACK):
+            nisa.tensor_copy(
+                dst=dA_packed_sb[p * NH : (p + 1) * NH, 0:SL],
+                src=dA_single_sb[0:NH, 0:SL],
+            )
 
         for d in nl.affine_range(HD):
+            # y accumulator for this head_dim slot
             y_acc_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
             nisa.memset(dst=y_acc_sb, value=0.0)
             Dx_row = d * NH
@@ -158,60 +183,83 @@ if HAS_NKI and USE_NKI_SCAN:
                 src=Dx_t[Dx_row : Dx_row + NH, 0:SL],
             )
 
-            for s in nl.affine_range(SS):
-                dBx_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.memset(dst=dBx_sb, value=0.0)
-                dBx_row = (d * SS + s) * NH
-                nisa.dma_copy(
-                    dst=dBx_sb[0:NH, 0:SL],
-                    src=dBx_t[dBx_row : dBx_row + NH, 0:SL],
+            # Process ssm_state_size in groups of PACK
+            for s_base in nl.affine_range(SS // PACK):
+                # Pack PACK dBx rows into one P_MAX-sized buffer
+                dBx_packed_sb = nl.ndarray(
+                    (P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf
                 )
+                nisa.memset(dst=dBx_packed_sb, value=0.0)
+                for p in nl.affine_range(PACK):
+                    s = s_base * PACK + p
+                    dBx_row = (d * SS + s) * NH
+                    nisa.dma_copy(
+                        dst=dBx_packed_sb[p * NH : (p + 1) * NH, 0:SL],
+                        src=dBx_t[dBx_row : dBx_row + NH, 0:SL],
+                    )
 
+                # Single scan for PACK state dimensions simultaneously
                 init_sb = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.memset(dst=init_sb, value=0.0)
 
-                state_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+                state_packed_sb = nl.ndarray(
+                    (P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf
+                )
                 nisa.tensor_tensor_scan(
-                    dst=state_sb[0:NH, 0:SL],
-                    data0=dA_sb[0:NH, 0:SL],
-                    data1=dBx_sb[0:NH, 0:SL],
-                    initial=init_sb[0:NH, 0:1],
+                    dst=state_packed_sb[0 : PACK * NH, 0:SL],
+                    data0=dA_packed_sb[0 : PACK * NH, 0:SL],
+                    data1=dBx_packed_sb[0 : PACK * NH, 0:SL],
+                    initial=init_sb[0 : PACK * NH, 0:1],
                     op0=nl.multiply,
                     op1=nl.add,
                 )
 
-                final_sb = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(
-                    dst=final_sb[0:NH, 0:1],
-                    src=state_sb[0:NH, SL - 1 : SL],
-                )
-                fs_row = (d * SS + s) * NH
-                nisa.dma_copy(
-                    dst=final_state_out[fs_row : fs_row + NH, 0:1],
-                    src=final_sb[0:NH, 0:1],
-                )
+                # Extract results for each packed slot
+                for p in nl.affine_range(PACK):
+                    s = s_base * PACK + p
 
-                C_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.memset(dst=C_sb, value=0.0)
-                C_row = s * NH
-                nisa.dma_copy(
-                    dst=C_sb[0:NH, 0:SL],
-                    src=C_t[C_row : C_row + NH, 0:SL],
-                )
+                    # Save final state
+                    final_sb = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(
+                        dst=final_sb[0:NH, 0:1],
+                        src=state_packed_sb[p * NH : (p + 1) * NH, SL - 1 : SL],
+                    )
+                    fs_row = (d * SS + s) * NH
+                    nisa.dma_copy(
+                        dst=final_state_out[fs_row : fs_row + NH, 0:1],
+                        src=final_sb[0:NH, 0:1],
+                    )
 
-                Cs_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_tensor(
-                    dst=Cs_sb[0:NH, 0:SL],
-                    data1=C_sb[0:NH, 0:SL],
-                    data2=state_sb[0:NH, 0:SL],
-                    op=nl.multiply,
-                )
-                nisa.tensor_tensor(
-                    dst=y_acc_sb[0:NH, 0:SL],
-                    data1=y_acc_sb[0:NH, 0:SL],
-                    data2=Cs_sb[0:NH, 0:SL],
-                    op=nl.add,
-                )
+                    # y_acc += C[s] * state[s]
+                    C_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.memset(dst=C_sb, value=0.0)
+                    C_row = s * NH
+                    nisa.dma_copy(
+                        dst=C_sb[0:NH, 0:SL],
+                        src=C_t[C_row : C_row + NH, 0:SL],
+                    )
+
+                    state_slice_sb = nl.ndarray(
+                        (P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    nisa.tensor_copy(
+                        dst=state_slice_sb[0:NH, 0:SL],
+                        src=state_packed_sb[p * NH : (p + 1) * NH, 0:SL],
+                    )
+
+                    Cs_sb = nl.ndarray((P_MAX, SL), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_tensor(
+                        dst=Cs_sb[0:NH, 0:SL],
+                        data1=C_sb[0:NH, 0:SL],
+                        data2=state_slice_sb[0:NH, 0:SL],
+                        op=nl.multiply,
+                    )
+                    nisa.tensor_tensor(
+                        dst=y_acc_sb[0:NH, 0:SL],
+                        data1=y_acc_sb[0:NH, 0:SL],
+                        data2=Cs_sb[0:NH, 0:SL],
+                        op=nl.add,
+                    )
 
             y_row = d * NH
             nisa.dma_copy(
@@ -512,7 +560,7 @@ class NeuronMamba2Layer(nn.Module):
     Architecture:
     - in_proj: hidden_size -> projection_size (gather_output=True)
     - Split into: gate (z), xBC_input, dt
-    - Manual depthwise conv1d on xBC (avoids TEN404 NKI bug)
+    - Depthwise conv1d on xBC (nn.Conv1d with groups=channels)
     - SiLU activation
     - Split conv output into: x, B, C
     - SSM computation (parallel scan for prefill, recurrence for decode)
@@ -567,15 +615,18 @@ class NeuronMamba2Layer(nn.Module):
                 self.intermediate_size, self.hidden_size, bias=False
             )
 
-        # Manual depthwise Conv1d — the NKI auto-inserted kernel crashes with
-        # TEN404 on seq_len=1. We store weights as plain parameters.
-        self.conv_weight = nn.Parameter(
-            torch.randn(self.conv_dim, self.conv_kernel_size)
+        # Depthwise Conv1d — TEN404 bug fixed in SDK 2.29.1, using native nn.Conv1d.
+        # groups=conv_dim makes this a depthwise convolution (one filter per channel).
+        # Causal padding: left-pad by (kernel_size - 1) so output[t] only depends on input[<=t].
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=self.conv_kernel_size
+            - 1,  # Full left+right padding; we trim right side
+            bias=self.use_conv_bias,
         )
-        if self.use_conv_bias:
-            self.conv_bias = nn.Parameter(torch.zeros(self.conv_dim))
-        else:
-            self.conv_bias = None
 
         # SSM parameters
         self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
@@ -718,27 +769,35 @@ class NeuronMamba2Layer(nn.Module):
             # nki-lib accelerated depthwise conv1d (TensorE implicit GEMM)
             hidden_states_B_C_conv = _nkilib_depthwise_conv1d(
                 hidden_states_B_C,
-                self.conv_weight,
-                self.conv_bias,
+                self.conv1d.weight.squeeze(1),  # (conv_dim, 1, K) -> (conv_dim, K)
+                self.conv1d.bias,
                 self.conv_kernel_size,
             )
         else:
-            # Manual depthwise conv1d with causal padding (TEN404 workaround)
+            # Manual depthwise conv1d for CTE (avoids compiler bug NCC_IBCG901 in
+            # NativeNkiKernel Conv1d_depthwise at seq_len>1 on SDK 2.29.1).
+            # Uses nn.Conv1d weights directly via loop over kernel taps.
+            # Input: (batch, seq_len, conv_dim)
+            K = self.conv_kernel_size
+            # Causal padding: pad K-1 zeros on the left
+            # hidden_states_B_C shape: (batch, seq_len, conv_dim)
             padded = F.pad(
-                hidden_states_B_C, (0, 0, self.conv_kernel_size - 1, 0), value=0.0
-            )
-
-            hidden_states_conv = torch.zeros_like(hidden_states_B_C)
-            for k in range(self.conv_kernel_size):
-                hidden_states_conv = hidden_states_conv + (
-                    padded[:, k : k + seq_len, :]
-                    * self.conv_weight[:, k].unsqueeze(0).unsqueeze(0)
+                hidden_states_B_C,  # (batch, seq_len, conv_dim)
+                (0, 0, K - 1, 0),  # pad seq_len dim: (left=K-1, right=0)
+                value=0.0,
+            )  # -> (batch, seq_len + K - 1, conv_dim)
+            # conv1d.weight shape: (conv_dim, 1, K) — depthwise
+            conv_weight = self.conv1d.weight.squeeze(1)  # -> (conv_dim, K)
+            # Accumulate over kernel taps (K=4, so just 4 iterations)
+            hidden_states_B_C_conv = torch.zeros_like(hidden_states_B_C)
+            for k in range(K):
+                # padded[:, k:k+seq_len, :] gives the k-th shifted input
+                hidden_states_B_C_conv = hidden_states_B_C_conv + (
+                    padded[:, k : k + seq_len, :] * conv_weight[None, None, :, k]
                 )
-
-            hidden_states_B_C_conv = hidden_states_conv
-            if self.conv_bias is not None:
+            if self.conv1d.bias is not None:
                 hidden_states_B_C_conv = (
-                    hidden_states_B_C_conv + self.conv_bias.unsqueeze(0).unsqueeze(0)
+                    hidden_states_B_C_conv + self.conv1d.bias[None, None, :]
                 )
 
         # Save conv_state from last K-1 real token positions
@@ -868,13 +927,15 @@ class NeuronMamba2Layer(nn.Module):
         """Decode path: single token, O(1) SSM update."""
         xBC_new = hidden_states_B_C.squeeze(1)
 
-        # Conv1d with state
+        # Conv1d with state: concatenate history + new token, apply conv weights
         xBC_new_t = xBC_new.unsqueeze(2)
-        conv_input = torch.cat([conv_state, xBC_new_t], dim=2)
+        conv_input = torch.cat([conv_state, xBC_new_t], dim=2)  # (B, C, K)
 
-        conv_out = (conv_input * self.conv_weight.unsqueeze(0)).sum(dim=2)
-        if self.conv_bias is not None:
-            conv_out = conv_out + self.conv_bias
+        # Dot product of conv_input with conv weights (equivalent to conv1d at seq_len=1)
+        conv_weight = self.conv1d.weight.squeeze(1)  # (conv_dim, 1, K) -> (conv_dim, K)
+        conv_out = (conv_input * conv_weight.unsqueeze(0)).sum(dim=2)
+        if self.conv1d.bias is not None:
+            conv_out = conv_out + self.conv1d.bias
 
         conv_state_new = conv_input[:, :, 1:].contiguous()
         conv_out = F.silu(conv_out)
@@ -932,18 +993,13 @@ def get_rmsnorm_cls():
 def convert_hf_to_neuron_mamba_weights(
     hf_state_dict: Dict[str, torch.Tensor], tp_degree: int = 4
 ) -> Dict[str, torch.Tensor]:
-    """Convert HF Granite Mamba conv1d weight keys to our parameter names."""
-    converted = {}
-    for key, tensor in hf_state_dict.items():
-        if "conv1d.weight" in key:
-            new_key = key.replace("conv1d.weight", "conv_weight")
-            converted[new_key] = tensor.squeeze(1)
-        elif "conv1d.bias" in key:
-            new_key = key.replace("conv1d.bias", "conv_bias")
-            converted[new_key] = tensor
-        else:
-            converted[key] = tensor
-    return converted
+    """Convert HF Granite Mamba weight keys to NxDI parameter names.
+
+    With nn.Conv1d, conv1d.weight and conv1d.bias keys match directly
+    (no renaming needed). This function is retained for any future key
+    remapping needs.
+    """
+    return dict(hf_state_dict)
 
 
 # ==============================================================================
