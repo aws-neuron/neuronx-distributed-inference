@@ -23,9 +23,14 @@ Key implementation details:
 - Mamba state persistence via nn.ParameterList + input_output_aliases
   (same mechanism as KV cache, following MLlama vision_key_values pattern)
 - Manual depthwise conv1d to avoid TEN404 NKI kernel bug on seq_len=1
+  (optional nki-lib depthwise_conv1d_implicit_gemm for prefill acceleration)
 - Full-sequence parallel scan for prefill, O(1) recurrence for decode
 - GraniteRMSNormGated: gate applied BEFORE norm (norm_before_gate=False)
 - ScaledEmbedding/ScaledLMHead wrappers for Granite's multiplier/scaling
+
+NKI kernels (optional, controlled by flags):
+- USE_NKI_SCAN: O(L) hardware scan via nisa.tensor_tensor_scan (NKI 0.3.0 GA)
+- USE_NKILIB_CONV1D: TensorE-accelerated depthwise conv1d from nki-lib
 """
 
 import gc
@@ -73,6 +78,17 @@ logger = logging.getLogger(__name__)
 
 USE_NKI_SCAN = False
 
+# ==============================================================================
+# nki-lib Depthwise Conv1D for Mamba2 prefill
+# ==============================================================================
+# When enabled, replaces the manual slice-and-multiply conv1d with the optimized
+# depthwise_conv1d_implicit_gemm from nki-lib (experimental/conv/).
+# Uses TensorE matmuls via implicit GEMM — much faster than the manual loop.
+# Only applies to prefill path (seq_len > 1); decode uses conv_state dot product.
+# Requires: C % 2 == 0 (LNC2 sharding), which Granite satisfies (conv_dim=8448).
+
+USE_NKILIB_CONV1D = False
+
 try:
     import nki
     import nki.language as nl
@@ -84,6 +100,26 @@ except ImportError:
     if USE_NKI_SCAN:
         logger.warning("NKI not available, falling back to quadratic scan")
         USE_NKI_SCAN = False
+    if USE_NKILIB_CONV1D:
+        logger.warning("NKI not available, falling back to manual conv1d")
+        USE_NKILIB_CONV1D = False
+
+# Try to import nki-lib depthwise conv1d
+HAS_NKILIB_CONV1D = False
+if HAS_NKI and USE_NKILIB_CONV1D:
+    try:
+        from nkilib.experimental.conv.depthwise_conv1d import (
+            depthwise_conv1d_implicit_gemm,
+        )
+
+        HAS_NKILIB_CONV1D = True
+        logger.info("nki-lib depthwise_conv1d_implicit_gemm available")
+    except ImportError:
+        logger.warning(
+            "nki-lib not installed, falling back to manual conv1d. "
+            "Install with: pip install git+https://github.com/aws-neuron/nki-library.git"
+        )
+        USE_NKILIB_CONV1D = False
 
 if HAS_NKI and USE_NKI_SCAN:
     P_MAX = 128
@@ -281,6 +317,56 @@ def _nki_selective_scan(
     )
 
     return y, final_state
+
+
+def _nkilib_depthwise_conv1d(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    conv_kernel_size: int,
+) -> torch.Tensor:
+    """
+    Optimized depthwise conv1d using nki-lib's implicit GEMM kernel.
+
+    Replaces the manual slice-and-multiply loop with a TensorE-accelerated
+    depthwise convolution. Only used for prefill (seq_len > 1).
+
+    Args:
+        input_tensor: (batch, seq_len, conv_dim) — input to convolve
+        weight: (conv_dim, kernel_size) — depthwise conv weights
+        bias: (conv_dim,) or None — optional bias
+        conv_kernel_size: int — kernel size (typically 4 for Mamba2)
+
+    Returns:
+        output: (batch, seq_len, conv_dim) — convolution result (no activation)
+    """
+    batch_size, seq_len, conv_dim = input_tensor.shape
+
+    # Reshape for nki-lib: [N, C, 1, W] format
+    # Input: (batch, seq_len, conv_dim) → (batch, conv_dim, 1, seq_len)
+    img = input_tensor.transpose(1, 2).unsqueeze(2)  # (B, C, 1, W=seq_len)
+
+    # Weight: (conv_dim, kernel_size) → (C, 1, 1, S)
+    filter_4d = weight.unsqueeze(1).unsqueeze(1)  # (C, 1, 1, S)
+
+    # Causal padding: left-pad by (kernel_size - 1), right-pad by 0
+    # After padding, W_padded = seq_len + kernel_size - 1
+    # Output Q = (W_padded - S) // stride + 1 = (seq_len + K-1 - K) // 1 + 1 = seq_len
+    output_4d = depthwise_conv1d_implicit_gemm(
+        img_ref=img,
+        filter_ref=filter_4d,
+        padding=((0, 0), (conv_kernel_size - 1, 0)),
+        stride=(1, 1),
+        feature_group_count=conv_dim,
+    )  # (B, C, 1, seq_len)
+
+    # Reshape back: (batch, conv_dim, 1, seq_len) → (batch, seq_len, conv_dim)
+    output = output_4d.squeeze(2).transpose(1, 2)
+
+    if bias is not None:
+        output = output + bias.unsqueeze(0).unsqueeze(0)
+
+    return output
 
 
 # ==============================================================================
@@ -627,23 +713,33 @@ class NeuronMamba2Layer(nn.Module):
         padding_mask=None,
     ):
         """Prefill path: process full sequence with parallel scan."""
-        # Manual depthwise conv1d with causal padding
-        padded = F.pad(
-            hidden_states_B_C, (0, 0, self.conv_kernel_size - 1, 0), value=0.0
-        )
-
-        hidden_states_conv = torch.zeros_like(hidden_states_B_C)
-        for k in range(self.conv_kernel_size):
-            hidden_states_conv = hidden_states_conv + (
-                padded[:, k : k + seq_len, :]
-                * self.conv_weight[:, k].unsqueeze(0).unsqueeze(0)
+        # Depthwise conv1d with causal padding
+        if USE_NKILIB_CONV1D and HAS_NKILIB_CONV1D:
+            # nki-lib accelerated depthwise conv1d (TensorE implicit GEMM)
+            hidden_states_B_C_conv = _nkilib_depthwise_conv1d(
+                hidden_states_B_C,
+                self.conv_weight,
+                self.conv_bias,
+                self.conv_kernel_size,
+            )
+        else:
+            # Manual depthwise conv1d with causal padding (TEN404 workaround)
+            padded = F.pad(
+                hidden_states_B_C, (0, 0, self.conv_kernel_size - 1, 0), value=0.0
             )
 
-        hidden_states_B_C_conv = hidden_states_conv
-        if self.conv_bias is not None:
-            hidden_states_B_C_conv = hidden_states_B_C_conv + self.conv_bias.unsqueeze(
-                0
-            ).unsqueeze(0)
+            hidden_states_conv = torch.zeros_like(hidden_states_B_C)
+            for k in range(self.conv_kernel_size):
+                hidden_states_conv = hidden_states_conv + (
+                    padded[:, k : k + seq_len, :]
+                    * self.conv_weight[:, k].unsqueeze(0).unsqueeze(0)
+                )
+
+            hidden_states_B_C_conv = hidden_states_conv
+            if self.conv_bias is not None:
+                hidden_states_B_C_conv = (
+                    hidden_states_B_C_conv + self.conv_bias.unsqueeze(0).unsqueeze(0)
+                )
 
         # Save conv_state from last K-1 real token positions
         if padding_mask is not None and seq_len >= self.conv_kernel_size - 1:
@@ -941,6 +1037,7 @@ class NeuronGraniteDecoderLayer(nn.Module):
             glu_mlp=config.neuron_config.glu_mlp,
             normalize_top_k_affinities=True,
             is_prefill=config.neuron_config.is_prefill_stage,
+            use_torch_block_wise=True,  # Required for SDK 2.29+ (NKI blockwise_mm removed)
         )
         shared_expert = SharedExperts(
             hidden_size=config.hidden_size,

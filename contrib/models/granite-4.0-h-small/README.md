@@ -54,29 +54,6 @@ Granite applies the gate BEFORE normalization (`norm_before_gate=False` in Mamba
 
 Prefill uses a full-sequence parallel scan via cumulative sum in log-space (L x L weight matrix). This is mathematically equivalent to HF's chunk-based SSD (chunk_size=256) but produces slightly different floating-point results due to BF16 precision and different accumulation order. Average Pearson=0.9968, average Cosine=0.9987 across 10 diverse prompts.
 
-### NKI Selective Scan Kernel (Optional)
-
-The model includes an optional NKI (Neuron Kernel Interface) kernel that replaces the O(L^2) quadratic parallel scan with an O(L) hardware-accelerated scan using `nisa.tensor_tensor_scan`. This is controlled by the `USE_NKI_SCAN` flag in `modeling_granite.py` (default: `False`).
-
-**Performance note:** At `max_context_length=128`, the quadratic scan is ~30% faster than the NKI kernel because the compiler efficiently vectorizes the 128x128 weight matrix operations, while the NKI kernel incurs overhead from 8,192 individual `tensor_tensor_scan` invocations (one per head_dim x ssm_state_size combination). At larger context lengths, the NKI kernel has a significant **compilation** advantage: at `max_context_length=256`, the NKI kernel compiles successfully while the quadratic scan causes compiler OOM (see Context Length Scaling section). The NKI kernel is expected to outperform the quadratic scan at runtime for L >= 256 on instances with sufficient HBM. See the Performance Benchmarks section for details.
-
-**How it works:**
-
-`tensor_tensor_scan` computes: `result[i] = op0(data0[i], result[i-1]) op1 data1[i]`
-
-For the Mamba2 SSM recurrence `state[t] = exp(dA[t]) * state[t-1] + dBx[t]`:
-- `data0 = exp(dA)`, `op0 = multiply`
-- `data1 = dBx`, `op1 = add`
-
-The kernel processes all 32 heads (TP-sharded from 128) in the partition dimension, with seq_len in the free dimension. An outer loop iterates over `head_dim(64) x ssm_state_size(128) = 8,192` scan invocations. Inputs are pre-transposed to `(num_heads, seq_len)` layout for efficient SBUF tiling.
-
-**Requirements:**
-- Set `NEURON_PLATFORM_TARGET_OVERRIDE` environment variable to match your target platform (e.g., `trn2` for Trainium2) during compilation
-- NKI Beta 2 / SDK 2.28+ (`import nki`, `import nki.language as nl`, `import nki.isa as nisa`)
-- Neuron hardware (Trainium or Inferentia with NKI support)
-
-**To enable:** Set `USE_NKI_SCAN = True` in `modeling_granite.py`. Recommended for `max_context_length >= 256` on instances with sufficient HBM, or when the quadratic scan fails to compile.
-
 ## Validation Results
 
 **Validated:** 2026-03-10
@@ -118,75 +95,18 @@ Both models produce coherent, factually correct text. Token-level divergence dur
 ### Compilation
 | Metric | Value |
 |--------|-------|
-| Compile time | ~16-20 min (trn2.3xlarge) |
+| Compile time | ~13 min (trn2.48xlarge), ~16 min (trn2.3xlarge) |
 | Compiler flags | `-O1 --auto-cast=none --enable-mixed-precision-accumulation` |
 
-**Note:** When using the NKI kernel (`USE_NKI_SCAN=True`), set `NEURON_PLATFORM_TARGET_OVERRIDE` to match your target platform (e.g., `trn2`) before compilation.
+### Inference Performance
 
-### NKI Kernel Accuracy (V16-NKI vs V15 Quadratic)
-
-The NKI selective scan kernel produces nearly identical results to the quadratic scan:
-
-| Metric | V15 (Quadratic) | V16 (NKI) |
-|--------|-----------------|-----------|
-| **Avg Pearson** | 0.9880 | 0.9872 |
-| **Avg Cosine** | 0.9800 | 0.9782 |
-| **Greedy match** | 100% | 100% |
-| **Generation quality** | Coherent | Matches V15 |
-
-The small difference between V15 and V16-NKI is due to different floating-point accumulation order (parallel quadratic vs sequential scan). Both produce correct text generation.
-
-## Performance Benchmarks
-
-**Benchmarked:** 2026-03-10
-**Configuration:** TP=4, batch_size=1, seq_len=2048, max_context_length=128, bfloat16
-**Instance:** trn2.3xlarge (LNC=2, SDK 2.28)
-
-### Latency Comparison: Quadratic Scan vs NKI Scan
-
-| Metric | Quadratic (default) | NKI Scan | Delta |
-|--------|-------------------|----------|-------|
-| **Prefill latency** | **717 ms** | 935 ms | +30% slower |
-| **Decode per-token** | 50.3 ms | 50.3 ms | identical |
-| **100-token throughput** | **17.6 tok/s** | 16.9 tok/s | -4% |
-| **100-token total** | 5694 ms | 5915 ms | +3.9% |
-
-**Analysis:**
-- Prefill latency is constant regardless of prompt length (1-23 tokens) because NxDI pads all inputs to `max_context_length=128`
-- The quadratic scan wins at L=128 because the compiler efficiently vectorizes the 128x128 weight matrix, while the NKI kernel has overhead from 8,192 individual `tensor_tensor_scan` calls
-- Decode latency is identical because the NKI kernel only affects prefill (decode uses O(1) recurrence)
-- The NKI kernel is required for L >= 256 where the quadratic scan fails to compile (compiler OOM)
-- **Recommendation:** Use the default quadratic scan for `max_context_length <= 128`. Enable NKI scan for larger contexts where the quadratic scan fails to compile.
-
-### Context Length Scaling
-
-The model's compilation and runtime behavior varies significantly with context length due to the large MoE architecture (72 experts × 40 layers). Testing was performed on trn2.3xlarge (96 GB HBM total, 24 GB per logical core with LNC=2).
-
-| max_context_length | Quadratic Compile | NKI Compile | Runtime Load | Notes |
-|--------------------|-------------------|-------------|-------------|-------|
-| **128** | OK (~16 min) | OK (~20 min) | OK (both) | Fully benchmarked, quadratic faster |
-| **256** | **FAILED** (compiler OOM) | **OK** (~19 min) | **FAILED** (HBM OOM) | NKI compiles where quadratic cannot |
-| **512** | FAILED (compiler OOM) | FAILED (compiler OOM) | N/A | Graph too large for 124 GB host RAM |
-| **1024** | FAILED (compiler OOM) | FAILED (compiler OOM) | N/A | Graph too large for 124 GB host RAM |
-
-**Key findings:**
-
-1. **NKI kernel enables longer compilation:** At L=256, the NKI kernel produces a compiler-friendlier HLO graph (avoids the 256×256 quadratic weight matrix expansion), allowing successful compilation where the quadratic approach causes `neuronx-cc` to OOM (exit code 70, >74 GB host RAM).
-
-2. **HBM is the runtime bottleneck:** Even when the NKI kernel compiles at L=256, the model cannot be loaded on trn2.3xlarge because the compiled graph requires more HBM than the 24 GB available per logical core. The error is a 1 GB transpose buffer allocation failure on HBM.
-
-3. **MoE dominates memory:** The 72 experts × 40 layers = 2,880 expert weight sets are the primary memory consumer, not the Mamba SSM states or KV caches.
-
-4. **Larger instances unlock longer contexts:** trn2.48xlarge (32 devices, up to 3 TB total HBM) should support `max_context_length=256+` by distributing experts across more cores. The NKI kernel's compilation advantage becomes essential at these scales.
-
-### Latency Breakdown (Quadratic, default)
-
-| Phase | Latency | Notes |
-|-------|---------|-------|
-| Prefill (any prompt up to 128 tokens) | 717 ms | Constant due to padding to max_context_length |
-| Decode (per token, steady state) | ~50 ms | Measured from 100-token generation |
-| Model load (from compiled) | ~71 s | One-time cost, includes weight sharding |
-| Compilation | ~16-20 min | One-time cost |
+| Metric | Value |
+|--------|-------|
+| Prefill latency | 699 ms (L=128, any prompt length up to 128) |
+| Decode per-token | 56.9 ms |
+| Decode throughput | 17.6 tok/s (100 tokens) |
+| Instance | trn2.48xlarge / trn2.3xlarge (identical results) |
+| Config | TP=4, LNC=2, BS=1, BF16 |
 
 ## Usage
 
@@ -243,45 +163,70 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 ## Compatibility Matrix
 
-| Instance Type | SDK 2.28 | SDK 2.27 |
-|--------------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | Validated | Not tested |
-| trn2.48xlarge (TP=4+) | Should work | Not tested |
-| trn1.32xlarge | Not tested | Not tested |
+| Instance Type | SDK 2.29 | SDK 2.28 | SDK 2.27 |
+|--------------|----------|----------|----------|
+| trn2.3xlarge (TP=4, LNC=2) | Validated (18.5 tok/s) | Validated | Not tested |
+| trn2.48xlarge (TP=4, LNC=2) | Expected | Validated (identical to 3xlarge) | Not tested |
+| trn1.32xlarge | Not supported | Not tested | Not tested |
 
-**Note:** This model requires MoE support (`MoENeuronConfig`) and Mamba state persistence. The TEN404 conv1d workaround is specific to SDK 2.28; future SDK versions may not need it.
+> **NxDI 2.29+ requires Trn2 or newer hardware.** For Trn1 support, pin to SDK 2.28.
+
+**Note:** This model requires MoE support (`MoENeuronConfig`) and Mamba state persistence. The TEN404 conv1d workaround is specific to SDK 2.28; future SDK versions may not need it. The NKI selective scan kernel is disabled by default (`USE_NKI_SCAN = False`); the quadratic O(L^2) scan is used instead.
 
 ## Testing
 
 ```bash
-# Integration tests (requires Neuron hardware + model weights)
+# Run with pytest
 cd contrib/models/granite-4.0-h-small/
 pytest test/integration/test_model.py -v
 
 # Or run directly
 python test/integration/test_model.py
-
-# NKI kernel unit test (requires Neuron hardware)
-export NEURON_PLATFORM_TARGET_OVERRIDE=trn2  # set to your target platform
-python test/unit/test_nki_selective_scan.py
 ```
 
 ## Known Limitations
 
-1. **max_context_length=128 on trn2.3xlarge** — compiler OOM prevents L=256+ with quadratic scan; NKI compiles at L=256 but HBM is insufficient for runtime. Larger instances (trn2.48xlarge) are needed for longer contexts.
+1. **Maximum context length is 128.** This is a hard limit imposed by per-core HBM on trn2. See [Context Length Limits](#context-length-limits) below for details.
 2. **No on-device sampling tested** — current validation uses raw logits (`on_device_sampling_config=None`). Enabling on-device sampling for production use needs testing.
 3. **Batch size 1 only** — batch_size > 1 has not been validated.
-4. **NKI scan slower at short contexts** — the optional `USE_NKI_SCAN` kernel is ~30% slower than the default quadratic scan at `max_context_length=128` due to per-invocation overhead. It is disabled by default. Enable for `max_context_length >= 256` where it is required for compilation.
+4. **Full-sequence parallel scan** — the prefill SSM uses an O(L^2) parallel scan. For very long sequences, a chunk-based approach or NKI kernel would be more efficient, but is moot given the L=128 HBM limit.
 5. **Conv1d workaround** — manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK bug is fixed.
+
+## Context Length Limits
+
+**`max_context_length=128` is the maximum on all current trn2 instance types.**
+
+Extensive testing on trn2.48xlarge (32 Neuron devices, 3 TB total HBM) confirmed that L=256 cannot be achieved with any combination of tensor parallelism, LNC configuration, or scan implementation:
+
+| Config | Context | TP | LNC | Result |
+|--------|---------|-----|-----|--------|
+| Quadratic scan | 128 | 4 | 2 | **Works** — 17.6 tok/s |
+| Quadratic scan | 256 | 4 | 2 | Compiler HBM OOM (24.46 GB > 24 GB per-core limit) |
+| NKI scan | 256 | 4 | 2 | Compiles but HBM OOM at load (22.9 GB + 1 GB scratchpad needed) |
+| NKI scan | 256 | 8 | 1 | Compiles but HBM OOM at load (23.5 GB + 8 GB scratchpad) |
+
+### Root Cause
+
+The 36 Mamba2 layers each require persistent state buffers (`conv_state` and `ssm_state`) that scale with context length. At L=256, the combined per-core I/O tensors (15.4 GB) plus scratchpad (8 GB) exceed the 24 GB per-HBM-bank limit. These state buffers are **per-layer, per-core** — they do not shard with tensor parallelism. Increasing TP from 4 to 8 shards the MoE weights but not the SSM state, so per-core memory stays above the limit.
+
+### Why Other Parallelism Strategies Don't Help
+
+- **Pipeline parallelism (PP):** Would split layers across devices, but `pp_degree > 1` is untested for NxDI inference. Mamba state persistence via `input_output_aliases` has no support for PP boundaries, and decode latency would degrade from inter-device communication at every pipeline stage.
+- **Context parallelism (CP):** Splits the sequence dimension across cores. Well-supported in NxDI for attention models (Llama4, Qwen3-MoE). However, CP only helps the 4 attention layers (at indices 5, 15, 25, 35). The 36 Mamba layers use sequential SSM recurrence (`h[t] = A * h[t-1] + B * x[t]`) which cannot be split across the sequence axis without a custom parallel scan implementation — a research-level effort.
+
+### What Would Enable Longer Contexts
+
+1. **Custom parallel scan partitioning** for Mamba SSM state across multiple cores (research effort)
+2. **Future Neuron hardware** with larger per-core HBM (>24 GB)
+3. **Model architecture changes** — fewer Mamba layers or smaller SSM state dimension would reduce per-core memory
 
 ## Source Files
 
 | File | Description | Lines |
 |------|-------------|-------|
-| `src/modeling_granite.py` | Full model implementation with NKI selective scan kernel (config, Mamba layer, attention, MoE, NKI kernel, model wrapper, state dict conversion) | ~1600 |
+| `src/modeling_granite.py` | Full model implementation (config, Mamba layer, attention, MoE, model wrapper, state dict conversion) | ~930 |
 | `src/__init__.py` | Public exports | ~30 |
 | `test/integration/test_model.py` | Integration tests (compile, load, generate, coherence, throughput) | ~260 |
-| `test/unit/test_nki_selective_scan.py` | Standalone NKI selective scan kernel with CPU reference, quadratic reference, and validation tests | ~750 |
 
 ## Example Checkpoints
 
@@ -289,6 +234,6 @@ python test/unit/test_nki_selective_scan.py
 
 ## Maintainer
 
-Jim Burtoft (jimburtoft)
+- **GitHub:** [@jimburtoft](https://github.com/jimburtoft)
 
-**Last Updated:** 2026-03-10
+**Last Updated:** 2026-05-12
