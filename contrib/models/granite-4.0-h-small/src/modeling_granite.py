@@ -69,6 +69,73 @@ from neuronx_distributed.utils import cpu_mode
 
 logger = logging.getLogger(__name__)
 
+
+# ==============================================================================
+# Monkeypatch: Fix NCC_IBCG901 compiler bug in Conv1d_depthwise f_packing
+# ==============================================================================
+# SDK 2.29.1 (neuronx-cc 2.24.8799.0) has a BIRCodeGen assertion error in
+# conv1d_depthwise_f_packing when output width > 128 (our CTE case: W_out=131).
+# The conv1d_depthwise_default variant works correctly for all sizes.
+# This patch modifies the on-disk kernel to force the default implementation.
+def _patch_conv1d_depthwise_kernel():
+    """Patch neuronxcc conv1d kernel on disk to avoid f_packing BIRCodeGen bug.
+
+    The compiler spawns subprocesses that load neuronxcc.private_nkl.conv, so
+    in-process monkeypatching won't work. We must patch the source file directly.
+    """
+    try:
+        import neuronxcc.private_nkl.conv as conv_module
+
+        conv_path = conv_module.__file__
+        with open(conv_path, "r") as f:
+            content = f.read()
+
+        # Check if already patched (handles both manual sed patch and this script)
+        if "PATCHED_NCC_IBCG901" in content or (
+            "flattend_input_img_size = 1" in content and "# PATCHED" in content
+        ):
+            logger.info("conv1d_depthwise kernel already patched (NCC_IBCG901)")
+            return True
+
+        # Patch: force flattend_input_img_size = 1 before dispatch check
+        old = "  # Dispatch based on f-packing tile count\n  if flattend_input_img_size == 1:"
+        new = (
+            "  # PATCHED_NCC_IBCG901: Force default variant to avoid BIRCodeGen assertion\n"
+            "  flattend_input_img_size = 1\n"
+            "  # Dispatch based on f-packing tile count\n"
+            "  if flattend_input_img_size == 1:"
+        )
+        if old not in content:
+            logger.warning(
+                "conv1d_depthwise: dispatch pattern not found, skipping patch"
+            )
+            return False
+
+        content = content.replace(old, new)
+        with open(conv_path, "w") as f:
+            f.write(content)
+
+        # Clear .pyc cache
+        import pathlib
+
+        pyc = pathlib.Path(conv_path).parent / "__pycache__"
+        if pyc.exists():
+            for p in pyc.glob("conv.cpython-*.pyc"):
+                p.unlink()
+
+        logger.info(f"Patched conv1d_depthwise at {conv_path} (NCC_IBCG901 fix)")
+        return True
+    except (ImportError, AttributeError, PermissionError) as e:
+        logger.warning(
+            f"Could not patch conv1d_depthwise kernel: {e}. "
+            "CTE will use manual conv loop fallback."
+        )
+        return False
+
+
+# Apply patch at import time. If patch fails, CTE falls back to manual loop.
+_CONV1D_KERNEL_PATCHED = _patch_conv1d_depthwise_kernel()
+
 # ==============================================================================
 # NKI Selective Scan Kernel for Mamba2 prefill
 # ==============================================================================
@@ -774,31 +841,33 @@ class NeuronMamba2Layer(nn.Module):
                 self.conv_kernel_size,
             )
         else:
-            # Manual depthwise conv1d for CTE (avoids compiler bug NCC_IBCG901 in
-            # NativeNkiKernel Conv1d_depthwise at seq_len>1 on SDK 2.29.1).
-            # Uses nn.Conv1d weights directly via loop over kernel taps.
-            # Input: (batch, seq_len, conv_dim)
-            K = self.conv_kernel_size
-            # Causal padding: pad K-1 zeros on the left
-            # hidden_states_B_C shape: (batch, seq_len, conv_dim)
-            padded = F.pad(
-                hidden_states_B_C,  # (batch, seq_len, conv_dim)
-                (0, 0, K - 1, 0),  # pad seq_len dim: (left=K-1, right=0)
-                value=0.0,
-            )  # -> (batch, seq_len + K - 1, conv_dim)
-            # conv1d.weight shape: (conv_dim, 1, K) — depthwise
-            conv_weight = self.conv1d.weight.squeeze(1)  # -> (conv_dim, K)
-            # Accumulate over kernel taps (K=4, so just 4 iterations)
-            hidden_states_B_C_conv = torch.zeros_like(hidden_states_B_C)
-            for k in range(K):
-                # padded[:, k:k+seq_len, :] gives the k-th shifted input
-                hidden_states_B_C_conv = hidden_states_B_C_conv + (
-                    padded[:, k : k + seq_len, :] * conv_weight[None, None, :, k]
-                )
-            if self.conv1d.bias is not None:
-                hidden_states_B_C_conv = (
-                    hidden_states_B_C_conv + self.conv1d.bias[None, None, :]
-                )
+            # Native nn.Conv1d (TEN404 fixed in SDK 2.29.1)
+            # Requires _patch_conv1d_depthwise_kernel() to have patched the compiler
+            # kernel (avoids NCC_IBCG901 bug in f_packing variant at seq_len>1).
+            # If patch failed, falls back to manual loop over kernel taps.
+            if _CONV1D_KERNEL_PATCHED:
+                # Input: (batch, seq_len, conv_dim) -> (batch, conv_dim, seq_len)
+                conv_input = hidden_states_B_C.transpose(1, 2)
+                conv_output = self.conv1d(conv_input)[:, :, :seq_len]
+                hidden_states_B_C_conv = conv_output.transpose(
+                    1, 2
+                )  # -> (batch, seq_len, conv_dim)
+            else:
+                # Fallback: manual depthwise conv1d via loop over K taps
+                K = self.conv_kernel_size
+                padded = F.pad(
+                    hidden_states_B_C, (0, 0, K - 1, 0), value=0.0
+                )  # -> (batch, seq_len + K - 1, conv_dim)
+                conv_weight = self.conv1d.weight.squeeze(1)  # -> (conv_dim, K)
+                hidden_states_B_C_conv = torch.zeros_like(hidden_states_B_C)
+                for k in range(K):
+                    hidden_states_B_C_conv = hidden_states_B_C_conv + (
+                        padded[:, k : k + seq_len, :] * conv_weight[None, None, :, k]
+                    )
+                if self.conv1d.bias is not None:
+                    hidden_states_B_C_conv = (
+                        hidden_states_B_C_conv + self.conv1d.bias[None, None, :]
+                    )
 
         # Save conv_state from last K-1 real token positions
         if padding_mask is not None and seq_len >= self.conv_kernel_size - 1:
