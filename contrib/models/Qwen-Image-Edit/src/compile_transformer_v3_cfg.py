@@ -468,7 +468,7 @@ def get_rope_from_original_model(pipe, frame, height, width, text_seq_len, dtype
 
     video_fhw = (frame, height, width)
     vid_freqs, txt_freqs = pipe.transformer.pos_embed(
-        video_fhw, txt_seq_lens=[text_seq_len], device=torch.device('cpu')
+        video_fhw, max_txt_seq_len=text_seq_len, device=torch.device('cpu')
     )
 
     img_cos = vid_freqs.real.float()
@@ -601,7 +601,7 @@ def compile_transformer_v3_cfg(args):
         )
 
         print("Compiling model...")
-        compile_args = "--model-type=transformer -O1 --auto-cast=none --lnc=2 --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=4' --internal-hlo2tensorizer-options='--enable-native-kernel=1 --remat'"
+        compile_args = "--model-type=transformer -O2 --auto-cast=none --lnc=2 --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=4' --internal-hlo2tensorizer-options='--enable-native-kernel=1 --remat'"
         traced_model = builder.compile(
             compiler_args=compile_args,
             compiler_workdir=args.compiler_workdir,
@@ -657,14 +657,20 @@ def compile_transformer_v3_cfg(args):
             original_count = len(shard_data)
             original_size = sum(v.numel() * v.element_size() for v in shard_data.values())
 
-            # Remove master_weight tensors (they duplicate the sharded weights)
-            cleaned = {k: v for k, v in shard_data.items() if 'master_weight' not in k}
+            # Remove master_weight tensors (they duplicate the sharded weights).
+            # Clone because load_file returns mmap'd tensors; overwriting the source
+            # file invalidates their backing storage and safetensors errors with
+            # "Bad address (os error 14)" during serialization.
+            cleaned = {k: v.clone().contiguous() for k, v in shard_data.items() if 'master_weight' not in k}
 
             # Add SPMDRank state (same value for all ranks)
             if global_rank_state:
-                cleaned.update(global_rank_state)
+                cleaned.update({k: v.clone().contiguous() if hasattr(v, 'clone') else v
+                                for k, v in global_rank_state.items()})
 
             cleaned_size = sum(v.numel() * v.element_size() for v in cleaned.values())
+            # Drop the original mmap before writing to the same path
+            del shard_data
             save_file(cleaned, shard_file)
             print(f"  tp{rank}: {original_count} -> {len(cleaned)} tensors, "
                   f"{original_size/1e9:.2f}GB -> {cleaned_size/1e9:.2f}GB")

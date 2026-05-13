@@ -73,7 +73,7 @@ except ImportError:
     print("WARNING: NxDModel not available. V2 models cannot be loaded.")
 
 # Constants
-COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models"
+COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models_qwen_image_edit"
 HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
 SEED = 42
@@ -892,7 +892,29 @@ class NeuronTransformerWrapperV3CFG(torch.nn.Module):
     def forward(self, hidden_states, encoder_hidden_states=None,
                 timestep=None, img_shapes=None, return_dict=False, **kwargs):
         """Forward pass with CFG Parallel. Expects batch_size=2 input."""
+        import time as _time
+        _step_t0 = _time.time()
         batch_size = hidden_states.shape[0]
+
+        # Opt-in per-step profile capture via QIE_PROFILE_STEP env var.
+        # Writes NTFF to $QIE_PROFILE_DIR (default /tmp/qie_ntff).
+        import os as _os
+        _profile_step = int(_os.environ.get("QIE_PROFILE_STEP", "0"))
+        if _profile_step > 0 and not hasattr(self, "_step_count"):
+            self._step_count = 0
+        if _profile_step > 0:
+            self._step_count = getattr(self, "_step_count", 0) + 1
+            _should_profile = (self._step_count == _profile_step
+                               and not getattr(self, "_did_profile", False))
+        else:
+            _should_profile = False
+        if _should_profile:
+            import libneuronxla as _lnx
+            _dump = _os.environ.get("QIE_PROFILE_DIR", "/tmp/qie_ntff")
+            _os.makedirs(_dump, exist_ok=True)
+            _lnx.set_global_profiler_dump_to(_dump)
+            _lnx.start_global_profiler_inspect(_dump)
+            print(f">>> QIE profile START (step {self._step_count}, dump={_dump})", flush=True)
 
         if not hasattr(self, '_debug_printed'):
             print(f"DEBUG Transformer V3 CFG input shapes:")
@@ -966,6 +988,18 @@ class NeuronTransformerWrapperV3CFG(torch.nn.Module):
 
         # Extract first frame as noise prediction for both batch items
         output_tensor = output_tensor[:, :self.base_patches, :]
+
+        if _should_profile:
+            import libneuronxla as _lnx
+            _lnx.stop_global_profiler_inspect()
+            self._did_profile = True
+            print(f">>> QIE profile STOP", flush=True)
+
+        _step_dt = _time.time() - _step_t0
+        if not hasattr(self, "_step_times"):
+            self._step_times = []
+        self._step_times.append(_step_dt)
+        print(f"  [transformer_step {len(self._step_times)}] {_step_dt*1000:.1f} ms")
 
         if return_dict:
             from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -1235,6 +1269,10 @@ def patch_pipeline_for_cfg_parallel(pipe):
             )
 
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+
+        import time as _time
+        _qie_stage_times = getattr(self, "_qie_stage_times", {})
+        _te_t0 = _time.time()
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             image=condition_images,
             prompt=prompt,
@@ -1254,6 +1292,9 @@ def patch_pipeline_for_cfg_parallel(pipe):
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
             )
+        _qie_stage_times["text_encoder"] = _time.time() - _te_t0
+        print(f"  [text_encoder] {_qie_stage_times['text_encoder']*1000:.1f} ms", flush=True)
+        self._qie_stage_times = _qie_stage_times
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
@@ -1418,7 +1459,13 @@ def patch_pipeline_for_cfg_parallel(pipe):
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
+            import time as _time
+            _vae_t0 = _time.time()
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+            _vae_dt = _time.time() - _vae_t0
+            print(f"  [vae_decode] {_vae_dt*1000:.1f} ms", flush=True)
+            if hasattr(self, "_qie_stage_times"):
+                self._qie_stage_times["vae_decode"] = _vae_dt
             image = self.image_processor.postprocess(image, output_type=output_type)
 
         self.maybe_free_model_hooks()

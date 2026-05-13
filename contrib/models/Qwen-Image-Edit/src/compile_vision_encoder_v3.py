@@ -462,15 +462,17 @@ def compile_vision_encoder_v3(args):
             original_count = len(data)
             original_size = sum(v.numel() * v.element_size() for v in data.values())
 
-            # Remove master_weight tensors (they duplicate the sharded weights)
-            cleaned = {k: v for k, v in data.items() if "master_weight" not in k}
+            # Remove master_weight tensors. Clone to detach from mmap before overwrite.
+            cleaned = {k: v.clone().contiguous() for k, v in data.items() if "master_weight" not in k}
 
             # Add inv_freq buffers
-            cleaned.update(inv_freq_buffers)
+            cleaned.update({k: (v.clone().contiguous() if hasattr(v, 'clone') else v)
+                            for k, v in inv_freq_buffers.items()})
 
             cleaned_size = sum(v.numel() * v.element_size() for v in cleaned.values())
 
             # Save optimized checkpoint
+            del data
             save_file(cleaned, shard_file)
             print(
                 f"  tp{rank}: {original_count} -> {len(cleaned)} tensors, "
