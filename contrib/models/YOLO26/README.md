@@ -100,7 +100,9 @@ print(f"CosSim: {metrics['cosine_similarity']}")
 3. **FP32 fails for m/l/x variants.** Use BF16 (`torch.bfloat16`) for these variants. FP32 for n/s only.
 4. **`--auto-cast=matmult` produces NaN.** Do not use autocast flags with YOLO26.
 5. **LNC=1 requires `--lnc 1` compiler flag.** NEFFs compiled without this flag cannot run on LNC=1 runtime.
-6. **Backbone compilation fails at batch size >= 4 at non-square resolutions.** Compiling layers 0-9 at batch sizes 4+ with rectangular input (e.g., 384x640) triggers an internal compiler error (`NCC_IPCC901`). Batch sizes 1-3 compile successfully. At 640x640 (square), larger batch sizes compile fine.
+6. **`torch.Tensor.split()` compiler bug (two manifestations):**
+   - *Numerical corruption:* `.split()` with unequal sizes on dim=2 of a 4D tensor (in C2PSA Attention) produces CosSim ~0.45. Fixed by patching `Attention.forward` to use tensor slicing.
+   - *Compilation failure:* `.split((c, c), dim=1)` in C2f blocks causes exit code 70 at batch_size=4 with small spatial dimensions (H×W < ~264). Fixed by using `.chunk(2, 1)` instead. See [aws-neuron-sdk#1323](https://github.com/aws-neuron/aws-neuron-sdk/issues/1323).
 7. **Classification variant has precision issue.** Narrow logit range + softmax amplification causes CosSim 0.257. Detection, pose, and OBB are unaffected.
 
 ## Compatibility Matrix

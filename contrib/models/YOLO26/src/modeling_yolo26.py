@@ -77,6 +77,21 @@ COSINE_SIM_THRESHOLDS = {
 # ---------------------------------------------------------------------------
 
 
+def _c2f_forward_chunk(self, x: torch.Tensor) -> torch.Tensor:
+    """C2f forward using .chunk() instead of .split().
+
+    The neuronx-cc compiler has a bug where .split((c, c), dim=1) causes
+    compilation failure (exit code 70) at batch_size=4 with small spatial
+    dimensions (H*W < ~264). Using .chunk(2, 1) — which is semantically
+    identical — compiles correctly.
+
+    See: https://github.com/aws-neuron/aws-neuron-sdk/issues/1323
+    """
+    y = list(self.cv1(x).chunk(2, 1))
+    y.extend(m(y[-1]) for m in self.m)
+    return self.cv2(torch.cat(y, 1))
+
+
 def _attention_forward_fixed(self, x: torch.Tensor) -> torch.Tensor:
     """Fixed Attention.forward that uses slicing instead of .split().
 
@@ -113,7 +128,8 @@ def prepare_yolo26(weight_path: str, dtype: torch.dtype = torch.float32) -> nn.M
     1. Set ``end2end=False`` before ``fuse()`` (topk unsupported on Neuron)
     2. ``fuse()`` merges BatchNorm into Conv2d, removes training branches
     3. Set ``export=True``, ``dynamic=False`` for clean single-tensor output
-    4. Replace ``C2f.forward`` with ``C2f.forward_split`` (split vs chunk)
+    4. Replace ``C2f.forward`` with chunk-based forward (works around
+       neuronx-cc compiler bug where ``.split()`` fails at bs=4)
     5. Patch ``Attention.forward`` to use slicing instead of ``.split()``
        (works around neuronx-cc compiler bug with unequal split sizes)
     6. Convert to target dtype if not FP32
@@ -148,8 +164,12 @@ def prepare_yolo26(weight_path: str, dtype: torch.dtype = torch.float32) -> nn.M
             m.format = "torchscript"
         if hasattr(m, "shape"):
             m.shape = None
+        # Fix C2f: use chunk-based forward instead of forward_split to work
+        # around neuronx-cc compiler bug where .split() causes compilation
+        # failure at bs=4 with small spatial dimensions (exit code 70).
+        # chunk(2, 1) is semantically identical to split((c, c), 1).
         if isinstance(m, C2f):
-            m.forward = m.forward_split
+            m.forward = _c2f_forward_chunk.__get__(m, type(m))
         # Fix C2PSA Attention: replace .split() with slicing to work around
         # neuronx-cc compiler bug with unequal split sizes on dim=2
         if UltralyticsAttention is not None and isinstance(m, UltralyticsAttention):
