@@ -26,7 +26,7 @@ Qwen3.6 weights.
 
 | Model | HuggingFace ID | Params | Instance |
 |-------|----------------|--------|----------|
-| **Qwen3.6-27B** | `Qwen/Qwen3.6-27B` | 27B | trn2.3xlarge (TP=4) |
+| **Qwen3.6-27B** | [`Qwen/Qwen3.6-27B`](https://huggingface.co/Qwen/Qwen3.6-27B) | 27B | trn2.3xlarge (TP=4) |
 
 **License:** Apache 2.0
 
@@ -63,9 +63,11 @@ Qwen3.6 weights.
 |-------------|-------|--------|
 | test_config.py | 26 | 26/26 PASS |
 | test_weight_conversion.py | 16 | 16/16 PASS |
-| **Total** | **42** | **42/42 PASS** |
+| test_hybrid_cache_manager.py | 13 | 13/13 PASS |
+| test_deltanet_decay.py | 2 | 2/2 PASS |
+| **Total** | **57** | **57/57 PASS** |
 
-Unit tests are architecture-level and do not depend on weights. Identical results to Qwen3.5-27B.
+Unit tests are architecture-level and do not depend on weights. Coverage includes config parsing, weight conversion, hybrid cache allocation/update behavior, and DeltaNet decay handling.
 
 ### Quality Validation (Qwen3.6-27B, trn2.3xlarge, TP=4, SDK 2.29)
 
@@ -304,7 +306,7 @@ cd contrib/models/Qwen3.6-27B/
 pytest test/unit/ -v
 ```
 
-Tests: config parsing (26), weight conversion (16) = **42 tests**.
+Tests: config parsing (26), weight conversion (16), hybrid cache manager (13), and DeltaNet decay handling (2) = **57 tests**.
 
 ### Integration Tests (needs trn2.3xlarge with 4 NeuronCores)
 
@@ -322,7 +324,7 @@ Note: The env var is `QWEN35_MODEL_PATH` (not `QWEN36`) because the code uses th
 
 ## Example Checkpoints
 
-- `Qwen/Qwen3.6-27B` (BF16, ~52 GB)
+- [`Qwen/Qwen3.6-27B`](https://huggingface.co/Qwen/Qwen3.6-27B) (BF16, ~52 GB)
 
 ## Maintainer
 
