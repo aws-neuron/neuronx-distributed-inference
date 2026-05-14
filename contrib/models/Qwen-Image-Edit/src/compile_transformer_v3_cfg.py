@@ -77,11 +77,19 @@ _legacy_flash_fwd_call = nki_jit()(attention_isa_kernel)
 # and without [grid] subscript — let the kernel handle LNC internally.
 _attention_cte_call = _nkilib_attention_cte
 
+# Phase 16: attention_cte fork that hoists the Q load out of the section
+# loop. QIE has num_sections=2 with identical Q across sections, so the
+# baseline kernel reloads Q in section_idx=1 unnecessarily. Hoisting saves
+# ~50% of Q DMA traffic on this workload.
+USE_HOISTED_Q_ATTENTION = os.getenv("QIE_HOISTED_Q_ATTENTION", "0") == "1"
+if USE_HOISTED_Q_ATTENTION:
+    from attention_cte_qie_hoisted_q import attention_cte_hoisted_q as _hoisted_q_call
+
 # Toggle between the two via env var (easy rollback during testing)
 USE_NKILIB_ATTENTION = os.getenv("QIE_USE_NKILIB_ATTENTION", "1") == "1"
 
 print(f"NKI Flash Attention kernel loaded: "
-      f"{'nkilib.core.attention.attention_cte' if USE_NKILIB_ATTENTION else 'attention_isa_kernel (legacy)'}")
+      f"{'attention_cte_hoisted_q (Phase 16: hoisted Q load)' if USE_HOISTED_Q_ATTENTION else ('nkilib.core.attention.attention_cte' if USE_NKILIB_ATTENTION else 'attention_isa_kernel (legacy)')}")
 
 CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
@@ -109,6 +117,23 @@ def nki_flash_attention(query, key, value):
     v_len = value.shape[2]
     scale = 1 / math.sqrt(d_head)
     vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
+
+    if USE_HOISTED_Q_ATTENTION:
+        # Phase 16: attention_cte fork that hoists Q load above the section loop.
+        # Same public API as attention_cte (causal_mask, tp_q/k/out, softmax_dtype, ...).
+        q = query.reshape(bs * n_head, q_len, d_head)
+        k = key.reshape(bs * n_head, k_len, d_head)
+        v = value.reshape(bs * n_head, v_len, d_head)
+        softmax_dtype = os.getenv("QIE_SOFTMAX_DTYPE", "float32")
+        kernel = _hoisted_q_call[vc_size]
+        attn_output = kernel(
+            q, k, v,
+            scale=scale, causal_mask=False,
+            tp_q=True, tp_k=True, tp_out=False,
+            softmax_dtype=softmax_dtype,
+            mm_out_dtype="float32",
+        )
+        return attn_output.reshape(bs, n_head, q_len, d_head)
 
     if USE_NKILIB_ATTENTION:
         # attention_cte expects:
