@@ -81,7 +81,7 @@ _attention_cte_call = _nkilib_attention_cte
 # loop. QIE has num_sections=2 with identical Q across sections, so the
 # baseline kernel reloads Q in section_idx=1 unnecessarily. Hoisting saves
 # ~50% of Q DMA traffic on this workload.
-USE_HOISTED_Q_ATTENTION = os.getenv("QIE_HOISTED_Q_ATTENTION", "0") == "1"
+USE_HOISTED_Q_ATTENTION = os.getenv("QIE_HOISTED_Q_ATTENTION", "1") == "1"
 if USE_HOISTED_Q_ATTENTION:
     from attention_cte_qie_hoisted_q import attention_cte_hoisted_q as _hoisted_q_call
 
