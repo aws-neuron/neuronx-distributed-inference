@@ -18,6 +18,8 @@ Neuron Strategy
 - No ``--auto-cast`` flags — ``matmult`` produces NaN for Conv2d-dominant models
 - Data Parallelism across NeuronCores for throughput scaling
 - ``--lnc 1`` compiler flag required when running on LNC=1 mode
+- **batch_size=1 per core recommended** — compiler bug degrades odd-indexed
+  batch elements at bs>=2 (see Known Issues #2 in README)
 
 Key Results (trn2.3xlarge, LNC=1, DP=8)
 ----------------------------------------

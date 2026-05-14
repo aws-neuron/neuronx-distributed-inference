@@ -95,15 +95,16 @@ print(f"CosSim: {metrics['cosine_similarity']}")
 
 ### Known Issues
 
-1. **C2PSA attention: `neuronx-cc` bug with `torch.Tensor.split()` (unequal sizes).** The Neuron compiler produces incorrect output when `.split([32, 32, 64], dim=2)` is applied to a 4D tensor after a `.view()` reshape. This caused the C2PSA attention module to produce CosSim ~0.46 vs CPU. **Fixed in `prepare_yolo26()`** by patching `Attention.forward` to use tensor slicing instead of `.split()`. The fix produces CosSim 0.9999. See [aws-neuron-sdk#1323](https://github.com/aws-neuron/aws-neuron-sdk/issues/1323) for the upstream compiler issue.
-2. **`topk` not supported on Neuron.** Models must be traced with `end2end=False`. Use `postprocess_detections()` for CPU NMS postprocessing (~0.1ms overhead).
-3. **FP32 fails for m/l/x variants.** Use BF16 (`torch.bfloat16`) for these variants. FP32 for n/s only.
-4. **`--auto-cast=matmult` produces NaN.** Do not use autocast flags with YOLO26.
-5. **LNC=1 requires `--lnc 1` compiler flag.** NEFFs compiled without this flag cannot run on LNC=1 runtime.
-6. **`torch.Tensor.split()` compiler bug (two manifestations):**
+1. **C2PSA attention: `neuronx-cc` bug with `torch.Tensor.split()` (unequal sizes).** The Neuron compiler produces incorrect output when `.split([32, 32, 64], dim=2)` is applied to a 4D tensor after a `.view()` reshape. This caused the C2PSA attention module to produce CosSim ~0.46 vs CPU. **Fixed in `prepare_yolo26()`** by patching `Attention.forward` to use tensor slicing instead of `.split()`. The fix produces CosSim 0.9999 at batch_size=1. See [aws-neuron-sdk#1323](https://github.com/aws-neuron/aws-neuron-sdk/issues/1323) for the upstream compiler issue.
+2. **C2PSA attention at batch_size >= 2: compiler graph-optimization bug.** When the attention block is compiled within the full YOLO26 graph at bs>=2, odd-indexed batch elements exhibit degraded accuracy (CosSim ~0.997 for odd elements, 1.000 for even elements). This is a separate `neuronx-cc` compiler issue from #1 — it triggers during graph-level optimization when the attention pattern is embedded in a larger CNN context. The attention block compiled in isolation works correctly at all batch sizes. No user-code workaround is available (tested: slice, narrow, contiguous, per-head loops, einsum, -O1, --model-type transformer — all produce identical results). **Recommended:** Use batch_size=1 per NeuronCore with Data Parallelism for correct output. See [aws-neuron-sdk#1323](https://github.com/aws-neuron/aws-neuron-sdk/issues/1323).
+3. **`topk` not supported on Neuron.** Models must be traced with `end2end=False`. Use `postprocess_detections()` for CPU NMS postprocessing (~0.1ms overhead).
+4. **FP32 fails for m/l/x variants.** Use BF16 (`torch.bfloat16`) for these variants. FP32 for n/s only.
+5. **`--auto-cast=matmult` produces NaN.** Do not use autocast flags with YOLO26.
+6. **LNC=1 requires `--lnc 1` compiler flag.** NEFFs compiled without this flag cannot run on LNC=1 runtime.
+7. **`torch.Tensor.split()` compiler bug (two manifestations):**
    - *Numerical corruption:* `.split()` with unequal sizes on dim=2 of a 4D tensor (in C2PSA Attention) produces CosSim ~0.45. Fixed by patching `Attention.forward` to use tensor slicing.
    - *Compilation failure:* `.split((c, c), dim=1)` in C2f blocks causes exit code 70 at batch_size=4 with small spatial dimensions (H×W < ~264). Fixed by using `.chunk(2, 1)` instead. See [aws-neuron-sdk#1323](https://github.com/aws-neuron/aws-neuron-sdk/issues/1323).
-7. **Classification variant has precision issue.** Narrow logit range + softmax amplification causes CosSim 0.257. Detection, pose, and OBB are unaffected.
+8. **Classification variant has precision issue.** Narrow logit range + softmax amplification causes CosSim 0.257. Detection, pose, and OBB are unaffected.
 
 ## Compatibility Matrix
 
