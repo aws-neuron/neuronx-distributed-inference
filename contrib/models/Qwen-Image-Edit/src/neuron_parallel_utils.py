@@ -53,10 +53,15 @@ def shard_rmsnorm(orig_norm, new_dim):
     return new_norm
 
 
-def shard_qwen_attention(tp_degree: int, attn: Attention):
+def shard_qwen_attention(tp_degree: int, attn: Attention, reduce_dtype: torch.dtype = torch.float32):
     """
     Shard QwenImage attention module for tensor parallelism.
     This handles both image attention (to_q/k/v) and text attention (add_q/k/v_proj).
+
+    ``reduce_dtype`` controls the dtype used by the row-parallel linears'
+    all-reduce. Default fp32 matches the upstream NxDI default; passing bf16
+    halves the bytes on the wire at the cost of a slightly less precise
+    reduction (acceptable for attention output projections in this model).
     """
     orig_inner_dim = attn.to_q.out_features
     dim_head = orig_inner_dim // attn.heads
@@ -112,7 +117,8 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
         attn.to_out[0].out_features,
         bias=(attn.to_out[0].bias is not None),
         input_is_parallel=True,
-        dtype=torch.bfloat16)
+        dtype=torch.bfloat16,
+        reduce_dtype=reduce_dtype)
     attn.to_out[0].weight.data = get_sharded_data(orig_out.weight.data, 1)
     if attn.to_out[0].bias is not None:
         attn.to_out[0].bias.data = orig_out.bias.data.detach()
@@ -166,7 +172,8 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
             orig_add_out.out_features,
             bias=(orig_add_out.bias is not None),
             input_is_parallel=True,
-            dtype=torch.bfloat16)
+            dtype=torch.bfloat16,
+            reduce_dtype=reduce_dtype)
         attn.to_add_out.weight.data = get_sharded_data(orig_add_out.weight.data, 1)
         if orig_add_out.bias is not None:
             attn.to_add_out.bias.data = orig_add_out.bias.data.detach()
@@ -182,8 +189,11 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
     return attn
 
 
-def shard_feedforward(ff: FeedForward) -> FeedForward:
-    """Shard FeedForward module for tensor parallelism."""
+def shard_feedforward(ff: FeedForward, reduce_dtype: torch.dtype = torch.float32) -> FeedForward:
+    """Shard FeedForward module for tensor parallelism.
+
+    See ``shard_qwen_attention`` for the meaning of ``reduce_dtype``.
+    """
     # Shard the first linear layer (GELU projection)
     orig_proj = ff.net[0].proj
     ff.net[0].proj = ColumnParallelLinear(
@@ -204,7 +214,8 @@ def shard_feedforward(ff: FeedForward) -> FeedForward:
         ff.net[2].out_features,
         bias=(ff.net[2].bias is not None),
         input_is_parallel=True,
-        dtype=torch.bfloat16)
+        dtype=torch.bfloat16,
+        reduce_dtype=reduce_dtype)
     ff.net[2].weight.data = get_sharded_data(orig_linear.weight.data, 1)
     if ff.net[2].bias is not None:
         ff.net[2].bias.data = orig_linear.bias.data.detach()

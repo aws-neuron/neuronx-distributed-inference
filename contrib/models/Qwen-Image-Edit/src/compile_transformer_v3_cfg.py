@@ -88,8 +88,19 @@ if USE_HOISTED_Q_ATTENTION:
 # Toggle between the two via env var (easy rollback during testing)
 USE_NKILIB_ATTENTION = os.getenv("QIE_USE_NKILIB_ATTENTION", "1") == "1"
 
+# Phase 17: lower the all-reduce dtype from fp32 to bf16 in the transformer
+# blocks' RowParallelLinear layers. The default upstream NxDI behavior is fp32
+# reduce, which on the V3 CFG configuration spends ~204 ms per step on 956
+# TP all-reduces totalling ~18 GB. bf16 halves the bytes on the wire and saves
+# ~137 ms / step (~9% E2E) with no visible image quality regression on the
+# 1024x1024 two-image merge workload. Set QIE_ALLREDUCE_BF16=0 to revert.
+ALLREDUCE_BF16 = os.getenv("QIE_ALLREDUCE_BF16", "1") == "1"
+_REDUCE_DTYPE = torch.bfloat16 if ALLREDUCE_BF16 else torch.float32
+
 print(f"NKI Flash Attention kernel loaded: "
       f"{'attention_cte_hoisted_q (Phase 16: hoisted Q load)' if USE_HOISTED_Q_ATTENTION else ('nkilib.core.attention.attention_cte' if USE_NKILIB_ATTENTION else 'attention_isa_kernel (legacy)')}")
+if ALLREDUCE_BF16:
+    print(f"  + TP all-reduce dtype = bf16 (Phase 17 experiment)")
 
 CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
@@ -410,9 +421,9 @@ class NeuronQwenTransformerV3CFG(nn.Module):
         self.transformer_blocks = nn.ModuleList()
         for i, block in enumerate(original_transformer.transformer_blocks):
             # Shard with TP degree
-            block.attn = shard_qwen_attention(tp_degree, block.attn)
-            block.img_mlp = shard_feedforward(block.img_mlp)
-            block.txt_mlp = shard_feedforward(block.txt_mlp)
+            block.attn = shard_qwen_attention(tp_degree, block.attn, reduce_dtype=_REDUCE_DTYPE)
+            block.img_mlp = shard_feedforward(block.img_mlp, reduce_dtype=_REDUCE_DTYPE)
+            block.txt_mlp = shard_feedforward(block.txt_mlp, reduce_dtype=_REDUCE_DTYPE)
             block.img_mod = shard_modulation(block.img_mod)
             block.txt_mod = shard_modulation(block.txt_mod)
             self.transformer_blocks.append(block)

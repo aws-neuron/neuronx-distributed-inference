@@ -120,12 +120,13 @@ NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_qwen_image_edit.
 
 ### Runtime toggles
 
-The transformer dispatch in `compile_transformer_v3_cfg.py` reads three
+The transformer dispatch in `compile_transformer_v3_cfg.py` reads four
 optional environment variables:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `QIE_HOISTED_Q_ATTENTION` | `1` | Use the Phase 16 hoisted-Q `attention_cte` fork. Set to `0` to fall back to upstream `nkilib.core.attention.attention_cte`. |
+| `QIE_ALLREDUCE_BF16` | `1` | Phase 17: use `bfloat16` instead of `float32` as the reduce dtype for every TP `RowParallelLinear` all-reduce. Halves the bytes on the wire and saves ~137 ms / step (~9% E2E) with no visible image quality regression. Set to `0` to keep the upstream `fp32` reduce. |
 | `QIE_USE_NKILIB_ATTENTION` | `1` | When the hoisted-Q fork is disabled, choose between `nkilib` `attention_cte` (`1`) and the legacy `attention_isa_kernel` (`0`). |
 | `QIE_SOFTMAX_DTYPE` | `float32` | Softmax accumulation dtype inside `attention_cte`. `bfloat16` is supported but measured no speedup on Trn2 because `mm_out_dtype` must stay `float32` on Gen3. |
 
@@ -156,6 +157,7 @@ PYTHONPATH=src:$PYTHONPATH python test/integration/run_all_tests.py
 5. **CFG Parallel**: Batches negative + positive prompts into single forward pass for ~6% speedup over CP.
 6. **NKI Flash Attention**: Custom NKI kernel for Trainium2, requires `XLA_DISABLE_FUNCTIONALIZATION=1`.
 7. **Hoisted-Q `attention_cte` (Phase 16)**: forked kernel (`attention_cte_qie_hoisted_q.py`) that hoists the Q-tile load out of the K/V section loop. For QIE shapes (`num_sections = 2` and Q identical across sections), this removes the redundant Q reload that the upstream `attention_cte` performs in `section_idx=1`. Bit-exact to the baseline (same `hardware_flops`, same output PNG MD5); −14.7 ms / step, +0.52 pp MFU on the V3 CFG configuration. Toggle via `QIE_HOISTED_Q_ATTENTION` (default `1`).
+8. **bf16 TP all-reduce (Phase 17)**: drops the all-reduce dtype on every `RowParallelLinear` (attention output, attention text-output, MLP output) from `float32` to `bfloat16`. The V3 CFG configuration emits 956 TP all-reduces per step totalling ~18 GB; halving the bytes on the wire saves **~137 ms / step (~9% E2E)** — by far the largest single win in this contrib's optimization history. Output images are visually equivalent to the `fp32`-reduce baseline on the 1024×1024 two-image merge workload; not bit-exact (small numerical drift accumulates over 60 blocks × 40 steps, but does not change scene content / faces / composition). Toggle via `QIE_ALLREDUCE_BF16` (default `1`).
 
 ## File Structure
 
