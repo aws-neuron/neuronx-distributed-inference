@@ -37,8 +37,13 @@ Key parameters:
 | V2 | TP=8 | Standard SDPA | ~1.2s | ~76s | ModelBuilder |
 | V1 | TP=8 | Standard SDPA | ~2.4s | ~136s | Baseline |
 
-Test: 1024x1024 output, guidance_scale=4.0, trn2.48xlarge.
-Total time includes VAE encoding/decoding and text encoding overhead.
+Test: 1024x1024 output, guidance_scale=4.0, trn2.48xlarge, single-image
+editing (`patch_multiplier=2`). Total time includes VAE encoding/decoding
+and text encoding overhead.
+
+> Note: a two-image merge (`patch_multiplier=3`) processes a longer joint
+> sequence (`S = 1024 + 12288 = 13312`) and lands at roughly 1.6× the
+> per-step time of single-image editing on the same configuration.
 
 ## Prerequisites
 
@@ -88,14 +93,41 @@ Compilation takes ~60-120 minutes total depending on version.
 
 ### 4. Run Inference
 
+`compile.sh` defaults to `patch_multiplier=3` (two-image merge), so the
+example below uses two input images. For single-image editing, recompile
+with `patch_multiplier=2` first.
+
 ```bash
+# Two-image merge (matches compile.sh default of patch_multiplier=3)
 NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_qwen_image_edit.py \
     --compiled_models_dir /opt/dlami/nvme/compiled_models_qwen_image_edit \
-    --images assets/image1.png \
-    --prompt "change the sky to sunset" \
+    --images assets/image1.png assets/image2.png \
+    --prompt "merge subjects from image1 and image2 into a single scene" \
+    --patch_multiplier 3 \
     --use_v3_cfg \
     --output output.png
+
+# Single-image editing (requires recompilation with patch_multiplier=2)
+# bash src/compile.sh v3_cfg 1024 1024 448 8 1024 2 1
+# NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_qwen_image_edit.py \
+#     --compiled_models_dir /opt/dlami/nvme/compiled_models_qwen_image_edit \
+#     --images assets/image1.png \
+#     --prompt "change the sky to sunset" \
+#     --patch_multiplier 2 \
+#     --use_v3_cfg \
+#     --output output.png
 ```
+
+### Runtime toggles
+
+The transformer dispatch in `compile_transformer_v3_cfg.py` reads three
+optional environment variables:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `QIE_HOISTED_Q_ATTENTION` | `1` | Use the Phase 16 hoisted-Q `attention_cte` fork. Set to `0` to fall back to upstream `nkilib.core.attention.attention_cte`. |
+| `QIE_USE_NKILIB_ATTENTION` | `1` | When the hoisted-Q fork is disabled, choose between `nkilib` `attention_cte` (`1`) and the legacy `attention_isa_kernel` (`0`). |
+| `QIE_SOFTMAX_DTYPE` | `float32` | Softmax accumulation dtype inside `attention_cte`. `bfloat16` is supported but measured no speedup on Trn2 because `mm_out_dtype` must stay `float32` on Gen3. |
 
 ## Compatibility Matrix
 
@@ -123,6 +155,7 @@ PYTHONPATH=src:$PYTHONPATH python test/integration/run_all_tests.py
 4. **VAE Interpolation**: Replaces `nearest-exact` with `nearest` for Neuron compatibility.
 5. **CFG Parallel**: Batches negative + positive prompts into single forward pass for ~6% speedup over CP.
 6. **NKI Flash Attention**: Custom NKI kernel for Trainium2, requires `XLA_DISABLE_FUNCTIONALIZATION=1`.
+7. **Hoisted-Q `attention_cte` (Phase 16)**: forked kernel (`attention_cte_qie_hoisted_q.py`) that hoists the Q-tile load out of the K/V section loop. For QIE shapes (`num_sections = 2` and Q identical across sections), this removes the redundant Q reload that the upstream `attention_cte` performs in `section_idx=1`. Bit-exact to the baseline (same `hardware_flops`, same output PNG MD5); −14.7 ms / step, +0.52 pp MFU on the V3 CFG configuration. Toggle via `QIE_HOISTED_Q_ATTENTION` (default `1`).
 
 ## File Structure
 
@@ -144,6 +177,7 @@ Qwen-Image-Edit/
     compile_transformer_v2_flash.py   # V2 Flash (ModelBuilder + NKI)
     compile_transformer_v3_cp.py      # V3 Context Parallel (TP=4, CP=2)
     compile_transformer_v3_cfg.py     # V3 CFG Parallel (TP=4, DP=2)
+    attention_cte_qie_hoisted_q.py    # Phase 16: hoisted-Q attention_cte fork
     compile_language_model_v3.py      # Language Model V3 (TP=4)
     compile_vision_encoder_v3.py      # Vision Encoder V3 (TP=4)
     compile_text_encoder.py           # Vision encoder single-device
@@ -171,4 +205,4 @@ Qwen-Image-Edit/
 
 Henan Wan (whn09)
 
-**Last Updated:** 2026-04-13
+**Last Updated:** 2026-05-14
