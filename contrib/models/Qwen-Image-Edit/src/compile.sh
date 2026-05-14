@@ -273,11 +273,16 @@ fi
 echo ""
 echo "To run inference on Trainium2:"
 echo ""
+echo "  # NOTE: defaults compile with patch_multiplier=3 (TWO-IMAGE merge)."
+echo "  #       The examples below use the 2-image merge form to match that."
+echo "  #       For single-image editing, recompile with patch_multiplier=2."
+echo ""
 if [[ "$VERSION_MODE" == "v3_cp" ]]; then
     echo "  # V3 CP (recommended, all V3 components enabled by default):"
     echo "  NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \\"
-    echo "      --images input.jpg \\"
-    echo "      --prompt \"your edit instruction\""
+    echo "      --images image1.png image2.png \\"
+    echo "      --prompt \"merge subjects from image1 and image2 into a single scene\" \\"
+    echo "      --patch_multiplier 3"
     echo ""
     echo "  # Note: --use_v3_vision_encoder is now default (10-15x faster than CPU)"
     echo "  #       Use --no-use_v3_vision_encoder to disable"
@@ -286,8 +291,9 @@ fi
 if [[ "$VERSION_MODE" == "v3_cfg" ]]; then
     echo "  # V3 CFG (CFG Parallel, batches neg+pos prompts for ~2x denoising speedup):"
     echo "  NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \\"
-    echo "      --images input.jpg \\"
-    echo "      --prompt \"your edit instruction\" \\"
+    echo "      --images image1.png image2.png \\"
+    echo "      --prompt \"merge subjects from image1 and image2 into a single scene\" \\"
+    echo "      --patch_multiplier 3 \\"
     echo "      --use_v3_cfg"
     echo ""
     echo "  # Note: --use_v3_cfg is mutually exclusive with --use_v3_cp"
@@ -296,39 +302,47 @@ if [[ "$VERSION_MODE" == "v3_cfg" ]]; then
 fi
 echo "  # V1 Flash (NKI Flash Attention):"
 echo "  python run_qwen_image_edit.py \\"
-echo "      --images input.jpg \\"
-echo "      --prompt \"your edit instruction\" \\"
+echo "      --images image1.png image2.png \\"
+echo "      --prompt \"merge subjects from image1 and image2 into a single scene\" \\"
+echo "      --patch_multiplier 3 \\"
 echo "      --use_v1_flash"
 echo ""
 echo "  # V2 Flash (ModelBuilder + NKI, same speed as V1 Flash):"
 echo "  python run_qwen_image_edit.py \\"
-echo "      --images input.jpg \\"
-echo "      --prompt \"your edit instruction\" \\"
+echo "      --images image1.png image2.png \\"
+echo "      --prompt \"merge subjects from image1 and image2 into a single scene\" \\"
+echo "      --patch_multiplier 3 \\"
 echo "      --use_v2_flash"
 echo ""
 echo "  # V2 (ModelBuilder):"
 echo "  python run_qwen_image_edit.py \\"
-echo "      --images input.jpg \\"
-echo "      --prompt \"your edit instruction\" \\"
+echo "      --images image1.png image2.png \\"
+echo "      --prompt \"merge subjects from image1 and image2 into a single scene\" \\"
+echo "      --patch_multiplier 3 \\"
 echo "      --use_v2"
 echo ""
 echo "  # V1:"
 echo "  python run_qwen_image_edit.py \\"
-echo "      --images input.jpg \\"
-echo "      --prompt \"your edit instruction\""
+echo "      --images image1.png image2.png \\"
+echo "      --prompt \"merge subjects from image1 and image2 into a single scene\" \\"
+echo "      --patch_multiplier 3"
 echo ""
 
-# 单图编辑示例 (CFG默认开启，true_cfg_scale=4.0)
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --warmup
+# Single-image editing example (CFG enabled by default, true_cfg_scale=4.0).
+# Requires the model to be compiled with patch_multiplier=2.
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "turn the woman into a man" --warmup
 
-# 多图合成示例 (需要 patch_multiplier=3)
+# Two-image merge example (requires patch_multiplier=3, the default in this script).
 # NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "..." --patch_multiplier 3 --warmup
 
-# # 完整运行示例
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v1
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v2
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v1_flash
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v2_flash
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v3_cp
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v3_cfg
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup
+# Full reference invocations across all transformer versions (two-image wedding-photo merge).
+# Prompt asks the model to combine the woman from image1 and the man from image2 into a wedding photo:
+#   red Chinese-style groom jacket, ornate xiuhe bridal robe, gold phoenix crown, vermillion palace wall
+#   with carved wooden lattice windows, soft and bright lighting, symmetric composition.
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "Using the woman from image 1 and the man from image 2, generate a wedding photo following this description: the groom wears a red Chinese-style jacket, the bride wears an ornate xiuhe robe and a gold phoenix crown. They stand side by side in front of an ancient vermillion palace wall, with carved wooden lattice windows in the background. Soft bright lighting, symmetric composition, festive and ceremonial atmosphere." --patch_multiplier 3 --warmup --use_v1
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "Using the woman from image 1 and the man from image 2, generate a wedding photo following this description: the groom wears a red Chinese-style jacket, the bride wears an ornate xiuhe robe and a gold phoenix crown. They stand side by side in front of an ancient vermillion palace wall, with carved wooden lattice windows in the background. Soft bright lighting, symmetric composition, festive and ceremonial atmosphere." --patch_multiplier 3 --warmup --use_v2
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "Using the woman from image 1 and the man from image 2, generate a wedding photo following this description: the groom wears a red Chinese-style jacket, the bride wears an ornate xiuhe robe and a gold phoenix crown. They stand side by side in front of an ancient vermillion palace wall, with carved wooden lattice windows in the background. Soft bright lighting, symmetric composition, festive and ceremonial atmosphere." --patch_multiplier 3 --warmup --use_v1_flash
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "Using the woman from image 1 and the man from image 2, generate a wedding photo following this description: the groom wears a red Chinese-style jacket, the bride wears an ornate xiuhe robe and a gold phoenix crown. They stand side by side in front of an ancient vermillion palace wall, with carved wooden lattice windows in the background. Soft bright lighting, symmetric composition, festive and ceremonial atmosphere." --patch_multiplier 3 --warmup --use_v2_flash
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "Using the woman from image 1 and the man from image 2, generate a wedding photo following this description: the groom wears a red Chinese-style jacket, the bride wears an ornate xiuhe robe and a gold phoenix crown. They stand side by side in front of an ancient vermillion palace wall, with carved wooden lattice windows in the background. Soft bright lighting, symmetric composition, festive and ceremonial atmosphere." --patch_multiplier 3 --warmup --use_v3_cp
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "Using the woman from image 1 and the man from image 2, generate a wedding photo following this description: the groom wears a red Chinese-style jacket, the bride wears an ornate xiuhe robe and a gold phoenix crown. They stand side by side in front of an ancient vermillion palace wall, with carved wooden lattice windows in the background. Soft bright lighting, symmetric composition, festive and ceremonial atmosphere." --patch_multiplier 3 --warmup --use_v3_cfg
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "Using the woman from image 1 and the man from image 2, generate a wedding photo following this description: the groom wears a red Chinese-style jacket, the bride wears an ornate xiuhe robe and a gold phoenix crown. They stand side by side in front of an ancient vermillion palace wall, with carved wooden lattice windows in the background. Soft bright lighting, symmetric composition, festive and ceremonial atmosphere." --patch_multiplier 3 --warmup
