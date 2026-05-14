@@ -18,8 +18,7 @@ Neuron Strategy
 - No ``--auto-cast`` flags — ``matmult`` produces NaN for Conv2d-dominant models
 - Data Parallelism across NeuronCores for throughput scaling
 - ``--lnc 1`` compiler flag required when running on LNC=1 mode
-- **batch_size=1 per core recommended** — compiler bug degrades odd-indexed
-  batch elements at bs>=2 (see Known Issues #2 in README)
+- Batch sizes > 1 supported (C2PSA .split() bug fixed via .chunk() workaround)
 
 Key Results (trn2.3xlarge, LNC=1, DP=8)
 ----------------------------------------
@@ -42,6 +41,11 @@ except ImportError:
 
 from ultralytics import YOLO
 from ultralytics.nn.modules.block import C2f
+
+try:
+    from ultralytics.nn.modules.block import C2PSA as UltralyticsC2PSA
+except ImportError:
+    UltralyticsC2PSA = None
 
 try:
     from ultralytics.nn.modules.block import Attention as UltralyticsAttention
@@ -94,6 +98,25 @@ def _c2f_forward_chunk(self, x: torch.Tensor) -> torch.Tensor:
     return self.cv2(torch.cat(y, 1))
 
 
+def _c2psa_forward_chunk(self, x: torch.Tensor) -> torch.Tensor:
+    """C2PSA forward using .chunk() instead of .split().
+
+    The neuronx-cc compiler has a bug where .split((c, c), dim=1) combined
+    with downstream attention produces incorrect output for odd-indexed batch
+    elements (CosSim ~0.08-0.23 vs CPU reference). This is the same .split()
+    bug as in C2f but manifests differently: instead of a compilation failure,
+    it produces silently wrong results at batch_size >= 2.
+
+    Workaround: use .chunk(2, 1) which is semantically identical to
+    .split((c, c), dim=1) but compiles correctly.
+
+    See: https://github.com/aws-neuron/aws-neuron-sdk/issues/1323
+    """
+    a, b = self.cv1(x).chunk(2, 1)
+    b = self.m(b)
+    return self.cv2(torch.cat((a, b), 1))
+
+
 def _attention_forward_fixed(self, x: torch.Tensor) -> torch.Tensor:
     """Fixed Attention.forward that uses slicing instead of .split().
 
@@ -132,9 +155,11 @@ def prepare_yolo26(weight_path: str, dtype: torch.dtype = torch.float32) -> nn.M
     3. Set ``export=True``, ``dynamic=False`` for clean single-tensor output
     4. Replace ``C2f.forward`` with chunk-based forward (works around
        neuronx-cc compiler bug where ``.split()`` fails at bs=4)
-    5. Patch ``Attention.forward`` to use slicing instead of ``.split()``
+    5. Replace ``C2PSA.forward`` with chunk-based forward (works around
+       neuronx-cc bug where ``.split()`` corrupts odd batch elements at bs>=2)
+    6. Patch ``Attention.forward`` to use slicing instead of ``.split()``
        (works around neuronx-cc compiler bug with unequal split sizes)
-    6. Convert to target dtype if not FP32
+    7. Convert to target dtype if not FP32
 
     Parameters
     ----------
@@ -172,6 +197,11 @@ def prepare_yolo26(weight_path: str, dtype: torch.dtype = torch.float32) -> nn.M
         # chunk(2, 1) is semantically identical to split((c, c), 1).
         if isinstance(m, C2f):
             m.forward = _c2f_forward_chunk.__get__(m, type(m))
+        # Fix C2PSA: use chunk-based forward instead of .split() to work
+        # around neuronx-cc bug where .split((c,c), 1) combined with
+        # downstream attention corrupts odd-indexed batch elements at bs>=2.
+        if UltralyticsC2PSA is not None and isinstance(m, UltralyticsC2PSA):
+            m.forward = _c2psa_forward_chunk.__get__(m, type(m))
         # Fix C2PSA Attention: replace .split() with slicing to work around
         # neuronx-cc compiler bug with unequal split sizes on dim=2
         if UltralyticsAttention is not None and isinstance(m, UltralyticsAttention):
