@@ -1,0 +1,210 @@
+# Contrib Model: Qwen-Image-Edit
+
+NeuronX adaptation of [alibaba-pai/Qwen-Image-Edit-2509](https://huggingface.co/alibaba-pai/Qwen-Image-Edit-2509) for AWS Trainium2 inference.
+
+## Model Information
+
+- **HuggingFace ID:** `alibaba-pai/Qwen-Image-Edit-2509`
+- **Model Type:** Diffusion model for image editing
+- **Architecture:** Multi-component (Qwen2.5-VL Vision Encoder + Language Model + QwenImageTransformer2DModel + 3D VAE)
+- **License:** Check HuggingFace model card
+
+## Architecture Details
+
+| Component | Model | Parameters | Neuron Parallelism |
+|-----------|-------|------------|-------------------|
+| Vision Encoder | Qwen2.5-VL ViT (32 blocks) | ~1.4B | TP=4, float32 (or CPU) |
+| Language Model | Qwen2.5-VL LM (28 layers) | ~7B | TP=4, world_size=8 (or CPU) |
+| Transformer | QwenImageTransformer2DModel | ~20.4B | TP=4-8, various parallelism modes |
+| VAE | 3D AutoencoderKL (causal) | ~300M | Single device, tiled processing |
+
+Key parameters:
+- **Transformer**: 48 attention heads, head_dim=128, inner_dim=6144
+- **Text Hidden Size**: 3584 (Qwen2.5-VL)
+- **Dual-stream blocks**: 20 (separate text/image norms+FFN, joint attention)
+- **Single-stream blocks**: 40 (concatenated text+image, parallel MLP+attention)
+
+## Performance
+
+6 compilation APIs with different parallelism strategies:
+
+| Version | Parallelism | Attention | Per Step | Total (50 steps) | Notes |
+|---------|------------|-----------|----------|-----------------|-------|
+| **V3 CFG** | TP=4, DP=2 | NKI Flash | **~0.75s** | **~53s** | Fastest, recommended |
+| V3 CP | TP=4, CP=2 | NKI Flash | ~0.77s | ~55s | Context Parallel |
+| V1 Flash | TP=8 | NKI Flash | ~1.2s | ~76s | NKI kernel |
+| V2 Flash | TP=8 | NKI Flash | ~1.2s | ~76s | ModelBuilder + NKI |
+| V2 | TP=8 | Standard SDPA | ~1.2s | ~76s | ModelBuilder |
+| V1 | TP=8 | Standard SDPA | ~2.4s | ~136s | Baseline |
+
+Test: 1024x1024 output, guidance_scale=4.0, trn2.48xlarge, single-image
+editing (`patch_multiplier=2`). Total time includes VAE encoding/decoding
+and text encoding overhead.
+
+> Note: a two-image merge (`patch_multiplier=3`) processes a longer joint
+> sequence (`S = 1024 + 12288 = 13312`) and lands at roughly 1.6× the
+> per-step time of single-image editing on the same configuration.
+
+## Prerequisites
+
+- **Instance**: trn2.48xlarge (64 NeuronCores, 1.5TB device memory)
+- **Virtual env**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference`
+  - PyTorch 2.9, neuronx-cc 2.22, neuronx-distributed 0.16
+- **NVMe**: Mount RAID at `/opt/dlami/nvme/` (run `src/setup_nvme.sh`)
+
+## Usage
+
+### 1. Setup
+
+```bash
+# Mount NVMe RAID
+sudo bash src/setup_nvme.sh
+
+# Activate virtual environment
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### 2. Download Model
+
+```bash
+python src/cache_hf_model.py
+```
+
+### 3. Compile All Components
+
+```bash
+# Compile V3 CFG (recommended, fastest)
+bash src/compile.sh v3_cfg
+
+# Compile V3 CP (Context Parallel)
+bash src/compile.sh v3_cp
+
+# Compile all versions
+bash src/compile.sh
+
+# Custom dimensions:
+# bash src/compile.sh <version> <height> <width> <image_size> <tp_degree> <max_seq_len> <patch_mult> <batch_size>
+```
+
+Compilation takes ~60-120 minutes total depending on version.
+
+### 4. Run Inference
+
+`compile.sh` defaults to `patch_multiplier=3` (two-image merge), so the
+example below uses two input images. For single-image editing, recompile
+with `patch_multiplier=2` first.
+
+```bash
+# Two-image merge (matches compile.sh default of patch_multiplier=3)
+NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_qwen_image_edit.py \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_qwen_image_edit \
+    --images assets/image1.png assets/image2.png \
+    --prompt "merge subjects from image1 and image2 into a single scene" \
+    --patch_multiplier 3 \
+    --use_v3_cfg \
+    --output output.png
+
+# Single-image editing (requires recompilation with patch_multiplier=2)
+# bash src/compile.sh v3_cfg 1024 1024 448 8 1024 2 1
+# NEURON_RT_NUM_CORES=8 PYTHONPATH=src:$PYTHONPATH python src/run_qwen_image_edit.py \
+#     --compiled_models_dir /opt/dlami/nvme/compiled_models_qwen_image_edit \
+#     --images assets/image1.png \
+#     --prompt "change the sky to sunset" \
+#     --patch_multiplier 2 \
+#     --use_v3_cfg \
+#     --output output.png
+```
+
+### Runtime toggles
+
+The transformer dispatch in `compile_transformer_v3_cfg.py` reads four
+optional environment variables:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `QIE_HOISTED_Q_ATTENTION` | `1` | Use the Phase 16 hoisted-Q `attention_cte` fork. Set to `0` to fall back to upstream `nkilib.core.attention.attention_cte`. |
+| `QIE_ALLREDUCE_BF16` | `1` | Phase 17: use `bfloat16` instead of `float32` as the reduce dtype for every TP `RowParallelLinear` all-reduce. Halves the bytes on the wire and saves ~137 ms / step (~9% E2E) with no visible image quality regression. Set to `0` to keep the upstream `fp32` reduce. |
+| `QIE_USE_NKILIB_ATTENTION` | `1` | When the hoisted-Q fork is disabled, choose between `nkilib` `attention_cte` (`1`) and the legacy `attention_isa_kernel` (`0`). |
+| `QIE_SOFTMAX_DTYPE` | `float32` | Softmax accumulation dtype inside `attention_cte`. `bfloat16` is supported but measured no speedup on Trn2 because `mm_out_dtype` must stay `float32` on Gen3. |
+
+## Compatibility Matrix
+
+| Instance/Version | 2.22+ (PyTorch 2.9) | 2.21 and earlier |
+|------------------|---------------------|------------------|
+| Trn2 (trn2.48xlarge) | Tested | Not tested |
+| Trn1 | Not tested | Not tested |
+| Inf2 | Not supported | Not supported |
+
+## Testing
+
+```bash
+# Run component tests
+PYTHONPATH=src:$PYTHONPATH pytest test/integration/ --capture=tee-sys -v
+
+# Run all tests manually
+PYTHONPATH=src:$PYTHONPATH python test/integration/run_all_tests.py
+```
+
+## Key Implementation Notes
+
+1. **Modulation Layer Sharding**: Uses `ColumnParallelLinear(gather_output=True)` to reduce memory from ~17GB to ~5.2GB per shard.
+2. **RoPE Without Complex Numbers**: Neuron doesn't support C64; uses (cos, sin) tuples instead.
+3. **M-RoPE Position IDs**: 3D position indices (temporal, height, width) for multimodal tokens.
+4. **VAE Interpolation**: Replaces `nearest-exact` with `nearest` for Neuron compatibility.
+5. **CFG Parallel**: Batches negative + positive prompts into single forward pass for ~6% speedup over CP.
+6. **NKI Flash Attention**: Custom NKI kernel for Trainium2, requires `XLA_DISABLE_FUNCTIONALIZATION=1`.
+7. **Hoisted-Q `attention_cte` (Phase 16)**: forked kernel (`attention_cte_qie_hoisted_q.py`) that hoists the Q-tile load out of the K/V section loop. For QIE shapes (`num_sections = 2` and Q identical across sections), this removes the redundant Q reload that the upstream `attention_cte` performs in `section_idx=1`. Bit-exact to the baseline (same `hardware_flops`, same output PNG MD5); −14.7 ms / step, +0.52 pp MFU on the V3 CFG configuration. Toggle via `QIE_HOISTED_Q_ATTENTION` (default `1`).
+8. **bf16 TP all-reduce (Phase 17)**: drops the all-reduce dtype on every `RowParallelLinear` (attention output, attention text-output, MLP output) from `float32` to `bfloat16`. The V3 CFG configuration emits 956 TP all-reduces per step totalling ~18 GB; halving the bytes on the wire saves **~137 ms / step (~9% E2E)** — by far the largest single win in this contrib's optimization history. Output images are visually equivalent to the `fp32`-reduce baseline on the 1024×1024 two-image merge workload; not bit-exact (small numerical drift accumulates over 60 blocks × 40 steps, but does not change scene content / faces / composition). Toggle via `QIE_ALLREDUCE_BF16` (default `1`).
+
+## File Structure
+
+```
+Qwen-Image-Edit/
+  README.md
+  requirements.txt
+  assets/
+    image1.png, image2.png            # Test input images
+  src/
+    run_qwen_image_edit.py            # Main inference script
+    neuron_commons.py                 # NeuronTextEncoderWrapper, SDPA implementations
+    neuron_parallel_utils.py          # TP sharding utilities
+    neuron_rope.py                    # Neuron-compatible RoPE
+    autoencoder_kl_qwenimage_neuron.py  # Neuron-compatible 3D VAE
+    compile_transformer.py            # V1 transformer (TP=8)
+    compile_transformer_v1_flash.py   # V1 Flash (NKI)
+    compile_transformer_v2.py         # V2 (ModelBuilder)
+    compile_transformer_v2_flash.py   # V2 Flash (ModelBuilder + NKI)
+    compile_transformer_v3_cp.py      # V3 Context Parallel (TP=4, CP=2)
+    compile_transformer_v3_cfg.py     # V3 CFG Parallel (TP=4, DP=2)
+    attention_cte_qie_hoisted_q.py    # Phase 16: hoisted-Q attention_cte fork
+    compile_language_model_v3.py      # Language Model V3 (TP=4)
+    compile_vision_encoder_v3.py      # Vision Encoder V3 (TP=4)
+    compile_text_encoder.py           # Vision encoder single-device
+    compile_vae.py                    # 3D VAE encoder/decoder
+    cache_hf_model.py                 # Download model
+    compile.sh                        # Master compilation script
+    setup_nvme.sh                     # NVMe RAID setup
+  test/
+    integration/
+      run_all_tests.py                # Master test runner
+      test_vae.py                     # VAE tests
+      test_transformer.py             # Transformer tests
+      test_text_encoder.py            # Text encoder tests
+      test_component_comparison.py    # Neuron vs CPU comparison
+      test_language_model_simple.py   # Language model tests
+      test_multimodal.py              # Multi-image tests
+    unit/
+```
+
+## Example Checkpoints
+
+* [alibaba-pai/Qwen-Image-Edit-2509](https://huggingface.co/alibaba-pai/Qwen-Image-Edit-2509)
+
+## Maintainer
+
+Henan Wan (whn09)
+
+**Last Updated:** 2026-05-14
