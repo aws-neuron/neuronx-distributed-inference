@@ -270,10 +270,14 @@ def compile_language_model(args):
             if not os.path.exists(shard_file):
                 continue
             data = dict(load_file(shard_file))
-            cleaned = {k: v for k, v in data.items() if 'master_weight' not in k}
+            # Clone — load_file returns memory-mapped tensors; save_file on the
+            # same path while those mmaps are alive triggers
+            # ``SafetensorError: I/O error: Bad address (os error 14)``.
+            cleaned = {k: v.detach().clone().contiguous() for k, v in data.items() if 'master_weight' not in k}
+            del data
             cleaned.update(inv_freq_buffers)
             save_file(cleaned, shard_file)
-            print(f"  tp{rank}: {len(data)} -> {len(cleaned)} tensors")
+            print(f"  tp{rank}: {len(cleaned)} tensors after cleanup")
 
         config = {
             "max_sequence_length": sequence_length,

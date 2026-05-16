@@ -616,7 +616,11 @@ def compile_transformer(args):
                 continue
             shard_data = dict(load_file(shard_file))
             original_count = len(shard_data)
-            cleaned = {k: v for k, v in shard_data.items() if 'master_weight' not in k}
+            # Clone to fresh storage — load_file returns memory-mapped tensors,
+            # writing back to the same path while those mmaps are alive triggers
+            # ``SafetensorError: I/O error: Bad address (os error 14)``.
+            cleaned = {k: v.detach().clone().contiguous() for k, v in shard_data.items() if 'master_weight' not in k}
+            del shard_data
             for gk, gv in global_rank_state.items():
                 cleaned[gk] = torch.tensor([rank], dtype=torch.int32)
 

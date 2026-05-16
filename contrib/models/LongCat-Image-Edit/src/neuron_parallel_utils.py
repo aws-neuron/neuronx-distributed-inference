@@ -8,12 +8,22 @@ LongCat uses a FLUX-style transformer with two types of blocks:
 This module provides sharding functions for both block types.
 """
 
+import os
 import torch
 from torch import nn
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
 import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
+
+# Optional: lower the TP all-reduce dtype on every RowParallelLinear from
+# fp32 (NxDI upstream default) to bf16. Halves the bytes on the wire for
+# every inter-rank reduce. Default on; set LONGCAT_ALLREDUCE_BF16=0 to
+# revert to fp32. See QIE Phase 17 / Wan2.2 for prior datapoints.
+_ALLREDUCE_BF16 = os.getenv("LONGCAT_ALLREDUCE_BF16", "1") == "1"
+_REDUCE_DTYPE = torch.bfloat16 if _ALLREDUCE_BF16 else torch.float32
+if _ALLREDUCE_BF16:
+    print("[LongCat] TP all-reduce dtype = bf16 (LONGCAT_ALLREDUCE_BF16=1)")
 
 
 def get_sharded_data(data, dim):
@@ -46,13 +56,20 @@ def shard_linear_column(orig_linear, gather_output=False, dtype=torch.bfloat16):
 
 
 def shard_linear_row(orig_linear, dtype=torch.bfloat16):
-    """Replace a nn.Linear with RowParallelLinear."""
+    """Replace a nn.Linear with RowParallelLinear.
+
+    Threads ``reduce_dtype`` from the module-level toggle so all
+    RowParallelLinear instances in this contrib (image attention to_out,
+    text to_add_out, FFN net[2], single-block proj/down_proj) pick up the
+    same all-reduce dtype.
+    """
     new_linear = RowParallelLinear(
         orig_linear.in_features,
         orig_linear.out_features,
         bias=(orig_linear.bias is not None),
         input_is_parallel=True,
         dtype=dtype,
+        reduce_dtype=_REDUCE_DTYPE,
     )
     new_linear.weight.data = get_sharded_data(orig_linear.weight.data, 1)
     if orig_linear.bias is not None:
@@ -206,6 +223,7 @@ def shard_proj_out_interleaved(orig_linear, attn_dim, mlp_dim, tp_degree, dtype=
         bias=(orig_linear.bias is not None),
         input_is_parallel=True,
         dtype=dtype,
+        reduce_dtype=_REDUCE_DTYPE,
     )
 
     # Extract correct non-contiguous weight columns for this rank
