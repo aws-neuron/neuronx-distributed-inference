@@ -26,16 +26,21 @@ Key parameters:
 
 ## Performance
 
-| Resolution | Frames | Trn2 CP (s) | Trn2 CFG (s) | H100 (s) | Decoder |
-|-----------|--------|-------------|--------------|----------|---------|
-| 512x384 | 81 | 20.67 | **15.77** | 16.13 | stateful rolling |
-| 512x384 | 121 | 30.07 | **26.44** | 24.48 | stateful rolling |
-| 640x480 | 81 | **33.20** | 34.10 | 26.06 | stateful rolling |
-| 640x480 | 121 | 49.29 | **45.15** | 39.67 | stateful rolling |
-| 1280x704 | 81 | 163.99 | **155.06** | 87.66 | tiled |
-| 1280x704 | 121 | 255.07 | **243.71** | 143.20 | tiled |
+Re-measured on trn2.48xlarge under the **bf16 TP all-reduce default** (`WAN_ALLREDUCE_BF16=1`),
+50 denoising steps, CFG Parallel (TP=4 × DP=2). H100 column is single H100 on p5.48xlarge with
+`diffusers` eager mode (bf16, FA2/SDPA), measured at the same time.
 
-Test: trn2.48xlarge, 50 denoising steps.
+| Resolution | Frames | Trn2 CFG bf16 (s) | H100 eager (s) | Decoder |
+|-----------|-------:|------------------:|---------------:|---------|
+| 512×384   | 81  | **15.26**  | 16.57 | stateful rolling |
+| 640×480   | 121 | **39.40**  | 86.34 | stateful rolling |
+| 1280×704  | 81  | **139.58** (denoise 67.8 s + tiled decode 70.8 s) | 89.08 | tiled (3×3, overlap=4) |
+
+Older fp32-reduce numbers and resolutions not re-measured here (e.g. 512×384×121,
+640×480×81, 1280×704×121) live in the PR description history; toggle with
+`WAN_ALLREDUCE_BF16=0` to reproduce them. The 1280×704 case is dominated by the
+tile decoder, not the transformer — single-tile decode at that resolution exceeds
+the compiler's 5 M instruction limit.
 
 ## Prerequisites
 
