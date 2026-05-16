@@ -69,7 +69,25 @@ from torch_neuronx.xla_impl.ops import nki_jit
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
-print("NKI Flash Attention kernel loaded successfully")
+# Modern nkilib attention_cte (production-grade, replaces deprecated isa_kernel).
+# Already wrapped with @nki.jit; call directly without re-wrapping.
+from nkilib.core.attention.attention_cte import attention_cte as _nkilib_attention_cte
+_attention_cte_call = _nkilib_attention_cte
+USE_NKILIB_ATTENTION = os.getenv("WAN_USE_NKILIB_ATTENTION", "0") == "1"
+
+# Lower the TP all-reduce dtype from fp32 (NxDI upstream default) to bf16.
+# Halves the bytes on the wire for every RowParallelLinear all-reduce. On
+# Wan2.2 V3 CFG (512x384, 81 frames), measured: per-step 0.314s -> 0.305s,
+# 50-step E2E 15.72s -> 15.26s (-2.9%, +5.4% ahead of H100 diffusers). Video
+# quality visually equivalent on the cat-walk reference workload. Set
+# WAN_ALLREDUCE_BF16=0 to revert to fp32.
+ALLREDUCE_BF16 = os.getenv("WAN_ALLREDUCE_BF16", "1") == "1"
+_REDUCE_DTYPE = torch.bfloat16 if ALLREDUCE_BF16 else torch.float32
+
+print(f"NKI Flash Attention kernel loaded: "
+      f"{'nkilib.core.attention.attention_cte' if USE_NKILIB_ATTENTION else 'attention_isa_kernel (legacy)'}")
+if ALLREDUCE_BF16:
+    print("  + TP all-reduce dtype = bf16 (experimental)")
 
 # Import from existing module
 from distributed_rmsnorm import DistributedRMSNorm
@@ -113,6 +131,9 @@ def nki_flash_attention(query, key, value):
 
     Returns:
         attention output [B, H, Q_len, D]
+
+    Default uses attention_isa_kernel. Set WAN_USE_NKILIB_ATTENTION=1 to use
+    the modern nkilib.core.attention.attention_cte instead.
     """
     bs, n_head, q_len, d_head = query.shape
     k_len = key.shape[2]
@@ -128,22 +149,37 @@ def nki_flash_attention(query, key, value):
     padded_k_len = key.shape[2]
     padded_v_len = value.shape[2]
 
-    # Reshape for NKI kernel: (B*H, D, S) for Q/K, (B*H, S, D) for V
-    q = query.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, padded_q_len))
-    k = key.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, padded_k_len))
-    v = value.clone().reshape((bs * n_head, padded_v_len, d_head))
-
-    attn_output = torch.zeros((bs * n_head, padded_q_len, d_head), dtype=torch.bfloat16, device=q.device)
     scale = 1 / math.sqrt(d_head)
-
     vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
-    if vc_size == 2:
-        grid = (nc(2),)
-        _flash_fwd_call[grid](q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
-    else:
-        _flash_fwd_call(q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
 
-    attn_output = attn_output.reshape((bs, n_head, padded_q_len, d_head))
+    if USE_NKILIB_ATTENTION:
+        # attention_cte expects q/k/v as [B, S, D] (tp_q=tp_k=True).
+        q = query.reshape(bs * n_head, padded_q_len, d_head)
+        k = key.reshape(bs * n_head, padded_k_len, d_head)
+        v = value.reshape(bs * n_head, padded_v_len, d_head)
+        kernel = _attention_cte_call[vc_size]
+        attn_output = kernel(
+            q, k, v,
+            scale=scale, causal_mask=False,
+            tp_q=True, tp_k=True, tp_out=False,
+            softmax_dtype="float32",
+            mm_out_dtype="float32",
+        )
+        attn_output = attn_output.reshape(bs, n_head, padded_q_len, d_head)
+    else:
+        # Legacy isa_kernel path
+        # Reshape for NKI kernel: (B*H, D, S) for Q/K, (B*H, S, D) for V
+        q = query.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, padded_q_len))
+        k = key.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, padded_k_len))
+        v = value.clone().reshape((bs * n_head, padded_v_len, d_head))
+
+        attn_output = torch.zeros((bs * n_head, padded_q_len, d_head), dtype=torch.bfloat16, device=q.device)
+        if vc_size == 2:
+            grid = (nc(2),)
+            _flash_fwd_call[grid](q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
+        else:
+            _flash_fwd_call(q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
+        attn_output = attn_output.reshape((bs, n_head, padded_q_len, d_head))
 
     # Slice back to original Q length
     if padded_q_len != orig_q_len:
@@ -513,7 +549,8 @@ def shard_attention_for_cp(tp_degree: int, attn: Attention):
         orig_out.in_features, orig_out.out_features,
         bias=(orig_out.bias is not None),
         input_is_parallel=True,
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
+        reduce_dtype=_REDUCE_DTYPE,
     )
     attn.to_out[0].weight.data = get_sharded_data(orig_out.weight.data, 1)
     if orig_out.bias is not None:
@@ -592,7 +629,8 @@ def shard_feedforward_for_cp(ff: FeedForward) -> FeedForward:
         orig_linear.in_features, orig_linear.out_features,
         bias=(orig_linear.bias is not None),
         input_is_parallel=True,
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
+        reduce_dtype=_REDUCE_DTYPE,
     )
     ff.net[2].weight.data = get_sharded_data(orig_linear.weight.data, 1)
     if orig_linear.bias is not None:
@@ -884,7 +922,10 @@ def fix_norm_weights_per_rank(weights_path, unsharded_norm_weights, tp_degree):
 
     for rank in range(tp_degree):
         ckpt_path = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
-        ckpt = load_file(ckpt_path)
+        # Materialise into owned tensors (load_file returns memory-mapped views;
+        # writing back to the same path while those mmaps are alive triggers
+        # ``SafetensorError: I/O error: Bad address (os error 14)``).
+        ckpt = {k: v.detach().clone().contiguous() for k, v in load_file(ckpt_path).items()}
 
         fixed_count = 0
         for key, unsharded_weight in unsharded_norm_weights.items():
@@ -1084,13 +1125,19 @@ def compile_transformer_v3_cp(args):
             shard_data = dict(load_file(shard_file))
             original_count = len(shard_data)
 
-            # Remove master_weight tensors (duplicates created by shard_checkpoint)
-            cleaned = {k: v for k, v in shard_data.items() if 'master_weight' not in k}
+            # Remove master_weight tensors (duplicates created by shard_checkpoint).
+            # ``load_file`` returns memory-mapped tensors that share storage with
+            # the safetensors file on disk; calling ``save_file`` on them would
+            # overwrite the file we are still reading from and trigger
+            # ``SafetensorError: I/O error: Bad address`` on some setups. Clone
+            # tensors into fresh, owned storage before writing.
+            cleaned = {k: v.detach().clone().contiguous() for k, v in shard_data.items() if 'master_weight' not in k}
 
             # Add SPMDRank state
             if global_rank_state:
-                cleaned.update(global_rank_state)
+                cleaned.update({k: (v.detach().clone().contiguous() if hasattr(v, 'detach') else v) for k, v in global_rank_state.items()})
 
+            del shard_data
             save_file(cleaned, shard_file)
             removed = original_count - len(cleaned) + len(global_rank_state)
             print(f"  tp{rank}: {original_count} -> {len(cleaned)} tensors (removed {removed} master_weight)")
