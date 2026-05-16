@@ -65,26 +65,53 @@ from torch_neuronx.xla_impl.ops import nki_jit
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
-print("NKI Flash Attention kernel loaded successfully")
+# Modern nkilib attention_cte (production-grade, replaces deprecated isa_kernel).
+# Already wrapped with @nki.jit; call directly without re-wrapping.
+from nkilib.core.attention.attention_cte import attention_cte as _nkilib_attention_cte
+_attention_cte_call = _nkilib_attention_cte
+USE_NKILIB_ATTENTION = os.getenv("LONGCAT_USE_NKILIB_ATTENTION", "0") == "1"
+
+print(f"NKI Flash Attention kernel loaded: "
+      f"{'nkilib.core.attention.attention_cte' if USE_NKILIB_ATTENTION else 'attention_isa_kernel (legacy)'}")
 
 CACHE_DIR = "/opt/dlami/nvme/longcat_hf_cache"
 MODEL_ID = "meituan-longcat/LongCat-Image-Edit"
 
 
 def nki_flash_attention(query, key, value):
-    """NKI Flash Attention wrapper. Args all [B, H, S, D]."""
+    """NKI Flash Attention wrapper. Args all [B, H, S, D].
+
+    Default uses attention_isa_kernel. Set LONGCAT_USE_NKILIB_ATTENTION=1 to
+    switch to the modern nkilib.core.attention.attention_cte kernel.
+    """
     bs, n_head, q_len, d_head = query.shape
     k_len = key.shape[2]
     v_len = value.shape[2]
 
+    scale = 1 / math.sqrt(d_head)
+    vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
+
+    if USE_NKILIB_ATTENTION:
+        # attention_cte expects q/k/v as [B, S, D] (tp_q=tp_k=True).
+        q = query.reshape(bs * n_head, q_len, d_head)
+        k = key.reshape(bs * n_head, k_len, d_head)
+        v = value.reshape(bs * n_head, v_len, d_head)
+        kernel = _attention_cte_call[vc_size]
+        attn_output = kernel(
+            q, k, v,
+            scale=scale, causal_mask=False,
+            tp_q=True, tp_k=True, tp_out=False,
+            softmax_dtype="float32",
+            mm_out_dtype="float32",
+        )
+        return attn_output.reshape(bs, n_head, q_len, d_head)
+
+    # Legacy isa_kernel path
     q = query.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, q_len))
     k = key.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, k_len))
     v = value.clone().reshape((bs * n_head, v_len, d_head))
 
     attn_output = torch.zeros((bs * n_head, q_len, d_head), dtype=torch.bfloat16, device=q.device)
-    scale = 1 / math.sqrt(d_head)
-
-    vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
     if vc_size == 2:
         grid = (nc(2),)
         _flash_fwd_call[grid](q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
