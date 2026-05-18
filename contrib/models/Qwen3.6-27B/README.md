@@ -346,7 +346,8 @@ larger batches or additional serving headroom.
 | Instance | TP | LNC | Status | Notes |
 |----------|-----|-----|--------|-------|
 | trn2.3xlarge | 4 | 2 | **PASS** | BF16 short-context and FP8 128K vLLM/APC validated |
-| trn2.12xlarge | 16 | 2 | Expected PASS | Untested, recommended for batching/headroom |
+| trn2.48xlarge | 4 | 2 | Expected PASS | Untested for this contrib; use the same TP=4 artifact shape when compiling for trn2.3xlarge deployment |
+| trn2u.48xlarge | 4 | 2 | Expected PASS | Untested for this contrib; same portability caveat as trn2.48xlarge |
 
 ### SDK Configuration
 
