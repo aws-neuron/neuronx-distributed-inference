@@ -151,6 +151,58 @@ matches:
 | Offline partial-prefix reuse | 25.52s | 1.70s | 15.0x | exact token-ID match |
 | Server cross-prefix reuse | 25.17s | 1.36s | 18.5x | exact text match |
 
+### Hybrid APC Follow-up Status
+
+Follow-up work on the `experimental` branch extended the baseline vLLM/APC
+path toward Qwen3.6 Hybrid APC, where attention KV prefix reuse is only correct
+when the matching DeltaNet recurrent/conv checkpoint is also available.
+
+What has been implemented and proven in that branch:
+
+- Scheduler-side safety gating prevents vLLM from reading an attention prefix
+  unless a matching GDN checkpoint is registered.
+- Qwen request prep consumes scheduler-authorized, request-scoped restore keys
+  instead of relying on prefix length alone.
+- The CTE restore path handles suffix-only execution over a restored prefix:
+  suffix tokens, slot mapping, `computed_context_lens`, `num_queries`, and GDN
+  restore metadata are kept aligned.
+- BF16 single-request backed-prefix validation passes with cold/warm exactness
+  on the 2K checkpoint-boundary case. The proven shape restores a 256-token GDN
+  checkpoint, executes a 16-token suffix, and matches cold output.
+- The safety fallback also passes: if attention KV has a prefix hit but no GDN
+  checkpoint exists, prefix reads are disabled and the request recomputes cold.
+
+Current blocker:
+
+- True generated-token batch-2 validation needs both `tkg_batch_size=2` and
+  `ctx_batch_size=2`.
+- A batch-2 artifact with `tkg_batch_size=2` but `ctx_batch_size=1` failed in
+  vLLM-Neuron host-logits sampling because two prefills were packed into one
+  CTE row, then logits were reordered for two live request ids.
+- Single-bucket `ctx_batch_size=2` / `tkg_batch_size=2` BF16 artifacts for CTE
+  bucket 256 and CTE bucket 512 compiled successfully.
+- The combined multi-bucket artifact (`cte_buckets=256,512`,
+  `prefix_buckets=256,512`) started compiling and the TKG priority HLO passed,
+  but the smaller Trainium instance became SSH-unresponsive during all-HLO CTE
+  compilation. This appears to be a Neuron/NxDI compile-capacity or compile
+  orchestration issue, not a model-correctness failure.
+
+Expected outcome after the batch-2 artifact or an equivalent prefill-only
+proof is available:
+
+- Batched Hybrid APC can preserve the same correctness rule as the
+  single-request path:
+  `usable_prefix_hit = attention_KV_prefix_hit AND matching_GDN_checkpoint_hit`.
+- Warm repeated-prefix and partial-prefix requests should avoid replaying the
+  shared cold prefill while restoring the required GDN state.
+- This is the path expected to turn the current exact single-request APC proof
+  into a measured cold-prefill performance win for batched serving.
+
+The fused CTE kernel and FP8 path are not the current correctness blockers.
+The BF16 per-chunk CTE path is the reference path for Hybrid APC validation:
+the fused BF16 CTE artifact has shown NaNs around token 105-106, and FP8 should
+be revisited after the BF16 batch-2 serving contract is proven.
+
 ### Key Observations
 
 - **BF16 TP=4 is HBM-limited:** The pure BF16 path is limited to short contexts on trn2.3xlarge. The validated 128K baseline uses MLP-only FP8 weights plus the hybrid cache manager.
