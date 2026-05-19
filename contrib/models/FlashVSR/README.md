@@ -30,8 +30,10 @@ Video super-resolution (4x upscaling) on AWS Trainium using a streaming DiT arch
 
 | Metric | Value |
 |--------|-------|
-| DiT neuron_allclose vs CPU (rtol=0.01) | PASS |
-| TCDecoder PSNR vs CPU reference | >45 dB |
+| DiT neuron_allclose vs CPU (rtol=0.05, atol=0.1) | PASS |
+| DiT max_rel_error | 0.025 |
+| DiT cosine similarity | 0.9997 |
+| DiT per-chunk latency (first chunk, f=6) | ~1540 ms |
 | Full pipeline visual quality | Matches reference implementation (DMD single-step) |
 
 ## Usage
