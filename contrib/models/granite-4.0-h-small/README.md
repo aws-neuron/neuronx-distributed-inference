@@ -44,7 +44,7 @@ This follows the MLlama vision_key_values pattern.
 
 ### Manual Depthwise Conv1d
 
-SDK 2.28 has a compiler bug (TEN404) where the auto-inserted NKI Conv1d kernel crashes on `seq_len=1` (decode path). We work around this by implementing depthwise convolution manually using weight parameters and a loop over kernel positions.
+The CTE (context encoding) path uses a manual depthwise conv1d loop over K=4 taps. This produces a compact HLO graph that compiles quickly at all batch sizes. The decode path uses `nn.Conv1d` weights directly (dot product at seq_len=1). The TEN404 compiler bug that required this workaround in SDK 2.28 is fixed in SDK 2.29.1, but the manual loop remains for CTE to avoid NCC_IBCG901 (f_packing assertion at output width > 128 tiles) and for faster compilation at higher batch sizes.
 
 ### Gated RMSNorm Ordering
 
@@ -56,9 +56,9 @@ Prefill uses a full-sequence parallel scan via cumulative sum in log-space (L x 
 
 ## Validation Results
 
-**Validated:** 2026-03-10
-**Configuration:** TP=4, batch_size=1, seq_len=2048, max_context_length=128, bfloat16
-**Instance:** trn2.3xlarge (LNC=2, SDK 2.28)
+**Validated:** 2026-05-19
+**Configuration:** TP=4, batch_size=7, seq_len=2048, max_context_length=128, bfloat16
+**Instance:** trn2.3xlarge (LNC=2, SDK 2.29.1)
 
 ### Prefill Accuracy (vs HF BF16 CPU, 10 prompts)
 
@@ -100,13 +100,17 @@ Both models produce coherent, factually correct text. Token-level divergence dur
 
 ### Inference Performance
 
-| Metric | Value |
-|--------|-------|
-| Prefill latency | 699 ms (L=128, any prompt length up to 128) |
-| Decode per-token | 56.9 ms |
-| Decode throughput | 17.6 tok/s (100 tokens) |
-| Instance | trn2.48xlarge / trn2.3xlarge (identical results) |
-| Config | TP=4, LNC=2, BS=1, BF16 |
+| Metric | BS=1 | BS=4 | BS=7 (optimal) |
+|--------|------|------|----------------|
+| Decode throughput | 24.7 tok/s | 44.3 tok/s | **62.8 tok/s** |
+| Decode per-token | 40.5 ms | 90.2 ms | 111.6 ms |
+| Prefill latency | 307 ms | 588 ms | ~2.0 s |
+| Instance | trn2.3xlarge | trn2.3xlarge | trn2.3xlarge |
+| Config | TP=4, LNC=2, BF16 | TP=4, LNC=2, BF16 | TP=4, LNC=2, BF16 |
+
+**BS=7 is the optimal batch size** for maximum throughput on trn2.3xlarge. At BS=8 and above, the MoE layer switches from selective expert loading (10/72 experts) to all-expert mode (72/72 experts), causing a 17% throughput regression (53.6 tok/s at BS=8 vs 62.8 tok/s at BS=7). The threshold is `batch_size * top_k / num_experts >= 1.0`, i.e. `BS * 10 / 72 >= 1.0` → BS >= 8 triggers all-expert mode.
+
+**TP=2 is not possible** — at TP=2, the compiler reports 30 GB needed per core vs 24 GB available (NCC_EVRF009). Weights at TP=2 are ~14 GB, Mamba state ~8 GB, plus activation/IO tensors push it over the limit. TP=4 is the minimum for this model on trn2.
 
 ## Usage
 
@@ -125,7 +129,7 @@ COMPILED_PATH = "/path/to/compiled_model/"
 # Configure
 neuron_config = MoENeuronConfig(
     tp_degree=4,
-    batch_size=1,
+    batch_size=7,  # BS=7 is optimal (selective expert loading)
     max_context_length=128,
     seq_len=2048,
     on_device_sampling_config=None,
@@ -163,15 +167,15 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 ## Compatibility Matrix
 
-| Instance Type | SDK 2.29 | SDK 2.28 | SDK 2.27 |
+| Instance Type | SDK 2.29.1 | SDK 2.29 | SDK 2.28 |
 |--------------|----------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | Validated (18.5 tok/s) | Validated | Not tested |
-| trn2.48xlarge (TP=4, LNC=2) | Expected | Validated (identical to 3xlarge) | Not tested |
-| trn1.32xlarge | Not supported | Not tested | Not tested |
+| trn2.3xlarge (TP=4, LNC=2) | **Validated** (62.8 tok/s @ BS=7) | Validated | Validated |
+| trn2.48xlarge (TP=4, LNC=2) | Expected | Expected | Validated (identical to 3xlarge) |
+| trn1.32xlarge | Not supported | Not supported | Not tested |
 
 > **NxDI 2.29+ requires Trn2 or newer hardware.** For Trn1 support, pin to SDK 2.28.
 
-**Note:** This model requires MoE support (`MoENeuronConfig`) and Mamba state persistence. The TEN404 conv1d workaround is specific to SDK 2.28; future SDK versions may not need it. The NKI selective scan kernel is disabled by default (`USE_NKI_SCAN = False`); the quadratic O(L^2) scan is used instead.
+**Note:** This model requires MoE support (`MoENeuronConfig`) and Mamba state persistence. The NKI selective scan kernel uses chunked SSD by default (`USE_CHUNKED_SSD = True`) for 2.5x faster prefill over the quadratic O(L^2) scan.
 
 ## Testing
 
@@ -187,10 +191,10 @@ python test/integration/test_model.py
 ## Known Limitations
 
 1. **Maximum context length is 128.** This is a hard limit imposed by per-core HBM on trn2. See [Context Length Limits](#context-length-limits) below for details.
-2. **No on-device sampling tested** — current validation uses raw logits (`on_device_sampling_config=None`). Enabling on-device sampling for production use needs testing.
-3. **Batch size 1 only** — batch_size > 1 has not been validated.
-4. **Full-sequence parallel scan** — the prefill SSM uses an O(L^2) parallel scan. For very long sequences, a chunk-based approach or NKI kernel would be more efficient, but is moot given the L=128 HBM limit.
-5. **Conv1d workaround** — manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK bug is fixed.
+2. **Minimum TP=4.** TP=2 exceeds per-core HBM (30 GB needed vs 24 GB limit). TP=4 is the minimum parallelism degree.
+3. **No on-device sampling tested** — current validation uses raw logits (`on_device_sampling_config=None`). Enabling on-device sampling for production use needs testing.
+4. **MoE expert threshold** — batch sizes >= 8 trigger all-expert mode, reducing throughput. Use BS=7 for maximum throughput.
+5. **Full-sequence parallel scan** — the prefill SSM uses chunked SSD (O(L) matmul-based). For very long sequences, the HBM state buffers are the bottleneck, not compute.
 
 ## Context Length Limits
 
@@ -236,4 +240,4 @@ The 36 Mamba2 layers each require persistent state buffers (`conv_state` and `ss
 
 - **GitHub:** [@jimburtoft](https://github.com/jimburtoft)
 
-**Last Updated:** 2026-05-12
+**Last Updated:** 2026-05-19
