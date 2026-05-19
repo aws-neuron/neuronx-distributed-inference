@@ -22,8 +22,9 @@ IBM Granite 4.0-H-Small is a hybrid Mamba2/Attention architecture with MoE:
 Key implementation details:
 - Mamba state persistence via nn.ParameterList + input_output_aliases
   (same mechanism as KV cache, following MLlama vision_key_values pattern)
-- nn.Conv1d depthwise convolution (TEN404 fixed in SDK 2.29.1)
-  (optional nki-lib depthwise_conv1d_implicit_gemm for prefill acceleration)
+- nn.Conv1d depthwise convolution (TEN404 fixed in SDK 2.29.1): decode uses nn.Conv1d
+  weights directly (dot product at seq_len=1), CTE uses manual loop for compact HLO graph.
+  Optional nki-lib depthwise_conv1d_implicit_gemm for CTE acceleration.
 - Full-sequence chunked SSD scan for prefill (Dao & Gu, 2024), O(1) recurrence for decode
 - GraniteRMSNormGated: gate applied BEFORE norm (norm_before_gate=False)
 - ScaledEmbedding/ScaledLMHead wrappers for Granite's multiplier/scaling
@@ -71,76 +72,6 @@ from neuronx_distributed.utils import cpu_mode
 
 logger = logging.getLogger(__name__)
 
-
-# ==============================================================================
-# Monkeypatch: Fix NCC_IBCG901 compiler bug in Conv1d_depthwise f_packing
-# ==============================================================================
-# SDK 2.29.1 (neuronx-cc 2.24.8799.0) has a BIRCodeGen assertion error in
-# conv1d_depthwise_f_packing when output width > 128 (our CTE case: W_out=131).
-# The conv1d_depthwise_default variant works correctly for all sizes.
-# This patch modifies the on-disk kernel to force the default implementation.
-def _patch_conv1d_depthwise_kernel():
-    """Patch neuronxcc conv1d kernel on disk to avoid f_packing BIRCodeGen bug.
-
-    The compiler spawns subprocesses that load neuronxcc.private_nkl.conv, so
-    in-process monkeypatching won't work. We must patch the source file directly.
-    """
-    try:
-        import neuronxcc.private_nkl.conv as conv_module
-
-        conv_path = conv_module.__file__
-        with open(conv_path, "r") as f:
-            content = f.read()
-
-        # Check if already patched (handles both manual sed patch and this script)
-        if "PATCHED_NCC_IBCG901" in content or (
-            "flattend_input_img_size = 1" in content and "# PATCHED" in content
-        ):
-            logger.info("conv1d_depthwise kernel already patched (NCC_IBCG901)")
-            return True
-
-        # Patch: force flattend_input_img_size = 1 before dispatch check
-        old = "  # Dispatch based on f-packing tile count\n  if flattend_input_img_size == 1:"
-        new = (
-            "  # PATCHED_NCC_IBCG901: Force default variant to avoid BIRCodeGen assertion\n"
-            "  flattend_input_img_size = 1\n"
-            "  # Dispatch based on f-packing tile count\n"
-            "  if flattend_input_img_size == 1:"
-        )
-        if old not in content:
-            logger.warning(
-                "conv1d_depthwise: dispatch pattern not found, skipping patch"
-            )
-            return False
-
-        content = content.replace(old, new)
-        with open(conv_path, "w") as f:
-            f.write(content)
-
-        # Clear .pyc cache
-        import pathlib
-
-        pyc = pathlib.Path(conv_path).parent / "__pycache__"
-        if pyc.exists():
-            for p in pyc.glob("conv.cpython-*.pyc"):
-                p.unlink()
-
-        logger.info(f"Patched conv1d_depthwise at {conv_path} (NCC_IBCG901 fix)")
-        return True
-    except (ImportError, AttributeError, PermissionError) as e:
-        logger.warning(
-            f"Could not patch conv1d_depthwise kernel: {e}. "
-            "CTE will use manual conv loop fallback."
-        )
-        return False
-
-
-# Apply patch at import time. If patch fails, CTE falls back to manual loop.
-# NOTE: The on-disk patch approach does NOT work because the compiler uses
-# source/AST analysis of the NKI kernel, not Python execution. The patched
-# function body is never actually called by the compiler. Until NCC_IBCG901 is
-# fixed upstream, always use the manual conv loop for CTE.
-_CONV1D_KERNEL_PATCHED = False  # _patch_conv1d_depthwise_kernel()
 
 # ==============================================================================
 # NKI Selective Scan Kernel for Mamba2 prefill
@@ -820,14 +751,15 @@ class NeuronMamba2Layer(nn.Module):
 
         # Depthwise Conv1d — TEN404 bug fixed in SDK 2.29.1, using native nn.Conv1d.
         # groups=conv_dim makes this a depthwise convolution (one filter per channel).
-        # Causal padding: left-pad by (kernel_size - 1) so output[t] only depends on input[<=t].
+        # padding=0: We manually left-pad in forward() to implement causal convolution.
+        # This avoids NCC_IBCG901 bug (f_packing BIRCodeGen assertion when output
+        # width > 128 tiles). With manual left-padding, output width = seq_len exactly.
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
             kernel_size=self.conv_kernel_size,
             groups=self.conv_dim,
-            padding=self.conv_kernel_size
-            - 1,  # Full left+right padding; we trim right side
+            padding=0,
             bias=self.use_conv_bias,
         )
 
@@ -951,8 +883,12 @@ class NeuronMamba2Layer(nn.Module):
             )
 
         # Dummy KV cache for compatibility with attention-based generation loop
-        dummy_k = torch.zeros(1, 1, 1, 1, dtype=output.dtype, device=output.device)
-        dummy_v = torch.zeros(1, 1, 1, 1, dtype=output.dtype, device=output.device)
+        dummy_k = torch.zeros(
+            batch_size, 1, 1, 1, dtype=output.dtype, device=output.device
+        )
+        dummy_v = torch.zeros(
+            batch_size, 1, 1, 1, dtype=output.dtype, device=output.device
+        )
 
         return (output, (dummy_k, dummy_v), (conv_state_new, ssm_state_new))
 
@@ -977,33 +913,26 @@ class NeuronMamba2Layer(nn.Module):
                 self.conv_kernel_size,
             )
         else:
-            # Native nn.Conv1d (TEN404 fixed in SDK 2.29.1)
-            # Requires _patch_conv1d_depthwise_kernel() to have patched the compiler
-            # kernel (avoids NCC_IBCG901 bug in f_packing variant at seq_len>1).
-            # If patch failed, falls back to manual loop over kernel taps.
-            if _CONV1D_KERNEL_PATCHED:
-                # Input: (batch, seq_len, conv_dim) -> (batch, conv_dim, seq_len)
-                conv_input = hidden_states_B_C.transpose(1, 2)
-                conv_output = self.conv1d(conv_input)[:, :, :seq_len]
-                hidden_states_B_C_conv = conv_output.transpose(
-                    1, 2
-                )  # -> (batch, seq_len, conv_dim)
-            else:
-                # Fallback: manual depthwise conv1d via loop over K taps
-                K = self.conv_kernel_size
-                padded = F.pad(
-                    hidden_states_B_C, (0, 0, K - 1, 0), value=0.0
-                )  # -> (batch, seq_len + K - 1, conv_dim)
-                conv_weight = self.conv1d.weight.squeeze(1)  # -> (conv_dim, K)
-                hidden_states_B_C_conv = torch.zeros_like(hidden_states_B_C)
-                for k in range(K):
-                    hidden_states_B_C_conv = hidden_states_B_C_conv + (
-                        padded[:, k : k + seq_len, :] * conv_weight[None, None, :, k]
-                    )
-                if self.conv1d.bias is not None:
-                    hidden_states_B_C_conv = (
-                        hidden_states_B_C_conv + self.conv1d.bias[None, None, :]
-                    )
+            # Manual depthwise conv1d via loop over K taps.
+            # This produces a compact HLO graph (just 4 multiply-adds for K=4) that
+            # compiles much faster than nn.Conv1d for CTE at higher batch sizes.
+            # nn.Conv1d is used for TKG (decode path) where seq_len=1.
+            K = self.conv_kernel_size
+            padded = F.pad(
+                hidden_states_B_C, (0, 0, K - 1, 0), value=0.0
+            )  # -> (batch, seq_len + K - 1, conv_dim)
+            conv_weight = self.conv1d.weight.squeeze(
+                1
+            )  # (conv_dim, 1, K) -> (conv_dim, K)
+            hidden_states_B_C_conv = torch.zeros_like(hidden_states_B_C)
+            for k in range(K):
+                hidden_states_B_C_conv = hidden_states_B_C_conv + (
+                    padded[:, k : k + seq_len, :] * conv_weight[None, None, :, k]
+                )
+            if self.conv1d.bias is not None:
+                hidden_states_B_C_conv = (
+                    hidden_states_B_C_conv + self.conv1d.bias[None, None, :]
+                )
 
         # Save conv_state from last K-1 real token positions
         if padding_mask is not None and seq_len >= self.conv_kernel_size - 1:
@@ -1825,7 +1754,9 @@ class NeuronGraniteForCausalLM(NeuronBaseForCausalLM):
         return (
             "--enable-saturate-infinity --enable-mixed-precision-accumulation "
             "--model-type transformer -O1 "
-            "--tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2' "
+            "--tensorizer-options='--enable-ccop-compute-overlap "
+            "--cc-pipeline-tiling-factor=2 "
+            "--vectorize-strided-dma' "
             "--auto-cast=none"
         )
 
