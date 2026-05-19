@@ -21,11 +21,10 @@ Video super-resolution (4x upscaling) on AWS Trainium using a streaming DiT arch
 
 | Metric | Value |
 |--------|-------|
-| End-to-end throughput | 8.27 FPS (768x1280 output) |
-| DiT latency (first chunk, f=6) | ~95 ms |
-| DiT latency (stream chunk, f=2) | ~35 ms |
-| TCDecoder latency (sequential, per frame) | ~45 ms |
-| Pipeline overhead (LQ proj + color correction) | ~200 ms total |
+| End-to-end throughput | 8.27 FPS (768x1280 output, 85 frames) |
+| Total DiT time | ~4.0s (1 first chunk + 8 stream chunks) |
+| Total TCDecoder time (sequential) | ~4.5s (22 frames sequential) |
+| LQ Projection | ~0.80s (single pass, all frames) |
 
 ### Accuracy Validation
 
@@ -33,7 +32,7 @@ Video super-resolution (4x upscaling) on AWS Trainium using a streaming DiT arch
 |--------|-------|
 | DiT neuron_allclose vs CPU (rtol=0.01) | PASS |
 | TCDecoder PSNR vs CPU reference | >45 dB |
-| Full pipeline visual quality | Matches GPU reference (DMD single-step) |
+| Full pipeline visual quality | Matches reference implementation (DMD single-step) |
 
 ## Usage
 
