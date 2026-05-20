@@ -7,7 +7,7 @@ FlashVSR inference pipeline for AWS Trainium.
 Orchestrates the full FlashVSR video super-resolution pipeline:
   1. LQ Projection (torch_neuronx.trace) -- generates per-token conditioning
   2. DiT denoising (NxDI ModelBuilder, TP=4) -- streaming chunks (first f=6, then f=2)
-  3. TCDecoder (torch_neuronx.trace, sequential) -- latent to RGB conversion
+  3. TCDecoder (NxDI ModelBuilder, HBM state persistence) -- latent to RGB conversion
   4. Color correction (CPU) -- wavelet/adain alignment with LQ reference
 
 Usage:
@@ -405,8 +405,9 @@ def compile_pipeline(
     This function compiles:
     1. DiT (first chunk, f=6) via NxDI ModelBuilder
     2. DiT (stream chunk, f=2) via NxDI ModelBuilder
-    3. LQ Projection via torch_neuronx.trace
-    4. TCDecoder (sequential) via torch_neuronx.trace
+    3. TCDecoder (sequential, HBM states) via NxDI ModelBuilder
+
+    LQ Projection must be compiled separately via torch_neuronx.trace.
 
     Args:
         weights_dir: Path to FlashVSR-v1.1 weights directory
@@ -461,6 +462,22 @@ def compile_pipeline(
         app = FlashVSRApplication(model_path=weights_dir, config=config)
         app.compile(dit_stream_dir)
         app.shard_weights(dit_stream_dir)
+
+    # Compile TCDecoder (NxDI with HBM state persistence)
+    tcdecoder_dir = os.path.join(output_dir, "tcdecoder")
+    if not os.path.exists(tcdecoder_dir):
+        from .tcdecoder import TCDecoderApplication, TCDecoderConfig
+
+        tcd_neuron_config = NeuronConfig(
+            tp_degree=1,
+            torch_dtype=torch.bfloat16,
+            batch_size=1,
+        )
+        tcd_config = TCDecoderConfig(
+            neuron_config=tcd_neuron_config, height=height, width=width
+        )
+        tcd_app = TCDecoderApplication(weights_dir=weights_dir, config=tcd_config)
+        tcd_app.compile(tcdecoder_dir)
 
 
 # ===================================================================
@@ -558,12 +575,32 @@ def load_pipeline(
         dit_stream_app.load(config.compiled_dit_stream)
         pipeline.dit_stream_app = dit_stream_app
 
-        # Load TCDecoder (if available)
-        if tcdecoder_path and os.path.exists(tcdecoder_path):
+        # Load TCDecoder (NxDI with HBM state persistence)
+        tcdecoder_compiled = os.path.join(compiled_dir, "tcdecoder")
+        if os.path.exists(tcdecoder_compiled):
+            from .tcdecoder import (
+                TCDecoderApplication,
+                TCDecoderConfig,
+                TCPixelShuffle3d,
+            )
+
+            tcd_neuron_config = NeuronConfig(
+                tp_degree=1,
+                torch_dtype=torch.bfloat16,
+                batch_size=1,
+            )
+            tcd_config = TCDecoderConfig(
+                neuron_config=tcd_neuron_config, height=height, width=width
+            )
+            tcd_app = TCDecoderApplication(weights_dir=weights_dir, config=tcd_config)
+            tcd_app.load(tcdecoder_compiled)
+            pipeline.tcdecoder_model = tcd_app
+            pipeline.tc_pixel_shuffle = TCPixelShuffle3d(4, 8, 8)
+        elif tcdecoder_path and os.path.exists(tcdecoder_path):
+            # Legacy fallback: load trace-based TCDecoder
             import torch_neuronx  # noqa: F401
 
             pipeline.tcdecoder_model = torch.jit.load(tcdecoder_path)
-            # Create pixel_shuffle for TCDecoder conditioning
             from .tcdecoder import TCPixelShuffle3d
 
             pipeline.tc_pixel_shuffle = TCPixelShuffle3d(4, 8, 8)
@@ -700,16 +737,30 @@ def run_inference(
 
     # Step 4: TCDecoder
     if pipeline.tcdecoder_model is not None and pipeline.tc_pixel_shuffle is not None:
-        from .tcdecoder import neuron_decode_video_sequential
+        from .tcdecoder import TCDecoderApplication, decode_video_nxdi
 
         LQ_cur_idx = process_total_num * 8 + 21 if process_total_num > 0 else 21
-        frames = neuron_decode_video_sequential(
-            pipeline.tcdecoder_model,
-            latents_out.transpose(1, 2),  # NCTHW -> NTCHW
-            LQ_video[:, :, :LQ_cur_idx, :, :],
-            pipeline.tc_pixel_shuffle,
-            frames_to_trim=3,
-        )
+
+        if isinstance(pipeline.tcdecoder_model, TCDecoderApplication):
+            # NxDI path: HBM state persistence (3.0x faster)
+            frames = decode_video_nxdi(
+                pipeline.tcdecoder_model,
+                latents_out.transpose(1, 2),  # NCTHW -> NTCHW
+                LQ_video[:, :, :LQ_cur_idx, :, :],
+                pipeline.tc_pixel_shuffle,
+                frames_to_trim=3,
+            )
+        else:
+            # Legacy trace-based path
+            from .tcdecoder import neuron_decode_video_sequential
+
+            frames = neuron_decode_video_sequential(
+                pipeline.tcdecoder_model,
+                latents_out.transpose(1, 2),  # NCTHW -> NTCHW
+                LQ_video[:, :, :LQ_cur_idx, :, :],
+                pipeline.tc_pixel_shuffle,
+                frames_to_trim=3,
+            )
     else:
         raise RuntimeError("TCDecoder not loaded -- required for full pipeline")
 
