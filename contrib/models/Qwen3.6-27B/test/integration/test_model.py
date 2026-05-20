@@ -260,19 +260,30 @@ def test_top_token_valid(compiled_model, tokenizer, generation_config):
 
 @requires_model_path
 def test_capital_of_france(compiled_model, tokenizer, generation_config):
-    """'The capital of France is' should produce 'Paris' as first token."""
+    """'The capital of France is' should produce 'Paris' in output.
+
+    Qwen3.6-27B defaults to thinking mode (emits <think>...</think> tags),
+    so we generate enough tokens to get past the thinking block.
+    """
     tokens, text = _generate(
         compiled_model,
         tokenizer,
         generation_config,
         "The capital of France is",
-        max_new_tokens=5,
+        max_new_tokens=30,
     )
     generated = text[len("The capital of France is") :].strip()
-    assert "paris" in generated.lower(), (
+    # Strip thinking tags if present
+    import re
+
+    generated_no_think = re.sub(
+        r"<think>.*?</think>", "", generated, flags=re.DOTALL
+    ).strip()
+    check_text = generated_no_think if generated_no_think else generated
+    assert "paris" in check_text.lower(), (
         f"Expected 'Paris' in output, got: '{generated}'"
     )
-    print(f"  Capital of France: {generated}")
+    print(f"  Capital of France: {check_text}")
 
 
 # ── Performance Tests ───────────────────────────────────────────────────
