@@ -1,5 +1,10 @@
 """
-NxDI contrib: Qwen3.5-27B (qwen3_5 -- dense model)
+NxDI contrib: Qwen3.5-27B / Qwen3.6-27B (qwen3_5 -- dense model)
+
+Supports both Qwen3.5-27B and Qwen3.6-27B. These models share identical
+architecture (qwen3_5 model_type). Qwen3.6-27B is a post-training update
+with improved agentic coding and thinking preservation -- no architecture
+changes, only weight differences.
 
 Hybrid DeltaNet + Standard Attention + Dense MLP architecture.
 Adapted from Qwen3.5-35B-A3B (MoE) -- MoE removed, dense MLP added.
@@ -14,13 +19,17 @@ Architecture details:
 - Dense MLP: standard SwiGLU (gate_proj, up_proj, down_proj) -- no MoE, no router, no experts
 - KV cache: NxDI KVCacheManager for attention layers; DeltaNet layers store recurrent+conv
   state as nn.Parameter buffers and return dummy KV tuples
+
+Config compatibility notes:
+- Qwen3.6-27B adds output_gate_type="swish" to text_config. This field is
+  unused by both HF transformers and this NxDI code (gate uses sigmoid, as
+  confirmed across transformers v4.57.6, v5.6.0, and GitHub main). Safe to ignore.
 """
 
 import gc
 import math
 import logging
 import os
-import sys
 from typing import List, Optional, Tuple
 
 import torch
@@ -66,6 +75,8 @@ from src.nki_kernels.nki_deltanet_fused import (
     _make_lower_mask,
     _make_lower_mask_diag,
     _make_identity,
+    _make_block_masks,
+    _make_row_masks,
 )
 
 from neuronx_distributed_inference.models.config import (
@@ -107,38 +118,20 @@ if USE_NKILIB_KERNEL:
             enable_stack_allocator as _enable_stack_allocator,
         )
 
-        import importlib
-
-        _fork_path = "/home/ubuntu/nki-library-fork/nkilib_src"
-        if os.path.isdir(_fork_path) and _fork_path not in sys.path:
-            sys.path.insert(0, _fork_path)
-        _to_remove = [k for k in sys.modules if k.startswith("nkilib")]
-        for k in _to_remove:
-            del sys.modules[k]
-        import nki.language as _stub_nl
-        import neuronxcc.nki.language as _real_nl
-
-        for _attr in [
-            "NKIObject",
-            "float8_e4m3fn",
-            "float8_e4m3fn_x4",
-            "float8_e5m2_x4",
-            "float4_e2m1fn_x4",
-        ]:
-            if not hasattr(_real_nl, _attr) and hasattr(_stub_nl, _attr):
-                setattr(_real_nl, _attr, getattr(_stub_nl, _attr))
+        # Load nkilib from the installed package (requires nki-library >= 2.29)
         from nkilib.core.attention.attention_cte import (
             attention_cte as _attention_cte_raw,
             _MAX_HEAD_DIM,
         )
 
-        assert _MAX_HEAD_DIM == 256, (
-            f"nkilib fork has _MAX_HEAD_DIM={_MAX_HEAD_DIM}, expected 256. "
-            f"System nkilib may have been loaded instead of fork."
-        )
-        logger.info(
-            f"Loaded nkilib attention_cte from fork (_MAX_HEAD_DIM={_MAX_HEAD_DIM})"
-        )
+        if _MAX_HEAD_DIM < 256:
+            logger.warning(
+                f"nkilib _MAX_HEAD_DIM={_MAX_HEAD_DIM}, need 256 for Qwen3.5 GQA layers. "
+                f"Falling back to standard ISA kernel for head_dim > 128."
+            )
+            raise ImportError(f"nkilib _MAX_HEAD_DIM={_MAX_HEAD_DIM} < 256")
+
+        logger.info(f"Loaded nkilib attention_cte (_MAX_HEAD_DIM={_MAX_HEAD_DIM})")
 
         _raw_fn = _peel_decorations(_attention_cte_raw)
         _platform = _get_platform_target()
@@ -154,11 +147,8 @@ if USE_NKILIB_KERNEL:
             _nkilib_flash_attn, log_level=logging.INFO
         )
         logger.info("Option B: nkilib flash attention loaded for head_dim > 128")
-    except Exception as e:
+    except (ImportError, AttributeError, AssertionError) as e:
         logger.warning(f"Option B: Failed to load nkilib flash attention: {e}")
-        import traceback as _tb
-
-        _tb.print_exc()
         _nkilib_flash_attn = None
 
 # Option A: Detect if patch_attn_kernel was imported
@@ -170,7 +160,7 @@ try:
     if hasattr(_attn_mod, "_original_attention_nki_kernel_adapter"):
         NKILIB_PATCH_ACTIVE = True
         logger.info("Option A detected: _pre_prod_kernels patched with nkilib kernel")
-except Exception:
+except (ImportError, ModuleNotFoundError):
     pass
 
 
@@ -223,7 +213,7 @@ class NeuronGatedDeltaNet(nn.Module):
     """
     Gated DeltaNet linear attention for Neuron.
 
-    Replaces standard attention for 48 of 64 layers in Qwen3.5-27B.
+    Replaces standard attention for 48 of 64 layers in Qwen3.5/3.6-27B.
     Uses a chunk-based linear recurrence instead of KV cache.
 
     HF weight layout (27B dense -- scaled dimensions):
@@ -484,17 +474,14 @@ class NeuronGatedDeltaNet(nn.Module):
     def _fused_chunked_forward(
         self, query, key, value, g, beta, output_final_state=False
     ):
-        """Fused single-kernel chunked forward for CTE — SSD-style.
+        """Fused single-kernel chunked forward for CTE — v14 8-block forward substitution.
 
         Processes all chunks in a single NKI kernel call per (B,H) pair.
         State persists in SBUF across chunks (no HBM round-trips).
         Cumsum of g computed in-kernel via tensor_tensor_scan.
 
-        This is the optimized version of _nki_chunked_forward with:
-          1. Single kernel call per (B,H) instead of B*H*num_chunks
-          2. State in SBUF across all chunks (biggest perf win)
-          3. In-kernel cumsum (avoids PyTorch cumsum overhead)
-          4. tensor_scalar for broadcasts (no explicit loops)
+        v14 uses 8-block (16x16) forward substitution with 4-round Neumann per block,
+        which avoids catastrophic cancellation in fp32 that the full 128x128 Neumann has.
         """
         chunk_size = 128
 
@@ -536,6 +523,10 @@ class NeuronGatedDeltaNet(nn.Module):
         lower_mask_diag = torch.tensor(
             _make_lower_mask_diag(), dtype=torch.float32, device=device
         )
+        block_masks = torch.tensor(
+            _make_block_masks(), dtype=torch.float32, device=device
+        )
+        row_masks = torch.tensor(_make_row_masks(), dtype=torch.float32, device=device)
 
         all_outputs = []
         all_states = []
@@ -549,6 +540,8 @@ class NeuronGatedDeltaNet(nn.Module):
                 lower_mask,  # (128, 128)
                 identity_mat,  # (128, 128)
                 lower_mask_diag,  # (128, 128)
+                block_masks,  # (8, 128, 128)
+                row_masks,  # (8, 128, 1)
             )
             all_outputs.append(out_bh)
             all_states.append(state_bh)
@@ -745,30 +738,27 @@ class NeuronGatedDeltaNet(nn.Module):
                 conv_state = self.conv_state_buffer[:batch_size]
             conv_input = torch.cat([conv_state, mixed], dim=-1)
 
-            w = self.conv1d.weight.squeeze(1)
-            conv_out = torch.zeros_like(mixed)
-            for k in range(4):
-                conv_out = (
-                    conv_out
-                    + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[:, :, k : k + 1]
-                )
-            mixed_post_conv = F.silu(conv_out)
+            # Depthwise conv1d: weight shape is (conv_dim, 1, kernel_size).
+            # conv_input has exactly kernel_size timesteps (state + current token).
+            # Use F.conv1d with groups=conv_dim for the depthwise application.
+            mixed_post_conv = F.silu(
+                F.conv1d(conv_input, self.conv1d.weight, groups=self.conv_dim)
+            )
 
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)
             alloc_bs = self.conv_state_buffer.shape[0]
             if seq_ids is not None:
-                # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
-                # Add buffer dependency for input_output_alias
-                new_conv_state = (
-                    new_conv_state.to(self.conv_state_buffer.dtype)
-                    + self.conv_state_buffer * 0
+                idx = seq_ids.view(-1, 1, 1).expand_as(new_conv_state)
+                new_conv_state = (self.conv_state_buffer * 1).scatter(
+                    0, idx, new_conv_state
                 )
             elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
                 new_conv_state = torch.cat(
                     [
                         new_conv_state,
-                        self.conv_state_buffer[batch_size:] * 0,
+                        self.conv_state_buffer[batch_size:]
+                        * 0,  # touch remaining buffer entries
                     ],
                     dim=0,
                 )
@@ -793,10 +783,9 @@ class NeuronGatedDeltaNet(nn.Module):
 
             alloc_bs = self.conv_state_buffer.shape[0]
             if seq_ids is not None:
-                # BS=1 optimization: scatter to index 0 = direct replacement
-                new_conv_state = (
-                    new_conv_state.to(self.conv_state_buffer.dtype)
-                    + self.conv_state_buffer * 0
+                idx = seq_ids.view(-1, 1, 1).expand_as(new_conv_state)
+                new_conv_state = (self.conv_state_buffer * 1).scatter(
+                    0, idx, new_conv_state
                 )
             elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
@@ -884,28 +873,32 @@ class NeuronGatedDeltaNet(nn.Module):
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
             alloc_bs = self.recurrent_state_buffer.shape[0]
             if seq_ids is not None:
-                # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
-                # Add buffer dependency for input_output_alias
-                new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
+                idx = seq_ids.view(-1, 1, 1, 1).expand_as(new_state_bf16)
+                new_rec_state = (self.recurrent_state_buffer * 1).scatter(
+                    0, idx, new_state_bf16
+                )
             elif batch_size < alloc_bs:
                 new_rec_state = torch.cat(
                     [
                         new_state_bf16,
-                        self.recurrent_state_buffer[batch_size:] * 0,
+                        self.recurrent_state_buffer[batch_size:]
+                        * 0,  # touch remaining buffer entries
                     ],
                     dim=0,
                 )
             else:
                 new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
         else:
-            # CTE: fused, chunk, NKI, or sequential forward
-            use_nki_fused = os.environ.get("USE_NKI_FUSED") == "1"
+            # CTE: fused NKI kernel by default (numerically stable v14 resolvent).
+            # Override with env vars for debugging/benchmarking.
+            use_nki_fused = os.environ.get("USE_NKI_FUSED", "1") != "0"
             use_nki_chunked = os.environ.get("USE_NKI_CHUNKED") == "1"
             use_nki = os.environ.get("USE_NKI") == "1"
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
+            use_pytorch_chunk = os.environ.get("USE_PYTORCH_CHUNK") == "1"
 
-            if use_nki_fused:
-                output, final_state = self._fused_chunked_forward(
+            if use_pytorch_chunk:
+                output, final_state = self._chunk_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
             elif use_nki_chunked:
@@ -920,8 +913,12 @@ class NeuronGatedDeltaNet(nn.Module):
                 output, final_state = self._sequential_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
+            elif use_nki_fused:
+                output, final_state = self._fused_chunked_forward(
+                    query, key, value, g, beta, output_final_state=True
+                )
             else:
-                output, final_state = self._chunk_forward(
+                output, final_state = self._fused_chunked_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
 
@@ -929,9 +926,10 @@ class NeuronGatedDeltaNet(nn.Module):
                 final_state_bf16 = final_state.to(self.recurrent_state_buffer.dtype)
                 alloc_bs = self.recurrent_state_buffer.shape[0]
                 if seq_ids is not None:
-                    # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
-                    # Add buffer dependency for input_output_alias
-                    new_rec_state = final_state_bf16 + self.recurrent_state_buffer * 0
+                    idx = seq_ids.view(-1, 1, 1, 1).expand_as(final_state_bf16)
+                    new_rec_state = (self.recurrent_state_buffer * 1).scatter(
+                        0, idx, final_state_bf16
+                    )
                 elif batch_size < alloc_bs:
                     new_rec_state = torch.cat(
                         [
@@ -983,7 +981,7 @@ class NeuronGatedDeltaNet(nn.Module):
 
 
 class Qwen35InferenceConfig(InferenceConfig):
-    """Config for Qwen3.5-27B (dense) with hybrid DeltaNet + Attention."""
+    """Config for Qwen3.5/3.6-27B (dense) with hybrid DeltaNet + Attention."""
 
     def __init__(self, *args, **kwargs):
         # Set defaults BEFORE super().__init__() because it calls validate_config()
@@ -1058,6 +1056,31 @@ class Qwen35InferenceConfig(InferenceConfig):
     @classmethod
     def get_neuron_config_cls(cls):
         return NeuronConfig
+
+    def add_derived_config(self):
+        """Promote text_config fields before validation.
+
+        When loaded via vLLM, the HF config has a multimodal-style layout
+        where model fields live inside text_config rather than at the top
+        level. This method promotes them so that validate_config() and the
+        rest of the model can access them as direct attributes.
+        """
+        if hasattr(self, "text_config") and not hasattr(self, "hidden_size"):
+            tc = self.text_config
+            for attr in dir(tc):
+                if not attr.startswith("_") and not hasattr(self, attr):
+                    setattr(self, attr, getattr(tc, attr))
+
+        # rope_theta lives inside rope_parameters in the HF config
+        if not hasattr(self, "rope_theta"):
+            rope_params = getattr(self, "rope_parameters", None)
+            if rope_params is not None:
+                if isinstance(rope_params, dict):
+                    self.rope_theta = rope_params.get("rope_theta", 10000000)
+                else:
+                    self.rope_theta = getattr(rope_params, "rope_theta", 10000000)
+
+        super().add_derived_config()
 
 
 # ============================================================
@@ -1358,7 +1381,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
 
 
 class Qwen35MLP(nn.Module):
-    """Dense SwiGLU MLP for Qwen3.5-27B.
+    """Dense SwiGLU MLP for Qwen3.5/3.6-27B.
 
     gate_proj: hidden_size -> intermediate_size (5120 -> 17408)
     up_proj:   hidden_size -> intermediate_size (5120 -> 17408)
@@ -1853,7 +1876,7 @@ class NeuronQwen35Model(NeuronBaseModel):
 
 
 def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
-    """Convert HF Qwen3.5-27B weights to NxDI format.
+    """Convert HF Qwen3.5/3.6-27B weights to NxDI format.
 
     Weight mappings per layer type:
 
