@@ -33,6 +33,7 @@ NKI kernels (optional, controlled by flags):
 - USE_CHUNKED_SSD: Chunked SSD matmul-based scan (DEFAULT, 21.7 tok/s, +18% over quadratic)
 - USE_NKI_SCAN: O(L) hardware scan via nisa.tensor_tensor_scan (NKI 0.3.0 GA)
 - USE_NKILIB_CONV1D: TensorE-accelerated depthwise conv1d from nki-lib
+- USE_NKI_FUSED_DECODE: Fused SSM state update + einsum for decode path
 """
 
 import gc
@@ -108,6 +109,16 @@ CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "64"))
 
 USE_NKILIB_CONV1D = False
 
+# ==============================================================================
+# NKI Fused SSM Decode Kernel
+# ==============================================================================
+# When enabled, replaces the PyTorch SSM state update + einsum + D*x skip in the
+# decode path with a single NKI kernel. This eliminates one HBM round-trip for
+# the intermediate y tensor between state update and output computation.
+# Controlled via USE_NKI_FUSED_DECODE=1 environment variable.
+
+USE_NKI_FUSED_DECODE = os.environ.get("USE_NKI_FUSED_DECODE", "0") == "1"
+
 try:
     import nki
     import nki.language as nl
@@ -122,6 +133,9 @@ except ImportError:
     if USE_NKILIB_CONV1D:
         logger.warning("NKI not available, falling back to manual conv1d")
         USE_NKILIB_CONV1D = False
+    if USE_NKI_FUSED_DECODE:
+        logger.warning("NKI not available, falling back to PyTorch SSM decode")
+        USE_NKI_FUSED_DECODE = False
 
 # Try to import nki-lib depthwise conv1d
 HAS_NKILIB_CONV1D = False
@@ -140,8 +154,11 @@ if HAS_NKI and USE_NKILIB_CONV1D:
         )
         USE_NKILIB_CONV1D = False
 
-if HAS_NKI and USE_NKI_SCAN:
+# NKI partition size constant (used by all NKI kernels)
+if HAS_NKI:
     P_MAX = 128
+
+if HAS_NKI and USE_NKI_SCAN:
 
     @nki.jit
     def nki_scan_kernel(
@@ -384,6 +401,179 @@ def _nki_selective_scan(
     )
 
     return y, final_state
+
+
+# ==============================================================================
+# NKI Fused SSM Decode Kernel
+# ==============================================================================
+
+if HAS_NKI and USE_NKI_FUSED_DECODE:
+
+    @nki.jit
+    def nki_fused_ssm_decode_kernel(
+        ssm_state,  # [BS, NH, HD, SS] float32 — input state
+        dA,  # [BS, NH] float32 — discretized decay (already exp'd)
+        dBx,  # [BS, NH, HD, SS] float32 — discretized input
+        C,  # [BS, NH, SS] float32 — output projection
+        D_param,  # [NH] float32 — skip connection weight
+        x,  # [BS, NH, HD] float32 — input for D*x skip
+    ):
+        """
+        Fused SSM decode V2: state_new = dA*state + dBx, y = einsum(state_new, C) + D*x.
+
+        Key optimization: uses nisa.activation(op=nl.copy, scale=dA_sb) for free-dim
+        broadcast of [NH, 1] → [NH, 8192] at ZERO cost (ScalarE pipelined multiply).
+        Processes full state [NH=128, HD*SS=8192] in 2 instructions instead of V1's
+        ~9000 instructions (128 broadcast copies × 8 d-tiles + inner loop overhead).
+
+        SBUF budget per batch item: ~8.3 MB (fits comfortably in 24 MB trn2 SBUF).
+        """
+        BS = ssm_state.shape[0]
+        NH = ssm_state.shape[1]  # 128
+        HD = ssm_state.shape[2]  # 64
+        SS = ssm_state.shape[3]  # 128
+        HDSS = HD * SS  # 8192
+
+        ssm_state_out = nl.ndarray(
+            (BS, NH, HD, SS), dtype=nl.float32, buffer=nl.shared_hbm
+        )
+        y_out = nl.ndarray((BS, NH, HD), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        # Load D parameter once (shared across all batch items): [NH] → [NH, 1]
+        D_sb = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=D_sb[0:NH, 0:1],
+            src=D_param.reshape((NH, 1))[0:NH, 0:1],
+        )
+
+        for b in nl.sequential_range(BS):
+            # Load dA: [NH] → [NH, 1]
+            dA_sb = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=dA_sb[0:NH, 0:1],
+                src=dA.reshape((BS, NH, 1))[b, 0:NH, 0:1],
+            )
+
+            # Load C: [NH, SS] = [128, 128]
+            C_sb = nl.ndarray((P_MAX, SS), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=C_sb[0:NH, 0:SS],
+                src=C[b, 0:NH, 0:SS],
+            )
+
+            # Load x: [NH, HD] = [128, 64]
+            x_sb = nl.ndarray((P_MAX, HD), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=x_sb[0:NH, 0:HD],
+                src=x[b, 0:NH, 0:HD],
+            )
+
+            # ===== PHASE 1: State Update (2 instructions for entire state) =====
+            # Load state as flat [NH, HDSS] = [128, 8192]
+            state_flat = nl.ndarray((P_MAX, HDSS), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=state_flat[0:NH, 0:HDSS],
+                src=ssm_state.reshape((BS, NH, HDSS))[b, 0:NH, 0:HDSS],
+            )
+
+            # Load dBx as flat [NH, HDSS] = [128, 8192]
+            dBx_flat = nl.ndarray((P_MAX, HDSS), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=dBx_flat[0:NH, 0:HDSS],
+                src=dBx.reshape((BS, NH, HDSS))[b, 0:NH, 0:HDSS],
+            )
+
+            # scaled_state = state * dA (FREE broadcast: dA [NH,1] → [NH,8192])
+            scaled_state = nl.ndarray((P_MAX, HDSS), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(
+                dst=scaled_state[0:NH, 0:HDSS],
+                op=nl.copy,
+                data=state_flat[0:NH, 0:HDSS],
+                scale=dA_sb[0:NH, 0:1],
+            )
+
+            # state_new = scaled_state + dBx (reuse dBx_flat buffer)
+            nisa.tensor_tensor(
+                dst=dBx_flat[0:NH, 0:HDSS],
+                data1=scaled_state[0:NH, 0:HDSS],
+                data2=dBx_flat[0:NH, 0:HDSS],
+                op=nl.add,
+            )
+            # dBx_flat now holds state_new [NH, HDSS]
+
+            # Write state_new to HBM
+            nisa.dma_copy(
+                dst=ssm_state_out.reshape((BS, NH, HDSS))[b, 0:NH, 0:HDSS],
+                src=dBx_flat[0:NH, 0:HDSS],
+            )
+
+            # ===== PHASE 2: Output einsum + D*x skip =====
+            # y[h, d] = sum_s(state_new[h, d, s] * C[h, s]) + D[h] * x[h, d]
+
+            # Compute D*x using activation scale broadcast: D[NH,1] * x[NH,HD]
+            Dx = nl.ndarray((P_MAX, HD), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(
+                dst=Dx[0:NH, 0:HD],
+                op=nl.copy,
+                data=x_sb[0:NH, 0:HD],
+                scale=D_sb[0:NH, 0:1],
+            )
+            # Initialize y_acc = D*x
+            y_acc = Dx
+
+            # Compute einsum for each d position
+            for d in nl.affine_range(HD):
+                d_offset = d * SS
+
+                # Extract state_new_d: [NH, SS] from flat buffer
+                state_new_d = nl.ndarray((P_MAX, SS), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(
+                    dst=state_new_d[0:NH, 0:SS],
+                    src=dBx_flat[0:NH, d_offset : d_offset + SS],
+                )
+
+                # prod = state_new_d * C
+                prod = nl.ndarray((P_MAX, SS), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(
+                    dst=prod[0:NH, 0:SS],
+                    data1=state_new_d[0:NH, 0:SS],
+                    data2=C_sb[0:NH, 0:SS],
+                    op=nl.multiply,
+                )
+
+                # y_d = sum(prod, axis=free_dim): [NH, SS] → [NH, 1]
+                y_d = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_reduce(
+                    dst=y_d[0:NH, 0:1],
+                    data=prod[0:NH, 0:SS],
+                    op=nl.add,
+                    axis=(1,),
+                )
+
+                # Accumulate: y_acc[d] += y_d
+                y_cur = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(
+                    dst=y_cur[0:NH, 0:1],
+                    src=y_acc[0:NH, d : d + 1],
+                )
+                nisa.tensor_tensor(
+                    dst=y_cur[0:NH, 0:1],
+                    data1=y_cur[0:NH, 0:1],
+                    data2=y_d[0:NH, 0:1],
+                    op=nl.add,
+                )
+                nisa.tensor_copy(
+                    dst=y_acc[0:NH, d : d + 1],
+                    src=y_cur[0:NH, 0:1],
+                )
+
+            # Store y output
+            nisa.dma_copy(
+                dst=y_out[b, 0:NH, 0:HD],
+                src=y_acc[0:NH, 0:HD],
+            )
+
+        return ssm_state_out, y_out
 
 
 # ==============================================================================
@@ -1111,10 +1301,15 @@ class NeuronMamba2Layer(nn.Module):
         dB = dt_processed.unsqueeze(-1) * B
         dBx = dB.unsqueeze(2) * x.unsqueeze(-1)
 
-        ssm_state_new = dA.unsqueeze(-1).unsqueeze(-1) * ssm_state.float() + dBx
-
-        y = torch.einsum("bhds,bhs->bhd", ssm_state_new, C)
-        y = y + self.D.view(1, -1, 1) * x
+        if USE_NKI_FUSED_DECODE and HAS_NKI:
+            # NKI fused kernel: state update + einsum + D*x in one HBM pass
+            ssm_state_new, y = nki_fused_ssm_decode_kernel(
+                ssm_state.float(), dA, dBx, C, self.D.float(), x
+            )
+        else:
+            ssm_state_new = dA.unsqueeze(-1).unsqueeze(-1) * ssm_state.float() + dBx
+            y = torch.einsum("bhds,bhs->bhd", ssm_state_new, C)
+            y = y + self.D.view(1, -1, 1) * x
         y = y.reshape(batch_size, -1)
 
         gate_squeezed = gate.squeeze(1)
