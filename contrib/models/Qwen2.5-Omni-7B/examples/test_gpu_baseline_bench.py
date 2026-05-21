@@ -309,60 +309,95 @@ def run_streaming_pipeline(
     text = processor.batch_decode(new_text_ids, skip_special_tokens=True)[0]
 
     # ----- Build talker input from thinker hidden states -----
-    # HF Qwen2_5Omni's talker uses the thinker's last hidden state of the
-    # reply tokens as conditioning, projected internally inside
-    # ``model._prepare_talker_input``. We call that helper if present;
-    # otherwise we fall back to ``model.generate`` for the talker stage.
-    prep_helper = getattr(model, "_prepare_talker_input", None)
-    if prep_helper is None:
-        # Fall back: use generate() to drive talker (no chunking) so this
-        # stays a working baseline even on transformers releases that
-        # don't expose the helper.
-        with torch.inference_mode():
-            _, audio = model.generate(
-                **inputs,
-                speaker=speaker,
-                return_audio=True,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-            )
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        t_end = time.time()
-        wav = audio.detach().float().reshape(-1).cpu()
-        return {
-            "text": text,
-            "n_text_tokens": int(new_text_ids.shape[1]),
-            "n_codec_tokens": -1,
-            "audio_chunks": [wav],
-            "chunk_meta": [{
-                "start": 0, "end": -1, "samples": int(wav.numel()),
-                "synthesis_s": t_end - t_thinker, "wall_t": t_end - t_start,
-            }],
-            "stages": {
-                "thinker": t_thinker - t_start,
-                "talker_plus_t2w": t_end - t_thinker,
-            },
-            "first_audio_byte_s": t_end - t_start,
-            "wall_time_s": t_end - t_start,
-            "note": "streaming fallback: helper missing; ran full pipeline",
-        }
+    # Mirror HF Qwen2_5OmniForConditionalGeneration.generate (talker section):
+    # mask out audio/image/video token embeds, build talker_input_ids =
+    # [mask*context, codec_pad, codec_bos], stitch thinker_reply_part with
+    # eos/pad, hand all of it to talker.generate. This is the same logic
+    # the Trn2 streaming bench uses (via prepare_talker_input + run_talker
+    # paired with set_vision_embeddings/thinker_reply_embeds).
+    speaker_params = model.speaker_map[speaker]
 
-    talker_input = prep_helper(
-        thinker_out, inputs["input_ids"], speaker=speaker,
+    embeds_to_talker = thinker_out.hidden_states[0][0].clone().to(device)
+    input_ids_t = inputs["input_ids"]
+    if "input_features" in inputs:
+        audio_ids_mask = input_ids_t == model.config.thinker_config.audio_token_index
+        m = audio_ids_mask.unsqueeze(-1).expand_as(embeds_to_talker)
+        z = torch.zeros(
+            [int(audio_ids_mask.sum()), embeds_to_talker.shape[-1]],
+            dtype=embeds_to_talker.dtype, device=device,
+        )
+        embeds_to_talker.masked_scatter_(m, z)
+
+    processed_thinker_hidden = (
+        (embeds_to_talker,) + thinker_out.hidden_states[0][1:],
+    ) + thinker_out.hidden_states[1:]
+    thinker_token_embeds = [
+        h[0].to(device) for h in processed_thinker_hidden
+    ]
+    thinker_hidden_states = [
+        h[-1].to(device) for h in processed_thinker_hidden
+    ]
+
+    talker_text_bos_token = int(speaker_params["bos_token"])
+    talker_input_ids = torch.cat(
+        [
+            torch.full_like(input_ids_t, fill_value=int(talker.codec_mask_token)),
+            torch.tensor([[int(talker.codec_pad_token)]], dtype=torch.long, device=device),
+            torch.tensor([[int(talker.codec_bos_token)]], dtype=torch.long, device=device),
+        ],
+        dim=1,
     )
+
+    thinker_embed_tokens = model.thinker.get_input_embeddings()
+    thinker_reply_part = (
+        torch.cat(thinker_hidden_states[1:], dim=1)
+        + torch.cat(thinker_token_embeds[1:], dim=1)
+    )
+    talker_inputs_embeds = thinker_hidden_states[0] + thinker_token_embeds[0]
+    bos_embed = thinker_embed_tokens(
+        torch.tensor([[talker_text_bos_token]], dtype=torch.long, device=device)
+    )
+    talker_inputs_embeds = torch.cat(
+        [talker_inputs_embeds, bos_embed, thinker_reply_part[:, :1, :]], dim=1
+    )
+
+    eos_embed = thinker_embed_tokens(
+        torch.tensor([[int(talker.text_eos_token)]], dtype=torch.long, device=device)
+    )
+    pad_embed = thinker_embed_tokens(
+        torch.tensor([[int(talker.text_pad_token)]], dtype=torch.long, device=device)
+    )
+    thinker_reply_part = torch.cat(
+        [thinker_reply_part[:, 1:, :], eos_embed, pad_embed], dim=1
+    )
+
+    talker_input_text_ids = torch.cat(
+        [
+            input_ids_t,
+            torch.tensor([[talker_text_bos_token]], dtype=torch.long, device=device),
+            full_ids[:, prompt_len:prompt_len + 1],
+        ],
+        dim=-1,
+    )
+
+    talker_attention_mask = None
+    if "attention_mask" in inputs:
+        talker_attention_mask = torch.cat(
+            [inputs["attention_mask"], inputs["attention_mask"].new_ones((1, 2))],
+            dim=1,
+        ).to(device)
     t_prep = time.time()
 
-    talker_input_ids = talker_input["input_ids"].to(device)
-    talker_attention_mask = talker_input.get("attention_mask")
-    if talker_attention_mask is not None:
-        talker_attention_mask = talker_attention_mask.to(device)
     context_len = int(talker_input_ids.shape[1])
-    conditioning = talker_input["conditioning"].to(device, dtype=dtype)
-    reference_mel = talker_input["reference_mel"].to(device, dtype=dtype)
+    conditioning = speaker_params["cond"].to(device).float()
+    reference_mel = speaker_params["ref_mel"].to(device).float()
     codec_eos = int(talker.config.tts_codec_end_token_id)
     codec_pad = int(talker.config.tts_codec_pad_token_id)
     codec_bos = int(talker.config.tts_codec_start_token_id)
+
+    # token2wav must run in fp32 (HF does this in generate as well).
+    if code2wav.dtype != torch.float:
+        code2wav.float()
 
     # Compute samples-per-codec-token for left-context trimming.
     bigvgan_cfg = getattr(code2wav.config, "bigvgan_config", None) or code2wav.bigvgan.config
@@ -405,6 +440,9 @@ def run_streaming_pipeline(
     with torch.inference_mode():
         out = talker.generate(
             input_ids=talker_input_ids,
+            input_text_ids=talker_input_text_ids,
+            thinker_reply_part=thinker_reply_part,
+            inputs_embeds=talker_inputs_embeds,
             attention_mask=talker_attention_mask,
             max_new_tokens=min(600, max_new_tokens * 25),
             eos_token_id=[codec_eos, codec_pad],

@@ -76,6 +76,17 @@ COMPILED_PATH = os.environ.get(
 )
 TP_DEGREE = int(os.environ.get("QWEN25_OMNI_TP_DEGREE", "4"))
 
+# DiT mel_len buckets. Streaming chunks (chunk_size=25 codec * dit.repeats(2) =
+# 50 mel frames) benefit hugely from a small bucket; full-utterance generation
+# still needs 2048. Override with QWEN25_OMNI_DIT_BUCKETS="60,120,256,2048".
+DEFAULT_DIT_BUCKETS = [60, 120, 256, 512, 2048]
+_env_buckets = os.environ.get("QWEN25_OMNI_DIT_BUCKETS")
+if _env_buckets:
+    DIT_BUCKETS = sorted({int(x) for x in _env_buckets.split(",") if x.strip()})
+else:
+    DIT_BUCKETS = list(DEFAULT_DIT_BUCKETS)
+DIT_MAX_MEL_LEN = max(DIT_BUCKETS)
+
 DEFAULT_PROMPT = "Say hello and briefly introduce yourself in two sentences."
 DEFAULT_SYSTEM = (
     "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
@@ -171,7 +182,12 @@ def _compile_dit(model_path, out_path):
                 if k.startswith("token2wav."):
                     state_dict[k[len("token2wav."):]] = v
     t2w.load_state_dict(state_dict, strict=False)
-    t2w.compile_dit(out_path, max_mel_len=2048, batch_size=2)
+    t2w.compile_dit(
+        out_path,
+        max_mel_len=DIT_MAX_MEL_LEN,
+        batch_size=2,
+        mel_lens=DIT_BUCKETS,
+    )
 
 
 def compile_all(model_path, compiled_path):
@@ -192,7 +208,7 @@ def compile_all(model_path, compiled_path):
     stages = [
         ("Thinker",  "thinker_tp4", "neuron_config.json",   _compile_thinker),
         ("Talker",   "talker_tp4",  "neuron_config.json",   _compile_talker),
-        ("DiT",      "dit_core",    "dit_core_neuron.pt",   _compile_dit),
+        ("DiT",      "dit_core",    "dit_core_meta.json",   _compile_dit),
     ]
     for idx, (label, subdir, marker, fn) in enumerate(stages, 1):
         print(f"\n--- [{idx}/{len(stages)}] Compiling {label} ---")
@@ -217,7 +233,7 @@ def _check_compiled(compiled_path):
     checks = [
         (os.path.join(compiled_path, "thinker_tp4", "neuron_config.json"), "Thinker"),
         (os.path.join(compiled_path, "talker_tp4", "neuron_config.json"), "Talker"),
-        (os.path.join(compiled_path, "dit_core", "dit_core_neuron.pt"), "DiT"),
+        (os.path.join(compiled_path, "dit_core", "dit_core_meta.json"), "DiT"),
     ]
     missing = [name for path, name in checks if not os.path.exists(path)]
     if missing:

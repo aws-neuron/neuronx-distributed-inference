@@ -386,10 +386,26 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
 
     def __init__(self, token2wav_config):
         super().__init__(token2wav_config)
-        self._neuron_dit_core = None
+        # Multi-bucket: dict[mel_len -> traced_module], sorted by key.
+        # For single-bucket compat, this dict has one entry.
+        self._neuron_dit_cores = {}
         self._dit_compiled_path = None
         self._dit_max_mel_len = None
         self._dit_batch_size = None
+
+    @property
+    def _neuron_dit_core(self):
+        """Backward-compat shim returning the largest compiled bucket."""
+        if not self._neuron_dit_cores:
+            return None
+        return self._neuron_dit_cores[max(self._neuron_dit_cores)]
+
+    def _pick_bucket(self, actual_mel_len):
+        """Smallest compiled mel_len >= actual_mel_len, or None if exceeds all."""
+        for b in sorted(self._neuron_dit_cores):
+            if b >= actual_mel_len:
+                return b
+        return None
 
     def _get_dit_module(self):
         """Extract the DiT sub-module from the HF Token2Wav model."""
@@ -408,6 +424,7 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         compiled_path,
         max_mel_len=2048,
         batch_size=2,
+        mel_lens=None,
     ):
         """Compile the DiT transformer core on Neuron.
 
@@ -417,10 +434,17 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
 
         Args:
             compiled_path: Directory to save compiled model
-            max_mel_len: Maximum mel spectrogram length (covers ~24s audio).
+            max_mel_len: Largest mel spectrogram length (covers ~24s audio).
                 Shorter inputs are padded; longer inputs fall back to CPU.
+                Used as the only bucket if ``mel_lens`` is None.
             batch_size: Batch size for compilation. Use 2 for standard
                 inference with classifier-free guidance (CFG doubles batch).
+            mel_lens: Optional list of mel_len buckets to compile. Each bucket
+                yields its own NEFF; at runtime the smallest bucket >= actual
+                mel_len is selected. ``max_mel_len`` is appended automatically
+                if not already in the list. Streaming pipelines benefit a lot
+                from a small bucket (e.g. 60 for chunk_size=25 codec tokens →
+                25 * dit.repeats(2) = 50 mel frames + a margin).
         """
         try:
             import torch_neuronx
@@ -442,72 +466,97 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         num_heads = getattr(dit_cfg, "num_attention_heads", 16)
         head_dim = dim // num_heads
 
+        # Resolve bucket list. Always include max_mel_len; dedupe + sort.
+        if mel_lens is None:
+            buckets = [int(max_mel_len)]
+        else:
+            buckets = sorted({int(m) for m in mel_lens} | {int(max_mel_len)})
+
         logger.info(
-            "Compiling DiT core: batch=%d, mel_len=%d, dim=%d, heads=%d",
-            batch_size, max_mel_len, dim, num_heads,
+            "Compiling DiT core: batch=%d, buckets=%s, dim=%d, heads=%d",
+            batch_size, buckets, dim, num_heads,
         )
 
         # Monkeypatch DiTAttention to fix in-place slice assignment
         _monkeypatch_dit_attention_for_neuron(dit)
 
-        # Create wrapper for transformer core only
+        # Create wrapper for transformer core only (shared across buckets)
         core = _NeuronDiTCore(dit)
         core.float()
         core.eval()
 
-        # Create example inputs
-        # time_embedding uses batch=1 (broadcasts to hidden_states batch)
-        hidden_states = torch.randn(
-            batch_size, max_mel_len, dim, dtype=torch.float32
-        )
-        time_embedding = torch.randn(1, dim, dtype=torch.float32)
-        cos = torch.randn(
-            batch_size, max_mel_len, head_dim, dtype=torch.float32
-        )
-        sin = torch.randn(
-            batch_size, max_mel_len, head_dim, dtype=torch.float32
-        )
-        # Three per-block attention masks (local, backward, ahead)
-        mask_local = torch.zeros(
-            batch_size, 1, max_mel_len, max_mel_len, dtype=torch.float32
-        )
-        mask_backward = torch.zeros(
-            batch_size, 1, max_mel_len, max_mel_len, dtype=torch.float32
-        )
-        mask_ahead = torch.zeros(
-            batch_size, 1, max_mel_len, max_mel_len, dtype=torch.float32
-        )
+        compiled_per_bucket = {}
+        for bucket_mel_len in buckets:
+            logger.info(
+                "  compiling bucket mel_len=%d (batch=%d)",
+                bucket_mel_len, batch_size,
+            )
+            hidden_states = torch.randn(
+                batch_size, bucket_mel_len, dim, dtype=torch.float32
+            )
+            time_embedding = torch.randn(1, dim, dtype=torch.float32)
+            cos = torch.randn(
+                batch_size, bucket_mel_len, head_dim, dtype=torch.float32
+            )
+            sin = torch.randn(
+                batch_size, bucket_mel_len, head_dim, dtype=torch.float32
+            )
+            mask_local = torch.zeros(
+                batch_size, 1, bucket_mel_len, bucket_mel_len,
+                dtype=torch.float32,
+            )
+            mask_backward = torch.zeros(
+                batch_size, 1, bucket_mel_len, bucket_mel_len,
+                dtype=torch.float32,
+            )
+            mask_ahead = torch.zeros(
+                batch_size, 1, bucket_mel_len, bucket_mel_len,
+                dtype=torch.float32,
+            )
 
-        compiled = torch_neuronx.trace(
-            core,
-            (hidden_states, time_embedding, cos, sin,
-             mask_local, mask_backward, mask_ahead),
-            compiler_args=[
-                "--auto-cast=none",
-                "--model-type=transformer",
-                "-O1",
-            ],
-        )
+            compiled = torch_neuronx.trace(
+                core,
+                (hidden_states, time_embedding, cos, sin,
+                 mask_local, mask_backward, mask_ahead),
+                compiler_args=[
+                    "--auto-cast=none",
+                    "--model-type=transformer",
+                    "-O1",
+                ],
+            )
 
-        save_path = os.path.join(compiled_path, "dit_core_neuron.pt")
-        torch.jit.save(compiled, save_path)
+            # Multi-bucket layout: dit_core_neuron_T{N}.pt; legacy single-bucket
+            # layout (one file named dit_core_neuron.pt) is still produced when
+            # only one bucket is compiled, for backward compat.
+            if len(buckets) == 1:
+                save_path = os.path.join(compiled_path, "dit_core_neuron.pt")
+            else:
+                save_path = os.path.join(
+                    compiled_path, f"dit_core_neuron_T{bucket_mel_len}.pt",
+                )
+            torch.jit.save(compiled, save_path)
+            compiled_per_bucket[bucket_mel_len] = compiled
+            logger.info("    saved bucket T=%d to %s", bucket_mel_len, save_path)
 
-        # Save metadata for load
+        # Save metadata for load (forward compatible: keep max_mel_len)
         meta = {
-            "max_mel_len": max_mel_len,
+            "max_mel_len": int(max_mel_len),
             "batch_size": batch_size,
             "dim": dim,
             "num_heads": num_heads,
             "head_dim": head_dim,
+            "buckets": buckets,
         }
         with open(os.path.join(compiled_path, "dit_core_meta.json"), "w") as f:
             json.dump(meta, f)
 
-        logger.info("Compiled DiT core saved to %s", save_path)
+        logger.info(
+            "Compiled %d DiT bucket(s) to %s", len(buckets), compiled_path,
+        )
 
-        self._neuron_dit_core = compiled
+        self._neuron_dit_cores = compiled_per_bucket
         self._dit_compiled_path = compiled_path
-        self._dit_max_mel_len = max_mel_len
+        self._dit_max_mel_len = int(max(buckets))
         self._dit_batch_size = batch_size
 
     def load_dit(self, compiled_path):
@@ -516,24 +565,47 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         Args:
             compiled_path: Directory containing compiled model
         """
-        save_path = os.path.join(compiled_path, "dit_core_neuron.pt")
         meta_path = os.path.join(compiled_path, "dit_core_meta.json")
 
-        if not os.path.exists(save_path):
-            raise FileNotFoundError(
-                f"Compiled DiT core not found at {save_path}"
-            )
-
-        self._neuron_dit_core = torch.jit.load(save_path)
-        self._dit_compiled_path = compiled_path
-
+        # New (multi-bucket) layout: meta.json lists buckets; one NEFF per
+        # bucket as dit_core_neuron_T{N}.pt. Legacy layout: single file
+        # dit_core_neuron.pt (single bucket = max_mel_len from meta).
+        meta = None
         if os.path.exists(meta_path):
             with open(meta_path) as f:
                 meta = json.load(f)
-            self._dit_max_mel_len = meta["max_mel_len"]
-            self._dit_batch_size = meta["batch_size"]
 
-        logger.info("Loaded compiled DiT core from %s", save_path)
+        cores = {}
+        legacy_path = os.path.join(compiled_path, "dit_core_neuron.pt")
+        if meta and "buckets" in meta and len(meta["buckets"]) > 1:
+            for bucket in meta["buckets"]:
+                p = os.path.join(compiled_path, f"dit_core_neuron_T{bucket}.pt")
+                if not os.path.exists(p):
+                    raise FileNotFoundError(
+                        f"Multi-bucket DiT NEFF missing: {p}"
+                    )
+                cores[int(bucket)] = torch.jit.load(p)
+        elif os.path.exists(legacy_path):
+            single_bucket = int((meta or {}).get("max_mel_len", 2048))
+            cores[single_bucket] = torch.jit.load(legacy_path)
+        else:
+            raise FileNotFoundError(
+                f"Compiled DiT core not found in {compiled_path}"
+            )
+
+        self._neuron_dit_cores = cores
+        self._dit_compiled_path = compiled_path
+        if meta:
+            self._dit_max_mel_len = int(meta["max_mel_len"])
+            self._dit_batch_size = int(meta["batch_size"])
+        else:
+            self._dit_max_mel_len = max(cores)
+            self._dit_batch_size = 2
+
+        logger.info(
+            "Loaded %d DiT bucket(s) %s from %s",
+            len(cores), sorted(cores), compiled_path,
+        )
 
     def _build_attention_masks(self, block_diff, actual_mel_len, max_mel_len):
         """Build three per-block float additive attention masks with padding.
@@ -598,8 +670,9 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         if self._neuron_dit_core is not None:
             dit = self._get_dit_module()
             original_forward = dit.forward
-            neuron_core = self._neuron_dit_core
-            max_mel_len = self._dit_max_mel_len
+            cores = self._neuron_dit_cores
+            pick_bucket = self._pick_bucket
+            max_bucket = max(cores)
             expected_batch = self._dit_batch_size
             build_masks = self._build_attention_masks
 
@@ -613,7 +686,12 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 drop_code=False,
                 apply_cfg=True,
             ):
-                """DiT forward with Neuron-accelerated transformer core."""
+                """DiT forward with Neuron-accelerated transformer core.
+
+                Picks the smallest compiled bucket >= mel_len; falls back
+                to the original CPU forward when mel_len exceeds the
+                largest bucket.
+                """
                 batch_size = hidden_states.shape[0]
                 if time_step.ndim == 0:
                     time_step = time_step.repeat(batch_size)
@@ -622,11 +700,11 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 # CFG, so we must fall back BEFORE calling it — otherwise
                 # original_forward would receive already-modified tensors.
                 est_mel_len = hidden_states.shape[1]
-                if est_mel_len > max_mel_len:
+                if est_mel_len > max_bucket:
                     logger.warning(
-                        "mel_len %d > max %d, falling back to CPU",
+                        "mel_len %d > max bucket %d, falling back to CPU",
                         est_mel_len,
-                        max_mel_len,
+                        max_bucket,
                     )
                     return original_forward(
                         hidden_states,
@@ -669,13 +747,17 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 actual_mel_len = hidden_states.shape[1]
                 actual_batch = hidden_states.shape[0]
 
-                # Build three per-block attention masks
+                # Pick the smallest bucket that fits.
+                bucket = pick_bucket(actual_mel_len)
+                neuron_core = cores[bucket]
+
+                # Build three per-block attention masks at bucket size
                 mask_local, mask_backward, mask_ahead = build_masks(
-                    block_diff, actual_mel_len, max_mel_len
+                    block_diff, actual_mel_len, bucket
                 )
 
                 # Pad to compiled shapes
-                pad_mel = max_mel_len - actual_mel_len
+                pad_mel = bucket - actual_mel_len
                 if pad_mel > 0:
                     hidden_states = torch.nn.functional.pad(
                         hidden_states, (0, 0, 0, pad_mel)
