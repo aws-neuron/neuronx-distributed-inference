@@ -755,18 +755,17 @@ class NeuronGatedDeltaNet(nn.Module):
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)
             alloc_bs = self.conv_state_buffer.shape[0]
             if seq_ids is not None:
-                # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
-                # Add buffer dependency for input_output_alias
-                new_conv_state = (
-                    new_conv_state.to(self.conv_state_buffer.dtype)
-                    + self.conv_state_buffer * 0
+                idx = seq_ids.view(-1, 1, 1).expand_as(new_conv_state)
+                new_conv_state = (self.conv_state_buffer * 1).scatter(
+                    0, idx, new_conv_state
                 )
             elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
                 new_conv_state = torch.cat(
                     [
                         new_conv_state,
-                        self.conv_state_buffer[batch_size:] * 0,
+                        self.conv_state_buffer[batch_size:]
+                        * 0,  # touch remaining buffer entries
                     ],
                     dim=0,
                 )
@@ -791,10 +790,9 @@ class NeuronGatedDeltaNet(nn.Module):
 
             alloc_bs = self.conv_state_buffer.shape[0]
             if seq_ids is not None:
-                # BS=1 optimization: scatter to index 0 = direct replacement
-                new_conv_state = (
-                    new_conv_state.to(self.conv_state_buffer.dtype)
-                    + self.conv_state_buffer * 0
+                idx = seq_ids.view(-1, 1, 1).expand_as(new_conv_state)
+                new_conv_state = (self.conv_state_buffer * 1).scatter(
+                    0, idx, new_conv_state
                 )
             elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
@@ -882,14 +880,16 @@ class NeuronGatedDeltaNet(nn.Module):
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
             alloc_bs = self.recurrent_state_buffer.shape[0]
             if seq_ids is not None:
-                # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
-                # Add buffer dependency for input_output_alias
-                new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
+                idx = seq_ids.view(-1, 1, 1, 1).expand_as(new_state_bf16)
+                new_rec_state = (self.recurrent_state_buffer * 1).scatter(
+                    0, idx, new_state_bf16
+                )
             elif batch_size < alloc_bs:
                 new_rec_state = torch.cat(
                     [
                         new_state_bf16,
-                        self.recurrent_state_buffer[batch_size:] * 0,
+                        self.recurrent_state_buffer[batch_size:]
+                        * 0,  # touch remaining buffer entries
                     ],
                     dim=0,
                 )
@@ -934,9 +934,10 @@ class NeuronGatedDeltaNet(nn.Module):
                 final_state_bf16 = final_state.to(self.recurrent_state_buffer.dtype)
                 alloc_bs = self.recurrent_state_buffer.shape[0]
                 if seq_ids is not None:
-                    # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
-                    # Add buffer dependency for input_output_alias
-                    new_rec_state = final_state_bf16 + self.recurrent_state_buffer * 0
+                    idx = seq_ids.view(-1, 1, 1, 1).expand_as(final_state_bf16)
+                    new_rec_state = (self.recurrent_state_buffer * 1).scatter(
+                        0, idx, final_state_bf16
+                    )
                 elif batch_size < alloc_bs:
                     new_rec_state = torch.cat(
                         [
@@ -1063,6 +1064,31 @@ class Qwen35InferenceConfig(InferenceConfig):
     @classmethod
     def get_neuron_config_cls(cls):
         return NeuronConfig
+
+    def add_derived_config(self):
+        """Promote text_config fields before validation.
+
+        When loaded via vLLM, the HF config has a multimodal-style layout
+        where model fields live inside text_config rather than at the top
+        level. This method promotes them so that validate_config() and the
+        rest of the model can access them as direct attributes.
+        """
+        if hasattr(self, "text_config") and not hasattr(self, "hidden_size"):
+            tc = self.text_config
+            for attr in dir(tc):
+                if not attr.startswith("_") and not hasattr(self, attr):
+                    setattr(self, attr, getattr(tc, attr))
+
+        # rope_theta lives inside rope_parameters in the HF config
+        if not hasattr(self, "rope_theta"):
+            rope_params = getattr(self, "rope_parameters", None)
+            if rope_params is not None:
+                if isinstance(rope_params, dict):
+                    self.rope_theta = rope_params.get("rope_theta", 10000000)
+                else:
+                    self.rope_theta = getattr(rope_params, "rope_theta", 10000000)
+
+        super().add_derived_config()
 
 
 # ============================================================
