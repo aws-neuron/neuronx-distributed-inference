@@ -35,8 +35,13 @@ from __future__ import annotations
 
 import os as _os
 
-# Pin all three Neuron-compiled models to the same TP=4 core group.
-_os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0-3")
+# Default: 8 cores visible (TP=4 thinker/talker on 0-3 + DiT replicas on
+# 4-7). Override with QWEN25_OMNI_VISIBLE_CORES="0-3" to fall back to the
+# old single-group layout for A/B comparison.
+_os.environ.setdefault(
+    "NEURON_RT_VISIBLE_CORES",
+    _os.environ.get("QWEN25_OMNI_VISIBLE_CORES", "0-7"),
+)
 
 import sys as _sys
 from pathlib import Path as _Path
@@ -51,7 +56,9 @@ import _upstream_compat  # noqa: F401
 
 import argparse
 import gc
+import queue
 import statistics
+import threading
 import time
 from typing import List, Tuple
 
@@ -233,34 +240,79 @@ def run_streaming_pipeline(
     )
 
     # ----- Streaming hook -----
-    audio_chunks: List[torch.Tensor] = []
-    chunk_meta: List[dict] = []
-    # Qwen2.5-Omni: BigVGAN upsample_rates=[5,3,2,2,2,2] => total_upsample=240
-    # mel_len = code_len * dit.repeats(=2); samples = mel_len * total_upsample.
+    # Producer/consumer: the emitter (called per talker decode step on the
+    # talker's thread) enqueues (idx, start, end, code_slice). A pool of
+    # ``num_workers`` background threads consumes the queue and runs DiT
+    # synthesis off the talker decode path. With DiT NEFFs replicated on
+    # cores 4-7 (see ``QWEN25_OMNI_DIT_CORE_*`` in the driver), multiple
+    # DiT forwards dispatch to different replicas concurrently while the
+    # talker keeps decoding on cores 0-3.
+    chunk_results: dict = {}
+    chunk_results_lock = threading.Lock()
+    work_q: queue.Queue = queue.Queue()
+    # NeuronQwen25OmniToken2WavWithNeuronDiT.__call__ monkey-patches
+    # ``dit.forward`` on a shared object, so concurrent calls would race.
+    # Serialize DiT calls; the win comes from running DiT on cores 4-7
+    # while the talker keeps decoding on 0-3 — not from intra-DiT
+    # concurrency.
+    t2w_lock = threading.Lock()
     upsample_rates = getattr(t2w_cfg.bigvgan_config, "upsample_rates", [5, 3, 2, 2, 2, 2])
     total_upsample = 1
     for r in upsample_rates:
         total_upsample *= int(r)
 
+    # NOTE: ``__call__`` is not thread-safe (it monkey-patches
+    # ``dit.forward`` on a shared object), so workers serialize on
+    # ``t2w_lock``. With 1 worker, the win is purely "DiT off the talker
+    # decode path + on different cores"; raising this past 1 won't help
+    # unless ``__call__`` is refactored to be re-entrant.
+    num_workers = max(1, int(_os.environ.get("QWEN25_OMNI_DIT_WORKERS", "1")))
+
+    def _dit_worker():
+        while True:
+            item = work_q.get()
+            if item is None:
+                work_q.task_done()
+                return
+            idx, start, end, codes_slice = item
+            t0 = time.time()
+            with t2w_lock:
+                wav = synthesize_chunk(
+                    t2w, t2w_cfg, codes_slice, start, end,
+                    left_context=left_context,
+                    conditioning=conditioning,
+                    reference_mel=reference_mel,
+                    total_upsample=total_upsample,
+                    codec_eos_token=codec_eos,
+                    codec_pad_token=codec_pad,
+                )
+            elapsed = time.time() - t0
+            with chunk_results_lock:
+                chunk_results[idx] = (wav, {
+                    "start": start, "end": end,
+                    "samples": int(wav.numel()),
+                    "synthesis_s": elapsed,
+                    "wall_t": time.time() - t_start,
+                })
+            work_q.task_done()
+
+    workers = [
+        threading.Thread(target=_dit_worker, daemon=True, name=f"dit-{i}")
+        for i in range(num_workers)
+    ]
+    for w in workers:
+        w.start()
+
+    chunk_counter = {"n": 0}
+
     def on_chunk(all_codes, start, end, final):
-        t0 = time.time()
-        wav = synthesize_chunk(
-            t2w, t2w_cfg, all_codes, start, end,
-            left_context=left_context,
-            conditioning=conditioning,
-            reference_mel=reference_mel,
-            total_upsample=total_upsample,
-            codec_eos_token=codec_eos,
-            codec_pad_token=codec_pad,
-        )
-        elapsed = time.time() - t0
-        audio_chunks.append(wav)
-        chunk_meta.append({
-            "start": start, "end": end,
-            "samples": int(wav.numel()),
-            "synthesis_s": elapsed,
-            "wall_t": time.time() - t_start,
-        })
+        idx = chunk_counter["n"]
+        chunk_counter["n"] = idx + 1
+        # Snapshot of all codec tokens up through ``end``. synthesize_chunk
+        # slices [start - left_context : end] inside the worker; copying
+        # protects the worker from concurrent appends to ``all_codes``.
+        codes_snapshot = list(all_codes[: end])
+        work_q.put((idx, start, end, codes_snapshot))
 
     emitter = CodecChunkEmitter(
         context_len=context_len, chunk_size=chunk_size, on_chunk=on_chunk,
@@ -288,6 +340,21 @@ def run_streaming_pipeline(
     if drained < len(full_codec):
         # Emit the residual tail as one final synthesis call.
         on_chunk(full_codec, drained, len(full_codec), final=True)
+
+    # Drain DiT workers.
+    work_q.join()
+    for _ in workers:
+        work_q.put(None)
+    for w in workers:
+        w.join()
+
+    # Reassemble in chunk-index order (workers may finish out of order).
+    audio_chunks: List[torch.Tensor] = []
+    chunk_meta: List[dict] = []
+    for idx in sorted(chunk_results):
+        wav, meta = chunk_results[idx]
+        audio_chunks.append(wav)
+        chunk_meta.append(meta)
     t_synth_end = time.time()
 
     return {

@@ -37,12 +37,15 @@ Usage:
 
 import os as _os
 
-# Pin all three Neuron-compiled models (Thinker, Talker, DiT) to the same
-# four NeuronCores. Without this, the runtime places the single-device DiT
-# NEFF on a different core group than the TP=4 Thinker/Talker, and the
-# resulting cross-group scheduling makes every DiT forward ~30% slower.
-# Set before any Neuron module is imported so the runtime picks it up.
-_os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0-3")
+# Make 8 cores visible by default. Thinker/Talker stay on cores 0-3 (TP=4);
+# DiT replicas go on cores 4-7 so its forwards run truly concurrently with
+# talker decode (Neuron driver serializes shared-core dispatches). Override
+# with QWEN25_OMNI_VISIBLE_CORES="0-3" to fall back to the old single-group
+# layout for A/B comparison.
+_os.environ.setdefault(
+    "NEURON_RT_VISIBLE_CORES",
+    _os.environ.get("QWEN25_OMNI_VISIBLE_CORES", "0-7"),
+)
 
 # --- Qwen2.5-Omni contrib bootstrap ---
 import sys as _sys
@@ -86,6 +89,13 @@ if _env_buckets:
 else:
     DIT_BUCKETS = list(DEFAULT_DIT_BUCKETS)
 DIT_MAX_MEL_LEN = max(DIT_BUCKETS)
+
+# DiT placement: by default replicate the single-core DiT NEFF onto cores
+# 4-7 so DiT forwards run truly concurrently with the TP=4 talker on
+# cores 0-3. Set START to -1 to disable the post-load placement (DiT then
+# falls in with whatever cores the runtime picks, typically inside 0-3).
+DIT_CORE_START = int(os.environ.get("QWEN25_OMNI_DIT_CORE_START", "4"))
+DIT_CORE_COUNT = int(os.environ.get("QWEN25_OMNI_DIT_CORE_COUNT", "1"))
 
 DEFAULT_PROMPT = "Say hello and briefly introduce yourself in two sentences."
 DEFAULT_SYSTEM = (
@@ -348,6 +358,19 @@ def load_token2wav(model_path, compiled_path):
 
     t0 = time.time()
     t2w.load_dit(os.path.join(compiled_path, "dit_core"))
+    if DIT_CORE_START >= 0:
+        import torch_neuronx
+        cores = getattr(t2w, "_neuron_dit_cores", None) or {}
+        for bucket, neff in cores.items():
+            t_place = time.time()
+            torch_neuronx.set_neuron_cores(
+                neff, start_nc=DIT_CORE_START, nc_count=DIT_CORE_COUNT,
+            )
+            print(
+                f"  [DiT]     bucket={bucket} placed start_nc={DIT_CORE_START} "
+                f"nc_count={DIT_CORE_COUNT} in {time.time()-t_place:.1f}s",
+                flush=True,
+            )
     load_time = time.time() - t0
     _restore_embedding()
     print(f"  [DiT]     loaded in {load_time:.1f}s")
