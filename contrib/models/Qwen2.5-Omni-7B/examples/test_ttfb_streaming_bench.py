@@ -526,6 +526,27 @@ def main():
         args.model_path, args.compiled_path,
     )
 
+    # ---- End-to-end warmup ----
+    # NxDI's per-NEFF "Warmup completed in 0.25s" only exercises NEFF
+    # boundaries with dummy input; the first real end-to-end pipeline
+    # run still pays for graph caching, BigVGAN JIT, ECAPA preprocessing,
+    # etc. Run one full serial pipeline and discard the timing so the
+    # measured runs are warm.
+    print("\n--- End-to-end warmup (1 serial run, timing discarded) ---")
+    _t0 = time.time()
+    _ = run_serial_pipeline(
+        model_path=args.model_path,
+        thinker_adapter=thinker_adapter, tokenizer=tokenizer,
+        hf_model=hf_model,
+        talker_model=talker_model, talker_adapter=talker_adapter,
+        talker_cfg=talker_cfg,
+        t2w=t2w, t2w_cfg=t2w_cfg,
+        speaker=args.speaker, prompt=args.prompt,
+        system_prompt=args.system_prompt,
+    )
+    print(f"  warmup took {time.time() - _t0:.2f}s")
+    gc.collect()
+
     serial_runs: List[dict] = []
     streaming_runs: List[dict] = []
 
