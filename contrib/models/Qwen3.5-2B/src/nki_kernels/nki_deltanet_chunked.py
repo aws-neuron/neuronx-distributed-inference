@@ -3,6 +3,8 @@
 
 """NKI per-chunk DeltaNet kernel for CTE (context encoding / prefill).
 
+Numerically stable — all exp() arguments guaranteed <= 0.
+
 Single-chunk kernel: processes one chunk (128 tokens) with Neumann-series
 power-doubling for intra-chunk correction. The caller loops over chunks
 in PyTorch, passing state between calls.
@@ -16,7 +18,12 @@ No sequence-indexed DMA inside the kernel -- all inputs/outputs are full tiles.
 This avoids the DMA OOB issue seen with nl.sequential_range + slice indexing
 in the NxDI model compilation context.
 
-NKI v3 (SDK 2.29, NKI 0.3.0). Uses nki.* namespace.
+Numerical stability:
+  - Decay mask: exp(gc[i] - gc[j]) computed directly via difference matrix
+  - State update: uses exp(g_last - gc[t]) instead of exp(-gc[t]) * exp(g_last)
+  - All exp() outputs in (0, 1] — no overflow possible
+
+NKI v3 (SDK 2.29, NKI 0.3.0).
 """
 
 import nki
@@ -39,11 +46,9 @@ def deltanet_chunk_step(
     identity,  # (128, 128) float32 -- identity matrix
     lower_mask_diag,  # (128, 128) float32 -- lower tri with diagonal
 ):
-    """Process one chunk of DeltaNet.
+    """Process one chunk of DeltaNet (numerically stable).
 
-    Returns:
-        output:    (128, 128) float32 -- chunk output
-        state_out: (128, 128) float32 -- updated recurrent state
+    All exp() calls produce values in (0, 1] — no overflow.
     """
     C, dim = query.shape  # C = 128, dim = 128
 
@@ -93,29 +98,70 @@ def deltanet_chunk_step(
     nisa.tensor_tensor(dst=v_beta, data1=v_c, data2=beta_c, op=nl.multiply)
 
     # ============================================================
-    # exp(g_cumsum) and exp(-g_cumsum)
+    # Compute exp(gc) — always <= 1 (gc <= 0). Safe underflow to 0.
     # ============================================================
     exp_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=exp_gc, op=nl.exp, data=gc_c, bias=None, scale=1.0)
 
-    neg_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(
-        dst=neg_gc,
-        data=gc_c,
-        op0=nl.multiply,
-        operand0=-1.0,
-        engine=nisa.vector_engine,
-    )
-    exp_neg_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(dst=exp_neg_gc, op=nl.exp, data=neg_gc, bias=None, scale=1.0)
+    # ============================================================
+    # Compute exp(g_last - gc) for state update.
+    # g_last - gc[t] = gc[-1] - gc[t] <= 0 since gc[-1] is most negative.
+    # So exp(g_last - gc) in (0, 1]. SAFE.
+    # ============================================================
+    gl_minus_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=gl_minus_gc, data1=gl_c, data2=gc_c, op=nl.subtract)
 
-    # exp(g_last) for state decay
+    exp_gl_minus_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(
+        dst=exp_gl_minus_gc, op=nl.exp, data=gl_minus_gc, bias=None, scale=1.0
+    )
+
+    # exp(g_last) for state decay (always <= 1)
     exp_gl = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=exp_gl, op=nl.exp, data=gl_c, bias=None, scale=1.0)
 
     # ============================================================
-    # Phase 1: Build A matrix (intra-chunk correction)
-    # QK = k_beta @ k^T  -- contract over features
+    # Build decay mask STABLY: exp(gc[i] - gc[j])
+    # gc_c is (P_MAX, dim) with gc broadcast across dim.
+    # We need gc_diff[i,j] = gc[i] - gc[j].
+    # gc_mat_rows[i,j] = gc[i] (gc_c already broadcast across columns)
+    # gc_mat_cols[i,j] = gc[j] (transpose of gc_c)
+    # ============================================================
+
+    # Transpose gc_c to get gc values along free dimension
+    gc_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=gc_T_psum, data=gc_c)
+    gc_mat_cols = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=gc_mat_cols, src=gc_T_psum)
+
+    # gc_mat_rows: gc_c[i,:] = gc[i] for all columns. Take P_MAX x P_MAX sub-tile.
+    gc_mat_rows = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=gc_mat_rows, src=gc_c[0:P_MAX, 0:P_MAX])
+
+    # gc_diff[i,j] = gc[i] - gc[j]
+    gc_diff = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(
+        dst=gc_diff, data1=gc_mat_rows, data2=gc_mat_cols, op=nl.subtract
+    )
+
+    # Clamp to <= 0 to avoid exp overflow in upper triangle
+    gc_diff_clamped = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=gc_diff_clamped,
+        data=gc_diff,
+        op0=nl.minimum,
+        operand0=0.0,
+        engine=nisa.vector_engine,
+    )
+
+    # exp_gc_diff[i,j] = exp(gc[i] - gc[j]), all in (0, 1]
+    exp_gc_diff = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(
+        dst=exp_gc_diff, op=nl.exp, data=gc_diff_clamped, bias=None, scale=1.0
+    )
+
+    # ============================================================
+    # QK = k_beta^T @ k (same as before)
     # ============================================================
     kb_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=kb_T_psum, stationary=k_beta, moving=eye)
@@ -133,23 +179,10 @@ def deltanet_chunk_step(
     nisa.tensor_copy(dst=QK, src=QK_psum)
 
     # ============================================================
-    # Decay mask: QK_decay[i,j] = QK[i,j] * exp(gc[i]) * exp(-gc[j])
+    # QK_decay = QK * exp_gc_diff (element-wise, stable)
     # ============================================================
-    QK_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=QK_row, data1=QK, data2=exp_gc, op=nl.multiply)
-
-    QK_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=QK_r_T_psum, stationary=QK_row, moving=eye)
-    QK_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=QK_r_T, src=QK_r_T_psum)
-
-    QK_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=QK_r_T_col, data1=QK_r_T, data2=exp_neg_gc, op=nl.multiply)
-
-    QK_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=QK_d_psum, stationary=QK_r_T_col, moving=eye)
     QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=QK_decay, src=QK_d_psum)
+    nisa.tensor_tensor(dst=QK_decay, data1=QK, data2=exp_gc_diff, op=nl.multiply)
 
     # A = -QK_decay * lower_mask
     neg_QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
@@ -160,6 +193,7 @@ def deltanet_chunk_step(
         operand0=-1.0,
         engine=nisa.vector_engine,
     )
+
     A = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=A, data1=neg_QK_decay, data2=Lmask, op=nl.multiply)
 
@@ -216,8 +250,7 @@ def deltanet_chunk_step(
     nisa.tensor_copy(dst=k_cumdecay, src=kcd_psum)
 
     # ============================================================
-    # Phase 2: Inter-chunk state propagation
-    # attn_intra = (q @ k^T) * decay_mask * lower_mask_diag
+    # attn_intra = (q @ k^T) * exp_gc_diff * lower_mask_diag
     # ============================================================
     q_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=q_T_psum, stationary=q_c, moving=eye)
@@ -229,21 +262,9 @@ def deltanet_chunk_step(
     qk_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=qk_raw, src=qk_psum)
 
-    qk_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=qk_row, data1=qk_raw, data2=exp_gc, op=nl.multiply)
-
-    qk_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=qk_r_T_psum, stationary=qk_row, moving=eye)
-    qk_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=qk_r_T, src=qk_r_T_psum)
-
-    qk_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=qk_r_T_col, data1=qk_r_T, data2=exp_neg_gc, op=nl.multiply)
-
-    qk_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=qk_d_psum, stationary=qk_r_T_col, moving=eye)
+    # Apply stable decay mask
     qk_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=qk_decay, src=qk_d_psum)
+    nisa.tensor_tensor(dst=qk_decay, data1=qk_raw, data2=exp_gc_diff, op=nl.multiply)
 
     attn_intra = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=attn_intra, data1=qk_decay, data2=Lmask_d, op=nl.multiply)
@@ -265,7 +286,8 @@ def deltanet_chunk_step(
     nisa.tensor_tensor(dst=v_new, data1=value_corr, data2=v_prime, op=nl.subtract)
 
     # ============================================================
-    # attn_inter = (q * exp(g_cumsum)) @ state
+    # attn_inter = (q * exp(gc)) @ state
+    # exp(gc) <= 1, underflows to 0 for large |gc| (correct behavior)
     # ============================================================
     q_exp = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=q_exp, data1=q_c, data2=exp_gc, op=nl.multiply)
@@ -302,21 +324,25 @@ def deltanet_chunk_step(
     nisa.dma_copy(dst=output, src=chunk_out)
 
     # ============================================================
-    # State update: state_new = exp(g_last) * (state + k_raw_decay^T @ v_new)
+    # State update: state_new = exp(g_last) * state + k_state_decay^T @ v_new
+    # k_state_decay = k * exp(g_last - gc)  [exp arg <= 0, safe]
     # ============================================================
-    k_raw_decay = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=k_raw_decay, data1=k_c, data2=exp_neg_gc, op=nl.multiply)
+    k_state_decay = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(
+        dst=k_state_decay, data1=k_c, data2=exp_gl_minus_gc, op=nl.multiply
+    )
 
     kv_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=kv_psum, stationary=k_raw_decay, moving=v_new)
+    nisa.nc_matmul(dst=kv_psum, stationary=k_state_decay, moving=v_new)
     kv_outer = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=kv_outer, src=kv_psum)
 
-    state_plus = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=state_plus, data1=state, data2=kv_outer, op=nl.add)
+    # state_new = exp(g_last) * state + kv_outer
+    state_decayed = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=state_decayed, data1=state, data2=exp_gl, op=nl.multiply)
 
     state_new = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=state_new, data1=state_plus, data2=exp_gl, op=nl.multiply)
+    nisa.tensor_tensor(dst=state_new, data1=state_decayed, data2=kv_outer, op=nl.add)
 
     nisa.dma_copy(dst=state_out, src=state_new)
 
