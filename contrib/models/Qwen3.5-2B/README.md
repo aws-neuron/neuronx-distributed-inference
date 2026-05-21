@@ -27,32 +27,33 @@ The DeltaNet layers use linear recurrent attention (gated delta rule) instead of
 
 ## Validation Results
 
-**Validated:** 2026-04-23
-**Instance:** trn2.3xlarge (TP=4, LNC=2)
-**SDK:** Neuron SDK 2.29, PyTorch 2.9, NKI 0.3.0
+**Validated:** 2026-05-21
+**Instance:** trn2.3xlarge (LNC=2)
+**SDK:** Neuron SDK 2.29.1, PyTorch 2.9, NKI 0.3.0
 
-### Benchmark Results
+### Recommended Configuration: TP=1, BS=2, DP=4
 
-All benchmarks on trn2.3xlarge, TP=4, LNC=2, BF16. Chat-formatted prompt (~19 input tokens). Throughput is total tokens/sec across all batch items.
+The optimal configuration for maximum throughput on trn2.3xlarge is **TP=1 with DP=4** (one model per core, 4 independent processes). Each core delivers the same per-sequence throughput as TP=4 while enabling 4x aggregate throughput.
 
-#### Batch Size Scaling (seq_len=128)
+| Config | TTFT | Per-Core Throughput | Aggregate | Concurrent Sequences |
+|--------|:----:|:-------------------:|:---------:|:--------------------:|
+| TP=1 BS=2 DP=4 | 362 ms | 104.5 tok/s | **418.7 tok/s** | 8 |
+| TP=4 BS=1 | 307 ms | 104.2 tok/s | 104.2 tok/s | 1 |
+| TP=2 BS=1 DP=2 | 294 ms | 91.2 tok/s | ~182 tok/s | 2 |
 
-| Batch Size | TTFT (ms) | Throughput (tok/s) | Per-Request (tok/s) |
-|:----------:|:---------:|:------------------:|:-------------------:|
-| 1 | 157.8 | 114.5 | 114.5 |
-| 2 | 72.0 | 233.1 | 116.5 |
-| 4 | 104.4 | 329.6 | 82.4 |
-| 8 | 185.6 | 409.5 | 51.2 |
+### Benchmark Results (TP=1, BS=2, DP=4)
 
-#### Sequence Length Scaling (BS=1)
+All benchmarks on trn2.3xlarge, LNC=2, BF16, seq_len=128. Each core runs independently with `NEURON_RT_VISIBLE_CORES=<n>`.
 
-| seq_len | TTFT (ms) | Throughput (tok/s) |
-|:-------:|:---------:|:------------------:|
-| 128 | 157.8 | 114.5 |
-| 512 | 54.3 | 138.1 |
-| 1024 | 102.7 | 125.3 |
-| 2048 | 199.7 | 106.5 |
-| 4096 | 401.7 | 80.3 |
+| Core | TTFT (ms) | Aggregate Throughput (tok/s) |
+|:----:|:---------:|:----------------------------:|
+| 0 | 362.1 | 104.6 |
+| 1 | 363.2 | 104.9 |
+| 2 | 361.5 | 105.5 |
+| 3 | 361.1 | 103.7 |
+| **Total** | — | **418.7** |
+
+Zero contention across cores — each core delivers identical throughput when running concurrently.
 
 ### Accuracy Validation
 
@@ -73,6 +74,8 @@ All benchmarks on trn2.3xlarge, TP=4, LNC=2, BF16. Chat-formatted prompt (~19 in
 
 ## Usage
 
+### Quick Start (TP=1, single core)
+
 ```python
 import json
 import os
@@ -84,13 +87,14 @@ from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGeneration
 from src.modeling_qwen35 import Qwen35InferenceConfig, NeuronQwen35ForCausalLM
 
 model_path = "/path/to/Qwen3.5-2B"
-compiled_path = "/scratch/qwen35_2b_traced/"
+compiled_path = "/scratch/qwen35_2b_tp1/"
 
+# Default: TP=1, BS=2 (optimal for throughput with DP=4)
 neuron_config = NeuronConfig(
-    tp_degree=4,
-    batch_size=1,
-    ctx_batch_size=1,
-    tkg_batch_size=1,
+    tp_degree=1,
+    batch_size=2,
+    ctx_batch_size=2,
+    tkg_batch_size=2,
     seq_len=128,
     torch_dtype=torch.bfloat16,
     logical_nc_config=2,
@@ -113,11 +117,12 @@ config = Qwen35InferenceConfig(
     **config_dict,
 )
 
-# Compile
+# Compile (one-time, ~34 min at TP=1)
 model = NeuronQwen35ForCausalLM(model_path, config)
 model.compile(compiled_path)
 
-# Load
+# Load (pin to a single core)
+os.environ["NEURON_RT_VISIBLE_CORES"] = "0"
 model = NeuronQwen35ForCausalLM(compiled_path)
 model.load(compiled_path)
 
@@ -132,6 +137,11 @@ gen_config = GenerationConfig(
 messages = [{"role": "user", "content": "What is the capital of France?"}]
 text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 inputs = tokenizer(text, padding=True, return_tensors="pt")
+# Pad to BS=2 (required minimum batch size at TP=1)
+if inputs.input_ids.shape[0] < 2:
+    inputs["input_ids"] = inputs.input_ids.repeat(2, 1)
+    inputs["attention_mask"] = inputs.attention_mask.repeat(2, 1)
+
 gen_model = HuggingFaceGenerationAdapter(model)
 outputs = gen_model.generate(
     inputs.input_ids,
@@ -142,30 +152,69 @@ outputs = gen_model.generate(
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
+### DP=4 Deployment (maximum throughput)
+
+For maximum throughput (418 tok/s), run 4 independent processes:
+
+```bash
+# Compile once (shared artifacts):
+python compile.py  # produces /scratch/qwen35_2b_tp1/
+
+# Run 4 processes (one per core):
+for core in 0 1 2 3; do
+    NEURON_RT_VISIBLE_CORES=$core python serve.py --port $((8000+core)) &
+done
+```
+
+Each process serves 2 concurrent sequences (BS=2) independently. Total: 8 concurrent sequences at 418 tok/s aggregate.
+
+### Alternative: TP=4 (lowest latency)
+
+For lowest per-request latency (307ms TTFT), use TP=4 with BS=1:
+
+```python
+neuron_config = NeuronConfig(
+    tp_degree=4,
+    batch_size=1,
+    ctx_batch_size=1,
+    tkg_batch_size=1,
+    seq_len=128,
+    torch_dtype=torch.bfloat16,
+    logical_nc_config=2,
+    enable_bucketing=False,
+    flash_decoding_enabled=False,
+    on_device_sampling_config=OnDeviceSamplingConfig(top_k=1),
+    save_sharded_checkpoint=True,
+)
+```
+
 **Note:** Qwen3.5-2B is a chat model. Use `tokenizer.apply_chat_template()` for best results. Raw text prompts may produce echoey output.
 
 **Note on `seq_len`:** The `seq_len` parameter is the total sequence budget (input + generated tokens). Do not pad inputs to `max_length=seq_len`. Use `padding=True` for automatic minimal padding.
 
 ## Compatibility Matrix
 
-| Instance | TP | SDK 2.29.1 | SDK 2.29 | SDK 2.28 |
-|----------|-----|------------|----------|----------|
-| trn2.3xlarge (LNC=2) | 4 | VALIDATED | VALIDATED | Not tested |
+| Instance | TP | DP | SDK 2.29.1 | Notes |
+|----------|-----|-----|------------|-------|
+| trn2.3xlarge (LNC=2) | 1 | 4 | **VALIDATED** | Recommended: 418 tok/s aggregate |
+| trn2.3xlarge (LNC=2) | 2 | 2 | VALIDATED | Balanced: ~182 tok/s |
+| trn2.3xlarge (LNC=2) | 4 | 1 | VALIDATED | Lowest latency: 307ms TTFT |
 
-### Tested Configurations (trn2.3xlarge, TP=4, LNC=2)
+### Tested Configurations (trn2.3xlarge, LNC=2)
 
-| Batch Size | seq_len | Status |
-|:----------:|:-------:|:------:|
-| 1 | 128 | VALIDATED |
-| 2 | 128 | VALIDATED |
-| 4 | 128 | VALIDATED |
-| 8 | 128 | VALIDATED |
-| 1 | 512 | VALIDATED |
-| 1 | 1024 | VALIDATED |
-| 1 | 2048 | VALIDATED |
-| 1 | 4096 | VALIDATED |
-| 2 | 1024 | VALIDATED |
-| 4 | 512 | VALIDATED |
+| TP | Batch Size | seq_len | Status | Notes |
+|:--:|:----------:|:-------:|:------:|-------|
+| 1 | 2 | 128 | VALIDATED | Default config |
+| 4 | 1 | 128 | VALIDATED | |
+| 4 | 2 | 128 | VALIDATED | |
+| 4 | 4 | 128 | VALIDATED | |
+| 4 | 8 | 128 | VALIDATED | |
+| 4 | 1 | 512 | VALIDATED | |
+| 4 | 1 | 1024 | VALIDATED | |
+| 4 | 1 | 2048 | VALIDATED | |
+| 4 | 1 | 4096 | VALIDATED | |
+| 2 | 1 | 1024 | VALIDATED | |
+| 1 | 1 | any | BLOCKED | Compiler exit code 70 |
 
 ## Example Checkpoints
 

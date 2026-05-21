@@ -15,21 +15,27 @@ Environment variables:
     QWEN35_MODEL_PATH       Path to HF model weights (required)
     QWEN35_COMPILED_PATH    Path to compiled artifacts (default: /tmp/qwen35_2b_traced)
     QWEN35_REF_LOGITS_PATH  Path to CPU reference logits .pt file (for logit validation)
-    QWEN35_TP_DEGREE        Tensor parallelism degree (default: 4)
+    QWEN35_TP_DEGREE        Tensor parallelism degree (default: 1)
+    QWEN35_BATCH_SIZE       Batch size (default: 2; must be >=2 at TP=1)
     QWEN35_SEQ_LEN          Max sequence length (default: 128)
     TTFT_THRESHOLD_MS       Max TTFT in ms (default: 5000)
     THROUGHPUT_THRESHOLD     Min throughput in tok/s (default: 5.0)
 
 Prerequisites:
-    - trn2.3xlarge or larger with TP >= 4 NeuronCores available
+    - trn2.3xlarge or larger with NeuronCores available
     - NXDI installed (neuronx_distributed_inference)
     - HuggingFace weights downloaded to QWEN35_MODEL_PATH
     - SDK 2.29+ (NKI 0.3.0 required for DeltaNet kernels)
 
 Usage:
-    # Full model (trn2.3xlarge, TP=4):
+    # Default (TP=1, BS=2, single core):
     QWEN35_MODEL_PATH=/mnt/models/Qwen3.5-2B \\
-    QWEN35_COMPILED_PATH=/mnt/models/qwen35_2b_traced \\
+    NEURON_RT_VISIBLE_CORES=0 \\
+    pytest test/integration/test_model.py --capture=tee-sys
+
+    # TP=4 mode:
+    QWEN35_MODEL_PATH=/mnt/models/Qwen3.5-2B \\
+    QWEN35_TP_DEGREE=4 QWEN35_BATCH_SIZE=1 \\
     pytest test/integration/test_model.py --capture=tee-sys
 """
 
@@ -52,7 +58,8 @@ MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", "")
 COMPILED_PATH = os.environ.get("QWEN35_COMPILED_PATH", "/tmp/qwen35_2b_traced")
 CPU_REFERENCE_LOGITS_PATH = os.environ.get("QWEN35_REF_LOGITS_PATH", "")
 LOGIT_COMPILED_PATH = os.environ.get("QWEN35_LOGIT_COMPILED_PATH", "")
-TP_DEGREE = int(os.environ.get("QWEN35_TP_DEGREE", "4"))
+TP_DEGREE = int(os.environ.get("QWEN35_TP_DEGREE", "1"))
+BATCH_SIZE = int(os.environ.get("QWEN35_BATCH_SIZE", "2"))
 SEQ_LEN = int(os.environ.get("QWEN35_SEQ_LEN", "128"))
 TTFT_THRESHOLD_MS = float(os.environ.get("TTFT_THRESHOLD_MS", "5000"))
 THROUGHPUT_THRESHOLD = float(os.environ.get("THROUGHPUT_THRESHOLD", "5.0"))
@@ -88,9 +95,9 @@ def compiled_model(model_path):
 
     neuron_config = NeuronConfig(
         tp_degree=TP_DEGREE,
-        batch_size=1,
-        ctx_batch_size=1,
-        tkg_batch_size=1,
+        batch_size=BATCH_SIZE,
+        ctx_batch_size=BATCH_SIZE,
+        tkg_batch_size=BATCH_SIZE,
         seq_len=SEQ_LEN,
         torch_dtype=torch.bfloat16,
         on_device_sampling_config=OnDeviceSamplingConfig(top_k=1),
@@ -167,11 +174,22 @@ def _generate(model, tokenizer, generation_config, prompt, max_new_tokens=20):
     )
 
     inputs = tokenizer(prompt, padding=True, return_tensors="pt")
+    input_ids = inputs.input_ids
+    attention_mask = inputs.attention_mask
+
+    # Pad to compiled batch size if needed (TP=1 requires BS=2)
+    if input_ids.shape[0] < BATCH_SIZE:
+        pad_count = BATCH_SIZE - input_ids.shape[0]
+        input_ids = torch.cat([input_ids, input_ids[:1].expand(pad_count, -1)], dim=0)
+        attention_mask = torch.cat(
+            [attention_mask, attention_mask[:1].expand(pad_count, -1)], dim=0
+        )
+
     gen_model = HuggingFaceGenerationAdapter(model)
     outputs = gen_model.generate(
-        inputs.input_ids,
+        input_ids,
         generation_config=generation_config,
-        attention_mask=inputs.attention_mask,
+        attention_mask=attention_mask,
         max_new_tokens=max_new_tokens,
     )
     return outputs[0].tolist(), tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -194,11 +212,22 @@ def _chat_generate(
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = tokenizer(text, padding=True, return_tensors="pt")
+    input_ids = inputs.input_ids
+    attention_mask = inputs.attention_mask
+
+    # Pad to compiled batch size if needed (TP=1 requires BS=2)
+    if input_ids.shape[0] < BATCH_SIZE:
+        pad_count = BATCH_SIZE - input_ids.shape[0]
+        input_ids = torch.cat([input_ids, input_ids[:1].expand(pad_count, -1)], dim=0)
+        attention_mask = torch.cat(
+            [attention_mask, attention_mask[:1].expand(pad_count, -1)], dim=0
+        )
+
     gen_model = HuggingFaceGenerationAdapter(model)
     outputs = gen_model.generate(
-        inputs.input_ids,
+        input_ids,
         generation_config=generation_config,
-        attention_mask=inputs.attention_mask,
+        attention_mask=attention_mask,
         max_new_tokens=max_new_tokens,
     )
     full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -602,9 +631,9 @@ if __name__ == "__main__":
 
     nc = NeuronConfig(
         tp_degree=TP_DEGREE,
-        batch_size=1,
-        ctx_batch_size=1,
-        tkg_batch_size=1,
+        batch_size=BATCH_SIZE,
+        ctx_batch_size=BATCH_SIZE,
+        tkg_batch_size=BATCH_SIZE,
         seq_len=SEQ_LEN,
         torch_dtype=torch.bfloat16,
         on_device_sampling_config=OnDeviceSamplingConfig(top_k=1),
