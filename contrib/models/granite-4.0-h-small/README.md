@@ -95,18 +95,21 @@ Both models produce coherent, factually correct text. Token-level divergence dur
 ### Compilation
 | Metric | Value |
 |--------|-------|
-| Compile time | ~13 min (trn2.48xlarge), ~16 min (trn2.3xlarge) |
+| Compile time (BS=1) | ~20 min (trn2.3xlarge, SDK 2.29.1) |
+| Compile time (BS=4) | ~30 min (trn2.3xlarge, SDK 2.29.1) |
 | Compiler flags | `-O1 --auto-cast=none --enable-mixed-precision-accumulation` |
 
 ### Inference Performance
 
 | Metric | BS=1 | BS=4 | BS=7 (optimal) |
 |--------|------|------|----------------|
-| Decode throughput | 24.7 tok/s | 44.3 tok/s | **62.8 tok/s** |
-| Decode per-token | 40.5 ms | 90.2 ms | 111.6 ms |
-| Prefill latency | 307 ms | 588 ms | ~2.0 s |
+| Decode throughput (NKI fused) | 25.3 tok/s | **64.9 tok/s** | ~90 tok/s (est.) |
+| Decode throughput (baseline) | 21.7 tok/s | 40.4 tok/s | 62.8 tok/s |
+| NKI improvement | +16.7% | **+60.7%** | ~+43% (est.) |
 | Instance | trn2.3xlarge | trn2.3xlarge | trn2.3xlarge |
 | Config | TP=4, LNC=2, BF16 | TP=4, LNC=2, BF16 | TP=4, LNC=2, BF16 |
+
+**NKI Fused Decode Kernel:** Set `USE_NKI_FUSED_DECODE=1` to enable the fused SSM state-update + output-projection kernel, which eliminates redundant memory traffic and reduces VectorE instructions by 23%. The improvement scales with batch size because at BS >= 4 the sequential batch loop becomes compute-bound rather than DMA-bound.
 
 **BS=7 is the optimal batch size** for maximum throughput on trn2.3xlarge. At BS=8 and above, the MoE layer switches from selective expert loading (10/72 experts) to all-expert mode (72/72 experts), causing a 17% throughput regression (53.6 tok/s at BS=8 vs 62.8 tok/s at BS=7). The threshold is `batch_size * top_k / num_experts >= 1.0`, i.e. `BS * 10 / 72 >= 1.0` → BS >= 8 triggers all-expert mode.
 
