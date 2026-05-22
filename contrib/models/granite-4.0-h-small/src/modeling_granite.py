@@ -419,12 +419,16 @@ if HAS_NKI and USE_NKI_FUSED_DECODE:
         x,  # [BS, NH, HD] float32 — input for D*x skip
     ):
         """
-        Fused SSM decode V2.1: state_new = dA*state + dBx, y = einsum(state_new, C) + D*x.
+        Fused SSM decode V3: state_new = dA*state + dBx, y = einsum(state_new, C) + D*x.
 
         Key optimization: uses nisa.activation(op=nl.copy, scale=dA_sb) for free-dim
         broadcast of [NH, 1] → [NH, 8192] at ZERO cost (ScalarE pipelined multiply).
         Processes full state [NH=128, HD*SS=8192] in 2 instructions instead of V1's
         ~9000 instructions (128 broadcast copies × 8 d-tiles + inner loop overhead).
+
+        V3 changes vs V2.1:
+        - In-place slice accumulation: y_acc[d:d+1] += y_d eliminates 2 tensor_copy per
+          iteration (128 fewer instructions total in einsum loop, 40% reduction)
 
         V2.1 changes vs V2:
         - In-place activation: eliminates 4 MB scaled_state buffer (peak SBUF 12.2→8.2 MB)
@@ -546,21 +550,12 @@ if HAS_NKI and USE_NKI_FUSED_DECODE:
                     axis=(1,),
                 )
 
-                # Accumulate: y_acc[d] += y_d
-                y_cur = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(
-                    dst=y_cur[0:NH, 0:1],
-                    src=y_acc[0:NH, d : d + 1],
-                )
+                # Accumulate: y_acc[d] += y_d (in-place slice add)
                 nisa.tensor_tensor(
-                    dst=y_cur[0:NH, 0:1],
-                    data1=y_cur[0:NH, 0:1],
+                    dst=y_acc[0:NH, d : d + 1],
+                    data1=y_acc[0:NH, d : d + 1],
                     data2=y_d[0:NH, 0:1],
                     op=nl.add,
-                )
-                nisa.tensor_copy(
-                    dst=y_acc[0:NH, d : d + 1],
-                    src=y_cur[0:NH, 0:1],
                 )
 
             # Store y output
