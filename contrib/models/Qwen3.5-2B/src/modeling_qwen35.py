@@ -2067,11 +2067,15 @@ class Qwen35ModelWrapper(ModelWrapper):
             is_cte = n_active_tokens > 1
 
             if is_cte:
+                # M-RoPE uses 3 spatial dimensions (temporal, height, width) per
+                # Qwen's multimodal RoPE design. For text-only CTE all 3 dimensions
+                # share the same sequential position IDs.
+                n_mrope_dims = 3
                 mrope_position_ids = (
                     torch.arange(0, n_active_tokens, dtype=torch.int32)
                     .unsqueeze(0)
                     .unsqueeze(0)
-                    .expand(3, batch_size, -1)
+                    .expand(n_mrope_dims, batch_size, -1)
                     .contiguous()
                 )
 
