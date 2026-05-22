@@ -172,15 +172,27 @@ def deltanet_fused_chunked_fwd(
     for i_chunk in nl.sequential_range(num_chunks):
         chunk_start = i_chunk * CHUNK_SIZE
 
-        # ---- Load chunk data ----
-        q_c = nl.ndarray((P_MAX, dim), dtype=query.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=q_c, src=query[chunk_start : chunk_start + CHUNK_SIZE, 0:dim])
+        # ---- Load chunk data (cast to fp32 for nc_transpose compatibility on gen3+) ----
+        q_c_raw = nl.ndarray((P_MAX, dim), dtype=query.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=q_c_raw, src=query[chunk_start : chunk_start + CHUNK_SIZE, 0:dim]
+        )
+        q_c = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=q_c, src=q_c_raw)
 
-        k_c = nl.ndarray((P_MAX, dim), dtype=key.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=k_c, src=key[chunk_start : chunk_start + CHUNK_SIZE, 0:dim])
+        k_c_raw = nl.ndarray((P_MAX, dim), dtype=key.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=k_c_raw, src=key[chunk_start : chunk_start + CHUNK_SIZE, 0:dim]
+        )
+        k_c = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=k_c, src=k_c_raw)
 
-        v_c = nl.ndarray((P_MAX, dim), dtype=value.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=v_c, src=value[chunk_start : chunk_start + CHUNK_SIZE, 0:dim])
+        v_c_raw = nl.ndarray((P_MAX, dim), dtype=value.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=v_c_raw, src=value[chunk_start : chunk_start + CHUNK_SIZE, 0:dim]
+        )
+        v_c = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=v_c, src=v_c_raw)
 
         g_chunk_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(
@@ -610,8 +622,11 @@ def deltanet_fused_chunked_fwd(
         # Output
         chunk_out = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=chunk_out, data1=attn_inter, data2=intra_out, op=nl.add)
+        chunk_out_cast = nl.ndarray((P_MAX, dim), dtype=query.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=chunk_out_cast, src=chunk_out)
         nisa.dma_copy(
-            dst=output[chunk_start : chunk_start + CHUNK_SIZE, 0:dim], src=chunk_out
+            dst=output[chunk_start : chunk_start + CHUNK_SIZE, 0:dim],
+            src=chunk_out_cast,
         )
 
         # State update
