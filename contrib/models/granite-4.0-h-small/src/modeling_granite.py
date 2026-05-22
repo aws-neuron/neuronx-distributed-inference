@@ -419,14 +419,18 @@ if HAS_NKI and USE_NKI_FUSED_DECODE:
         x,  # [BS, NH, HD] float32 — input for D*x skip
     ):
         """
-        Fused SSM decode V2: state_new = dA*state + dBx, y = einsum(state_new, C) + D*x.
+        Fused SSM decode V2.1: state_new = dA*state + dBx, y = einsum(state_new, C) + D*x.
 
         Key optimization: uses nisa.activation(op=nl.copy, scale=dA_sb) for free-dim
         broadcast of [NH, 1] → [NH, 8192] at ZERO cost (ScalarE pipelined multiply).
         Processes full state [NH=128, HD*SS=8192] in 2 instructions instead of V1's
         ~9000 instructions (128 broadcast copies × 8 d-tiles + inner loop overhead).
 
-        SBUF budget per batch item: ~8.3 MB (fits comfortably in 24 MB trn2 SBUF).
+        V2.1 changes vs V2:
+        - In-place activation: eliminates 4 MB scaled_state buffer (peak SBUF 12.2→8.2 MB)
+        - Direct slice in tensor_tensor: removes 64 redundant tensor_copy instructions
+
+        SBUF budget per batch item: ~8.2 MB (fits comfortably in 29 MB trn2 SBUF).
         """
         BS = ssm_state.shape[0]
         NH = ssm_state.shape[1]  # 128
@@ -483,28 +487,27 @@ if HAS_NKI and USE_NKI_FUSED_DECODE:
                 src=dBx.reshape((BS, NH, HDSS))[b, 0:NH, 0:HDSS],
             )
 
-            # scaled_state = state * dA (FREE broadcast: dA [NH,1] → [NH,8192])
-            scaled_state = nl.ndarray((P_MAX, HDSS), dtype=nl.float32, buffer=nl.sbuf)
+            # state_flat *= dA (in-place, FREE broadcast: dA [NH,1] → [NH,8192])
             nisa.activation(
-                dst=scaled_state[0:NH, 0:HDSS],
+                dst=state_flat[0:NH, 0:HDSS],
                 op=nl.copy,
                 data=state_flat[0:NH, 0:HDSS],
                 scale=dA_sb[0:NH, 0:1],
             )
 
-            # state_new = scaled_state + dBx (reuse dBx_flat buffer)
+            # state_new = state_flat + dBx (write to state_flat, reuse buffer)
             nisa.tensor_tensor(
-                dst=dBx_flat[0:NH, 0:HDSS],
-                data1=scaled_state[0:NH, 0:HDSS],
+                dst=state_flat[0:NH, 0:HDSS],
+                data1=state_flat[0:NH, 0:HDSS],
                 data2=dBx_flat[0:NH, 0:HDSS],
                 op=nl.add,
             )
-            # dBx_flat now holds state_new [NH, HDSS]
+            # state_flat now holds state_new [NH, HDSS]
 
             # Write state_new to HBM
             nisa.dma_copy(
                 dst=ssm_state_out.reshape((BS, NH, HDSS))[b, 0:NH, 0:HDSS],
-                src=dBx_flat[0:NH, 0:HDSS],
+                src=state_flat[0:NH, 0:HDSS],
             )
 
             # ===== PHASE 2: Output einsum + D*x skip =====
@@ -525,18 +528,11 @@ if HAS_NKI and USE_NKI_FUSED_DECODE:
             for d in nl.affine_range(HD):
                 d_offset = d * SS
 
-                # Extract state_new_d: [NH, SS] from flat buffer
-                state_new_d = nl.ndarray((P_MAX, SS), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(
-                    dst=state_new_d[0:NH, 0:SS],
-                    src=dBx_flat[0:NH, d_offset : d_offset + SS],
-                )
-
-                # prod = state_new_d * C
+                # prod = state_new_d * C (direct slice from state_flat)
                 prod = nl.ndarray((P_MAX, SS), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_tensor(
                     dst=prod[0:NH, 0:SS],
-                    data1=state_new_d[0:NH, 0:SS],
+                    data1=state_flat[0:NH, d_offset : d_offset + SS],
                     data2=C_sb[0:NH, 0:SS],
                     op=nl.multiply,
                 )
