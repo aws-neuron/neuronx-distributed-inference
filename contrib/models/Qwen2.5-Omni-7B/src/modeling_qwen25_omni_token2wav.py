@@ -392,6 +392,11 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         self._dit_compiled_path = None
         self._dit_max_mel_len = None
         self._dit_batch_size = None
+        # BigVGAN multi-bucket: dict[mel_len -> traced_module]. Empty when
+        # BigVGAN runs on CPU; populated by load_bigvgan().
+        self._neuron_bigvgan_cores = {}
+        self._bigvgan_compiled_path = None
+        self._bigvgan_max_mel_len = None
 
     @property
     def _neuron_dit_core(self):
@@ -607,6 +612,159 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
             len(cores), sorted(cores), compiled_path,
         )
 
+    # ---------------------------------------------------------------- BigVGAN
+
+    def _get_bigvgan_module(self):
+        """Return the HF BigVGAN sub-module from the Token2Wav model."""
+        return getattr(self.model, "code2wav_bigvgan_model", None)
+
+    def _pick_bigvgan_bucket(self, actual_mel_len):
+        for b in sorted(self._neuron_bigvgan_cores):
+            if b >= actual_mel_len:
+                return b
+        return None
+
+    class _BigVGANTraceWrapper(torch.nn.Module):
+        """Trace-friendly BigVGAN: drops ``.squeeze().cpu()`` from HF.forward.
+
+        HF's BigVGAN ends with ``.squeeze().cpu()`` which the XLA tracer
+        cannot handle. We replicate the forward body but keep everything on
+        the trace device and return ``(1, 1, T*upsample)``; the runtime shim
+        reshapes/trims the result.
+
+        Aliasing filter bypass: HF wraps SnakeBeta in
+        ``TorchActivation1d`` (UpSample1d + Snake + DownSample1d) for
+        anti-aliasing. The internal x2 upsample doubles temporal length and
+        creates a 96 x ~87k tile that overflows the Neuron SB. Qwen3-Omni's
+        BigVGAN omits this filter entirely; we mirror that by patching every
+        ``TorchActivation1d`` to call its inner Snake directly. Mild high-
+        frequency aliasing is the trade-off.
+        """
+
+        def __init__(self, bigvgan):
+            super().__init__()
+            self.bigvgan = bigvgan
+            for module in self.bigvgan.modules():
+                if module.__class__.__name__ == "TorchActivation1d":
+                    module.forward = module.act.forward
+
+        def forward(self, mel_spectrogram):
+            bv = self.bigvgan
+            processed = bv.process_mel_spectrogram(mel_spectrogram)
+            hidden = bv.conv_pre(processed)
+            for layer_index in range(bv.num_upsample_layers):
+                hidden = bv.ups[layer_index][0](hidden)
+                residual = sum(
+                    bv.resblocks[layer_index * bv.num_residual_blocks + b](hidden)
+                    for b in range(bv.num_residual_blocks)
+                )
+                hidden = residual / bv.num_residual_blocks
+            hidden = bv.activation_post(hidden)
+            wav = bv.conv_post(hidden)
+            return torch.clamp(wav, min=-1.0, max=1.0)
+
+    def compile_bigvgan(
+        self,
+        compiled_path,
+        mel_lens=None,
+    ):
+        """Trace the BigVGAN vocoder onto Neuron, one NEFF per mel_len bucket.
+
+        BigVGAN is shape-static (input ``(1, mel_dim, T_mel)``, output
+        ``(1, 1, T_mel * total_upsample)``) so we compile per-bucket and at
+        runtime pick the smallest bucket >= actual T_mel, right-pad the mel
+        with replicate-mode, run the NEFF, and trim the waveform back. The
+        upsample chain ``[5, 3, 2, 2, 2, 2]`` gives ``total_upsample = 240``.
+
+        Args:
+            compiled_path: directory where bucket NEFFs are written.
+            mel_lens: list of T_mel buckets to compile. Each codec token
+                produces ``dit.repeats`` (=2) mel frames, so for chunk_size=25
+                we get T_mel=50; the default DiT buckets [60,120,256,512,2048]
+                cover the same range of audio lengths.
+        """
+        try:
+            import torch_neuronx
+        except ImportError as e:
+            raise ImportError(
+                "torch_neuronx required for BigVGAN compilation."
+            ) from e
+
+        os.makedirs(compiled_path, exist_ok=True)
+        bigvgan = self._get_bigvgan_module()
+        if bigvgan is None:
+            raise RuntimeError("BigVGAN sub-module not found on Token2Wav model")
+        bigvgan = bigvgan.eval().float()
+        wrapper = self._BigVGANTraceWrapper(bigvgan).eval()
+
+        if mel_lens is None:
+            # Match the DiT bucket grid by default — whatever sizes pass through
+            # DiT will hit the same-sized BigVGAN bucket.
+            mel_lens = sorted(self._neuron_dit_cores) or [2048]
+        buckets = sorted(set(int(b) for b in mel_lens))
+
+        mel_dim = int(bigvgan.config.mel_dim)
+        compiled_per_bucket = {}
+        for bucket in buckets:
+            example_mel = torch.zeros((1, mel_dim, bucket), dtype=torch.float32)
+            logger.info("Tracing BigVGAN bucket T=%d ...", bucket)
+            traced = torch_neuronx.trace(
+                wrapper,
+                example_mel,
+                compiler_workdir=os.path.join(
+                    compiled_path, f"workdir_T{bucket}"
+                ),
+                compiler_args="--auto-cast=none",
+            )
+            save_path = os.path.join(
+                compiled_path, f"bigvgan_neuron_T{bucket}.pt",
+            )
+            traced.save(save_path)
+            compiled_per_bucket[bucket] = traced
+
+        meta = {
+            "buckets": buckets,
+            "max_mel_len": max(buckets),
+            "mel_dim": mel_dim,
+            "total_upsample": int(self._compute_total_upsample(bigvgan)),
+        }
+        with open(os.path.join(compiled_path, "bigvgan_meta.json"), "w") as f:
+            json.dump(meta, f)
+
+        self._neuron_bigvgan_cores = compiled_per_bucket
+        self._bigvgan_compiled_path = compiled_path
+        self._bigvgan_max_mel_len = max(buckets)
+
+    @staticmethod
+    def _compute_total_upsample(bigvgan):
+        prod = 1
+        for r in bigvgan.config.upsample_rates:
+            prod *= int(r)
+        return prod
+
+    def load_bigvgan(self, compiled_path):
+        """Load previously compiled BigVGAN bucket NEFFs from compiled_path."""
+        meta_path = os.path.join(compiled_path, "bigvgan_meta.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(
+                f"BigVGAN meta not found in {compiled_path}"
+            )
+        with open(meta_path) as f:
+            meta = json.load(f)
+        cores = {}
+        for bucket in meta["buckets"]:
+            p = os.path.join(compiled_path, f"bigvgan_neuron_T{bucket}.pt")
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"BigVGAN NEFF missing: {p}")
+            cores[int(bucket)] = torch.jit.load(p)
+        self._neuron_bigvgan_cores = cores
+        self._bigvgan_compiled_path = compiled_path
+        self._bigvgan_max_mel_len = int(meta["max_mel_len"])
+        logger.info(
+            "Loaded %d BigVGAN bucket(s) %s from %s",
+            len(cores), sorted(cores), compiled_path,
+        )
+
     def _build_attention_masks(self, block_diff, actual_mel_len, max_mel_len):
         """Build three per-block float additive attention masks with padding.
 
@@ -665,8 +823,46 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         Monkeypatches dit.forward to split execution:
         - CPU: preprocessing (time/text/input embed, rotary, block_diff)
         - Neuron: 22 transformer blocks + norm + proj
-        - CPU: ODE solver, BigVGAN vocoder
+        - CPU: ODE solver, BigVGAN vocoder (or Neuron if load_bigvgan ran)
         """
+        # ----- BigVGAN: if compiled buckets are loaded, swap forward in place
+        bigvgan_restore = None
+        if self._neuron_bigvgan_cores:
+            bigvgan = self._get_bigvgan_module()
+            if bigvgan is not None:
+                bigvgan_restore = (bigvgan, bigvgan.forward)
+                cores_bv = self._neuron_bigvgan_cores
+                pick_bv = self._pick_bigvgan_bucket
+                max_bv = max(cores_bv)
+                upsamp = self._compute_total_upsample(bigvgan)
+                cpu_forward = bigvgan.forward
+
+                def neuron_bigvgan_forward(mel_spectrogram):
+                    actual_T = mel_spectrogram.shape[-1]
+                    if actual_T > max_bv:
+                        logger.warning(
+                            "BigVGAN mel_len %d > max bucket %d, CPU fallback",
+                            actual_T, max_bv,
+                        )
+                        return cpu_forward(mel_spectrogram)
+                    bucket = pick_bv(actual_T)
+                    if actual_T < bucket:
+                        pad = bucket - actual_T
+                        mel_padded = torch.nn.functional.pad(
+                            mel_spectrogram, (0, pad), mode="replicate",
+                        )
+                    else:
+                        mel_padded = mel_spectrogram
+                    wav = cores_bv[bucket](mel_padded.float())
+                    # HF BigVGAN.forward returns shape ``(T*upsamp,)`` (it
+                    # squeezes (1,1,T*upsamp) → (T*upsamp,)). Mimic that here
+                    # after trimming to actual length so downstream code that
+                    # expects 1-D doesn't break.
+                    wav = wav.reshape(-1)[: actual_T * upsamp]
+                    return wav.cpu()
+
+                bigvgan.forward = neuron_bigvgan_forward
+
         if self._neuron_dit_core is not None:
             dit = self._get_dit_module()
             original_forward = dit.forward
@@ -805,17 +1001,23 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 )
             finally:
                 dit.forward = original_forward
+                if bigvgan_restore is not None:
+                    bigvgan_restore[0].forward = bigvgan_restore[1]
             return result
         else:
-            return self.model(
-                code=code,
-                conditioning=conditioning,
-                reference_mel=reference_mel,
-                num_steps=num_steps,
-                guidance_scale=guidance_scale,
-                sway_coefficient=sway_coefficient,
-                **kwargs,
-            )
+            try:
+                return self.model(
+                    code=code,
+                    conditioning=conditioning,
+                    reference_mel=reference_mel,
+                    num_steps=num_steps,
+                    guidance_scale=guidance_scale,
+                    sway_coefficient=sway_coefficient,
+                    **kwargs,
+                )
+            finally:
+                if bigvgan_restore is not None:
+                    bigvgan_restore[0].forward = bigvgan_restore[1]
 
     @classmethod
     def from_pretrained_state_dict(cls, token2wav_config, state_dict):

@@ -97,6 +97,25 @@ DIT_MAX_MEL_LEN = max(DIT_BUCKETS)
 DIT_CORE_START = int(os.environ.get("QWEN25_OMNI_DIT_CORE_START", "4"))
 DIT_CORE_COUNT = int(os.environ.get("QWEN25_OMNI_DIT_CORE_COUNT", "1"))
 
+# BigVGAN: enable Neuron-traced vocoder via QWEN25_OMNI_BIGVGAN_NEURON=1.
+# Compiler accepts only small mel buckets — T=60 and T=128 compile,
+# T>=256 crashes with [NCC_ITIN902] TensorInitialization. The default
+# bucket grid therefore covers streaming chunks (chunk_size=25 -> 50 mel
+# frames per chunk) only; full-utterance synthesis (T_mel ~ 600) falls
+# back to CPU BigVGAN. Override via QWEN25_OMNI_BIGVGAN_BUCKETS once the
+# compiler is fixed.
+DEFAULT_BIGVGAN_BUCKETS = [60, 128]
+BIGVGAN_NEURON = os.environ.get("QWEN25_OMNI_BIGVGAN_NEURON", "1") == "1"
+_env_bv_buckets = os.environ.get("QWEN25_OMNI_BIGVGAN_BUCKETS")
+if _env_bv_buckets:
+    BIGVGAN_BUCKETS = sorted(
+        {int(x) for x in _env_bv_buckets.split(",") if x.strip()}
+    )
+else:
+    BIGVGAN_BUCKETS = list(DEFAULT_BIGVGAN_BUCKETS)
+BIGVGAN_CORE_START = int(os.environ.get("QWEN25_OMNI_BIGVGAN_CORE_START", "5"))
+BIGVGAN_CORE_COUNT = int(os.environ.get("QWEN25_OMNI_BIGVGAN_CORE_COUNT", "1"))
+
 DEFAULT_PROMPT = "Say hello and briefly introduce yourself in two sentences."
 DEFAULT_SYSTEM = (
     "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
@@ -200,6 +219,27 @@ def _compile_dit(model_path, out_path):
     )
 
 
+def _compile_bigvgan(model_path, out_path):
+    from transformers import AutoConfig
+    from safetensors.torch import load_file
+    from modeling_qwen25_omni_token2wav import (
+        NeuronQwen25OmniToken2WavWithNeuronDiT,
+    )
+
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    t2w = NeuronQwen25OmniToken2WavWithNeuronDiT(hf_config.token2wav_config)
+
+    state_dict = {}
+    for fn in sorted(os.listdir(model_path)):
+        if fn.endswith(".safetensors"):
+            sd = load_file(os.path.join(model_path, fn))
+            for k, v in sd.items():
+                if k.startswith("token2wav."):
+                    state_dict[k[len("token2wav."):]] = v
+    t2w.load_state_dict(state_dict, strict=False)
+    t2w.compile_bigvgan(out_path, mel_lens=BIGVGAN_BUCKETS)
+
+
 def compile_all(model_path, compiled_path):
     """Compile all three Neuron components: Thinker, Talker, DiT.
 
@@ -220,6 +260,10 @@ def compile_all(model_path, compiled_path):
         ("Talker",   "talker_tp4",  "neuron_config.json",   _compile_talker),
         ("DiT",      "dit_core",    "dit_core_meta.json",   _compile_dit),
     ]
+    if BIGVGAN_NEURON:
+        stages.append(
+            ("BigVGAN", "bigvgan", "bigvgan_meta.json", _compile_bigvgan)
+        )
     for idx, (label, subdir, marker, fn) in enumerate(stages, 1):
         print(f"\n--- [{idx}/{len(stages)}] Compiling {label} ---")
         out_path = os.path.join(compiled_path, subdir)
@@ -245,6 +289,10 @@ def _check_compiled(compiled_path):
         (os.path.join(compiled_path, "talker_tp4", "neuron_config.json"), "Talker"),
         (os.path.join(compiled_path, "dit_core", "dit_core_meta.json"), "DiT"),
     ]
+    if BIGVGAN_NEURON:
+        checks.append(
+            (os.path.join(compiled_path, "bigvgan", "bigvgan_meta.json"), "BigVGAN")
+        )
     missing = [name for path, name in checks if not os.path.exists(path)]
     if missing:
         print(f"ERROR: Missing compiled artifacts for: {', '.join(missing)}")
@@ -374,6 +422,29 @@ def load_token2wav(model_path, compiled_path):
     load_time = time.time() - t0
     _restore_embedding()
     print(f"  [DiT]     loaded in {load_time:.1f}s")
+
+    bigvgan_dir = os.path.join(compiled_path, "bigvgan")
+    if BIGVGAN_NEURON and os.path.exists(
+        os.path.join(bigvgan_dir, "bigvgan_meta.json")
+    ):
+        t1 = time.time()
+        t2w.load_bigvgan(bigvgan_dir)
+        if BIGVGAN_CORE_START >= 0:
+            import torch_neuronx
+            for bucket, neff in t2w._neuron_bigvgan_cores.items():
+                tp = time.time()
+                torch_neuronx.set_neuron_cores(
+                    neff,
+                    start_nc=BIGVGAN_CORE_START,
+                    nc_count=BIGVGAN_CORE_COUNT,
+                )
+                print(
+                    f"  [BigVGAN] bucket={bucket} placed start_nc={BIGVGAN_CORE_START} "
+                    f"nc_count={BIGVGAN_CORE_COUNT} in {time.time()-tp:.1f}s",
+                    flush=True,
+                )
+        _restore_embedding()
+        print(f"  [BigVGAN] loaded in {time.time()-t1:.1f}s")
     return t2w, t2w_cfg, load_time
 
 
