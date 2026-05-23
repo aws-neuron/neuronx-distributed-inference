@@ -3,11 +3,7 @@
 
 """Fused single-kernel DeltaNet chunked forward for CTE (context encoding).
 
-v15: 8-block (16x16) forward substitution with 4-round Neumann per block.
-     Neumann uses static_range (unrolled) to eliminate GpSimd↔Tensor hardware
-     barriers — compiler enforces ordering via data-flow, not semaphores.
-     This allows overlapping matmuls across blocks and reduces round-trip
-     latency from ~268ms to near-zero for the resolvent computation.
+v14: 8-block (16x16) forward substitution with 4-round Neumann per block.
 
 ROOT CAUSE of v4/v12 failure: Neumann power-doubling on large blocks (64x64 or
 128x128) suffers CATASTROPHIC CANCELLATION in fp32. Intermediate matrices
@@ -406,10 +402,7 @@ def deltanet_fused_chunked_fwd(
             A_pow = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=A_pow, src=A_diag)
 
-            # Unrolled Neumann: use static_range to avoid hardware barriers
-            # between rounds. Data dependencies are enforced by register flow,
-            # not explicit semaphores — lets compiler overlap across blocks.
-            for _r in nl.static_range(NEUMANN_ROUNDS):
+            for _r in nl.sequential_range(NEUMANN_ROUNDS):
                 # A_pow = A_pow @ A_pow
                 Ap_T_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_transpose(dst=Ap_T_ps, data=A_pow)
