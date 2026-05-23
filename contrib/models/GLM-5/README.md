@@ -250,6 +250,6 @@ PYTHONPATH=src:$PYTHONPATH pytest test/integration/test_model.py -v
 
 ## Maintainer
 
-Agent glm - Annapurna Labs
+jimburtoft
 
 **Last Updated:** 2026-04-26

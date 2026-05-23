@@ -1312,6 +1312,24 @@ class GLM5Attention(NeuronAttentionBase):
         self.attn_kernel_enabled = self.neuron_config.attn_kernel_enabled
         self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
 
+        # MLA attention NKI kernel (Option C: fused attention-only for TKG decode)
+        self.mla_attention_nki_enabled = getattr(
+            self.neuron_config, "mla_attention_nki_kernel_enabled", False
+        )
+        if self.mla_attention_nki_enabled:
+            try:
+                from mla_attention_nki import mla_attention_tkg
+
+                self._mla_attention_nki_fn = mla_attention_tkg
+            except ImportError:
+                import warnings
+
+                warnings.warn(
+                    "mla_attention_nki_kernel_enabled=True but mla_attention_nki.py not found. "
+                    "Falling back to standard attention path."
+                )
+                self.mla_attention_nki_enabled = False
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1477,54 +1495,114 @@ class GLM5Attention(NeuronAttentionBase):
             cached_mla = cached_kv_full[
                 :, :, :, :mla_cache_dim
             ]  # [B, 1, cache_len, 576]
-            k_pe_prior = cached_mla[
-                :, :, :, : self.qk_rope_head_dim
-            ]  # [B, 1, cache_len, 64]
-            compressed_kv_prior = cached_mla[
-                :, :, :, self.qk_rope_head_dim :
-            ]  # [B, 1, cache_len, 512]
-            # Squeeze the KV head dim for einsum compatibility
-            compressed_kv_prior = compressed_kv_prior.squeeze(1)  # [B, cache_len, 512]
 
-            # Scores for prior (cached) tokens
-            prior_scores = torch.matmul(
-                q_pe, k_pe_prior.transpose(2, 3)
-            ) + torch.einsum("bhqc,blc->bhql", q_nope, compressed_kv_prior)
-            prior_scores *= self.softmax_scale
+            if self.mla_attention_nki_enabled and dsa_mask is None:
+                # --- NKI MLA Attention Kernel path ---
+                # Fuses: dual-score + softmax + V-accumulation + V-absorption
+                # Includes active token by appending to cache view
+                cache_len = cached_mla.shape[2]
 
-            # Apply DSA mask to prior scores (if available)
-            if dsa_mask is not None:
-                # dsa_mask: [B, 1, 1, T] where T = cache_len + 1
-                # We only need the cache_len part for prior_scores
-                dsa_mask_prior = dsa_mask[:, :, :, : prior_scores.shape[-1]]
-                # Combine: attention_mask handles causal/padding, dsa_mask adds sparsity
-                prior_scores = torch.where(
-                    attention_mask,
-                    prior_scores + dsa_mask_prior,
-                    torch.finfo(prior_scores.dtype).min,
+                # Construct full cache including active token: [B, cache_len+1, 576]
+                # Active token KV: [k_pe | compressed_kv] = [B, 1, 576]
+                k_pe_flat_active = k_pe[:, 0, :, :]  # [B, 1, 64] (squeeze head dim)
+                active_kv = torch.cat(
+                    [k_pe_flat_active, compressed_kv], dim=-1
+                )  # [B, 1, 576]
+                # Append to prior cache (squeeze the KV head dim from cached_mla)
+                cached_mla_2d = cached_mla.squeeze(1)  # [B, cache_len, 576]
+                full_cache = torch.cat(
+                    [cached_mla_2d, active_kv], dim=1
+                )  # [B, cache_len+1, 576]
+                total_len = cache_len + 1
+
+                # Construct mask: [B*H, total_len]
+                # attention_mask is [B, H, 1, cache_len] (bool, for prior positions)
+                # Active token always attends (append True)
+                prior_mask = attention_mask.squeeze(2)  # [B, H, cache_len]
+                prior_mask_flat = prior_mask.reshape(bsz * self.num_heads, cache_len)
+                active_mask_col = torch.ones(
+                    bsz * self.num_heads, 1, dtype=torch.bool, device=prior_mask.device
                 )
+                full_mask = torch.cat(
+                    [prior_mask_flat, active_mask_col], dim=1
+                )  # [BH, total_len]
+
+                # Reshape queries for kernel: [BH, dim]
+                q_pe_flat = q_pe.reshape(
+                    bsz * self.num_heads, self.qk_rope_head_dim
+                )  # [BH, 64]
+                q_nope_flat = q_nope.reshape(
+                    bsz * self.num_heads, self.kv_lora_rank
+                )  # [BH, 512]
+
+                # Call NKI kernel
+                attn_output = self._mla_attention_nki_fn(
+                    q_pe=q_pe_flat,
+                    q_nope=q_nope_flat,
+                    kv_cache=full_cache,
+                    v_absorb=v_absorb,
+                    attn_mask=full_mask,
+                    softmax_scale=self.softmax_scale,
+                    n_heads=self.num_heads,
+                    d_rope=self.qk_rope_head_dim,
+                    d_c=self.kv_lora_rank,
+                    d_v=self.v_head_dim,
+                    seq_len=total_len,
+                )
+                # Output: [BH, d_v] -> reshape to [B, H, 1, d_v]
+                attn_output = attn_output.view(bsz, self.num_heads, 1, self.v_head_dim)
             else:
-                prior_scores = torch.where(
-                    attention_mask,
-                    prior_scores,
-                    torch.finfo(prior_scores.dtype).min,
+                # --- Standard PyTorch attention path ---
+                k_pe_prior = cached_mla[
+                    :, :, :, : self.qk_rope_head_dim
+                ]  # [B, 1, cache_len, 64]
+                compressed_kv_prior = cached_mla[
+                    :, :, :, self.qk_rope_head_dim :
+                ]  # [B, 1, cache_len, 512]
+                # Squeeze the KV head dim for einsum compatibility
+                compressed_kv_prior = compressed_kv_prior.squeeze(
+                    1
+                )  # [B, cache_len, 512]
+
+                # Scores for prior (cached) tokens
+                prior_scores = torch.matmul(
+                    q_pe, k_pe_prior.transpose(2, 3)
+                ) + torch.einsum("bhqc,blc->bhql", q_nope, compressed_kv_prior)
+                prior_scores *= self.softmax_scale
+
+                # Apply DSA mask to prior scores (if available)
+                if dsa_mask is not None:
+                    # dsa_mask: [B, 1, 1, T] where T = cache_len + 1
+                    # We only need the cache_len part for prior_scores
+                    dsa_mask_prior = dsa_mask[:, :, :, : prior_scores.shape[-1]]
+                    # Combine: attention_mask handles causal/padding, dsa_mask adds sparsity
+                    prior_scores = torch.where(
+                        attention_mask,
+                        prior_scores + dsa_mask_prior,
+                        torch.finfo(prior_scores.dtype).min,
+                    )
+                else:
+                    prior_scores = torch.where(
+                        attention_mask,
+                        prior_scores,
+                        torch.finfo(prior_scores.dtype).min,
+                    )
+                prior_scores = prior_scores.to(torch.float32)
+
+                softmax_prior, softmax_active = manual_softmax(
+                    prior_scores, active_scores, is_speculation=False
                 )
-            prior_scores = prior_scores.to(torch.float32)
+                softmax_prior = softmax_prior.to(k_pe.dtype)
+                softmax_active = softmax_active.to(k_pe.dtype)
 
-            softmax_prior, softmax_active = manual_softmax(
-                prior_scores, active_scores, is_speculation=False
-            )
-            softmax_prior = softmax_prior.to(k_pe.dtype)
-            softmax_active = softmax_active.to(k_pe.dtype)
+                # V absorption for active and prior
+                x = torch.einsum("bhql,blc->bhqc", softmax_active, compressed_kv)
+                attn_active = torch.einsum("bhqc,hdc->bhqd", x, v_absorb)
 
-            # V absorption for active and prior
-            x = torch.einsum("bhql,blc->bhqc", softmax_active, compressed_kv)
-            attn_active = torch.einsum("bhqc,hdc->bhqd", x, v_absorb)
+                x = torch.einsum("bhql,blc->bhqc", softmax_prior, compressed_kv_prior)
+                attn_prior = torch.einsum("bhqc,hdc->bhqd", x, v_absorb)
 
-            x = torch.einsum("bhql,blc->bhqc", softmax_prior, compressed_kv_prior)
-            attn_prior = torch.einsum("bhqc,hdc->bhqd", x, v_absorb)
-
-            attn_output = attn_prior + attn_active
+                attn_output = attn_prior + attn_active
 
         # Reshape: BHSD -> BSHD -> BS(H*D)
         attn_output = attn_output.transpose(1, 2).contiguous()
