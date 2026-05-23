@@ -65,8 +65,8 @@ from src.nki_kernels.nki_deltanet_fused import (
     _make_lower_mask,
     _make_lower_mask_diag,
     _make_identity,
-    _make_block_masks,
     _make_row_masks,
+    _make_blkdiag_mask,
 )
 
 from neuronx_distributed_inference.models.config import (
@@ -530,10 +530,10 @@ class NeuronGatedDeltaNet(nn.Module):
         lower_mask_diag = torch.tensor(
             _make_lower_mask_diag(), dtype=torch.float32, device=device
         )
-        block_masks = torch.tensor(
-            _make_block_masks(), dtype=torch.float32, device=device
-        )
         row_masks = torch.tensor(_make_row_masks(), dtype=torch.float32, device=device)
+        blkdiag_mask_t = torch.tensor(
+            _make_blkdiag_mask(), dtype=torch.float32, device=device
+        )
 
         all_outputs = []
         all_states = []
@@ -547,8 +547,8 @@ class NeuronGatedDeltaNet(nn.Module):
                 lower_mask,  # (128, 128)
                 identity_mat,  # (128, 128)
                 lower_mask_diag,  # (128, 128)
-                block_masks,  # (8, 128, 128)
                 row_masks,  # (8, 128, 1)
+                blkdiag_mask_t,  # (128, 128) — v17 block-diagonal mask
             )
             all_outputs.append(out_bh)
             all_states.append(state_bh)

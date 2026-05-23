@@ -3,7 +3,21 @@
 
 """Fused single-kernel DeltaNet chunked forward for CTE (context encoding).
 
-v14: 8-block (16x16) forward substitution with 4-round Neumann per block.
+v17: Batched Neumann — compute all 8 block resolvents simultaneously using
+     one 128x128 block-diagonal Neumann iteration instead of 8 separate 16x16
+     iterations. Reduces Neumann phase from 136 TE ops to 17 TE ops (88% fewer).
+
+     Key insight: If D = diag(A₁, A₂, ..., A₈) is block-diagonal with 8
+     independent 16x16 SLT blocks, then D^k = diag(A₁^k, ..., A₈^k) and
+     the Neumann product (I+D)(I+D²)(I+D⁴)(I+D⁸) = diag(N₁, ..., N₈)
+     computes ALL block resolvents in parallel. No cross-block interaction.
+
+     Numerical stability: Each diagonal block's intermediates are bounded by
+     ~2300 (same as per-block v14). The zero off-diagonal blocks prevent any
+     catastrophic cancellation. This is fundamentally different from the v4/v12
+     failure where a FULL 128x128 SLT matrix caused overflow.
+
+Previously: v14: 8-block (16x16) forward substitution with 4-round Neumann per block.
 
 ROOT CAUSE of v4/v12 failure: Neumann power-doubling on large blocks (64x64 or
 128x128) suffers CATASTROPHIC CANCELLATION in fp32. Intermediate matrices
@@ -18,16 +32,19 @@ well within fp32 precision (error < 2e-4 even for worst case).
 Algorithm:
   For (I - A)^{-1} @ b where A is 128x128 strictly lower triangular:
 
-  Partition into 8 blocks of 16 rows each. Sequential forward solve:
-    x_accum = 0
-    For i = 0 to 7:
-      cross_i = (A @ x_accum) masked to block i rows
-      b_adj_i = b[block_i] + cross_i
-      x_i = N_i @ b_adj_i  (N_i = 4-round Neumann on diagonal block i)
-      x_accum += x_i
+  1. Extract block-diagonal D from A (8 independent 16x16 blocks)
+  2. Compute batched resolvent N = (I+D)(I+D²)(I+D⁴)(I+D⁸) — single 128x128 Neumann
+  3. Forward solve with cross-block coupling:
+     x_accum = 0
+     For i = 0 to 7:
+       cross_i = (A @ x_accum) masked to block i rows
+       b_adj_i = b[block_i] + cross_i
+       x_i = N @ b_adj_i  (block-diagonal N: only block i contributes)
+       x_accum += x_i
 
-Optimization: Compute all 8 block resolvents ONCE (before the forward solve),
-then reuse them for both value_corr and k_cumdecay solves.
+Optimization: Compute batched block-diagonal resolvent ONCE (before forward solve),
+then reuse for both value_corr and k_cumdecay solves. v17 batching reduces
+Neumann from 136 TE ops (8 separate 16x16 iterations) to 17 TE ops (one 128x128).
 
 Performance: ~107 matmuls per chunk → ~107µs. Negligible vs 50ms TTFT.
 
@@ -59,8 +76,8 @@ Chunk size = 128 = P_MAX (one tile per chunk).
 Mathematical framework:
   Per-chunk 8-block forward substitution for intra-chunk correction:
     A = -QK_decay * lower_mask   (QK_decay[i,j] = (k_beta^T @ k)[i,j] * exp(gc[i]-gc[j]))
-    Partition rows into 8 blocks of 16. For each block, 4-round Neumann
-    on the 16x16 diagonal sub-block gives N_i = (I+A_ii)(I+A_ii^2)(I+A_ii^4)(I+A_ii^8).
+    Extract block-diagonal D = A * blkdiag_mask (8 independent 16x16 blocks).
+    Batched 4-round Neumann on D gives resolvent N = diag(N₁,...,N₈).
     Forward solve with cross-block coupling gives the full resolvent.
 
   Inter-chunk state propagation:
@@ -108,6 +125,15 @@ def _make_block_masks():
     return masks
 
 
+def _make_blkdiag_mask():
+    """Block-diagonal mask: union of all 8 diagonal block masks (128x128)."""
+    mask = np.zeros((CHUNK_SIZE, CHUNK_SIZE), dtype=np.float32)
+    for i in range(NUM_BLOCKS):
+        start = i * BLOCK_SIZE
+        mask[start : start + BLOCK_SIZE, start : start + BLOCK_SIZE] = 1.0
+    return mask
+
+
 def _make_row_masks():
     """8 row selection masks, packed as (8, 128, 1)."""
     masks = np.zeros((NUM_BLOCKS, CHUNK_SIZE, 1), dtype=np.float32)
@@ -127,8 +153,8 @@ def deltanet_fused_chunked_fwd(
     lower_mask: nl.ndarray,
     identity: nl.ndarray,
     lower_mask_diag: nl.ndarray,
-    block_masks: nl.ndarray,  # (8, 128, 128)
     row_masks: nl.ndarray,  # (8, 128, 1)
+    blkdiag_mask: nl.ndarray,  # (128, 128) — union of all 8 block masks
 ):
     """Fused chunked DeltaNet forward — 8-block forward substitution resolvent."""
     seq_len = query.shape[0]
@@ -148,11 +174,9 @@ def deltanet_fused_chunked_fwd(
     Lmask_d = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=Lmask_d, src=lower_mask_diag)
 
-    # Load block masks
-    blk_masks = [None] * NUM_BLOCKS
-    for bi in nl.static_range(NUM_BLOCKS):
-        blk_masks[bi] = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=blk_masks[bi], src=block_masks[bi, 0:P_MAX, 0:P_MAX])
+    # Load block-diagonal mask from HBM (v17: single mask replaces 8 separate block masks)
+    blkdiag_m = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=blkdiag_m, src=blkdiag_mask[0:P_MAX, 0:P_MAX])
 
     # Load row masks
     r_masks = [None] * NUM_BLOCKS
@@ -384,59 +408,57 @@ def deltanet_fused_chunked_fwd(
         nisa.tensor_copy(dst=A_T, src=A_T_psum)
 
         # ================================================================
-        # PRE-COMPUTE 8 BLOCK RESOLVENTS (4-round Neumann each)
-        # Store transposed resolvents for nc_matmul application.
+        # PRE-COMPUTE BLOCK-DIAGONAL RESOLVENT (batched Neumann)
+        # All 8 block resolvents computed simultaneously on the full
+        # 128x128 tile. Since A_blkdiag is block-diagonal, D^k remains
+        # block-diagonal — each block evolves independently.
+        # v17: 17 TE ops total (down from 136 in per-block approach).
         # ================================================================
-        blk_resolvents_T = [None] * NUM_BLOCKS
-        for bi in nl.static_range(NUM_BLOCKS):
-            # Extract diagonal block: A_diag = A_mat * blk_mask[bi]
-            A_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(
-                dst=A_diag, data1=A_mat, data2=blk_masks[bi], op=nl.multiply
-            )
+        # Extract block-diagonal part of A
+        A_blkdiag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=A_blkdiag, data1=A_mat, data2=blkdiag_m, op=nl.multiply)
 
-            # Neumann: P = (I+A)(I+A^2)(I+A^4)(I+A^8)
-            P_blk = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=P_blk, data1=eye, data2=A_diag, op=nl.add)
+        # Neumann on full 128x128 block-diagonal:
+        # P = (I+D)(I+D^2)(I+D^4)(I+D^8) where D = A_blkdiag
+        P_resolvent = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=P_resolvent, data1=eye, data2=A_blkdiag, op=nl.add)
 
-            A_pow = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=A_pow, src=A_diag)
+        A_pow = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=A_pow, src=A_blkdiag)
 
-            for _r in nl.sequential_range(NEUMANN_ROUNDS):
-                # A_pow = A_pow @ A_pow
-                Ap_T_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_transpose(dst=Ap_T_ps, data=A_pow)
-                Ap_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=Ap_T, src=Ap_T_ps)
+        for _r in nl.sequential_range(NEUMANN_ROUNDS):
+            # A_pow = A_pow @ A_pow (block-diagonal preserved)
+            Ap_T_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(dst=Ap_T_ps, data=A_pow)
+            Ap_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=Ap_T, src=Ap_T_ps)
 
-                Ap_sq_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dst=Ap_sq_ps, stationary=Ap_T, moving=A_pow)
-                nisa.tensor_copy(dst=A_pow, src=Ap_sq_ps)
+            Ap_sq_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=Ap_sq_ps, stationary=Ap_T, moving=A_pow)
+            nisa.tensor_copy(dst=A_pow, src=Ap_sq_ps)
 
-                # P = (I + A_pow) @ P
-                IpA = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_tensor(dst=IpA, data1=eye, data2=A_pow, op=nl.add)
+            # P = (I + A_pow) @ P
+            IpA = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=IpA, data1=eye, data2=A_pow, op=nl.add)
 
-                IpA_T_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_transpose(dst=IpA_T_ps, data=IpA)
-                IpA_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=IpA_T, src=IpA_T_ps)
+            IpA_T_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(dst=IpA_T_ps, data=IpA)
+            IpA_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=IpA_T, src=IpA_T_ps)
 
-                P_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dst=P_ps, stationary=IpA_T, moving=P_blk)
-                nisa.tensor_copy(dst=P_blk, src=P_ps)
+            P_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=P_ps, stationary=IpA_T, moving=P_resolvent)
+            nisa.tensor_copy(dst=P_resolvent, src=P_ps)
 
-            # Transpose resolvent for later nc_matmul application
-            blk_resolvents_T[bi] = nl.ndarray(
-                (P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf
-            )
-            P_T_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_transpose(dst=P_T_ps, data=P_blk)
-            nisa.tensor_copy(dst=blk_resolvents_T[bi], src=P_T_ps)
+        # Transpose resolvent for nc_matmul application (stationary^T @ moving)
+        resolvent_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        P_T_ps = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=P_T_ps, data=P_resolvent)
+        nisa.tensor_copy(dst=resolvent_T, src=P_T_ps)
 
         # ================================================================
         # FORWARD SOLVE 1: value_corr = (I-A)^{-1} @ v_beta
-        # Uses static_range to allow list indexing of block resolvents.
+        # Uses the batched block-diagonal resolvent (v17).
         # The sequential dependency (x_accum) is maintained by data flow.
         # ================================================================
         vc_accum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
@@ -471,9 +493,9 @@ def deltanet_fused_chunked_fwd(
             b_adj = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_tensor(dst=b_adj, data1=b_m, data2=cross_m, op=nl.add)
 
-            # Apply resolvent
+            # Apply resolvent (block-diagonal: only matching block contributes)
             x_i_ps = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=x_i_ps, stationary=blk_resolvents_T[bi], moving=b_adj)
+            nisa.nc_matmul(dst=x_i_ps, stationary=resolvent_T, moving=b_adj)
             x_i = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=x_i, src=x_i_ps)
 
@@ -492,7 +514,7 @@ def deltanet_fused_chunked_fwd(
 
         # ================================================================
         # FORWARD SOLVE 2: k_cumdecay = (I-A)^{-1} @ kb_exp_gc
-        # Uses static_range for list indexing.
+        # Uses batched block-diagonal resolvent (v17).
         # ================================================================
         kb_exp_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
@@ -534,7 +556,7 @@ def deltanet_fused_chunked_fwd(
             nisa.tensor_tensor(dst=b_adj2, data1=b_m2, data2=cross_m2, op=nl.add)
 
             x_i_ps2 = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=x_i_ps2, stationary=blk_resolvents_T[bi], moving=b_adj2)
+            nisa.nc_matmul(dst=x_i_ps2, stationary=resolvent_T, moving=b_adj2)
             x_i2 = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=x_i2, src=x_i_ps2)
 
