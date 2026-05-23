@@ -3,10 +3,7 @@
 
 """Fused single-kernel DeltaNet chunked forward for CTE (context encoding).
 
-v16: 8-block (16x16) forward substitution with 3-round Neumann per block.
-     Reduced from 4 rounds: for 16x16 SLT matrices, A^16=0, so the 4th round
-     computes (I + A^16) @ P = (I + 0) @ P = P (a no-op). 3 rounds capture
-     all terms through A^15 which is the exact inverse for block_size=16.
+v14: 8-block (16x16) forward substitution with 4-round Neumann per block.
 
 ROOT CAUSE of v4/v12 failure: Neumann power-doubling on large blocks (64x64 or
 128x128) suffers CATASTROPHIC CANCELLATION in fp32. Intermediate matrices
@@ -15,9 +12,8 @@ max ~1.0. The matmul (I + A^k) @ P involves terms of magnitude 10^7+ that
 must cancel to ~1.0, but fp32's 7 significant digits lose this cancellation.
 
 SOLUTION: Split 128x128 resolvent into 8 blocks of 16x16. Each 16x16 block
-needs 3 rounds of Neumann (A^8 covers through A^15, which is exact since
-A^16 = 0 for 16x16 SLT), max intermediate ~2300, well within fp32 precision
-(error < 2e-4 even for worst case).
+needs 4 rounds of Neumann (A^16 = 0 for 16x16 SLT), max intermediate ~2300,
+well within fp32 precision (error < 2e-4 even for worst case).
 
 Algorithm:
   For (I - A)^{-1} @ b where A is 128x128 strictly lower triangular:
@@ -27,7 +23,7 @@ Algorithm:
     For i = 0 to 7:
       cross_i = (A @ x_accum) masked to block i rows
       b_adj_i = b[block_i] + cross_i
-      x_i = N_i @ b_adj_i  (N_i = 3-round Neumann on diagonal block i)
+      x_i = N_i @ b_adj_i  (N_i = 4-round Neumann on diagonal block i)
       x_accum += x_i
 
 Optimization: Compute all 8 block resolvents ONCE (before the forward solve),
@@ -63,7 +59,7 @@ Chunk size = 128 = P_MAX (one tile per chunk).
 Mathematical framework:
   Per-chunk 8-block forward substitution for intra-chunk correction:
     A = -QK_decay * lower_mask   (QK_decay[i,j] = (k_beta^T @ k)[i,j] * exp(gc[i]-gc[j]))
-    Partition rows into 8 blocks of 16. For each block, 3-round Neumann
+    Partition rows into 8 blocks of 16. For each block, 4-round Neumann
     on the 16x16 diagonal sub-block gives N_i = (I+A_ii)(I+A_ii^2)(I+A_ii^4)(I+A_ii^8).
     Forward solve with cross-block coupling gives the full resolvent.
 
@@ -86,7 +82,7 @@ P_MAX = 128
 CHUNK_SIZE = 128
 BLOCK_SIZE = 16
 NUM_BLOCKS = 8
-NEUMANN_ROUNDS = 3  # 3 rounds captures through A^15 (exact for 16x16 SLT)
+NEUMANN_ROUNDS = 4
 
 _BROADCAST_MASK = [0] * 32
 
@@ -388,7 +384,7 @@ def deltanet_fused_chunked_fwd(
         nisa.tensor_copy(dst=A_T, src=A_T_psum)
 
         # ================================================================
-        # PRE-COMPUTE 8 BLOCK RESOLVENTS (3-round Neumann each)
+        # PRE-COMPUTE 8 BLOCK RESOLVENTS (4-round Neumann each)
         # Store transposed resolvents for nc_matmul application.
         # ================================================================
         blk_resolvents_T = [None] * NUM_BLOCKS
