@@ -2055,7 +2055,32 @@ class Qwen35ModelWrapper(ModelWrapper):
         )
 
     def input_generator(self):
-        """Generate inputs including mrope_position_ids, vision_embeddings, and vision_mask."""
+        """Generate inputs including mrope_position_ids, vision_embeddings, and vision_mask.
+
+        Layout depends on whether prefix caching is enabled:
+
+        WITHOUT prefix caching (24 args):
+        - Positions 0-6: standard NxDI (input_ids, attn_mask, pos_ids, seq_ids, sampling, prev_hidden, adapter)
+        - Positions 7-20: empty tensors (unused NxDI slots)
+        - Position 21: rotary_position_id = mrope_position_ids (3, BS, seq_len) for CTE, empty for TKG
+        - Position 22: vision_embeddings (BS, seq_len, hidden_size) for CTE, empty for TKG
+        - Position 23: vision_mask (BS, seq_len, 1) for CTE, empty for TKG
+
+        WITH prefix caching (24 args, different layout):
+        - Positions 0-6: standard (input_ids, attn_mask, pos_ids, seq_ids, sampling, prev_hidden, adapter)
+        - Positions 7-10: empty (medusa slots)
+        - Position 11: slot_mapping (BS, n_active_tokens)
+        - Position 12: active_block_table (BS, num_blocks) or (1,) if no prefix
+        - Position 13: num_queries (BS, 1)
+        - Position 14: computed_context_lens (BS, 1)
+        - Positions 15-20: empty
+        - Position 21: rotary_position_id = mrope_position_ids
+        - Position 22: vision_embeddings
+        - Position 23: vision_mask
+        """
+        if self.is_prefix_caching:
+            return self._input_generator_prefix_caching()
+
         base_inputs = super().input_generator()
         extended_inputs = []
 
@@ -2217,6 +2242,173 @@ class Qwen35ModelWrapper(ModelWrapper):
 
         return padded_args
 
+    def _input_generator_prefix_caching(self):
+        """Generate trace inputs for prefix caching mode.
+
+        Uses the base class prefix caching layout (positions 0-14) which aligns
+        with the model's forward() signature for block KV parameters, then adds
+        mRoPE and vision args at positions 21-23.
+
+        Layout:
+        0: input_ids, 1: attention_mask, 2: position_ids, 3: seq_ids,
+        4: sampling_params, 5: prev_hidden (empty), 6: adapter_ids,
+        7-10: empties (medusa slots),
+        11: slot_mapping, 12: active_block_table, 13: num_queries,
+        14: computed_context_lens, 15-20: empties,
+        21: mrope_position_ids, 22: vision_embeddings, 23: vision_mask
+        """
+        # Get base prefix caching inputs (positions 0-14)
+        base_inputs = super().input_generator()
+        extended_inputs = []
+
+        for bucket_inputs in base_inputs:
+            # base_inputs already has the prefix caching layout from
+            # _get_input_shape_for_prefix_caching: 15 args (0-14)
+            input_ids = bucket_inputs[0]
+            batch_size = input_ids.shape[0]
+            n_active_tokens = input_ids.shape[1]
+            is_cte = n_active_tokens > 1
+
+            if is_cte:
+                mrope_position_ids = (
+                    torch.arange(0, n_active_tokens, dtype=torch.int32)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(3, batch_size, -1)
+                    .contiguous()
+                )
+                vision_embeddings = torch.zeros(
+                    (batch_size, n_active_tokens, self.config.hidden_size),
+                    dtype=self.config.neuron_config.torch_dtype,
+                )
+                vision_mask = torch.full(
+                    (batch_size, n_active_tokens, 1),
+                    fill_value=n_active_tokens - 1,
+                    dtype=torch.int32,
+                )
+            else:
+                mrope_position_ids = torch.zeros((0,), dtype=torch.int32)
+                vision_embeddings = torch.zeros(
+                    (0,), dtype=self.config.neuron_config.torch_dtype
+                )
+                vision_mask = torch.zeros((0,), dtype=torch.int32)
+
+            # Start from base prefix caching inputs (already has 15 args: 0-14)
+            padded = list(bucket_inputs)
+            # Pad positions 15-20 with empties
+            while len(padded) < _NXDI_BASE_FORWARD_ARGS:
+                padded.append(torch.zeros((0,), dtype=torch.int32))
+            # Add Qwen3.5-specific args at positions 21-23
+            padded.append(mrope_position_ids)  # position 21: rotary_position_id
+            padded.append(vision_embeddings)  # position 22
+            padded.append(vision_mask)  # position 23
+
+            extended_inputs.append(tuple(padded))
+
+        return extended_inputs
+
+    def _forward_with_pad(self, *args):
+        """Override to include Qwen3.5-specific args (positions 15-23) for TKG.
+
+        The base class _forward_with_pad only builds padded_args for positions
+        0-14 when is_prefix_caching=True, then calls self._forward(*padded_args).
+        Our model has 24 traced args: 15-20 are empties, 21 is mrope_position_ids,
+        22 is vision_embeddings, 23 is vision_mask.
+
+        For TKG decode, these are all empty/zero tensors that don't need batch
+        padding. We intercept _forward to append them.
+        """
+        if not self.is_prefix_caching or len(args) <= 15:
+            return super()._forward_with_pad(*args)
+
+        # Save extra args (positions 15-23) that base class will ignore
+        extra_args = list(args[15:])
+
+        # Temporarily wrap _forward to append extra args
+        orig_forward = self._forward
+
+        def _forward_with_extra(*padded_args):
+            full_args = list(padded_args) + extra_args
+            return orig_forward(*full_args)
+
+        self._forward = _forward_with_extra
+        try:
+            result = super()._forward_with_pad(*args)
+        finally:
+            self._forward = orig_forward
+
+        return result
+
+    def _pad_prefix_caching_inputs(self, *args, pad_type="first_fit"):
+        """Override to additionally pad mRoPE and vision args for prefix caching.
+
+        The base class handles positions 0-14 (input_ids, attn_mask, pos_ids,
+        slot_mapping, block_table padding). We additionally pad:
+        - Position 21: mrope_position_ids (3, BS, seq_len) → pad seq_len dim
+        - Position 22: vision_embeddings (BS, seq_len, H) → pad seq_len dim
+        - Position 23: vision_mask (BS, seq_len, 1) → pad seq_len dim
+        """
+        # Let base class handle standard prefix caching padding (positions 0-14)
+        padded_args = super()._pad_prefix_caching_inputs(*args, pad_type=pad_type)
+
+        # If this is CTE and we have 24 args, pad the Qwen3.5-specific args
+        if (
+            len(padded_args) >= 24
+            and self.tag == CONTEXT_ENCODING_MODEL_TAG
+            and padded_args[0].shape[1] > 1  # is CTE
+        ):
+            padded_seq_len = padded_args[0].shape[1]
+            batch_size = padded_args[0].shape[0]
+
+            # Pad mrope_position_ids at position 21: (3, BS, orig_len) → (3, BS, padded_len)
+            mrope = padded_args[21]
+            if mrope.ndim == 3 and mrope.shape[-1] != padded_seq_len:
+                orig_len = mrope.shape[-1]
+                if orig_len < padded_seq_len:
+                    pad_size = padded_seq_len - orig_len
+                    last_pos = mrope[:, :, -1:]
+                    pad_offsets = torch.arange(1, pad_size + 1, dtype=mrope.dtype)
+                    pad_offsets = (
+                        pad_offsets.unsqueeze(0).unsqueeze(0).expand(3, batch_size, -1)
+                    )
+                    mrope_pad = last_pos + pad_offsets
+                    mrope = torch.cat([mrope, mrope_pad], dim=-1)
+                else:
+                    mrope = mrope[:, :, :padded_seq_len]
+
+            # Pad vision_embeddings at position 22: (BS, orig_len, H) → (BS, padded_len, H)
+            vis_emb = padded_args[22]
+            if vis_emb.ndim == 3 and vis_emb.shape[1] != padded_seq_len:
+                if vis_emb.shape[1] < padded_seq_len:
+                    pad_emb = torch.zeros(
+                        (
+                            batch_size,
+                            padded_seq_len - vis_emb.shape[1],
+                            vis_emb.shape[2],
+                        ),
+                        dtype=vis_emb.dtype,
+                    )
+                    vis_emb = torch.cat([vis_emb, pad_emb], dim=1)
+                else:
+                    vis_emb = vis_emb[:, :padded_seq_len]
+
+            # Pad vision_mask at position 23: (BS, orig_len, 1) → (BS, padded_len, 1)
+            vis_mask = padded_args[23]
+            if vis_mask.ndim == 3 and vis_mask.shape[1] != padded_seq_len:
+                if vis_mask.shape[1] < padded_seq_len:
+                    pad_mask = torch.full(
+                        (batch_size, padded_seq_len - vis_mask.shape[1], 1),
+                        fill_value=padded_seq_len - 1,
+                        dtype=torch.int32,
+                    )
+                    vis_mask = torch.cat([vis_mask, pad_mask], dim=1)
+                else:
+                    vis_mask = vis_mask[:, :padded_seq_len]
+
+            padded_args = (*padded_args[:21], mrope, vis_emb, vis_mask)
+
+        return padded_args
+
 
 # ============================================================
 # Top-Level Model
@@ -2341,6 +2533,27 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         tf_args=None,
     ):
         """Override to pass all 24 positional args explicitly."""
+        # --- PREFIX CACHING PATH ---
+        # When prefix caching is enabled and slot_mapping is provided (vLLM scheduler),
+        # use the block KV layout with args at positions 11-14, plus Qwen3.5 args at 21-23.
+        # The slot_mapping check ensures we don't enter this path from the HF generation
+        # adapter which doesn't supply prefix caching arguments.
+        if self.neuron_config.is_prefix_caching and slot_mapping is not None:
+            return self._get_model_outputs_prefix_caching(
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                prev_hidden,
+                adapter_ids,
+                llava_args,
+                slot_mapping,
+                block_table,
+                full_context_lens,
+                computed_context_lens,
+            )
+
         is_prefill = self._is_prefill(position_ids)
 
         seq_len = input_ids.shape[1]
@@ -2537,6 +2750,114 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             )
             is_run_on_neuron = self.token_generation_model.is_neuron()
 
+        return outputs, is_run_on_neuron
+
+    def _get_model_outputs_prefix_caching(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        prev_hidden,
+        adapter_ids,
+        llava_args,
+        slot_mapping,
+        block_table,
+        full_context_lens,
+        computed_context_lens,
+    ):
+        """Handle prefix caching using block KV layout.
+
+        Uses the base class prefix caching arg layout (positions 0-14) which aligns
+        with the model's forward() parameter positions, plus Qwen3.5 custom args
+        (mRoPE, vision) at positions 21-23.
+
+        Trace layout:
+        0: input_ids, 1: attention_mask, 2: position_ids, 3: seq_ids,
+        4: sampling_params, 5: prev_hidden (empty), 6: adapter_ids,
+        7-10: empties (medusa slots),
+        11: slot_mapping, 12: active_block_table, 13: num_queries,
+        14: computed_context_lens, 15-20: empties,
+        21: mrope_position_ids, 22: vision_embeddings, 23: vision_mask
+        """
+        batch_size = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
+        is_prefill = self._is_prefill(position_ids)
+
+        # Compute num_queries from full_context_lens and computed_context_lens
+        num_queries = full_context_lens - computed_context_lens
+
+        # Determine which model to use (CTE or TKG)
+        is_context_encoding = input_ids.shape[-1] > 1 and not position_ids.min().item()
+        base_model = (
+            self.context_encoding_model
+            if is_context_encoding
+            else self.token_generation_model
+        )
+
+        # Extract vision inputs from llava_args
+        if llava_args and len(llava_args) >= 2:
+            vision_embeddings = llava_args[0]
+            vision_mask = llava_args[1]
+            mrope_position_ids = llava_args[2] if len(llava_args) >= 3 else None
+        elif is_prefill:
+            vision_embeddings = torch.zeros(
+                (batch_size, seq_len, self.config.hidden_size),
+                dtype=self.config.neuron_config.torch_dtype,
+            )
+            vision_mask = torch.full(
+                (batch_size, seq_len, 1),
+                fill_value=seq_len - 1,
+                dtype=torch.int32,
+            )
+            mrope_position_ids = None
+        else:
+            vision_embeddings = torch.zeros((0,), dtype=torch.float32)
+            vision_mask = torch.zeros((0,), dtype=torch.int32)
+            mrope_position_ids = None
+
+        # For CTE: generate mRoPE position IDs if not provided
+        if is_prefill:
+            if mrope_position_ids is None:
+                mrope_position_ids = (
+                    torch.arange(0, seq_len, dtype=torch.int32)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(3, batch_size, -1)
+                    .contiguous()
+                )
+        else:
+            mrope_position_ids = torch.zeros((0,), dtype=torch.int32)
+
+        # Build empties for unused positions
+        empties_7_10 = [torch.empty(0) for _ in range(4)]  # positions 7-10
+        empties_15_20 = [torch.empty(0) for _ in range(6)]  # positions 15-20
+
+        # Call the model with the prefix caching layout
+        outputs = base_model(
+            input_ids,  # 0
+            attention_mask,  # 1
+            position_ids,  # 2
+            seq_ids,  # 3
+            sampling_params,  # 4
+            torch.empty(0),  # 5: prev_hidden (unused in prefix caching)
+            adapter_ids,  # 6
+            *empties_7_10,  # 7-10: medusa slots (empty)
+            slot_mapping,  # 11: slot_mapping
+            block_table,  # 12: active_block_table
+            num_queries,  # 13: num_queries
+            computed_context_lens,  # 14: computed_context_lens
+            *empties_15_20,  # 15-20: empty
+            mrope_position_ids,  # 21: rotary_position_id
+            vision_embeddings,  # 22: vision_embeddings
+            vision_mask,  # 23: vision_mask
+        )
+
+        if is_context_encoding:
+            self.kv_cache_populated = True
+
+        is_run_on_neuron = base_model.is_neuron()
         return outputs, is_run_on_neuron
 
     def get_compiler_args(self):
