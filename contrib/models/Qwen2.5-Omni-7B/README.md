@@ -205,15 +205,28 @@ Per-component measured breakdown for text-to-speech (14.1s audio output):
 
 ### Full Neuron Speech Pipeline (trn2.48xlarge, TP=4, BF16)
 
-End-to-end speech synthesis with all components on Neuron (9.1s audio output):
+End-to-end full-utterance speech synthesis from
+`examples/generate_qwen25_omni_speech.py`, prompt `"Say hello and briefly
+introduce yourself in two sentences."`, speaker Ethan, **4-core shared
+layout** (`NEURON_RT_VISIBLE_CORES=0-3`, DiT and BigVGAN collapsed onto
+cores 0-3):
 
-| Component | Time | Notes |
-|-----------|------|-------|
-| Thinker (7B, Neuron TP=4) | 0.3s | 24 text tokens |
-| CPU hidden state extraction | ~3s | HF model forward for thinker states |
-| Talker (690M, Neuron TP=4) | 2.1s | 454 codec tokens, per-step thinker injection |
-| Token2Wav (Neuron DiT + CPU BigVGAN) | 9.9s | 22 DiT blocks × 10 ODE steps |
-| **Total** | **~15s** | **9.1s audio, RTF ~1.7x** |
+| Stage | Time | Notes |
+|-------|------|-------|
+| Thinker (7B, Neuron TP=4) | 0.40s | 40 text tokens, ~10ms TPOT |
+| Hidden state extraction (HF CPU) | 0.47s | one forward pass to harvest thinker states |
+| Talker prep (projection, conditioning) | 0.17s | CPU |
+| Talker (690M, Neuron TP=4) | 2.27s | 573 codec tokens, ~4ms TPOT, per-step thinker injection |
+| Token2Wav (Neuron DiT + CPU BigVGAN) | 11.46s | mel_len=1146 → CPU BigVGAN fallback (bucket cap 128) |
+| **Pipeline total** | **14.77s** | **11.5s audio, RTF 1.29x** |
+
+Model load (one-time cost, excluded from pipeline): Thinker 11.9s, HF CPU
+0.3s, Talker 1.9s, DiT 104.7s, BigVGAN 18.1s — total ~140s.
+
+The 8-core split layout (`NEURON_RT_VISIBLE_CORES=0-7`, DiT on core 4,
+BigVGAN on core 5) primarily benefits streaming / TTFB by overlapping
+DiT with talker decode; for full-utterance synthesis the two layouts
+land within noise of each other.
 
 ### Neuron vs CPU Speedup (trn2.48xlarge, TP=4, BF16)
 
@@ -232,6 +245,40 @@ Token2Wav component breakdown (300 codec tokens / 6.0s audio):
 | DiT only (22 blocks, 10 ODE steps) | 24.1s | 3.8s | 6.3x |
 | Token2Wav end-to-end | 13.7s | 5.2s | 2.7x |
 | DiT core single forward (batch=2, mel_len=1024) | 592ms | 60ms | 9.8x |
+
+### GPU Reference (H100 80GB, BF16, SDPA)
+
+End-to-end full-utterance speech synthesis from `examples/test_gpu_baseline_bench.py`
+on a single H100 80GB HBM3, prompt `"Say hello and briefly introduce yourself in
+two sentences."`, speaker Ethan, 2 runs:
+
+| Run | Audio length | First-audio-byte (= wall) | RTF |
+|-----|-------------|---------------------------|-----|
+| 1 (warmup-loaded) | 6.46s | 22.20s | 3.44x |
+| 2 (steady state) | 8.24s | 14.06s | 1.71x |
+| Median | — | **18.13s** | — |
+
+Run 1 carries first-call CUDA graph / kernel-warmup overhead; run 2 is
+representative of steady-state full-utterance latency. Reproduce with:
+
+```bash
+python examples/test_gpu_baseline_bench.py
+```
+
+### Trn2 vs H100 (full-utterance, BF16)
+
+Same prompt and speaker on both platforms; Neuron numbers are from the
+4-core shared layout above.
+
+| Platform | Audio | Pipeline (steady-state) | RTF |
+|----------|-------|-------------------------|-----|
+| Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 11.5s | 14.77s | **1.29x** |
+| H100 80GB (single GPU, SDPA) | 8.24s | 14.06s | 1.71x |
+
+Trn2 produces ~40% more audio in roughly the same wall time, so RTF is
+~25% better than a single H100 on this prompt. Streaming / TTFB numbers
+(where the 8-core split layout matters) are tracked separately in
+`examples/test_ttfb_streaming_bench.py`.
 
 Key observations:
 - **Full Neuron speech pipeline** verified end-to-end: Thinker → Talker → Token2Wav all on Neuron, producing real human speech

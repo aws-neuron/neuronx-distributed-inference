@@ -5,16 +5,21 @@ End-to-end speech synthesis for Qwen2.5-Omni-7B on NeuronX (TP=4).
 Full pipeline: Thinker (text) -> Talker (codec tokens) -> Token2Wav (audio).
 
 All three Neuron-compiled components (Thinker, Talker, Token2Wav DiT) are
-loaded *once* into the same Python process on the same NeuronCores (TP=4,
-core 0-3) and reused across runs. The first inference still pays the
-full model-load cost, but subsequent runs are pure inference.
+loaded *once* into the same Python process and reused across runs. The
+default 8-core layout puts Thinker/Talker on cores 0-3 (TP=4) and DiT on
+core 4 / BigVGAN on core 5 so DiT/vocoder run concurrently with talker
+decode. With `NEURON_RT_VISIBLE_CORES=0-3` (e.g. on trn2.3xlarge) the
+script auto-collapses DiT/BigVGAN onto the 0-3 group — slower for
+streaming but functional for full-utterance synthesis. The first
+inference still pays the full model-load cost, but subsequent runs are
+pure inference.
 
 Two-step workflow:
   Step 1: Compile all Neuron components (one-time, ~30 min)
   Step 2: Run inference
 
 Prerequisites:
-  - Trn2 instance (trn2.48xlarge or trn2.xlarge, 4+ NeuronCores)
+  - Trn2 instance (trn2.48xlarge or trn2.3xlarge, 4+ NeuronCores)
   - Neuron SDK 2.23+ with PyTorch 2.9
   - Model weights downloaded from Qwen/Qwen2.5-Omni-7B (auto-fetched on first run)
   - pip install soundfile
@@ -90,12 +95,48 @@ else:
     DIT_BUCKETS = list(DEFAULT_DIT_BUCKETS)
 DIT_MAX_MEL_LEN = max(DIT_BUCKETS)
 
-# DiT placement: by default replicate the single-core DiT NEFF onto cores
-# 4-7 so DiT forwards run truly concurrently with the TP=4 talker on
-# cores 0-3. Set START to -1 to disable the post-load placement (DiT then
-# falls in with whatever cores the runtime picks, typically inside 0-3).
-DIT_CORE_START = int(os.environ.get("QWEN25_OMNI_DIT_CORE_START", "4"))
+# Count visible NeuronCores so we can collapse the 8-core layout down to
+# whatever the runtime actually exposes (e.g. 4 cores on trn2.3xlarge or
+# when the user sets NEURON_RT_VISIBLE_CORES=0-3 for an A/B comparison).
+def _count_visible_cores():
+    spec = os.environ.get("NEURON_RT_VISIBLE_CORES", "").strip()
+    if not spec:
+        return None  # unknown — let the runtime decide
+    n = 0
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            n += int(hi) - int(lo) + 1
+        else:
+            n += 1
+    return n
+
+
+_VISIBLE_CORES = _count_visible_cores()
+
+
+def _resolve_core_start(env_var, default_start, count):
+    """Honor the env var when set; otherwise pick default if it fits, else -1."""
+    raw = os.environ.get(env_var)
+    if raw is not None:
+        return int(raw)
+    if _VISIBLE_CORES is not None and default_start + count > _VISIBLE_CORES:
+        return -1  # not enough cores for split layout — collapse onto 0..N-1
+    return default_start
+
+
+# DiT placement: by default replicate the single-core DiT NEFF onto core 4
+# so DiT forwards run truly concurrently with the TP=4 talker on cores 0-3.
+# Set START to -1 to disable the post-load placement (DiT then falls in
+# with whatever cores the runtime picks, typically inside 0-3). When fewer
+# than 5 cores are visible the script auto-collapses to -1.
 DIT_CORE_COUNT = int(os.environ.get("QWEN25_OMNI_DIT_CORE_COUNT", "1"))
+DIT_CORE_START = _resolve_core_start(
+    "QWEN25_OMNI_DIT_CORE_START", 4, DIT_CORE_COUNT
+)
 
 # BigVGAN: enable Neuron-traced vocoder via QWEN25_OMNI_BIGVGAN_NEURON=1.
 # Compiler accepts only small mel buckets — T=60 and T=128 compile,
@@ -113,8 +154,10 @@ if _env_bv_buckets:
     )
 else:
     BIGVGAN_BUCKETS = list(DEFAULT_BIGVGAN_BUCKETS)
-BIGVGAN_CORE_START = int(os.environ.get("QWEN25_OMNI_BIGVGAN_CORE_START", "5"))
 BIGVGAN_CORE_COUNT = int(os.environ.get("QWEN25_OMNI_BIGVGAN_CORE_COUNT", "1"))
+BIGVGAN_CORE_START = _resolve_core_start(
+    "QWEN25_OMNI_BIGVGAN_CORE_START", 5, BIGVGAN_CORE_COUNT
+)
 
 DEFAULT_PROMPT = "Say hello and briefly introduce yourself in two sentences."
 DEFAULT_SYSTEM = (
@@ -750,6 +793,17 @@ def main():
     print(f"  Prompt:   {args.prompt}")
     print(f"  Output:   {args.output}")
     print(f"  Runs:     {num_runs}")
+    visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "?")
+    dit_loc = (
+        f"core {DIT_CORE_START}" if DIT_CORE_START >= 0 else "shared 0-3"
+    )
+    bv_loc = (
+        f"core {BIGVGAN_CORE_START}" if BIGVGAN_CORE_START >= 0 else "shared 0-3"
+    )
+    print(
+        f"  Layout:   visible={visible}  thinker/talker=0-3 (TP=4)  "
+        f"dit={dit_loc}  bigvgan={bv_loc}"
+    )
     t_total = time.time()
 
     # ----- Load everything once -----
