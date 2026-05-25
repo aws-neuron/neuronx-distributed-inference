@@ -30,8 +30,8 @@ Key features:
 
 ## Prerequisites
 
-- **Instance**: trn2.48xlarge or trn2.xlarge (4+ NeuronCores sufficient)
-- **Weights**: Download from [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) — the example scripts auto-download via `huggingface_hub.snapshot_download` on first run.
+- **Instance**: trn2.48xlarge or trn2.3xlarge (4+ NeuronCores sufficient)
+- **Weights**: Download from [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) — the example scripts auto-download via `huggingface_hub.snapshot_download` on first run. Set `QWEN25_OMNI_MODEL_PATH=/path/to/local/snapshot` to skip the download and use a local copy (the directory must contain `config.json`).
 - **Python dependencies** (on top of the NxDI venv):
   ```bash
   pip install soundfile          # writes WAV output in generate_qwen25_omni_speech.py
@@ -93,23 +93,20 @@ output = adapter.generate("What is quantum computing?", max_new_tokens=256)
 
 ### Multimodal (Vision + Audio + Speech)
 
-```python
-from modeling_qwen25_omni import (
-    NeuronQwen25OmniMultimodalForCausalLM,
-    Qwen25OmniMultimodalInferenceConfig,
-)
+The full multimodal pipeline (image / audio / text → text → speech) is wired up
+in the runnable example entrypoints:
 
-# After loading text model, enable multimodal components:
-# model.enable_audio_encoder(audio_state_dict)
-# model.compile_audio_encoder("/path/to/compiled_audio/")  # compile Neuron transformer
-# model.load_audio_encoder("/path/to/compiled_audio/")     # load compiled model
-# model.enable_talker(talker_state_dict)
-# model.enable_token2wav(token2wav_state_dict, speaker_dict_path="spk_dict.pt")
-#
-# Full multimodal pipeline:
-#   Thinker generates text -> hidden states passed to Talker
-#   -> Talker generates codec tokens -> Token2Wav generates waveform
-```
+- `examples/generate_qwen25_omni.py` — text and image/audio understanding via
+  `NeuronQwen25OmniMultimodalForCausalLM` + `Qwen25OmniMultimodalInferenceConfig`
+  (see `run_text_only` / `run_multimodal`).
+- `examples/generate_qwen25_omni_speech.py` — full Thinker → Talker → Token2Wav
+  speech synthesis pipeline (compiles each component, sets
+  `NEURON_RT_VISIBLE_CORES=0-3`, writes a WAV).
+
+The pipeline calls these methods on the multimodal model in order:
+`enable_audio_encoder` → `compile_audio_encoder` → `load_audio_encoder` →
+`enable_talker` → `enable_token2wav(state_dict, speaker_dict_path="spk_dict.pt")`.
+Refer to the example scripts above for the exact wiring.
 
 ## vLLM Integration
 
@@ -252,7 +249,7 @@ Key observations:
 | Instance/Version | 2.23+ (PyTorch 2.9) | 2.22 and earlier |
 |------------------|---------------------|------------------|
 | Trn2 (trn2.48xlarge) | Tested (TP=4) | Not tested |
-| Trn2 (trn2.xlarge) | Supported (TP=4) | Not tested |
+| Trn2 (trn2.3xlarge) | Supported (TP=4) | Not tested |
 | Trn1 (trn1.32xlarge) | Should work (TP=4, 4 NeuronCores) | Not tested |
 | Inf2 (inf2.48xlarge) | Should work (TP=4) | Not tested |
 
@@ -268,8 +265,12 @@ Verified on trn2.48xlarge with real Qwen2.5-Omni-7B weights:
 - **Text generation (TP=4)**: Compile + load + generate working, TPOT ~11-13ms, correct outputs verified
 
 ```bash
-# End-to-end test (compile + load + generate)
-python /tmp/test_qwen25_omni_tp4.py
+# End-to-end multimodal test (text / image+text / audio+text / text→speech)
+python test/integration/test_e2e_qwen25_omni.py
+
+# Or run the example entrypoints directly
+python examples/generate_qwen25_omni.py --mode text
+python examples/generate_qwen25_omni_speech.py
 ```
 
 ## Key Implementation Notes
