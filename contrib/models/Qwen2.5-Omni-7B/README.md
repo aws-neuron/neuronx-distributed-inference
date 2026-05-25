@@ -288,10 +288,10 @@ module is timed in isolation with fixed input shapes and fixed
 
 | Module | Trn2 (4-core, BF16) | H100 (BF16, SDPA) | Neuron / GPU |
 |--------|---------------------|--------------------|--------------|
-| Thinker (TPOT, 32 tok) | 10.3 ms | 24.3 ms | **2.4x faster** |
-| Talker (TPOT, 200 tok) | 4.1 ms | 21.3 ms | **5.2x faster** |
-| DiT (per step, mel=1024, batch=2 CFG, fp32) | 62.4 ms | 29.9 ms | 2.1x slower |
-| BigVGAN (mel=1024, chunked T=256) | 280 ms | (mel=128) 39 ms ref only | see notes below |
+| Thinker (TPOT, 32 tok) | 10.3 ms | 24.1 ms | **2.3x faster** |
+| Talker (TPOT, 200 tok) | 4.1 ms | 21.1 ms | **5.1x faster** |
+| DiT (per step, mel=1024, batch=2 CFG, fp32) | 62.4 ms | 29.8 ms | 2.1x slower |
+| BigVGAN (mel=1024, chunked T=256 on Neuron, single fwd on H100) | 280 ms | 90 ms | 3.1x slower |
 
 Reproduce with:
 
@@ -315,9 +315,11 @@ precision); H100's fp32 matmul throughput plus exclusive-device
 scheduling beats the 4-core shared NeuronCore layout on this fixed-shape
 kernel. BigVGAN compiles only up to T=256 on neuronxcc <= 2.25 (see the
 "BigVGAN compile cap" subsection below), so the runtime does chunked
-overlap-add at T=256 to handle full utterances; the 280ms cell above is
-the cost of 5 NEFF calls + crossfade at mel=1024, vs ~86 ms for a single
-mel=128 NEFF — overhead scales sub-linearly thanks to fixed-batch reuse.
+overlap-add at T=256 to handle full utterances. The 280ms cell at
+mel=1024 is the cost of 5 NEFF calls + 4 crossfades + Python dispatch;
+H100 runs the same workload as a single fp32 forward on one device,
+which is the bulk of its 3.1x lead. Once the SDK lifts the T=256 cap,
+a single mel=1024 NEFF should close most of this gap.
 Thinker and Talker are autoregressive and dominated by per-step Python /
 sampling overhead in HF ``generate``, where Neuron's on-device sampling
 and fused-embed talker pull ahead. Talker's 5.2x margin × ~570 codec
