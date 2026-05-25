@@ -213,12 +213,12 @@ cores 0-3):
 
 | Stage | Time | Notes |
 |-------|------|-------|
-| Thinker (7B, Neuron TP=4) | 0.40s | 40 text tokens, ~10ms TPOT |
+| Thinker (7B, Neuron TP=4) | 0.39s | 40 text tokens, ~10ms TPOT |
 | Hidden state extraction (HF CPU) | 0.47s | one forward pass to harvest thinker states |
 | Talker prep (projection, conditioning) | 0.17s | CPU |
-| Talker (690M, Neuron TP=4) | 2.27s | 573 codec tokens, ~4ms TPOT, per-step thinker injection |
-| Token2Wav (Neuron DiT + CPU BigVGAN) | 11.46s | mel_len=1146 → CPU BigVGAN fallback (bucket cap 128) |
-| **Pipeline total** | **14.77s** | **11.5s audio, RTF 1.29x** |
+| Talker (690M, Neuron TP=4) | 2.30s | 573 codec tokens, ~4ms TPOT, per-step thinker injection |
+| Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 10.53s | mel_len=1146 → 5 chunks × T=256 NEFF + cos² crossfade |
+| **Pipeline total** | **13.86s** | **11.9s audio, RTF 1.16x** |
 
 Model load (one-time cost, excluded from pipeline): Thinker 11.9s, HF CPU
 0.3s, Talker 1.9s, DiT 104.7s, BigVGAN 18.1s — total ~140s.
@@ -235,8 +235,8 @@ land within noise of each other.
 | Thinker (7B) | 30.4s | 0.47s | **64.7x** | TPOT 10.2ms |
 | Talker (690M) | 98.1s | 2.0s (500 tokens) | **49.1x** | TPOT 4.0ms |
 | Token2Wav DiT (85M) | 24.1s | 3.8s | **6.3x** | 22 blocks × 10 ODE steps, batch=2 (CFG) |
-| Token2Wav BigVGAN | 2.8s | 2.8s (CPU) | 1x | Stays on CPU |
-| **Total** | **267.9s** | **~15s** | **~18x** | All Neuron components active |
+| Token2Wav BigVGAN | 2.8s | 0.28s (chunked, mel=1024) | **10x** | T=256 NEFF × 5 chunks + cos² crossfade |
+| **Total** | **267.9s** | **~14s** | **~19x** | All Neuron components active |
 
 Token2Wav component breakdown (300 codec tokens / 6.0s audio):
 
@@ -288,10 +288,10 @@ module is timed in isolation with fixed input shapes and fixed
 
 | Module | Trn2 (4-core, BF16) | H100 (BF16, SDPA) | Neuron / GPU |
 |--------|---------------------|--------------------|--------------|
-| Thinker (TPOT, 32 tok) | 10.2 ms | 24.3 ms | **2.4x faster** |
-| Talker (TPOT, 200 tok) | 3.9 ms | 21.3 ms | **5.5x faster** |
-| DiT (per step, mel=1024, batch=2 CFG, fp32) | 62.5 ms | 29.9 ms | 2.1x slower |
-| BigVGAN (mel=128) | 86 ms | 39 ms | 2.2x slower |
+| Thinker (TPOT, 32 tok) | 10.3 ms | 24.3 ms | **2.4x faster** |
+| Talker (TPOT, 200 tok) | 4.1 ms | 21.3 ms | **5.2x faster** |
+| DiT (per step, mel=1024, batch=2 CFG, fp32) | 62.4 ms | 29.9 ms | 2.1x slower |
+| BigVGAN (mel=1024, chunked T=256) | 280 ms | (mel=128) 39 ms ref only | see notes below |
 
 Reproduce with:
 
@@ -310,20 +310,98 @@ python examples/compare_bench.py --neuron bench_neuron.json \
     --gpu bench_gpu.json --md bench_compare.md
 ```
 
-DiT and BigVGAN run in fp32 on both platforms (Token2Wav requires fp32
-ODE precision); H100's fp32 matmul throughput plus exclusive-device
-scheduling beats the 4-core shared NeuronCore layout on these two
-fixed-shape kernels. Thinker and Talker are autoregressive and dominated
-by per-step Python / sampling overhead in HF ``generate``, where Neuron's
-on-device sampling and fused-embed talker pull ahead. Talker's 5.5x
-margin × ~570 codec tokens is what keeps the full-utterance pipeline
-ahead of the H100 baseline despite the DiT/BigVGAN deficit.
+DiT runs in fp32 on both platforms (Token2Wav requires fp32 ODE
+precision); H100's fp32 matmul throughput plus exclusive-device
+scheduling beats the 4-core shared NeuronCore layout on this fixed-shape
+kernel. BigVGAN compiles only up to T=256 on neuronxcc <= 2.25 (see the
+"BigVGAN compile cap" subsection below), so the runtime does chunked
+overlap-add at T=256 to handle full utterances; the 280ms cell above is
+the cost of 5 NEFF calls + crossfade at mel=1024, vs ~86 ms for a single
+mel=128 NEFF — overhead scales sub-linearly thanks to fixed-batch reuse.
+Thinker and Talker are autoregressive and dominated by per-step Python /
+sampling overhead in HF ``generate``, where Neuron's on-device sampling
+and fused-embed talker pull ahead. Talker's 5.2x margin × ~570 codec
+tokens is what keeps the full-utterance pipeline ahead of the H100
+baseline.
+
+#### BigVGAN compile cap (neuronxcc <= 2.25) and chunked workaround
+
+`compile_bigvgan` traces one NEFF per mel_len bucket. On neuronxcc
+2.25.3371 we observe two related compiler bugs:
+
+1. **`T >= 256` crashes with `[NCC_ITIN902] TensorInitialization`** on
+   `--auto-cast=none`. Sweeping `--optlevel`, `--target=trn2`,
+   `--logical-nc-config=2`, `--disable-internal-io-dge`, and
+   `--model-type=transformer` does not help — the failing pass is the
+   same. **`--auto-cast=all` bypasses it** (the compiler is allowed to
+   cast internal matmuls to bf16, which sidesteps a fragile fp32 layout
+   path). Numerics stay tight: at T=256, output cosine vs CPU fp32 =
+   0.9999, max_abs = 5.8e-4 (~ −70 dB), well below audible threshold.
+   Verified with `examples/probe_bigvgan_buckets.py`.
+2. **`T >= 512` still crashes even with `--auto-cast=all`** — the same
+   internal pass overflows on a larger tile budget. T=256 is the hard
+   cap on this SDK.
+
+`compile_bigvgan` therefore picks `--auto-cast=all` automatically when
+`bucket > 128` and `--auto-cast=none` otherwise. To handle full
+utterances (mel_len ≫ 256) the runtime BigVGAN forward shim does
+**chunked overlap-add**: split the mel into 256-frame chunks with a
+32-frame overlap (≈ 7680 wav samples / ~480ms after the 240× upsample),
+run each chunk through the T=256 NEFF, and crossfade the wav-domain
+overlap with an equal-amplitude `cos²` window (`fade_in + fade_out = 1`
+sample-wise). Because BigVGAN is fully convolutional with deterministic
+240× upsample, no state has to be carried between chunks. Verified end
+to end: an 11.9s utterance synthesized from the speech pipeline (5
+chunks at mel_len=1146) is artifact-free at chunk boundaries.
+
+#### NKI flash-attention kernel evaluation (negative result)
+
+The DiT attention currently uses an explicit-matmul implementation
+(`_monkeypatch_dit_attention_for_neuron` in
+`src/modeling_qwen25_omni_token2wav.py`). We evaluated whether replacing
+it with one of NxDI's NKI flash-attention kernels would help. Numbers
+below are from `examples/bench_nki_flash_attn.py` on the DiT shape
+(B=2 CFG, H=16, head_dim=64, S=1024, single core):
+
+| Kernel | dtype | median | speedup | cosine vs CPU fp32 |
+|--------|-------|--------|---------|--------------------|
+| explicit_matmul (current) | fp32 | 4.30 ms | 1.00x | 1.0 |
+| `attention_cte` | fp32 | 3.65 ms | 1.18x | 1.0 |
+| `attention_isa_kernel` | fp32 | 3.55 ms | 1.21x | 1.0 |
+| `attention_cte` | bf16 | 2.25 ms | 1.91x | 1.0 |
+| `attention_isa_kernel` | bf16 | 2.23 ms | 1.93x | 1.0 |
+| `flash_fwd` | — | — | — | unsupported (`seqlen_k % 2048 == 0`, S=1024) |
+
+**We did not integrate any of these.** Reasons:
+
+1. **NKI kernels do not accept arbitrary additive masks.** The DiT uses
+   block-diagonal sparse masks (`block_size=24`) for 19 of 22 blocks
+   (`look_backward=0, look_ahead=0`), and block-tridiagonal masks for
+   blocks 0/10/20. `attention_cte` only exposes
+   `causal_mask`/`sliding_window`/`k_prior`/`sink`; `attention_isa_kernel`
+   only exposes `sliding_window`. Block-diagonal-with-block_size=24
+   cannot be expressed by sliding_window. Substituting any of these
+   kernels would silently turn DiT attention into global full attention,
+   leaking across chunk boundaries and corrupting the audio output.
+   The 1.18-1.21x numbers above were measured against a zero mask, which
+   is **not what the real DiT runs**.
+2. Even ignoring (1), the attention-only speedup (~20% in fp32) translates
+   to ~5-8% on the DiT pipeline (attention is one part of each block ×
+   22 blocks × 10 ODE × 2 CFG), which does not justify forking the
+   attention path or maintaining a kernel-vs-mask compatibility shim.
+3. Token2Wav requires fp32 for ODE accumulation, so the bf16 row of the
+   table is informational only.
+
+The bench script remains in the repo (`examples/bench_nki_flash_attn.py`)
+as a reference for future SDK upgrades — if a future kernel exposes a
+generic `attention_bias` argument, this is the test harness to validate
+it on.
 
 Key observations:
 - **Full Neuron speech pipeline** verified end-to-end: Thinker → Talker → Token2Wav all on Neuron, producing real human speech
 - Thinker and Talker achieve **49-65x speedup** on Neuron
 - Token2Wav DiT achieves **6.3x speedup** (9.8x for isolated transformer core)
-- BigVGAN vocoder (CPU) is now the remaining bottleneck
+- BigVGAN now runs fully on Neuron via T=256 NEFF + chunked overlap-add (10x speedup vs CPU at mel=1024)
 - **Per-step thinker state injection**: Talker v2 adds thinker_reply_part[step] embedding at each autoregressive step, matching HF behavior
 - **Vision embeddings auto-padding**: Compiled Neuron models require fixed bucket shapes; vision_embeddings are auto-padded to max_context_length
 - Split architecture for Token2Wav: CPU preprocessing (ECAPA-TDNN, codec/input embed, rotary, block_diff) + Neuron transformer core (22 blocks + norm + proj)

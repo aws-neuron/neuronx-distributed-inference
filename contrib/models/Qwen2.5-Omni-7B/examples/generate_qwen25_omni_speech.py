@@ -140,13 +140,15 @@ DIT_CORE_START = _resolve_core_start(
 )
 
 # BigVGAN: enable Neuron-traced vocoder via QWEN25_OMNI_BIGVGAN_NEURON=1.
-# Compiler accepts only small mel buckets — T=60 and T=128 compile,
-# T>=256 crashes with [NCC_ITIN902] TensorInitialization. The default
-# bucket grid therefore covers streaming chunks (chunk_size=25 -> 50 mel
-# frames per chunk) only; full-utterance synthesis (T_mel ~ 600) falls
-# back to CPU BigVGAN. Override via QWEN25_OMNI_BIGVGAN_BUCKETS once the
-# compiler is fixed.
-DEFAULT_BIGVGAN_BUCKETS = [60, 128]
+# Compiler bucket caps at T=256 on neuronxcc <= 2.25 — T>=512 crashes
+# [NCC_ITIN902] TensorInitialization regardless of compiler args, and
+# T=256 only compiles under --auto-cast=all (compile_bigvgan picks that
+# automatically). For full utterances (T_mel >> 256) the runtime BigVGAN
+# shim does chunked overlap-add at T=256, so a single large bucket is
+# enough to keep the vocoder fully on Neuron. We still keep two small
+# buckets in the grid for streaming chunks (chunk_size=25 → 50 mel
+# frames) where overlap-add overhead would dominate.
+DEFAULT_BIGVGAN_BUCKETS = [60, 128, 256]
 BIGVGAN_NEURON = os.environ.get("QWEN25_OMNI_BIGVGAN_NEURON", "1") == "1"
 _env_bv_buckets = os.environ.get("QWEN25_OMNI_BIGVGAN_BUCKETS")
 if _env_bv_buckets:

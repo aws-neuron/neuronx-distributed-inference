@@ -708,13 +708,21 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
         for bucket in buckets:
             example_mel = torch.zeros((1, mel_dim, bucket), dtype=torch.float32)
             logger.info("Tracing BigVGAN bucket T=%d ...", bucket)
+            # Buckets > 128 hit a compiler internal bug
+            # (NCC_ITIN902 TensorInitialization) under --auto-cast=none on
+            # neuronxcc <= 2.25. --auto-cast=all bypasses the failing pass
+            # by letting the compiler cast internal matmuls to bf16; this
+            # was verified at T=256 to keep audio-domain numerics tight
+            # (cosine 0.9999, max_abs 5.8e-4 vs CPU fp32). T<=128 keeps
+            # strict fp32 since the bug doesn't trigger there.
+            cargs = "--auto-cast=all" if bucket > 128 else "--auto-cast=none"
             traced = torch_neuronx.trace(
                 wrapper,
                 example_mel,
                 compiler_workdir=os.path.join(
                     compiled_path, f"workdir_T{bucket}"
                 ),
-                compiler_args="--auto-cast=none",
+                compiler_args=cargs,
             )
             save_path = os.path.join(
                 compiled_path, f"bigvgan_neuron_T{bucket}.pt",
@@ -836,30 +844,108 @@ class NeuronQwen25OmniToken2WavWithNeuronDiT(NeuronQwen25OmniToken2Wav):
                 max_bv = max(cores_bv)
                 upsamp = self._compute_total_upsample(bigvgan)
                 cpu_forward = bigvgan.forward
+                # Chunked overlap-add for mel longer than the largest bucket.
+                # BigVGAN is fully convolutional with deterministic upsample
+                # (240x), so we can split mel into ``max_bv``-frame windows,
+                # run each through the NEFF, and Hann-crossfade in the wav
+                # domain. Overlap = 32 mel frames = 32*240 = 7680 wav samples
+                # (~480ms @ 16kHz upsample) — enough to mask BigVGAN's
+                # non-linear receptive-field artifacts at chunk boundaries.
+                chunk_overlap = 32
+                fade_cache = {}
+
+                def _equal_amp_fade(n):
+                    """Build complementary fade-in / fade-out of length n
+                    that sum to 1 at every sample (equal-amplitude crossfade,
+                    correct for waveform-domain blending)."""
+                    if n not in fade_cache:
+                        # cos² ramp: fade_in[i] = sin²(π/2 * (i+0.5)/n)
+                        # fade_in + fade_out = 1 sample-wise
+                        idx = (torch.arange(n, dtype=torch.float32) + 0.5) / n
+                        fade_in = torch.sin(idx * (torch.pi / 2)) ** 2
+                        fade_out = 1.0 - fade_in
+                        fade_cache[n] = (fade_in, fade_out)
+                    return fade_cache[n]
 
                 def neuron_bigvgan_forward(mel_spectrogram):
                     actual_T = mel_spectrogram.shape[-1]
-                    if actual_T > max_bv:
+                    if actual_T <= max_bv:
+                        bucket = pick_bv(actual_T)
+                        if actual_T < bucket:
+                            pad = bucket - actual_T
+                            mel_padded = torch.nn.functional.pad(
+                                mel_spectrogram, (0, pad), mode="replicate",
+                            )
+                        else:
+                            mel_padded = mel_spectrogram
+                        wav = cores_bv[bucket](mel_padded.float())
+                        wav = wav.reshape(-1)[: actual_T * upsamp]
+                        return wav.cpu()
+
+                    # Long mel: chunked overlap-add at the largest bucket.
+                    bucket = max_bv
+                    stride = bucket - chunk_overlap
+                    if stride <= 0:
+                        # Bucket too small to overlap meaningfully — fall back.
                         logger.warning(
-                            "BigVGAN mel_len %d > max bucket %d, CPU fallback",
-                            actual_T, max_bv,
+                            "BigVGAN bucket %d <= overlap %d, CPU fallback",
+                            bucket, chunk_overlap,
                         )
                         return cpu_forward(mel_spectrogram)
-                    bucket = pick_bv(actual_T)
-                    if actual_T < bucket:
-                        pad = bucket - actual_T
-                        mel_padded = torch.nn.functional.pad(
-                            mel_spectrogram, (0, pad), mode="replicate",
-                        )
-                    else:
-                        mel_padded = mel_spectrogram
-                    wav = cores_bv[bucket](mel_padded.float())
-                    # HF BigVGAN.forward returns shape ``(T*upsamp,)`` (it
-                    # squeezes (1,1,T*upsamp) → (T*upsamp,)). Mimic that here
-                    # after trimming to actual length so downstream code that
-                    # expects 1-D doesn't break.
-                    wav = wav.reshape(-1)[: actual_T * upsamp]
-                    return wav.cpu()
+                    # Chunk start indices: 0, stride, 2*stride, ... covering
+                    # [0, actual_T). Last chunk may extend past actual_T and
+                    # is right-padded with replicate.
+                    starts = list(range(0, actual_T, stride))
+                    # Drop trailing starts whose window the previous chunk
+                    # already fully covers (would only contribute padding).
+                    while len(starts) >= 2 and starts[-2] + bucket >= actual_T:
+                        starts.pop()
+                    out_total = actual_T * upsamp
+                    overlap_wav = chunk_overlap * upsamp
+                    fade_in, fade_out = _equal_amp_fade(overlap_wav)
+                    wav_out = torch.zeros(out_total, dtype=torch.float32)
+                    prev_end = 0
+                    for i, s in enumerate(starts):
+                        end = min(s + bucket, actual_T)
+                        chunk = mel_spectrogram[..., s:end]
+                        if chunk.shape[-1] < bucket:
+                            chunk = torch.nn.functional.pad(
+                                chunk, (0, bucket - chunk.shape[-1]),
+                                mode="replicate",
+                            )
+                        wav_chunk = cores_bv[bucket](chunk.float())
+                        wav_chunk = wav_chunk.reshape(-1).cpu()
+                        # Trim chunk to its valid wav range:
+                        # valid_T = (end - s) mel frames produced by this run
+                        valid_wav = (end - s) * upsamp
+                        wav_chunk = wav_chunk[:valid_wav]
+                        chunk_start_wav = s * upsamp
+                        if i == 0:
+                            wav_out[chunk_start_wav:chunk_start_wav + valid_wav] = wav_chunk
+                            prev_end = chunk_start_wav + valid_wav
+                        else:
+                            ov = min(overlap_wav, prev_end - chunk_start_wav, valid_wav)
+                            if ov > 0:
+                                # Equal-amplitude crossfade: tail*fade_out + head*fade_in
+                                # fade_in[0..ov] + fade_out[0..ov] == 1 sample-wise
+                                fi = fade_in[:ov]
+                                fo = fade_out[:ov]
+                                tail = wav_out[chunk_start_wav:chunk_start_wav + ov]
+                                head = wav_chunk[:ov]
+                                wav_out[chunk_start_wav:chunk_start_wav + ov] = (
+                                    tail * fo + head * fi
+                                )
+                                # Append non-overlap remainder
+                                rest = valid_wav - ov
+                                if rest > 0:
+                                    wav_out[chunk_start_wav + ov:chunk_start_wav + ov + rest] = (
+                                        wav_chunk[ov:ov + rest]
+                                    )
+                                prev_end = chunk_start_wav + valid_wav
+                            else:
+                                wav_out[chunk_start_wav:chunk_start_wav + valid_wav] = wav_chunk
+                                prev_end = chunk_start_wav + valid_wav
+                    return wav_out[:out_total]
 
                 bigvgan.forward = neuron_bigvgan_forward
 
