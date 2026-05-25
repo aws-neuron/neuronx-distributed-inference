@@ -280,6 +280,45 @@ Trn2 produces ~40% more audio in roughly the same wall time, so RTF is
 (where the 8-core split layout matters) are tracked separately in
 `examples/test_ttfb_streaming_bench.py`.
 
+### Per-Module Micro-Bench (Trn2 4-core vs H100 80GB, BF16)
+
+To remove pipeline coupling and run-to-run sampling noise, each top-level
+module is timed in isolation with fixed input shapes and fixed
+``max_new_tokens``. Median of 5 runs:
+
+| Module | Trn2 (4-core, BF16) | H100 (BF16, SDPA) | Neuron / GPU |
+|--------|---------------------|--------------------|--------------|
+| Thinker (TPOT, 32 tok) | 10.2 ms | 24.3 ms | **2.4x faster** |
+| Talker (TPOT, 200 tok) | 3.9 ms | 21.3 ms | **5.5x faster** |
+| DiT (per step, mel=1024, batch=2 CFG, fp32) | 62.5 ms | 29.9 ms | 2.1x slower |
+| BigVGAN (mel=128) | 86 ms | 39 ms | 2.2x slower |
+
+Reproduce with:
+
+```bash
+# Trn2 (4-core layout). Compile once; the 1024 bucket avoids the 4x O(n^2)
+# tax of falling through to the next-larger 2048 bucket.
+NEURON_RT_VISIBLE_CORES=0-3 \
+    python examples/bench_modules_neuron.py --num-runs 5 \
+    --dit-mel-len 1024 --json bench_neuron.json
+
+# H100 (single GPU)
+python examples/bench_modules_gpu.py --num-runs 5 --json bench_gpu.json
+
+# Side-by-side markdown table
+python examples/compare_bench.py --neuron bench_neuron.json \
+    --gpu bench_gpu.json --md bench_compare.md
+```
+
+DiT and BigVGAN run in fp32 on both platforms (Token2Wav requires fp32
+ODE precision); H100's fp32 matmul throughput plus exclusive-device
+scheduling beats the 4-core shared NeuronCore layout on these two
+fixed-shape kernels. Thinker and Talker are autoregressive and dominated
+by per-step Python / sampling overhead in HF ``generate``, where Neuron's
+on-device sampling and fused-embed talker pull ahead. Talker's 5.5x
+margin × ~570 codec tokens is what keeps the full-utterance pipeline
+ahead of the H100 baseline despite the DiT/BigVGAN deficit.
+
 Key observations:
 - **Full Neuron speech pipeline** verified end-to-end: Thinker → Talker → Token2Wav all on Neuron, producing real human speech
 - Thinker and Talker achieve **49-65x speedup** on Neuron

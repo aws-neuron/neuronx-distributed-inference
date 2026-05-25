@@ -86,8 +86,9 @@ TP_DEGREE = int(os.environ.get("QWEN25_OMNI_TP_DEGREE", "4"))
 
 # DiT mel_len buckets. Streaming chunks (chunk_size=25 codec * dit.repeats(2) =
 # 50 mel frames) benefit hugely from a small bucket; full-utterance generation
-# still needs 2048. Override with QWEN25_OMNI_DIT_BUCKETS="60,120,256,2048".
-DEFAULT_DIT_BUCKETS = [60, 120, 256, 512, 2048]
+# still needs 2048. The 1024 bucket avoids 4x O(n^2) waste when actual mel_len
+# falls in (512, 1024]. Override with QWEN25_OMNI_DIT_BUCKETS="60,120,256,2048".
+DEFAULT_DIT_BUCKETS = [60, 120, 256, 512, 1024, 2048]
 _env_buckets = os.environ.get("QWEN25_OMNI_DIT_BUCKETS")
 if _env_buckets:
     DIT_BUCKETS = sorted({int(x) for x in _env_buckets.split(",") if x.strip()})
