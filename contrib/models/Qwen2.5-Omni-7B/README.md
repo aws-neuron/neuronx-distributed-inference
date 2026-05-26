@@ -17,7 +17,7 @@ NeuronX Distributed Inference implementation of [Qwen/Qwen2.5-Omni-7B](https://h
 | Vision encoder | Neuron | 4 | embed=1280, heads=16, depth=32, SwiGLU MLP |
 | Audio encoder | CPU+Neuron | 4 | d_model=1280, heads=20, layers=32, chunked attention |
 | Talker | Neuron | 4 | hidden=896, heads=12, kv_heads=4, head_dim=128, layers=24, vocab=8448, fused embed (8448→896) |
-| Token2Wav | CPU+Neuron (fp32) | N/A | DiT: dim=1024, 22 blocks (Neuron); BigVGAN: 6 upsample stages (CPU) |
+| Token2Wav | CPU+Neuron (fp32) | N/A | DiT: dim=1024, 22 blocks (Neuron); BigVGAN: 6 upsample stages (Neuron, T=256 NEFF + chunked overlap-add) |
 
 **Total state dict keys:** 2448 (Text: 339, Vision: 518, Audio: 489, Talker: 293, Token2Wav: 809)
 
@@ -26,7 +26,7 @@ Key features:
 - **Vision encoder**: SwiGLU MLP, RMSNorm, separate QKV projections, PatchMerger (16 heads / 4 TP = 4 per rank)
 - **Audio encoder**: Whisper-style with chunked attention. Hybrid CPU+Neuron: Conv1d frontend + chunking on CPU, 32 transformer layers on Neuron (20 heads / 4 TP = 5 per rank), AvgPool + LayerNorm + projection on CPU
 - **Talker**: Neuron-compiled with fused embedding (embed_tokens 8448→3584 + thinker_to_talker_proj 3584→896 collapsed into 8448→896), explicit head_dim=128, 3D mRoPE, per-step thinker state injection via vision_embeddings (12 heads / 4 TP = 3 per rank, 4 kv_heads / 4 TP = 1 per rank). Auto-pads vision_embeddings to max_context_length for compiled bucket compatibility.
-- **Token2Wav**: DiT transformer core (22 blocks) on Neuron + BigVGAN vocoder on CPU, ODE sampling (Runge-Kutta 4, 10 steps), float32. Split architecture: CPU preprocessing (ECAPA-TDNN, codec embed, input embed, rotary) + Neuron transformer core + CPU ODE solver + CPU BigVGAN. Automatic CPU fallback when mel_len exceeds compiled max.
+- **Token2Wav**: DiT transformer core (22 blocks) and BigVGAN vocoder both on Neuron, ODE sampling (Runge-Kutta 4, 10 steps), float32. Split architecture: CPU preprocessing (ECAPA-TDNN, codec embed, input embed, rotary) + Neuron DiT core + CPU ODE solver + Neuron BigVGAN (T=256 NEFF + chunked overlap-add at runtime; see "BigVGAN compile cap" under Performance). Automatic CPU fallback when mel_len exceeds compiled max or when `QWEN25_OMNI_BIGVGAN_NEURON=0`.
 
 ## Prerequisites
 
