@@ -209,19 +209,34 @@ End-to-end full-utterance speech synthesis from
 `examples/generate_qwen25_omni_speech.py`, prompt `"Say hello and briefly
 introduce yourself in two sentences."`, speaker Ethan, **4-core shared
 layout** (`NEURON_RT_VISIBLE_CORES=0-3`, DiT and BigVGAN collapsed onto
-cores 0-3):
+cores 0-3), `--greedy --seed 1234`, median of 3 runs:
 
 | Stage | Time | Notes |
 |-------|------|-------|
-| Thinker (7B, Neuron TP=4) | 0.39s | 40 text tokens, ~10ms TPOT |
-| Hidden state extraction (HF CPU) | 0.47s | one forward pass to harvest thinker states |
-| Talker prep (projection, conditioning) | 0.17s | CPU |
-| Talker (690M, Neuron TP=4) | 2.30s | 573 codec tokens, ~4ms TPOT, per-step thinker injection |
-| Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 10.53s | mel_len=1146 → 5 chunks × T=256 NEFF + cos² crossfade |
-| **Pipeline total** | **13.86s** | **11.9s audio, RTF 1.16x** |
+| Thinker (7B, Neuron TP=4, greedy) | 0.26s | 25 text tokens, ~10ms TPOT |
+| Hidden state extraction (HF CPU) | 0.45s | one forward pass to harvest thinker states |
+| Talker prep (projection, conditioning) | 0.18s | CPU |
+| Talker (690M, Neuron TP=4, sampled, seeded) | 1.76s | 448 codec tokens, ~4ms TPOT, per-step thinker injection |
+| Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 6.10s | mel_len=896 → 4 chunks × T=256 NEFF + cos² crossfade |
+| **Pipeline total** | **8.76s** | **9.0s audio, RTF 0.97x** |
 
-Model load (one-time cost, excluded from pipeline): Thinker 11.9s, HF CPU
-0.3s, Talker 1.9s, DiT 104.7s, BigVGAN 18.1s — total ~140s.
+Model load (one-time cost, excluded from pipeline): Thinker 12.8s, HF CPU
+0.3s, Talker 2.0s, DiT 225.5s, BigVGAN ~50s (from cold cache) — total ~291s.
+
+#### Sampling configuration
+
+Talker compiles **without** `OnDeviceSamplingConfig`: the on-device
+sampling NEFF returns a 1-D token tensor and `outputs.logits` is `None`,
+which causes the HF generation adapter to skip its `LogitsProcessorList`
+— silently dropping `repetition_penalty=1.05`. Without that penalty
+the talker mode-collapses into a single codec token (audible "ooooo")
+after ~75 tokens. Falling back to CPU sampling (NEFF returns gathered
+bf16 logits, HF samples on CPU) lets `repetition_penalty` take effect
+and adds <2ms per step. `run_talker` calls `torch.manual_seed(seed)`
+right before `talker_adapter.generate` so codec sequences are
+reproducible across runs on a single host (cross-hardware byte
+equality is unreachable: CUDA RNG ≠ CPU RNG, and bf16 matmul numerics
+diverge between H100 and Trn2).
 
 The 8-core split layout (`NEURON_RT_VISIBLE_CORES=0-7`, DiT on core 4,
 BigVGAN on core 5) primarily benefits streaming / TTFB by overlapping
@@ -250,35 +265,46 @@ Token2Wav component breakdown (300 codec tokens / 6.0s audio):
 
 End-to-end full-utterance speech synthesis from `examples/test_gpu_baseline_bench.py`
 on a single H100 80GB HBM3, prompt `"Say hello and briefly introduce yourself in
-two sentences."`, speaker Ethan, 2 runs:
+two sentences."`, speaker Ethan, `--greedy --seed 1234`, 4 runs:
 
 | Run | Audio length | First-audio-byte (= wall) | RTF |
 |-----|-------------|---------------------------|-----|
-| 1 (warmup-loaded) | 6.46s | 22.20s | 3.44x |
-| 2 (steady state) | 8.24s | 14.06s | 1.71x |
-| Median | — | **18.13s** | — |
+| 1 (warmup-loaded) | 7.22s | 24.74s | 3.43x |
+| 2 (steady state) | 7.20s | 9.54s | 1.32x |
+| 3 (steady state) | 7.18s | 9.56s | 1.33x |
+| 4 (steady state) | 7.12s | 9.44s | 1.33x |
+| Median (runs 2-4) | 7.18s | **9.55s** | **1.33x** |
 
-Run 1 carries first-call CUDA graph / kernel-warmup overhead; run 2 is
-representative of steady-state full-utterance latency. Reproduce with:
+Run 1 carries first-call CUDA graph / kernel-warmup overhead; runs 2-4
+are representative of steady-state full-utterance latency. Reproduce with:
 
 ```bash
-python examples/test_gpu_baseline_bench.py
+python examples/test_gpu_baseline_bench.py --greedy --seed 1234 --num-runs 4
 ```
 
-### Trn2 vs H100 (full-utterance, BF16)
+### Trn2 vs H100 (full-utterance, BF16, aligned sampling)
 
-Same prompt and speaker on both platforms; Neuron numbers are from the
-4-core shared layout above.
+Same prompt, speaker, sampling kwargs (`do_sample=False` for thinker;
+talker `do_sample=True, temperature=0.9, top_k=40, top_p=0.8,
+repetition_penalty=1.05`), and seed (`1234`) on both platforms; median
+of 3-4 runs (excluding first run for warmup):
 
 | Platform | Audio | Pipeline (steady-state) | RTF |
 |----------|-------|-------------------------|-----|
-| Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 11.5s | 14.77s | **1.29x** |
-| H100 80GB (single GPU, SDPA) | 8.24s | 14.06s | 1.71x |
+| Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 9.0s | **8.76s** | **0.97x** |
+| H100 80GB (single GPU, SDPA) | 7.18s | 9.55s | 1.33x |
 
-Trn2 produces ~40% more audio in roughly the same wall time, so RTF is
-~25% better than a single H100 on this prompt. Streaming / TTFB numbers
-(where the 8-core split layout matters) are tracked separately in
-`examples/test_ttfb_streaming_bench.py`.
+With aligned sampling (greedy thinker pins text, seeded talker pins
+codec sequence run-to-run), Trn2 wins on absolute latency
+(~9% faster wall time) and on RTF (0.97x vs 1.33x → Trn2 produces
+~25% more audio per second of wall time). The audio-length difference
+remains because CUDA RNG ≠ CPU RNG and bf16 matmul numerics diverge
+across hardware, so the Trn2 talker draws a different codec sequence
+even from identical prompts and parameters; the longer codec costs
+extra Token2Wav work, but Trn2's faster Token2Wav still finishes first.
+
+Streaming / TTFB numbers (where the 8-core split layout matters)
+are tracked separately in `examples/test_ttfb_streaming_bench.py`.
 
 ### Per-Module Micro-Bench (Trn2 4-core vs H100 80GB, BF16)
 

@@ -48,7 +48,7 @@ DEFAULTS = {
     "talker_max_new_tokens": 200,
     "dit_mel_len": 1024,
     "dit_num_steps": 10,
-    "bigvgan_mel_len": 128,
+    "bigvgan_mel_len": 1024,
 }
 
 

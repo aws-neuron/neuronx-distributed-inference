@@ -60,7 +60,7 @@ import queue
 import statistics
 import threading
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from transformers.generation.stopping_criteria import StoppingCriteria
@@ -134,6 +134,7 @@ def synthesize_chunk(
     total_upsample: int,
     codec_eos_token: int,
     codec_pad_token: int,
+    seed: Optional[int] = None,
 ) -> torch.Tensor:
     """Synthesize ``codec_codes[start:end]`` with ``left_context`` codec
     tokens of padding to absorb BigVGAN edge artifacts.
@@ -157,6 +158,11 @@ def synthesize_chunk(
     num_embeds = getattr(t2w_cfg.dit_config, "num_embeds", 8193)
     if code_tensor.numel() and code_tensor.max() >= num_embeds:
         code_tensor = code_tensor.clamp(0, num_embeds - 1)
+
+    if seed is not None:
+        # Mix start into seed so each chunk gets a distinct but
+        # deterministic init noise.
+        torch.manual_seed(seed + start)
 
     wav = t2w(
         code=code_tensor,
@@ -191,6 +197,8 @@ def run_streaming_pipeline(
     system_prompt: str,
     chunk_size: int,
     left_context: int,
+    greedy: bool = False,
+    seed: int = 42,
 ):
     """Run one full streaming inference and return timings + audio chunks."""
     t_start = time.time()
@@ -285,6 +293,7 @@ def run_streaming_pipeline(
                     total_upsample=total_upsample,
                     codec_eos_token=codec_eos,
                     codec_pad_token=codec_pad,
+                    seed=seed,
                 )
             elapsed = time.time() - t0
             with chunk_results_lock:
@@ -318,6 +327,15 @@ def run_streaming_pipeline(
         context_len=context_len, chunk_size=chunk_size, on_chunk=on_chunk,
     )
 
+    # Talker always uses normal sampling regardless of ``greedy`` (which
+    # only pins the thinker). Forcing argmax here on Trn2 reproducibly
+    # loops on a single codec token ("ooooo"); cross-hardware codec
+    # equality is unattainable in bf16 either way.
+    talker_sample_kwargs = {
+        "do_sample": True, "temperature": 0.9,
+        "top_k": 40, "top_p": 0.8, "repetition_penalty": 1.05,
+    }
+
     t_talker_start = time.time()
     out = talker_adapter.generate(
         input_ids=talker_input_ids,
@@ -325,9 +343,8 @@ def run_streaming_pipeline(
         max_new_tokens=max_gen,
         eos_token_id=[codec_eos, codec_pad],
         suppress_tokens=[codec_bos],
-        do_sample=True, temperature=0.9, top_k=40, top_p=0.8,
-        repetition_penalty=1.05,
         stopping_criteria=[emitter],
+        **talker_sample_kwargs,
     )
     t_talker_end = time.time()
 
@@ -391,6 +408,8 @@ def run_serial_pipeline(
     speaker: str,
     prompt: str,
     system_prompt: str,
+    greedy: bool = False,
+    seed: int = 42,
 ):
     """Reproduce the serial pipeline used by ``generate_qwen25_omni_speech.py``.
 
@@ -416,6 +435,7 @@ def run_serial_pipeline(
 
     codec_codes, talker_time = omni_demo.run_talker(
         talker_model, talker_adapter, talker_cfg, talker_input,
+        greedy=greedy, seed=seed,
     )
     t_talker = time.time()
 
@@ -425,6 +445,7 @@ def run_serial_pipeline(
     wav, t2w_time = omni_demo.run_token2wav(
         t2w, t2w_cfg, codec_codes,
         talker_input["conditioning"], talker_input["reference_mel"],
+        seed=seed,
     )
     t_synth = time.time()
 
@@ -496,9 +517,18 @@ def main():
                         choices=["serial", "streaming", "both"])
     parser.add_argument("--out-prefix", default="streaming_bench",
                         help="WAV prefix for first run output (default 'streaming_bench')")
+    parser.add_argument("--greedy", dest="greedy", action="store_true", default=False,
+                        help=("Use greedy thinker NEFF (thinker_tp4_greedy). "
+                              "Talker always uses sampling. Needs prior "
+                              "--compile --greedy in "
+                              "generate_qwen25_omni_speech.py."))
+    parser.add_argument("--no-greedy", dest="greedy", action="store_false",
+                        help="Use the sampling NEFF (default for the demo path).")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Seed for DiT init noise. Default 42.")
     args = parser.parse_args()
 
-    if not omni_demo._check_compiled(args.compiled_path):
+    if not omni_demo._check_compiled(args.compiled_path, greedy=args.greedy):
         _sys.exit(1)
 
     print("=" * 70)
@@ -512,11 +542,13 @@ def main():
     print(f"  Left context: {args.left_context} codec tokens")
     print(f"  Runs:         {args.num_runs}")
     print(f"  Mode:         {args.mode}")
+    print(f"  Greedy:       {args.greedy}")
+    print(f"  Seed:         {args.seed}")
 
     # ---- Load all models once ----
     print("\n--- Loading models (one-time cost) ---")
     thinker_adapter, tokenizer, _ = omni_demo.load_thinker(
-        args.model_path, args.compiled_path,
+        args.model_path, args.compiled_path, greedy=args.greedy,
     )
     hf_model, _ = omni_demo.load_hf_cpu(args.model_path)
     talker_model, talker_adapter, talker_cfg, _ = omni_demo.load_talker(
@@ -543,6 +575,7 @@ def main():
         t2w=t2w, t2w_cfg=t2w_cfg,
         speaker=args.speaker, prompt=args.prompt,
         system_prompt=args.system_prompt,
+        greedy=args.greedy, seed=args.seed,
     )
     print(f"  warmup took {time.time() - _t0:.2f}s")
     gc.collect()
@@ -562,6 +595,7 @@ def main():
                 t2w=t2w, t2w_cfg=t2w_cfg,
                 speaker=args.speaker, prompt=args.prompt,
                 system_prompt=args.system_prompt,
+                greedy=args.greedy, seed=args.seed,
             )
             if res is not None:
                 print(f"  text: {res['thinker_text'][:80]}")
@@ -587,6 +621,7 @@ def main():
                 system_prompt=args.system_prompt,
                 chunk_size=args.chunk_size,
                 left_context=args.left_context,
+                greedy=args.greedy, seed=args.seed,
             )
             print(f"  text: {res['thinker_text'][:80]}")
             print(f"  codec={res['n_codec_tokens']} tokens, "

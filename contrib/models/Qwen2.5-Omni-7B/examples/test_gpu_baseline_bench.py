@@ -127,24 +127,77 @@ def run_full_pipeline(
     speaker: str,
     max_new_tokens: int,
     use_audio_in_video: bool,
+    greedy: bool,
+    seed: int,
+    capture_codec: Optional[List[int]] = None,
 ):
-    """One end-to-end generate(); returns text + waveform + timing dict."""
+    """One end-to-end generate(); returns text + waveform + timing dict.
+
+    If ``capture_codec`` is a list, the talker codec ids generated this run
+    are appended to it (used for cross-hardware divergence diagnosis).
+    """
     device = next(model.parameters()).device
     inputs = build_text_inputs(processor, prompt, system_prompt, str(device))
+
+    # Seed DiT init noise so the apples-to-apples Trn2 vs H100 compare gets
+    # the same starting latent. Sampler RNG (talker / thinker) is also
+    # seeded but only matters when --no-greedy is set.
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # HF Qwen2_5OmniForConditionalGeneration.generate forwards thinker_*
+    # / talker_* prefixed kwargs to the respective sub-models. --greedy
+    # only pins the thinker (token-equal across Trn2 and GPU). The talker
+    # always runs with normal sampling: forcing argmax there falls into
+    # degenerate single-token loops on at least Trn2.
+    if greedy:
+        sample_kwargs = {
+            "do_sample": False,
+            "talker_do_sample": True,
+            "talker_top_k": 40,
+            "talker_top_p": 0.8,
+            "talker_temperature": 0.9,
+            "talker_repetition_penalty": 1.05,
+        }
+    else:
+        sample_kwargs = {
+            "do_sample": True, "temperature": 0.9,
+            "top_k": 40, "top_p": 0.8, "repetition_penalty": 1.05,
+        }
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     t_start = time.time()
 
-    with torch.inference_mode():
-        text_ids, audio = model.generate(
-            **inputs,
-            speaker=speaker,
-            use_audio_in_video=use_audio_in_video,
-            return_audio=True,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
+    # If asked, wrap talker.generate to capture codec ids without
+    # re-implementing HF's full generate(). HF strips the talker prompt
+    # and the trailing eos: codec = result[:, talker_input_ids.shape[1]:-1]
+    _orig_talker_generate = model.talker.generate
+    if capture_codec is not None:
+        def _talker_capture(*a, **kw):
+            inp = kw.get("input_ids")
+            if inp is None and a:
+                inp = a[0]
+            tlen = int(inp.shape[1]) if inp is not None else 0
+            out = _orig_talker_generate(*a, **kw)
+            ids = out[0, tlen:-1].tolist()
+            capture_codec[:] = [int(x) for x in ids]
+            return out
+        model.talker.generate = _talker_capture
+    try:
+        with torch.inference_mode():
+            text_ids, audio = model.generate(
+                **inputs,
+                speaker=speaker,
+                use_audio_in_video=use_audio_in_video,
+                return_audio=True,
+                max_new_tokens=max_new_tokens,
+                **sample_kwargs,
+            )
+    finally:
+        if capture_codec is not None:
+            model.talker.generate = _orig_talker_generate
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -155,12 +208,14 @@ def run_full_pipeline(
         skip_special_tokens=True,
     )[0]
     n_text = int(text_ids.shape[1] - inputs["input_ids"].shape[1])
+    gen_token_ids = text_ids[0, inputs["input_ids"].shape[1]:].tolist()
 
     wav = audio.detach().float().reshape(-1).cpu()
 
     return {
         "text": text,
         "n_text_tokens": n_text,
+        "thinker_token_ids": [int(x) for x in gen_token_ids],
         "wav": wav,
         "audio_seconds": float(wav.numel()) / SAMPLE_RATE,
         "first_audio_byte_s": t_end - t_start,
@@ -235,6 +290,7 @@ def _synthesize_chunk_gpu(
     codec_pad: int,
     device,
     dtype,
+    seed: int,
 ):
     eff_end = end
     while eff_end > start and codec_codes[eff_end - 1] in (codec_eos, codec_pad):
@@ -245,6 +301,13 @@ def _synthesize_chunk_gpu(
     ctx_start = max(0, start - left_context)
     chunk_codes = codec_codes[ctx_start:eff_end]
     code_tensor = torch.tensor([chunk_codes], dtype=torch.long, device=device)
+
+    # Seed DiT init noise so every Token2Wav call is reproducible across
+    # hardware. We mix `start` into the seed so each chunk gets a distinct
+    # but deterministic init.
+    torch.manual_seed(seed + start)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed + start)
 
     with torch.inference_mode():
         wav = code2wav(
@@ -272,6 +335,8 @@ def run_streaming_pipeline(
     max_new_tokens: int,
     chunk_size: int,
     left_context: int,
+    greedy: bool,
+    seed: int,
 ):
     """Thinker -> talker(generate w/ chunk hook) -> token2wav per chunk.
 
@@ -286,18 +351,29 @@ def run_streaming_pipeline(
     talker = model.talker
     code2wav = model.token2wav
 
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     t_start = time.time()
+
+    thinker_sample_kwargs = (
+        {"do_sample": False}
+        if greedy
+        else {"do_sample": True, "temperature": 0.7,
+              "top_k": 20, "top_p": 0.8}
+    )
 
     # ----- Thinker -----
     with torch.inference_mode():
         thinker_out = thinker.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
             return_dict_in_generate=True,
             output_hidden_states=True,
+            **thinker_sample_kwargs,
         )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -421,6 +497,7 @@ def run_streaming_pipeline(
             samples_per_token=samples_per_token,
             codec_eos=codec_eos, codec_pad=codec_pad,
             device=device, dtype=dtype,
+            seed=seed,
         )
         elapsed = time.time() - t0
         audio_chunks.append(wav)
@@ -435,6 +512,20 @@ def run_streaming_pipeline(
         context_len=context_len, chunk_size=chunk_size, on_chunk=on_chunk,
     )
 
+    # "Greedy via top_k=1 sampling" — see the full-mode comment above.
+    talker_sample_kwargs = (
+        {"do_sample": True, "top_k": 1, "temperature": 1.0,
+         "repetition_penalty": 1.05}
+        if greedy
+        else {"do_sample": True, "temperature": 0.9,
+              "top_k": 40, "top_p": 0.8, "repetition_penalty": 1.05}
+    )
+
+    if greedy:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
     # ----- Talker decode with chunk hook -----
     t_talker_start = time.time()
     with torch.inference_mode():
@@ -447,9 +538,8 @@ def run_streaming_pipeline(
             max_new_tokens=min(600, max_new_tokens * 25),
             eos_token_id=[codec_eos, codec_pad],
             suppress_tokens=[codec_bos],
-            do_sample=True, temperature=0.9, top_k=40, top_p=0.8,
-            repetition_penalty=1.05,
             stopping_criteria=[emitter],
+            **talker_sample_kwargs,
         )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -530,6 +620,17 @@ def main():
                         choices=["sdpa", "flash_attention_2", "eager"])
     parser.add_argument("--out-prefix", default="gpu_baseline")
     parser.add_argument("--use-audio-in-video", action="store_true")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Seed for DiT init noise (and sampler RNG if not greedy).")
+    parser.add_argument("--greedy", dest="greedy", action="store_true", default=True,
+                        help="Use greedy thinker (default). Talker always samples.")
+    parser.add_argument("--no-greedy", dest="greedy", action="store_false",
+                        help="Use sampling decoding instead (matches the demo defaults).")
+    parser.add_argument("--dump-codec", default=None,
+                        help=("Path to write a JSON dump of the first full-mode "
+                              "run's {thinker_text, thinker_token_ids, "
+                              "codec_token_ids} for cross-hardware codec "
+                              "divergence diagnosis."))
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -550,6 +651,8 @@ def main():
     print(f"  dtype:        {args.dtype}")
     print(f"  attn_impl:    {args.attn_impl}")
     print(f"  num_runs:     {args.num_runs}")
+    print(f"  greedy:       {args.greedy}")
+    print(f"  seed:         {args.seed}")
     if args.mode in ("streaming", "both"):
         print(f"  chunk_size:   {args.chunk_size}")
         print(f"  left_context: {args.left_context}")
@@ -563,12 +666,16 @@ def main():
     for i in range(args.num_runs):
         if args.mode in ("full", "both"):
             print(f"\n--- [full] Run {i+1}/{args.num_runs} ---")
+            codec_buf: List[int] = []
+            want_dump = (i == 0 and args.dump_codec)
             res = run_full_pipeline(
                 model=model, processor=processor,
                 prompt=args.prompt, system_prompt=args.system_prompt,
                 speaker=args.speaker,
                 max_new_tokens=args.max_new_tokens,
                 use_audio_in_video=args.use_audio_in_video,
+                greedy=args.greedy, seed=args.seed,
+                capture_codec=codec_buf if want_dump else None,
             )
             print(f"  text: {res['text'][:80]}")
             print(f"  audio={res['audio_seconds']:.2f}s, "
@@ -577,6 +684,23 @@ def main():
             if i == 0:
                 sf.write(f"{args.out_prefix}_full.wav",
                          res["wav"].numpy(), SAMPLE_RATE)
+            if want_dump:
+                import json as _json
+                dump = {
+                    "platform": "gpu",
+                    "device": torch.cuda.get_device_name(0),
+                    "dtype": args.dtype,
+                    "attn_impl": args.attn_impl,
+                    "greedy": bool(args.greedy),
+                    "seed": int(args.seed),
+                    "thinker_text": res["text"],
+                    "thinker_token_ids": res["thinker_token_ids"],
+                    "codec_token_ids": codec_buf,
+                }
+                with open(args.dump_codec, "w") as _f:
+                    _json.dump(dump, _f, indent=2)
+                print(f"  [dump] wrote {args.dump_codec} "
+                      f"({len(codec_buf)} codec tokens)")
             full_runs.append(res)
             gc.collect()
             torch.cuda.empty_cache()
@@ -590,6 +714,7 @@ def main():
                 max_new_tokens=args.max_new_tokens,
                 chunk_size=args.chunk_size,
                 left_context=args.left_context,
+                greedy=args.greedy, seed=args.seed,
             )
             print(f"  text: {res['text'][:80]}")
             print(f"  codec={res['n_codec_tokens']} tokens, "

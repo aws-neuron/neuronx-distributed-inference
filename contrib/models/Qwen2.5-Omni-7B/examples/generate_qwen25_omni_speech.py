@@ -63,6 +63,7 @@ import _upstream_compat  # noqa: F401  (applies hf_adapter shim)
 
 import argparse
 import gc
+import json
 import os
 import sys
 import time
@@ -197,7 +198,7 @@ class Timer:
 # Compilation (--compile)
 # ==========================================================================
 
-def _compile_thinker(model_path, out_path):
+def _compile_thinker(model_path, out_path, greedy=False):
     from neuronx_distributed_inference.models.config import (
         NeuronConfig, OnDeviceSamplingConfig,
     )
@@ -206,12 +207,17 @@ def _compile_thinker(model_path, out_path):
         NeuronQwen25OmniForCausalLM, Qwen25OmniInferenceConfig,
     )
 
+    sampling = (
+        OnDeviceSamplingConfig(do_sample=False)
+        if greedy
+        else OnDeviceSamplingConfig(
+            do_sample=True, temperature=0.7, top_k=20, top_p=0.8,
+        )
+    )
     nc = NeuronConfig(
         tp_degree=TP_DEGREE, batch_size=1, seq_len=2048, max_context_length=2048,
         torch_dtype=torch.bfloat16,
-        on_device_sampling_config=OnDeviceSamplingConfig(
-            do_sample=True, temperature=0.7, top_k=20, top_p=0.8,
-        ),
+        on_device_sampling_config=sampling,
     )
     cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(model_path))
     model = NeuronQwen25OmniForCausalLM(model_path, cfg)
@@ -228,6 +234,11 @@ def _compile_talker(model_path, out_path):
     hf = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     tc = hf.talker_config
 
+    # No OnDeviceSamplingConfig: the NEFF returns gathered bf16 logits and
+    # CPU-side HF adapter samples them. On-device sampling silently drops
+    # repetition_penalty (HF applies it via logits_processor only when
+    # outputs.logits is not None), and without it talker mode-collapses
+    # into "oooo" past ~75 codec tokens. CPU sampling adds <2ms/step.
     tnc = TalkerNeuronConfig(
         tp_degree=TP_DEGREE, batch_size=1, seq_len=2048, max_context_length=2048,
         torch_dtype=torch.bfloat16,
@@ -286,12 +297,16 @@ def _compile_bigvgan(model_path, out_path):
     t2w.compile_bigvgan(out_path, mel_lens=BIGVGAN_BUCKETS)
 
 
-def compile_all(model_path, compiled_path):
+def compile_all(model_path, compiled_path, greedy=False):
     """Compile all three Neuron components: Thinker, Talker, DiT.
 
     Each component is compiled sequentially in the current process. Compilation
     holds the Neuron compiler (not the runtime) so there's no core-conflict
     issue even when all three share TP=4 / core 0-3.
+
+    ``greedy=True`` adds a thinker NEFF compiled with do_sample=False (saved
+    to ``thinker_tp4_greedy`` so the sampling NEFF is preserved for the demo
+    flow). The talker / DiT / BigVGAN NEFFs are sampling-agnostic and reused.
     """
     print("=" * 60)
     print("Compiling Qwen2.5-Omni Speech Components")
@@ -299,12 +314,16 @@ def compile_all(model_path, compiled_path):
     print(f"  Model:    {model_path}")
     print(f"  Output:   {compiled_path}")
     print(f"  TP:       {TP_DEGREE}")
+    print(f"  Greedy thinker: {greedy}")
     t_total = time.time()
 
+    thinker_subdir = "thinker_tp4_greedy" if greedy else "thinker_tp4"
+    thinker_fn = (lambda mp, op: _compile_thinker(mp, op, greedy=greedy))
+
     stages = [
-        ("Thinker",  "thinker_tp4", "neuron_config.json",   _compile_thinker),
-        ("Talker",   "talker_tp4",  "neuron_config.json",   _compile_talker),
-        ("DiT",      "dit_core",    "dit_core_meta.json",   _compile_dit),
+        ("Thinker",  thinker_subdir, "neuron_config.json",   thinker_fn),
+        ("Talker",   "talker_tp4",   "neuron_config.json",   _compile_talker),
+        ("DiT",      "dit_core",     "dit_core_meta.json",   _compile_dit),
     ]
     if BIGVGAN_NEURON:
         stages.append(
@@ -329,9 +348,10 @@ def compile_all(model_path, compiled_path):
 # Inference: model loading (once per process)
 # ==========================================================================
 
-def _check_compiled(compiled_path):
+def _check_compiled(compiled_path, greedy=False):
+    thinker_dir = "thinker_tp4_greedy" if greedy else "thinker_tp4"
     checks = [
-        (os.path.join(compiled_path, "thinker_tp4", "neuron_config.json"), "Thinker"),
+        (os.path.join(compiled_path, thinker_dir, "neuron_config.json"), "Thinker"),
         (os.path.join(compiled_path, "talker_tp4", "neuron_config.json"), "Talker"),
         (os.path.join(compiled_path, "dit_core", "dit_core_meta.json"), "DiT"),
     ]
@@ -348,8 +368,13 @@ def _check_compiled(compiled_path):
     return True
 
 
-def load_thinker(model_path, compiled_path):
-    """Load the Thinker (Qwen2.5-Omni text model) onto Neuron, return (adapter, tokenizer)."""
+def load_thinker(model_path, compiled_path, greedy=False):
+    """Load the Thinker (Qwen2.5-Omni text model) onto Neuron, return (adapter, tokenizer).
+
+    ``greedy=True`` loads the NEFF compiled with do_sample=False, used for
+    apples-to-apples Trn2 vs H100 benches where the text reply must be
+    deterministic across hardware.
+    """
     from neuronx_distributed_inference.models.config import (
         NeuronConfig, OnDeviceSamplingConfig,
     )
@@ -361,18 +386,24 @@ def load_thinker(model_path, compiled_path):
     )
     from transformers import AutoTokenizer
 
+    sampling = (
+        OnDeviceSamplingConfig(do_sample=False)
+        if greedy
+        else OnDeviceSamplingConfig(
+            do_sample=True, temperature=0.7, top_k=20, top_p=0.8,
+        )
+    )
     nc = NeuronConfig(
         tp_degree=TP_DEGREE, batch_size=1, seq_len=2048, max_context_length=2048,
         torch_dtype=torch.bfloat16,
-        on_device_sampling_config=OnDeviceSamplingConfig(
-            do_sample=True, temperature=0.7, top_k=20, top_p=0.8,
-        ),
+        on_device_sampling_config=sampling,
     )
     cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(model_path))
     model = NeuronQwen25OmniForCausalLM(model_path, cfg)
 
+    thinker_dir = "thinker_tp4_greedy" if greedy else "thinker_tp4"
     t0 = time.time()
-    model.load(os.path.join(compiled_path, "thinker_tp4"))
+    model.load(os.path.join(compiled_path, thinker_dir))
     load_time = time.time() - t0
     print(f"  [Thinker] loaded in {load_time:.1f}s")
 
@@ -671,8 +702,17 @@ def prepare_talker_input(model_path, hf_model, outputs, full_ids, prompt_len, sp
     }
 
 
-def run_talker(talker_model, talker_adapter, talker_cfg, talker_input):
-    """Phase 4: Talker generates codec tokens."""
+def run_talker(talker_model, talker_adapter, talker_cfg, talker_input, *,
+               greedy=False, seed=None):
+    """Phase 4: Talker generates codec tokens.
+
+    ``seed`` (when set) seeds the CPU torch RNG immediately before
+    talker.generate() so the codec sequence is reproducible across runs
+    on Trn2. Note: this only stabilizes Trn2 ↔ Trn2; Trn2 ↔ GPU codec
+    sequences still differ (CUDA RNG ≠ CPU RNG and bf16 matmul numerics
+    diverge), but with the same sampling kwargs and a greedy thinker
+    pinning the text, codec lengths are statistically close.
+    """
     projected_context = talker_input["projected_context"]
     projected_reply = talker_input["projected_reply"]
     context_len = talker_input["context_len"]
@@ -697,6 +737,18 @@ def run_talker(talker_model, talker_adapter, talker_cfg, talker_input):
     reply = projected_reply.to(torch.bfloat16)
     talker_model.set_vision_embeddings(ve, vm, thinker_reply_embeds=reply)
 
+    # Talker always uses normal sampling regardless of ``greedy`` (which
+    # only pins the thinker). Forcing argmax here on Trn2 reproducibly
+    # falls into a single-token loop ("ooooo"); cross-hardware codec
+    # equality is unattainable in bf16 either way.
+    sample_kwargs = {
+        "do_sample": True, "temperature": 0.9,
+        "top_k": 40, "top_p": 0.8, "repetition_penalty": 1.05,
+    }
+
+    if seed is not None:
+        torch.manual_seed(seed)
+
     t0 = time.time()
     out = talker_adapter.generate(
         input_ids=talker_input_ids,
@@ -704,8 +756,7 @@ def run_talker(talker_model, talker_adapter, talker_cfg, talker_input):
         max_new_tokens=max_gen,
         eos_token_id=[codec_eos, codec_pad],
         suppress_tokens=[codec_bos],
-        do_sample=True, temperature=0.9, top_k=40, top_p=0.8,
-        repetition_penalty=1.05,
+        **sample_kwargs,
     )
     elapsed = time.time() - t0
 
@@ -715,12 +766,20 @@ def run_talker(talker_model, talker_adapter, talker_cfg, talker_input):
     return gen_tokens, elapsed
 
 
-def run_token2wav(t2w, t2w_cfg, codec_codes, conditioning, reference_mel):
-    """Phase 5: Token2Wav DiT + BigVGAN synthesize a waveform."""
+def run_token2wav(t2w, t2w_cfg, codec_codes, conditioning, reference_mel, *, seed=None):
+    """Phase 5: Token2Wav DiT + BigVGAN synthesize a waveform.
+
+    ``seed`` (when set) calls ``torch.manual_seed(seed)`` immediately before
+    the DiT init noise is drawn so the starting latent is reproducible.
+    Used by the apples-to-apples Trn2 vs H100 bench.
+    """
     code_tensor = torch.tensor([codec_codes], dtype=torch.long)
     num_embeds = getattr(t2w_cfg.dit_config, "num_embeds", 8193)
     if code_tensor.max() >= num_embeds:
         code_tensor = code_tensor.clamp(0, num_embeds)
+
+    if seed is not None:
+        torch.manual_seed(seed)
 
     t0 = time.time()
     wav = t2w(
@@ -774,6 +833,28 @@ def main():
         "--output", default="speech_output.wav",
         help="Output WAV file path (default: speech_output.wav)",
     )
+    parser.add_argument(
+        "--greedy", action="store_true",
+        help=(
+            "Use greedy thinker NEFF (do_sample=False). Talker always uses "
+            "sampling. Loads / compiles ``thinker_tp4_greedy``."
+        ),
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help=(
+            "Seed used right before each Token2Wav call so DiT init noise "
+            "is reproducible across hardware. Default 42."
+        ),
+    )
+    parser.add_argument(
+        "--dump-codec", default=None,
+        help=(
+            "Path to write a JSON dump of the first run's "
+            "{thinker_text, thinker_token_ids, codec_token_ids} for "
+            "cross-hardware codec divergence diagnosis."
+        ),
+    )
     args = parser.parse_args()
 
     model_path = args.model_path
@@ -781,10 +862,10 @@ def main():
     num_runs = args.num_runs
 
     if args.compile:
-        ok = compile_all(model_path, compiled_path)
+        ok = compile_all(model_path, compiled_path, greedy=args.greedy)
         sys.exit(0 if ok else 1)
 
-    if not _check_compiled(compiled_path):
+    if not _check_compiled(compiled_path, greedy=args.greedy):
         sys.exit(1)
 
     print("=" * 60)
@@ -812,7 +893,9 @@ def main():
     # ----- Load everything once -----
     print("\n--- Loading models (one-time cost) ---")
     t_load_total = time.time()
-    thinker_adapter, tokenizer, thinker_load = load_thinker(model_path, compiled_path)
+    thinker_adapter, tokenizer, thinker_load = load_thinker(
+        model_path, compiled_path, greedy=args.greedy,
+    )
     hf_model, hf_load = load_hf_cpu(model_path)
     talker_model, talker_adapter, talker_cfg, talker_load = load_talker(model_path, compiled_path)
     t2w, t2w_cfg, dit_load = load_token2wav(model_path, compiled_path)
@@ -856,6 +939,7 @@ def main():
 
         codec_codes, talker_time = run_talker(
             talker_model, talker_adapter, talker_cfg, talker_input,
+            greedy=args.greedy, seed=args.seed,
         )
         talker_times.append(talker_time)
         print(f"  [Talker]    {len(codec_codes)} codec tokens in {talker_time:.3f}s")
@@ -866,6 +950,7 @@ def main():
         wav, t2w_time = run_token2wav(
             t2w, t2w_cfg, codec_codes,
             talker_input["conditioning"], talker_input["reference_mel"],
+            seed=args.seed,
         )
         t2w_times.append(t2w_time)
         print(f"  [Token2Wav] synthesized in {t2w_time:.2f}s")
@@ -874,6 +959,21 @@ def main():
             first_text = thinker_result["gen_text"]
             first_codes = codec_codes
             first_wav = wav
+            if args.dump_codec:
+                dump = {
+                    "platform": "neuron",
+                    "greedy": bool(args.greedy),
+                    "seed": int(args.seed),
+                    "thinker_text": thinker_result["gen_text"],
+                    "thinker_token_ids": thinker_result["all_ids"][
+                        thinker_result["prompt_len"]:
+                    ],
+                    "codec_token_ids": list(map(int, codec_codes)),
+                }
+                with open(args.dump_codec, "w") as _f:
+                    json.dump(dump, _f, indent=2)
+                print(f"  [dump]      wrote {args.dump_codec} "
+                      f"({len(dump['codec_token_ids'])} codec tokens)")
 
         # Free the per-run temporaries so the heap doesn't grow across runs.
         del outputs, full_ids, talker_input
