@@ -616,6 +616,113 @@ def load_hf_cpu(model_path):
 
 
 # ==========================================================================
+# Talker prep cache (one-time setup, off the hot path)
+# ==========================================================================
+
+class TalkerPrepCache:
+    """All static inputs the talker prep step needs, built once at startup.
+
+    The original ``prepare_talker_input`` re-loaded the speaker dict from
+    disk, scanned every safetensors shard to find ``talker.model.embed_tokens.weight``,
+    re-instantiated ``ThinkerToTalkerProjection`` from the HF state dict,
+    and re-read ``hf_config.talker_config`` on **every** utterance. None
+    of that data changes between runs; together they accounted for ~150ms
+    of the 170ms per-utterance prep budget.
+
+    This class hoists all of it to startup so the per-utterance path is
+    pure tensor math. Once a cache exists, ``hf_model`` can be freed
+    (the cache holds its own copies of the embed tables and proj weights),
+    cutting CPU resident memory by ~9GB.
+    """
+
+    def __init__(self, thinker_embed, talker_embed, proj,
+                 talker_cfg, speakers):
+        self.thinker_embed = thinker_embed
+        self.talker_embed = talker_embed
+        self.proj = proj
+        self.talker_cfg = talker_cfg
+        self.speakers = speakers
+
+    @classmethod
+    def build(cls, model_path, hf_model):
+        from transformers import AutoConfig
+        from modeling_qwen25_omni_talker import ThinkerToTalkerProjection
+
+        t0 = time.time()
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        talker_cfg = hf_config.talker_config
+
+        # Detach a standalone copy of the thinker input embedding so we can
+        # free hf_model later. The HF copy is wired into the full 7B forward
+        # graph; nn.Embedding(weight) gives us a clean, dtype-stable lookup.
+        thinker_emb_src = hf_model.thinker.get_input_embeddings()
+        thinker_embed = torch.nn.Embedding(
+            thinker_emb_src.num_embeddings, thinker_emb_src.embedding_dim
+        )
+        thinker_embed.weight.data = thinker_emb_src.weight.data.detach().clone()
+        thinker_embed.eval()
+
+        # Same idea for the talker input embedding. It lives under
+        # ``talker.model.embed_tokens.weight`` in the HF state dict.
+        talker_w = None
+        for k, v in hf_model.state_dict().items():
+            if k.endswith("talker.model.embed_tokens.weight"):
+                talker_w = v
+                break
+        if talker_w is None:
+            raise RuntimeError(
+                "talker.model.embed_tokens.weight not found in hf_model state dict"
+            )
+        talker_embed = torch.nn.Embedding(talker_w.shape[0], talker_w.shape[1])
+        talker_embed.weight.data = talker_w.detach().clone().float()
+        talker_embed.eval()
+
+        # ThinkerToTalkerProjection (3584 -> 896). Live in bf16 to match
+        # the talker's vision_embeddings dtype downstream.
+        proj_weight = proj_bias = None
+        for k, v in hf_model.state_dict().items():
+            if "thinker_to_talker_proj.weight" in k:
+                proj_weight = v
+            elif "thinker_to_talker_proj.bias" in k:
+                proj_bias = v
+        if proj_weight is None:
+            raise RuntimeError("thinker_to_talker_proj.weight not found in hf_model")
+        proj = ThinkerToTalkerProjection(proj_weight.shape[1], proj_weight.shape[0])
+        proj.proj.weight.data = proj_weight.detach().clone()
+        if proj_bias is not None:
+            proj.proj.bias.data = proj_bias.detach().clone()
+        proj.to(proj_weight.dtype)
+        proj.eval()
+
+        # Speaker conditioning lives in spk_dict.pt next to the model
+        # weights. Load all entries up-front so switching speakers between
+        # runs is free.
+        spk_dict_path = os.path.join(model_path, "spk_dict.pt")
+        raw = torch.load(spk_dict_path, weights_only=True)
+        speakers = {}
+        for name, sp in raw.items():
+            cond = sp["cond"].float()
+            if cond.dim() == 1:
+                cond = cond.unsqueeze(0)
+            ref_mel = sp["ref_mel"].float()
+            if ref_mel.dim() == 2:
+                ref_mel = ref_mel.unsqueeze(0)
+            bos = sp["bos_token"]
+            if isinstance(bos, torch.Tensor):
+                bos = bos.item()
+            speakers[name] = {
+                "conditioning": cond,
+                "reference_mel": ref_mel,
+                "bos_token": int(bos),
+            }
+
+        elapsed = time.time() - t0
+        print(f"  [Prep cache] built in {elapsed:.2f}s "
+              f"(speakers={list(speakers)}, talker_vocab={talker_w.shape[0]})")
+        return cls(thinker_embed, talker_embed, proj, talker_cfg, speakers)
+
+
+# ==========================================================================
 # Inference: per-run phases
 # ==========================================================================
 
@@ -650,7 +757,7 @@ def run_thinker(thinker_adapter, tokenizer, prompt, system_prompt):
     }
 
 
-def extract_hidden_states(thinker_model, hf_model, thinker_result):
+def extract_hidden_states(thinker_model, cache, thinker_result):
     """Phase 2: Recover per-token hidden states the talker needs.
 
     The compiled Neuron Thinker emits sampled tokens only, but with
@@ -662,6 +769,9 @@ def extract_hidden_states(thinker_model, hf_model, thinker_result):
     The talker also wants ``hidden_states[0]`` (embedding output) but that is
     just ``embed_tokens(input_ids)`` and is cheap on CPU — we compute it
     locally rather than re-running the 7B transformer stack.
+
+    Uses ``cache.thinker_embed`` for the embedding lookup so callers can
+    free the HF CPU model once the cache is built.
 
     Returns a duck-typed object exposing ``.hidden_states`` so the rest of the
     pipeline (``prepare_talker_input``) is unchanged.
@@ -690,8 +800,7 @@ def extract_hidden_states(thinker_model, hf_model, thinker_result):
             )
         last_hidden = captured[0][:, :total_len, :].to(torch.bfloat16)
 
-        embed_tokens = hf_model.thinker.get_input_embeddings()
-        embedding_output = embed_tokens(full_ids).to(torch.bfloat16)
+        embedding_output = cache.thinker_embed(full_ids).to(torch.bfloat16)
 
         # Reset the KV state before the next generate() so cte runs again.
         thinker_model.reset()
@@ -706,26 +815,18 @@ def extract_hidden_states(thinker_model, hf_model, thinker_result):
     return outputs, full_ids, prompt_len, elapsed
 
 
-def prepare_talker_input(model_path, hf_model, outputs, full_ids, prompt_len, speaker):
-    """Phase 3: Build projected thinker states for the Talker."""
-    from transformers import AutoConfig
-    from safetensors.torch import load_file
-    from modeling_qwen25_omni_talker import ThinkerToTalkerProjection
+def prepare_talker_input(cache, outputs, full_ids, prompt_len, speaker):
+    """Phase 3: Build projected thinker states for the Talker.
 
-    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    talker_cfg = hf_config.talker_config
-
-    spk_dict = torch.load(os.path.join(model_path, "spk_dict.pt"), weights_only=True)
-    sp = spk_dict[speaker]
-    conditioning = sp["cond"].unsqueeze(0).float() if sp["cond"].dim() == 1 else sp["cond"].float()
-    if conditioning.dim() == 1:
-        conditioning = conditioning.unsqueeze(0)
-    reference_mel = sp["ref_mel"].unsqueeze(0).float() if sp["ref_mel"].dim() == 2 else sp["ref_mel"].float()
-    if reference_mel.dim() == 2:
-        reference_mel = reference_mel.unsqueeze(0)
+    Pure tensor math — all weight loading / config reading happens once at
+    startup in ``TalkerPrepCache.build``. Per-utterance cost is dominated
+    by two ``proj(...)`` calls and a few small embedding lookups.
+    """
+    talker_cfg = cache.talker_cfg
+    sp = cache.speakers[speaker]
+    conditioning = sp["conditioning"]
+    reference_mel = sp["reference_mel"]
     bos_token = sp["bos_token"]
-    if isinstance(bos_token, torch.Tensor):
-        bos_token = bos_token.item()
 
     embedding_output = outputs.hidden_states[0]
     last_hidden = outputs.hidden_states[-1]
@@ -733,71 +834,41 @@ def prepare_talker_input(model_path, hf_model, outputs, full_ids, prompt_len, sp
 
     context_embed = embedding_output[:, :prompt_len, :]
     context_hidden = last_hidden[:, :prompt_len, :]
-    reply_embeds = [embedding_output[:, i:i+1, :] for i in range(prompt_len, total_len)]
-    reply_hiddens = [last_hidden[:, i:i+1, :] for i in range(prompt_len, total_len)]
+    reply_embeds = embedding_output[:, prompt_len:total_len, :]
+    reply_hiddens = last_hidden[:, prompt_len:total_len, :]
 
-    thinker_token_embeds = [context_embed] + reply_embeds
-    thinker_hidden_states_list = [context_hidden] + reply_hiddens
+    thinker_reply_part = reply_hiddens + reply_embeds
+    talker_inputs_embeds = context_hidden + context_embed
 
-    thinker_reply_part = (
-        torch.cat(thinker_hidden_states_list[1:], dim=1)
-        + torch.cat(thinker_token_embeds[1:], dim=1)
-    )
-    talker_inputs_embeds = thinker_hidden_states_list[0] + thinker_token_embeds[0]
-
-    thinker_embed_tokens = hf_model.thinker.get_input_embeddings()
-    bos_embed = thinker_embed_tokens(torch.tensor([[bos_token]], dtype=torch.long))
+    bos_embed = cache.thinker_embed(torch.tensor([[bos_token]], dtype=torch.long))
     talker_inputs_embeds = torch.cat([
         talker_inputs_embeds, bos_embed, thinker_reply_part[:, :1, :],
     ], dim=1)
 
-    talker_embed_weight = None
-    for fn in sorted(os.listdir(model_path)):
-        if fn.endswith(".safetensors"):
-            sd = load_file(os.path.join(model_path, fn))
-            if "talker.model.embed_tokens.weight" in sd:
-                talker_embed_weight = sd["talker.model.embed_tokens.weight"]
-                break
-    if talker_embed_weight is not None:
-        talker_embed_layer = torch.nn.Embedding(
-            talker_embed_weight.shape[0], talker_embed_weight.shape[1],
-        )
-        talker_embed_layer.weight.data = talker_embed_weight.float()
-        codec_bos_embed = talker_embed_layer(
-            torch.tensor([talker_cfg.tts_codec_start_token_id]),
-        )
-        codec_pad_embed = talker_embed_layer(
-            torch.tensor([talker_cfg.tts_codec_pad_token_id]),
-        )
-        talker_inputs_embeds[:, -1, :] += codec_bos_embed
-        talker_inputs_embeds[:, -2, :] += codec_pad_embed
+    codec_bos_embed = cache.talker_embed(
+        torch.tensor([talker_cfg.tts_codec_start_token_id])
+    )
+    codec_pad_embed = cache.talker_embed(
+        torch.tensor([talker_cfg.tts_codec_pad_token_id])
+    )
+    talker_inputs_embeds[:, -1, :] += codec_bos_embed
+    talker_inputs_embeds[:, -2, :] += codec_pad_embed
 
-    eos_embed = thinker_embed_tokens(
-        torch.tensor([[talker_cfg.tts_text_end_token_id]], dtype=torch.long),
+    eos_embed = cache.thinker_embed(
+        torch.tensor([[talker_cfg.tts_text_end_token_id]], dtype=torch.long)
     )
-    pad_embed = thinker_embed_tokens(
-        torch.tensor([[talker_cfg.tts_text_pad_token_id]], dtype=torch.long),
+    pad_embed = cache.thinker_embed(
+        torch.tensor([[talker_cfg.tts_text_pad_token_id]], dtype=torch.long)
     )
-    thinker_reply_part = torch.cat([thinker_reply_part[:, 1:, :], eos_embed, pad_embed], dim=1)
+    thinker_reply_part = torch.cat(
+        [thinker_reply_part[:, 1:, :], eos_embed, pad_embed], dim=1
+    )
 
     context_len = talker_inputs_embeds.shape[1]
     n_reply = thinker_reply_part.shape[1]
 
-    proj_weight = proj_bias = None
-    for k, v in hf_model.state_dict().items():
-        if "thinker_to_talker_proj.weight" in k:
-            proj_weight = v
-        if "thinker_to_talker_proj.bias" in k:
-            proj_bias = v
-
-    proj = ThinkerToTalkerProjection(proj_weight.shape[1], proj_weight.shape[0])
-    proj.proj.weight.data = proj_weight
-    if proj_bias is not None:
-        proj.proj.bias.data = proj_bias
-    proj.to(proj_weight.dtype)
-
-    projected_context = proj(talker_inputs_embeds)
-    projected_reply = proj(thinker_reply_part)
+    projected_context = cache.proj(talker_inputs_embeds)
+    projected_reply = cache.proj(thinker_reply_part)
 
     return {
         "projected_context": projected_context,
@@ -1006,6 +1077,14 @@ def main():
     hf_model, hf_load = load_hf_cpu(model_path)
     talker_model, talker_adapter, talker_cfg, talker_load = load_talker(model_path, compiled_path)
     t2w, t2w_cfg, dit_load = load_token2wav(model_path, compiled_path)
+
+    # Build the talker prep cache, then drop the 17GB HF CPU model. The
+    # cache holds detached copies of the only weights the per-utterance
+    # prep step actually needs (thinker embed, talker embed, projection).
+    prep_cache = TalkerPrepCache.build(model_path, hf_model)
+    del hf_model
+    gc.collect()
+
     total_load = time.time() - t_load_total
     print(f"  Total model load time: {total_load:.1f}s")
 
@@ -1028,14 +1107,14 @@ def main():
         )
 
         outputs, full_ids, prompt_len, hidden_time = extract_hidden_states(
-            thinker_adapter.neuron_model, hf_model, thinker_result,
+            thinker_adapter.neuron_model, prep_cache, thinker_result,
         )
         hidden_times.append(hidden_time)
         print(f"  [Hidden]    forward pass in {hidden_time:.2f}s")
 
         t0 = time.time()
         talker_input = prepare_talker_input(
-            model_path, hf_model, outputs, full_ids, prompt_len, args.speaker,
+            prep_cache, outputs, full_ids, prompt_len, args.speaker,
         )
         prep_time = time.time() - t0
         prep_times.append(prep_time)

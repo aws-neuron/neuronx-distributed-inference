@@ -141,10 +141,10 @@ cores 0-3), `--greedy --seed 1234`, median of 3 runs:
 |-------|------|-------|
 | Thinker (7B, Neuron TP=4, greedy) | 0.23s | 24 text tokens, ~10ms TPOT, 256-token bucket |
 | Hidden state extraction (Neuron capture) | 0.02s | last-layer norm output side-banded as a NEFF output via `TensorCaptureConfig(modules_to_capture=["norm"])` |
-| Talker prep (projection, conditioning) | 0.17s | CPU |
+| Talker prep (projection, conditioning) | <0.01s | CPU; speaker dict, talker embed, projection cached at startup via `TalkerPrepCache` (was 0.17s when re-loaded per utterance) |
 | Talker (690M, Neuron TP=4, sampled, seeded) | 1.20s | 334 codec tokens, ~3.6ms TPOT, per-step thinker injection, multi-bucket NEFF (256/512/1024/2048) |
 | Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 5.98s | mel_len=668 → 3 BigVGAN chunks × T=256 NEFF + cos² crossfade |
-| **Pipeline total** | **7.60s** | **6.7s audio, RTF 1.13x** |
+| **Pipeline total** | **7.43s** | **6.7s audio, RTF 1.11x** |
 
 Model load (one-time cost, excluded from pipeline) takes ~5min on a cold
 NVMe cache (DiT trace dominates); subsequent loads from the on-disk NEFF
@@ -181,7 +181,7 @@ steady-state runs from `examples/generate_qwen25_omni_speech.py`:
 
 | Platform | Audio | Pipeline (steady-state) | RTF |
 |----------|-------|-------------------------|-----|
-| Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 6.7s | **7.60s** | **1.13x** |
+| Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 6.7s | **7.43s** | **1.11x** |
 | H100 80GB (single GPU, SDPA) | 7.18s | 9.55s | 1.33x |
 
 Trn2 finishes ~20% sooner in wall time. The audio-length gap (7.5s vs
@@ -375,7 +375,7 @@ Verified on trn2.48xlarge with real Qwen2.5-Omni-7B weights:
 - **Config**: TP=4 head divisibility verified (Thinker 7/1, Audio 5, Vision 4 per rank)
 - **State dict**: All 2448 keys converted correctly (text=339, audio=489, vision=518, talker=293, token2wav=809)
 - **Text generation (TP=4)**: Compile + load + generate working, TPOT ~10ms, correct outputs verified
-- **Speech pipeline**: Full Thinker → Talker → Token2Wav verified end-to-end on Neuron, RTF 1.13x (see Performance)
+- **Speech pipeline**: Full Thinker → Talker → Token2Wav verified end-to-end on Neuron, RTF 1.11x (see Performance)
 
 ```bash
 # End-to-end multimodal test (text / image+text / audio+text / text→speech)

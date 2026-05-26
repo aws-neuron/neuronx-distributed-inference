@@ -183,10 +183,9 @@ def synthesize_chunk(
 
 def run_streaming_pipeline(
     *,
-    model_path: str,
+    prep_cache,
     thinker_adapter,
     tokenizer,
-    hf_model,
     talker_model,
     talker_adapter,
     talker_cfg,
@@ -209,15 +208,15 @@ def run_streaming_pipeline(
     )
     t_thinker = time.time()
 
-    # 2) HF CPU re-forward to extract hidden states (current architecture).
+    # 2) Side-banded norm output from the thinker NEFF + cached embed.
     outputs, full_ids, prompt_len, hidden_time = omni_demo.extract_hidden_states(
-        hf_model, thinker_result,
+        thinker_adapter.neuron_model, prep_cache, thinker_result,
     )
     t_hidden = time.time()
 
     # 3) Project thinker reply states -> 896-dim talker embeddings.
     talker_input = omni_demo.prepare_talker_input(
-        model_path, hf_model, outputs, full_ids, prompt_len, speaker,
+        prep_cache, outputs, full_ids, prompt_len, speaker,
     )
     t_prep = time.time()
 
@@ -396,10 +395,9 @@ def run_streaming_pipeline(
 
 def run_serial_pipeline(
     *,
-    model_path: str,
+    prep_cache,
     thinker_adapter,
     tokenizer,
-    hf_model,
     talker_model,
     talker_adapter,
     talker_cfg,
@@ -424,12 +422,12 @@ def run_serial_pipeline(
     t_thinker = time.time()
 
     outputs, full_ids, prompt_len, hidden_time = omni_demo.extract_hidden_states(
-        hf_model, thinker_result,
+        thinker_adapter.neuron_model, prep_cache, thinker_result,
     )
     t_hidden = time.time()
 
     talker_input = omni_demo.prepare_talker_input(
-        model_path, hf_model, outputs, full_ids, prompt_len, speaker,
+        prep_cache, outputs, full_ids, prompt_len, speaker,
     )
     t_prep = time.time()
 
@@ -558,6 +556,10 @@ def main():
         args.model_path, args.compiled_path,
     )
 
+    prep_cache = omni_demo.TalkerPrepCache.build(args.model_path, hf_model)
+    del hf_model
+    gc.collect()
+
     # ---- End-to-end warmup ----
     # NxDI's per-NEFF "Warmup completed in 0.25s" only exercises NEFF
     # boundaries with dummy input; the first real end-to-end pipeline
@@ -567,9 +569,8 @@ def main():
     print("\n--- End-to-end warmup (1 serial run, timing discarded) ---")
     _t0 = time.time()
     _ = run_serial_pipeline(
-        model_path=args.model_path,
+        prep_cache=prep_cache,
         thinker_adapter=thinker_adapter, tokenizer=tokenizer,
-        hf_model=hf_model,
         talker_model=talker_model, talker_adapter=talker_adapter,
         talker_cfg=talker_cfg,
         t2w=t2w, t2w_cfg=t2w_cfg,
@@ -587,9 +588,8 @@ def main():
         if args.mode in ("serial", "both"):
             print(f"\n--- [serial] Run {i+1}/{args.num_runs} ---")
             res = run_serial_pipeline(
-                model_path=args.model_path,
+                prep_cache=prep_cache,
                 thinker_adapter=thinker_adapter, tokenizer=tokenizer,
-                hf_model=hf_model,
                 talker_model=talker_model, talker_adapter=talker_adapter,
                 talker_cfg=talker_cfg,
                 t2w=t2w, t2w_cfg=t2w_cfg,
@@ -611,9 +611,8 @@ def main():
         if args.mode in ("streaming", "both"):
             print(f"\n--- [streaming] Run {i+1}/{args.num_runs} ---")
             res = run_streaming_pipeline(
-                model_path=args.model_path,
+                prep_cache=prep_cache,
                 thinker_adapter=thinker_adapter, tokenizer=tokenizer,
-                hf_model=hf_model,
                 talker_model=talker_model, talker_adapter=talker_adapter,
                 talker_cfg=talker_cfg,
                 t2w=t2w, t2w_cfg=t2w_cfg,

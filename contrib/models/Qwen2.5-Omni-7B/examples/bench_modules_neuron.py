@@ -106,7 +106,7 @@ def bench_thinker(thinker_adapter, tokenizer, runs, max_new_tokens):
 
 
 def bench_talker(
-    model_path, hf_model, thinker_adapter, tokenizer,
+    prep_cache, thinker_adapter, tokenizer,
     talker_model, talker_adapter, talker_cfg,
     runs, max_new_tokens, speaker,
 ):
@@ -114,18 +114,18 @@ def bench_talker(
 
     Reuses the speech pipeline's helpers verbatim:
       run_thinker -> {all_ids, prompt_len, ...}
-      extract_hidden_states -> (outputs, full_ids, prompt_len, elapsed)
-      prepare_talker_input(model_path, hf_model, outputs, full_ids, prompt_len, speaker)
+      extract_hidden_states(thinker_neuron_model, prep_cache, thinker_result)
+      prepare_talker_input(prep_cache, outputs, full_ids, prompt_len, speaker)
     """
     prompt = "Say hello and briefly introduce yourself in two sentences."
     thinker_result = gen.run_thinker(
         thinker_adapter, tokenizer, prompt, gen.DEFAULT_SYSTEM,
     )
     outputs, full_ids, prompt_len, _ = gen.extract_hidden_states(
-        hf_model, thinker_result,
+        thinker_adapter.neuron_model, prep_cache, thinker_result,
     )
     talker_input = gen.prepare_talker_input(
-        model_path, hf_model, outputs, full_ids, prompt_len, speaker,
+        prep_cache, outputs, full_ids, prompt_len, speaker,
     )
 
     codec_bos = talker_cfg.tts_codec_start_token_id
@@ -318,6 +318,12 @@ def main():
     )
     t2w, t2w_cfg, _ = gen.load_token2wav(args.model_path, args.compiled_path)
 
+    # Build the talker prep cache once and free the 17GB HF CPU model.
+    prep_cache = gen.TalkerPrepCache.build(args.model_path, hf_model)
+    del hf_model
+    import gc as _gc
+    _gc.collect()
+
     results = {
         "platform": "neuron",
         "device": f"trn2 / TP={gen.TP_DEGREE}",
@@ -338,7 +344,7 @@ def main():
     if "talker" not in args.skip:
         print("\n--- Bench Talker ---")
         results["modules"]["talker"] = bench_talker(
-            args.model_path, hf_model, thinker_adapter, tokenizer,
+            prep_cache, thinker_adapter, tokenizer,
             talker_model, talker_adapter, talker_cfg,
             args.num_runs, args.talker_max_new_tokens, args.speaker,
         )
