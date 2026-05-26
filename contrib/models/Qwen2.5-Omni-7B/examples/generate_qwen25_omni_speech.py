@@ -85,6 +85,21 @@ COMPILED_PATH = os.environ.get(
 )
 TP_DEGREE = int(os.environ.get("QWEN25_OMNI_TP_DEGREE", "4"))
 
+# Thinker prefill / decode buckets. Without bucketing the NEFF prefills the
+# full seq_len (2048) regardless of input length — TTFT is flat ~70ms even
+# for a 30-token chat prompt. Buckets pin prefill cost to actual input
+# length; the multimodal path (generate_qwen25_omni.py:217-218) already uses
+# the same scheme. seq_len/max_context_length stay at 2048 (= max bucket).
+DEFAULT_THINKER_BUCKETS = [256, 512, 1024, 2048]
+_env_thinker_buckets = os.environ.get("QWEN25_OMNI_THINKER_BUCKETS")
+if _env_thinker_buckets:
+    THINKER_BUCKETS = sorted(
+        {int(x) for x in _env_thinker_buckets.split(",") if x.strip()}
+    )
+else:
+    THINKER_BUCKETS = list(DEFAULT_THINKER_BUCKETS)
+THINKER_MAX_SEQ = max(THINKER_BUCKETS)
+
 # DiT mel_len buckets. Streaming chunks (chunk_size=25 codec * dit.repeats(2) =
 # 50 mel frames) benefit hugely from a small bucket; full-utterance generation
 # still needs 2048. The 1024 bucket avoids 4x O(n^2) waste when actual mel_len
@@ -215,8 +230,12 @@ def _compile_thinker(model_path, out_path, greedy=False):
         )
     )
     nc = NeuronConfig(
-        tp_degree=TP_DEGREE, batch_size=1, seq_len=2048, max_context_length=2048,
+        tp_degree=TP_DEGREE, batch_size=1,
+        seq_len=THINKER_MAX_SEQ, max_context_length=THINKER_MAX_SEQ,
         torch_dtype=torch.bfloat16,
+        enable_bucketing=True,
+        context_encoding_buckets=THINKER_BUCKETS,
+        token_generation_buckets=THINKER_BUCKETS,
         on_device_sampling_config=sampling,
     )
     cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(model_path))
@@ -394,8 +413,12 @@ def load_thinker(model_path, compiled_path, greedy=False):
         )
     )
     nc = NeuronConfig(
-        tp_degree=TP_DEGREE, batch_size=1, seq_len=2048, max_context_length=2048,
+        tp_degree=TP_DEGREE, batch_size=1,
+        seq_len=THINKER_MAX_SEQ, max_context_length=THINKER_MAX_SEQ,
         torch_dtype=torch.bfloat16,
+        enable_bucketing=True,
+        context_encoding_buckets=THINKER_BUCKETS,
+        token_generation_buckets=THINKER_BUCKETS,
         on_device_sampling_config=sampling,
     )
     cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(model_path))
