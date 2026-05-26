@@ -165,44 +165,6 @@ See `perf_test/3_bench_qwen25_omni_7b.sh` for full benchmark configurations.
 
 ## Performance
 
-Text-only benchmark (trn2, BF16, TP=4):
-
-| Config | TPOT (ms) | Output tok/s | Notes |
-|--------|-----------|--------------|-------|
-| BS=1, non-CB, greedy | ~11-13 | ~77-90 | Tested with chat template |
-| BS=4, CB, c=4 | TBD | TBD | vLLM serving |
-
-Model load time: ~15s (from compiled artifacts on NVMe).
-
-Audio encoder performance (CPU frontend + CPU postprocessor, no Neuron transformer):
-
-| Audio Length | Mel Frames | Frontend | Postprocessor |
-|-------------|-----------|----------|---------------|
-| 1s | ~100 | ~20ms | included |
-| 3s | ~300 | ~22ms | included |
-| 10s | ~1000 | ~33ms | included |
-| 30s | ~3000 | ~34ms | included |
-
-### End-to-End Multimodal (CPU inference, trn2.48xlarge)
-
-| Test | Input | Output | Time |
-|------|-------|--------|------|
-| Text → Text | "What is the capital of France?" | Correct answer (Paris) | 15.1s |
-| Image + Text → Text | Synthetic image (shapes) + description prompt | Correctly identified red square, blue circle, yellow circle, green triangle | 59.5s |
-| Audio + Text → Text | 440Hz sine wave + "What do you hear?" | Text response generated | 12.1s |
-| Text → Speech | "Say hello and tell me the weather" | Text + audio waveform (14.2s audio) | 197.2s |
-
-### Speech Pipeline Profiling (CPU inference, trn2.48xlarge)
-
-Per-component measured breakdown for text-to-speech (14.1s audio output):
-
-| Component | Time | % of Total | RTF | Notes |
-|-----------|------|------------|-----|-------|
-| Thinker (7B) | 31.0s | 12% | — | 59 text tokens, ~1.9 tok/s on CPU |
-| Talker (690M) | 103.3s | 41% | 7.3x | Autoregressive codec token generation, 24 layers |
-| Token2Wav (DiT+BigVGAN) | 117.9s | 47% | 8.4x | 22 DiT blocks × 10 ODE steps × 2 (CFG) = 440 forward passes |
-| **Total** | **252.1s** | **100%** | **17.9x** | Generating 14.1s audio takes 252.1s on CPU |
-
 ### Full Neuron Speech Pipeline (trn2.48xlarge, TP=4, BF16)
 
 End-to-end full-utterance speech synthesis from
@@ -217,11 +179,12 @@ cores 0-3), `--greedy --seed 1234`, median of 3 runs:
 | Hidden state extraction (HF CPU) | 0.45s | one forward pass to harvest thinker states |
 | Talker prep (projection, conditioning) | 0.18s | CPU |
 | Talker (690M, Neuron TP=4, sampled, seeded) | 1.76s | 448 codec tokens, ~4ms TPOT, per-step thinker injection |
-| Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 6.10s | mel_len=896 → 4 chunks × T=256 NEFF + cos² crossfade |
+| Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 6.10s | mel_len=896 → 4 BigVGAN chunks × T=256 NEFF + cos² crossfade |
 | **Pipeline total** | **8.76s** | **9.0s audio, RTF 0.97x** |
 
-Model load (one-time cost, excluded from pipeline): Thinker 12.8s, HF CPU
-0.3s, Talker 2.0s, DiT 225.5s, BigVGAN ~50s (from cold cache) — total ~291s.
+Model load (one-time cost, excluded from pipeline) takes ~5min on a cold
+NVMe cache (DiT trace dominates); subsequent loads from the on-disk NEFF
+cache are well under a minute.
 
 #### Sampling configuration
 
@@ -243,65 +206,38 @@ BigVGAN on core 5) primarily benefits streaming / TTFB by overlapping
 DiT with talker decode; for full-utterance synthesis the two layouts
 land within noise of each other.
 
-### Neuron vs CPU Speedup (trn2.48xlarge, TP=4, BF16)
-
-| Component | CPU Time | Neuron Time | Speedup | Notes |
-|-----------|----------|-------------|---------|-------|
-| Thinker (7B) | 30.4s | 0.47s | **64.7x** | TPOT 10.2ms |
-| Talker (690M) | 98.1s | 2.0s (500 tokens) | **49.1x** | TPOT 4.0ms |
-| Token2Wav DiT (85M) | 24.1s | 3.8s | **6.3x** | 22 blocks × 10 ODE steps, batch=2 (CFG) |
-| Token2Wav BigVGAN | 2.8s | 0.28s (chunked, mel=1024) | **10x** | T=256 NEFF × 5 chunks + cos² crossfade |
-| **Total** | **267.9s** | **~14s** | **~19x** | All Neuron components active |
-
-Token2Wav component breakdown (300 codec tokens / 6.0s audio):
-
-| Config | CPU | Neuron DiT | Speedup |
-|--------|-----|-----------|---------|
-| DiT only (22 blocks, 10 ODE steps) | 24.1s | 3.8s | 6.3x |
-| Token2Wav end-to-end | 13.7s | 5.2s | 2.7x |
-| DiT core single forward (batch=2, mel_len=1024) | 592ms | 60ms | 9.8x |
-
-### GPU Reference (H100 80GB, BF16, SDPA)
-
-End-to-end full-utterance speech synthesis from `examples/test_gpu_baseline_bench.py`
-on a single H100 80GB HBM3, prompt `"Say hello and briefly introduce yourself in
-two sentences."`, speaker Ethan, `--greedy --seed 1234`, 4 runs:
-
-| Run | Audio length | First-audio-byte (= wall) | RTF |
-|-----|-------------|---------------------------|-----|
-| 1 (warmup-loaded) | 7.22s | 24.74s | 3.43x |
-| 2 (steady state) | 7.20s | 9.54s | 1.32x |
-| 3 (steady state) | 7.18s | 9.56s | 1.33x |
-| 4 (steady state) | 7.12s | 9.44s | 1.33x |
-| Median (runs 2-4) | 7.18s | **9.55s** | **1.33x** |
-
-Run 1 carries first-call CUDA graph / kernel-warmup overhead; runs 2-4
-are representative of steady-state full-utterance latency. Reproduce with:
-
-```bash
-python examples/test_gpu_baseline_bench.py --greedy --seed 1234 --num-runs 4
-```
-
 ### Trn2 vs H100 (full-utterance, BF16, aligned sampling)
 
 Same prompt, speaker, sampling kwargs (`do_sample=False` for thinker;
 talker `do_sample=True, temperature=0.9, top_k=40, top_p=0.8,
-repetition_penalty=1.05`), and seed (`1234`) on both platforms; median
-of 3-4 runs (excluding first run for warmup):
+repetition_penalty=1.05`), and seed (`1234`) on both platforms. H100 row
+is the median of runs 2-4 from `examples/test_gpu_baseline_bench.py`
+(run 1 is warmup-only and excluded); Trn2 row is the median of 3
+steady-state runs from `examples/generate_qwen25_omni_speech.py`:
 
 | Platform | Audio | Pipeline (steady-state) | RTF |
 |----------|-------|-------------------------|-----|
 | Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 9.0s | **8.76s** | **0.97x** |
 | H100 80GB (single GPU, SDPA) | 7.18s | 9.55s | 1.33x |
 
-With aligned sampling (greedy thinker pins text, seeded talker pins
-codec sequence run-to-run), Trn2 wins on absolute latency
-(~9% faster wall time) and on RTF (0.97x vs 1.33x → Trn2 produces
-~25% more audio per second of wall time). The audio-length difference
-remains because CUDA RNG ≠ CPU RNG and bf16 matmul numerics diverge
-across hardware, so the Trn2 talker draws a different codec sequence
-even from identical prompts and parameters; the longer codec costs
-extra Token2Wav work, but Trn2's faster Token2Wav still finishes first.
+Trn2 finishes ~9% sooner in wall time and clears real-time (RTF < 1.0).
+The audio-length gap (9.0s vs 7.18s) is unavoidable: CUDA RNG ≠ CPU RNG
+and bf16 matmul numerics diverge across hardware, so the Trn2 talker
+draws a different — and in this run slightly longer — codec sequence
+even from identical prompts and parameters. The longer codec adds
+Token2Wav work, yet Trn2's faster Token2Wav still finishes first.
+
+Reproduce with:
+
+```bash
+# H100
+python examples/test_gpu_baseline_bench.py --greedy --seed 1234 --num-runs 4
+
+# Trn2 (after `--compile --greedy`)
+NEURON_RT_VISIBLE_CORES=0-3 \
+    python examples/generate_qwen25_omni_speech.py \
+    --greedy --seed 1234 --num-runs 3
+```
 
 Streaming / TTFB numbers (where the 8-core split layout matters)
 are tracked separately in `examples/test_ttfb_streaming_bench.py`.
@@ -347,10 +283,10 @@ H100 runs the same workload as a single fp32 forward on one device,
 which is the bulk of its 3.1x lead. Once the SDK lifts the T=256 cap,
 a single mel=1024 NEFF should close most of this gap.
 Thinker and Talker are autoregressive and dominated by per-step Python /
-sampling overhead in HF ``generate``, where Neuron's on-device sampling
-and fused-embed talker pull ahead. Talker's 5.2x margin × ~570 codec
-tokens is what keeps the full-utterance pipeline ahead of the H100
-baseline.
+sampling overhead in HF ``generate``, where Neuron's fused-embed talker
+pulls ahead. Talker's 5.1x per-step margin × the ~450 codec tokens of a
+typical reply is what keeps the full-utterance pipeline ahead of the
+H100 baseline.
 
 #### BigVGAN compile cap (neuronxcc <= 2.25) and chunked workaround
 
@@ -425,17 +361,6 @@ as a reference for future SDK upgrades — if a future kernel exposes a
 generic `attention_bias` argument, this is the test harness to validate
 it on.
 
-Key observations:
-- **Full Neuron speech pipeline** verified end-to-end: Thinker → Talker → Token2Wav all on Neuron, producing real human speech
-- Thinker and Talker achieve **49-65x speedup** on Neuron
-- Token2Wav DiT achieves **6.3x speedup** (9.8x for isolated transformer core)
-- BigVGAN now runs fully on Neuron via T=256 NEFF + chunked overlap-add (10x speedup vs CPU at mel=1024)
-- **Per-step thinker state injection**: Talker v2 adds thinker_reply_part[step] embedding at each autoregressive step, matching HF behavior
-- **Vision embeddings auto-padding**: Compiled Neuron models require fixed bucket shapes; vision_embeddings are auto-padded to max_context_length
-- Split architecture for Token2Wav: CPU preprocessing (ECAPA-TDNN, codec/input embed, rotary, block_diff) + Neuron transformer core (22 blocks + norm + proj)
-- Overcame XLA tracing limitations: in-place slice assignment in DiTAttention (→ torch.cat), SDPA dispatch (→ explicit matmul), ECAPA-TDNN/codec embed issues (→ kept on CPU)
-- Automatic CPU fallback when mel_len exceeds compiled DiT max
-
 ## Compatibility Matrix
 
 | Instance/Version | 2.23+ (PyTorch 2.9) | 2.22 and earlier |
@@ -452,9 +377,8 @@ Verified on trn2.48xlarge with real Qwen2.5-Omni-7B weights:
 - **Imports**: All model classes import successfully
 - **Config**: TP=4 head divisibility verified (Thinker 7/1, Audio 5, Vision 4 per rank)
 - **State dict**: All 2448 keys converted correctly (text=339, audio=489, vision=518, talker=293, token2wav=809)
-- **Audio CPU**: Frontend+postprocessor 1s=20ms, 30s=34ms
-- **Talker CPU**: 1351M params loaded in ~10s, codec tokens verified
-- **Text generation (TP=4)**: Compile + load + generate working, TPOT ~11-13ms, correct outputs verified
+- **Text generation (TP=4)**: Compile + load + generate working, TPOT ~10ms, correct outputs verified
+- **Speech pipeline**: Full Thinker → Talker → Token2Wav verified end-to-end on Neuron, RTF 0.97x (see Performance)
 
 ```bash
 # End-to-end multimodal test (text / image+text / audio+text / text→speech)
