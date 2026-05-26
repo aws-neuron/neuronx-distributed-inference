@@ -100,6 +100,21 @@ else:
     THINKER_BUCKETS = list(DEFAULT_THINKER_BUCKETS)
 THINKER_MAX_SEQ = max(THINKER_BUCKETS)
 
+# Talker prefill / decode buckets. Same motivation as the thinker: without
+# bucketing, every decode step computes attention against the full 2048
+# bucket regardless of how many codec tokens have actually been generated.
+# Talker context (~50-100 tokens) + max_gen (600) keeps the active sequence
+# under 1024 for typical chat-style replies.
+DEFAULT_TALKER_BUCKETS = [256, 512, 1024, 2048]
+_env_talker_buckets = os.environ.get("QWEN25_OMNI_TALKER_BUCKETS")
+if _env_talker_buckets:
+    TALKER_BUCKETS = sorted(
+        {int(x) for x in _env_talker_buckets.split(",") if x.strip()}
+    )
+else:
+    TALKER_BUCKETS = list(DEFAULT_TALKER_BUCKETS)
+TALKER_MAX_SEQ = max(TALKER_BUCKETS)
+
 # DiT mel_len buckets. Streaming chunks (chunk_size=25 codec * dit.repeats(2) =
 # 50 mel frames) benefit hugely from a small bucket; full-utterance generation
 # still needs 2048. The 1024 bucket avoids 4x O(n^2) waste when actual mel_len
@@ -283,8 +298,12 @@ def _compile_talker(model_path, out_path):
     # outputs.logits is not None), and without it talker mode-collapses
     # into "oooo" past ~75 codec tokens. CPU sampling adds <2ms/step.
     tnc = TalkerNeuronConfig(
-        tp_degree=TP_DEGREE, batch_size=1, seq_len=2048, max_context_length=2048,
+        tp_degree=TP_DEGREE, batch_size=1,
+        seq_len=TALKER_MAX_SEQ, max_context_length=TALKER_MAX_SEQ,
         torch_dtype=torch.bfloat16,
+        enable_bucketing=True,
+        context_encoding_buckets=TALKER_BUCKETS,
+        token_generation_buckets=TALKER_BUCKETS,
     )
     tic = TalkerInferenceConfig(
         neuron_config=tnc, load_config=load_pretrained_config(hf_config=tc),
@@ -491,8 +510,12 @@ def load_talker(model_path, compiled_path):
     tc = hf.talker_config
 
     tnc = TalkerNeuronConfig(
-        tp_degree=TP_DEGREE, batch_size=1, seq_len=2048, max_context_length=2048,
+        tp_degree=TP_DEGREE, batch_size=1,
+        seq_len=TALKER_MAX_SEQ, max_context_length=TALKER_MAX_SEQ,
         torch_dtype=torch.bfloat16,
+        enable_bucketing=True,
+        context_encoding_buckets=TALKER_BUCKETS,
+        token_generation_buckets=TALKER_BUCKETS,
     )
     tic = TalkerInferenceConfig(
         neuron_config=tnc, load_config=load_pretrained_config(hf_config=tc),
@@ -813,7 +836,7 @@ def run_talker(talker_model, talker_adapter, talker_cfg, talker_input, *,
     ], dim=1)
     talker_attention_mask = torch.ones_like(talker_input_ids, dtype=torch.long)
 
-    max_gen = min(600, 2048 - context_len - 10)
+    max_gen = min(600, TALKER_MAX_SEQ - context_len - 10)
 
     # Re-set vision embeddings before each run (context encoding consumes them).
     ve = projected_context.to(torch.bfloat16)
@@ -1088,7 +1111,7 @@ def main():
     print(f"    Total:     {total_load:.1f}s")
     print(f"\n  Per-run latency (avg of {num_runs} runs):")
     print(f"    Thinker:     {_avg(thinker_times):.3f}s")
-    print(f"    Hidden:      {_avg(hidden_times):.3f}s (HF CPU forward)")
+    print(f"    Hidden:      {_avg(hidden_times):.3f}s (Neuron capture)")
     print(f"    Prep:        {_avg(prep_times):.3f}s")
     print(f"    Talker:      {_avg(talker_times):.3f}s")
     print(f"    Token2Wav:   {_avg(t2w_times):.2f}s")

@@ -25,7 +25,7 @@ Key features:
 - **Thinker**: Architecturally identical to Qwen2.5-7B; reuses `NeuronQwen2ForCausalLM` with state-dict prefix remapping (28 heads / 4 TP = 7 per rank, 4 kv_heads / 4 TP = 1 per rank)
 - **Vision encoder**: SwiGLU MLP, RMSNorm, separate QKV projections, PatchMerger (16 heads / 4 TP = 4 per rank)
 - **Audio encoder**: Whisper-style with chunked attention. Hybrid CPU+Neuron: Conv1d frontend + chunking on CPU, 32 transformer layers on Neuron (20 heads / 4 TP = 5 per rank), AvgPool + LayerNorm + projection on CPU
-- **Talker**: Neuron-compiled with fused embedding (embed_tokens 8448→3584 + thinker_to_talker_proj 3584→896 collapsed into 8448→896), explicit head_dim=128, 3D mRoPE, per-step thinker state injection via vision_embeddings (12 heads / 4 TP = 3 per rank, 4 kv_heads / 4 TP = 1 per rank). Auto-pads vision_embeddings to max_context_length for compiled bucket compatibility.
+- **Talker**: Neuron-compiled with fused embedding (embed_tokens 8448→3584 + thinker_to_talker_proj 3584→896 collapsed into 8448→896), explicit head_dim=128, 3D mRoPE, per-step thinker state injection via vision_embeddings (12 heads / 4 TP = 3 per rank, 4 kv_heads / 4 TP = 1 per rank). Multi-bucket NEFF (`[256, 512, 1024, 2048]`) so prefill / per-step attention work scales with actual codec sequence length. vision_embeddings padded to the runtime-selected bucket inside `_get_model_outputs` to keep its seq dim equal to NxDI's `pad_length` (otherwise NxDI's `_pad_to_bucket` zeros out vision_embeddings on shape mismatch).
 - **Token2Wav**: DiT transformer core (22 blocks) and BigVGAN vocoder both on Neuron, ODE sampling (Runge-Kutta 4, 10 steps), float32. Split architecture: CPU preprocessing (ECAPA-TDNN, codec embed, input embed, rotary) + Neuron DiT core + CPU ODE solver + Neuron BigVGAN (T=256 NEFF + chunked overlap-add at runtime; see "BigVGAN compile cap" under Performance). Automatic CPU fallback when mel_len exceeds compiled max or when `QWEN25_OMNI_BIGVGAN_NEURON=0`.
 
 ## Prerequisites
@@ -178,9 +178,9 @@ cores 0-3), `--greedy --seed 1234`, median of 3 runs:
 | Thinker (7B, Neuron TP=4, greedy) | 0.23s | 24 text tokens, ~10ms TPOT, 256-token bucket |
 | Hidden state extraction (Neuron capture) | 0.02s | last-layer norm output side-banded as a NEFF output via `TensorCaptureConfig(modules_to_capture=["norm"])` |
 | Talker prep (projection, conditioning) | 0.17s | CPU |
-| Talker (690M, Neuron TP=4, sampled, seeded) | 1.45s | 375 codec tokens, ~4ms TPOT, per-step thinker injection |
-| Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 6.09s | mel_len=748 → 3 BigVGAN chunks × T=256 NEFF + cos² crossfade |
-| **Pipeline total** | **7.95s** | **7.5s audio, RTF 1.06x** |
+| Talker (690M, Neuron TP=4, sampled, seeded) | 1.20s | 334 codec tokens, ~3.6ms TPOT, per-step thinker injection, multi-bucket NEFF (256/512/1024/2048) |
+| Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 5.98s | mel_len=668 → 3 BigVGAN chunks × T=256 NEFF + cos² crossfade |
+| **Pipeline total** | **7.60s** | **6.7s audio, RTF 1.13x** |
 
 Model load (one-time cost, excluded from pipeline) takes ~5min on a cold
 NVMe cache (DiT trace dominates); subsequent loads from the on-disk NEFF
@@ -217,10 +217,10 @@ steady-state runs from `examples/generate_qwen25_omni_speech.py`:
 
 | Platform | Audio | Pipeline (steady-state) | RTF |
 |----------|-------|-------------------------|-----|
-| Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 7.5s | **7.95s** | **1.06x** |
+| Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 6.7s | **7.60s** | **1.13x** |
 | H100 80GB (single GPU, SDPA) | 7.18s | 9.55s | 1.33x |
 
-Trn2 finishes ~17% sooner in wall time. The audio-length gap (7.5s vs
+Trn2 finishes ~20% sooner in wall time. The audio-length gap (7.5s vs
 7.18s) is unavoidable: CUDA RNG ≠ CPU RNG and bf16 matmul numerics
 diverge across hardware, so the Trn2 talker draws a different codec
 sequence even from identical prompts and parameters. Trn2's faster
@@ -411,7 +411,7 @@ Verified on trn2.48xlarge with real Qwen2.5-Omni-7B weights:
 - **Config**: TP=4 head divisibility verified (Thinker 7/1, Audio 5, Vision 4 per rank)
 - **State dict**: All 2448 keys converted correctly (text=339, audio=489, vision=518, talker=293, token2wav=809)
 - **Text generation (TP=4)**: Compile + load + generate working, TPOT ~10ms, correct outputs verified
-- **Speech pipeline**: Full Thinker → Talker → Token2Wav verified end-to-end on Neuron, RTF 1.06x (see Performance)
+- **Speech pipeline**: Full Thinker → Talker → Token2Wav verified end-to-end on Neuron, RTF 1.13x (see Performance)
 
 ```bash
 # End-to-end multimodal test (text / image+text / audio+text / text→speech)
@@ -426,7 +426,7 @@ python examples/generate_qwen25_omni_speech.py
 
 1. **TP=4 for all Neuron components**: Thinker (28 heads/4=7 per rank), Vision (16 heads/4=4), Audio (20 heads/4=5). All heads divisible by 4.
 2. **Audio encoder hybrid architecture**: Conv1d frontend + chunking on CPU, 32 transformer layers on Neuron with TP=4, AvgPool + LayerNorm + projection on CPU. Asymmetric attention bias (q/v have bias, k has none) handled via ColumnParallelLinear.
-3. **Talker on Neuron**: Non-standard head_dim (128 != 896/12), 3D mRoPE with per-step thinker-state injection, ~690M params. Uses ImageToTextModelWrapper with 24 positional args. Fused embedding (embed_tokens 8448→3584 + proj 3584→896 collapsed into 8448→896). Per-step thinker reply states injected via vision_embeddings during token generation. Vision embeddings auto-padded to max_context_length for compiled bucket compatibility. TPOT 4.0ms.
+3. **Talker on Neuron**: Non-standard head_dim (128 != 896/12), 3D mRoPE with per-step thinker-state injection, ~690M params. Uses ImageToTextModelWrapper with 24 positional args. Fused embedding (embed_tokens 8448→3584 + proj 3584→896 collapsed into 8448→896). Per-step thinker reply states injected via vision_embeddings during token generation. Multi-bucket NEFF (`[256, 512, 1024, 2048]`); vision_embeddings padded to the runtime-selected bucket inside `_get_model_outputs` to avoid NxDI's mismatch-zeroing fallback. TPOT ~3.6ms.
 4. **Token2Wav split architecture**: DiT transformer core (22 blocks) on Neuron via torch_neuronx.trace(). CPU preprocessing: ECAPA-TDNN speaker encoder, codec embedding (repeat_interleave), input embedding, rotary embedding, block_diff mask. CPU postprocessing: ODE solver (RK4, 10 steps), BigVGAN vocoder. Float32 for ODE precision. XLA fixes: DiTAttention in-place slice assignment → torch.cat, SDPA dispatch → explicit matmul attention, float additive attention mask. Automatic CPU fallback when mel_len exceeds compiled max.
 5. **Speaker support**: `spk_dict.pt` contains per-speaker conditioning (Ethan, Chelsie)
 6. **State dict prefix remapping**: `thinker.model.*` -> `model.*`, `thinker.lm_head.*` -> `lm_head.*`, `thinker.visual.*` -> `visual.*`, `thinker.audio_tower.*` -> `frontend.*`/`transformer.*`/`postprocessor.*`

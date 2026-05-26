@@ -717,10 +717,14 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
         injected as vision_embeddings. During token generation, per-step
         thinker reply states are ADDED to codec token embeddings.
 
-        Vision embeddings are padded to max_context_length to match the
-        compiled bucket shapes (the compiled model expects fixed-size
-        vision_embeddings matching the bucket, while input_ids and
-        attention_mask are padded by preprocess_inputs).
+        Vision embeddings are stored at their natural length here; padding
+        to the bucket selected by NxDI happens lazily in _get_model_outputs
+        once input_ids length is known. This matters under multi-bucket
+        compilation: NxDI's _pad_to_bucket (model_wrapper.py:798-816) will
+        ZERO OUT vision_embeddings if their seq dim does not equal the
+        bucket pad_length, which silently kills the thinker injection. By
+        padding to the right bucket on the fly we keep shape == pad_length
+        and skip that fallback.
 
         Args:
             vision_embeddings: (batch, seq, 896) projected thinker states
@@ -731,20 +735,6 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
                 reply_embeds[:, step, :] is added to the codec token
                 embedding at each generation step.
         """
-        # Pad vision_embeddings and vision_mask to max_context_length so they
-        # match the compiled NEFF bucket shapes.
-        max_ctx = self.neuron_config.max_context_length
-        batch, seq, dim = vision_embeddings.shape
-        if seq < max_ctx:
-            pad_ve = torch.zeros(
-                batch, max_ctx - seq, dim, dtype=vision_embeddings.dtype
-            )
-            vision_embeddings = torch.cat([vision_embeddings, pad_ve], dim=1)
-            pad_vm = torch.zeros(
-                batch, max_ctx - seq, 1, dtype=vision_mask.dtype
-            )
-            vision_mask = torch.cat([vision_mask, pad_vm], dim=1)
-
         self._vision_embeddings = vision_embeddings
         self._vision_mask = vision_mask
         self._thinker_reply_embeds = thinker_reply_embeds
@@ -775,6 +765,37 @@ class NeuronQwen25OmniTalkerForCausalLM(NeuronBaseForCausalLM):
         vision_mask = getattr(self, '_vision_mask', torch.empty(0))
 
         if self._is_prefill(position_ids):
+            # Pad vision_embeddings to the bucket NxDI is going to pick for
+            # input_ids/attention_mask so shape[1] matches pad_length —
+            # otherwise NxDI replaces ve with zeros (model_wrapper.py:813).
+            if vision_embeddings.numel() > 0 and vision_embeddings.dim() == 3:
+                ce_buckets = (
+                    self.neuron_config.context_encoding_buckets
+                    or [self.neuron_config.max_context_length]
+                )
+                input_len = input_ids.shape[1]
+                target = next(
+                    (b for b in ce_buckets if input_len < b),
+                    ce_buckets[-1],
+                )
+                cur = vision_embeddings.shape[1]
+                if cur < target:
+                    batch, _, dim = vision_embeddings.shape
+                    vision_embeddings = torch.cat(
+                        [vision_embeddings,
+                         torch.zeros(batch, target - cur, dim,
+                                     dtype=vision_embeddings.dtype)],
+                        dim=1,
+                    )
+                    vision_mask = torch.cat(
+                        [vision_mask,
+                         torch.zeros(batch, target - cur, 1,
+                                     dtype=vision_mask.dtype)],
+                        dim=1,
+                    )
+                elif cur > target:
+                    vision_embeddings = vision_embeddings[:, :target, :]
+                    vision_mask = vision_mask[:, :target, :]
             outputs = self.context_encoding_model(
                 input_ids,
                 attention_mask,
