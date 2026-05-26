@@ -369,7 +369,7 @@ class AudioTransformerModelWrapper(ModelWrapper):
 
     def __init__(self, config, model_cls, tag="", compiler_args=None,
                  priority_model_idx=None, pipeline_execution=True,
-                 return_ranked_to_cpu=False, model_init_kwargs={}):
+                 return_ranked_to_cpu=True, model_init_kwargs={}):
         super().__init__(
             config, model_cls, tag, compiler_args, priority_model_idx,
             pipeline_execution, return_ranked_to_cpu, model_init_kwargs,
@@ -508,7 +508,9 @@ class AudioEncoderInferenceConfig(InferenceConfig):
         super().__init__(neuron_config=neuron_config, **kwargs)
 
     def add_derived_config(self):
-        pass
+        # NxDI's get_builder reads config.num_cores_per_group when wiring up
+        # the ModelBuilder.
+        self.num_cores_per_group = 1
 
     def get_required_attributes(self):
         return []

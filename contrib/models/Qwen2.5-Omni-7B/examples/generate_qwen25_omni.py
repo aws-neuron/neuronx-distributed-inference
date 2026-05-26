@@ -262,7 +262,11 @@ def run_multimodal(mode="full", model_path=MODEL_PATH, compiled_path=COMPILED_PA
 
     with Timer("Load compiled model"):
         model.load(compiled_dir)
-        processor = AutoProcessor.from_pretrained(compiled_dir)
+        # Reload processor from compiled_dir with trust_remote_code so the
+        # full Qwen2_5OmniProcessor (with audio support) is reconstructed.
+        # Without trust_remote_code, AutoProcessor falls back to a base
+        # processor that silently drops the `audios` kwarg.
+        processor = AutoProcessor.from_pretrained(compiled_dir, trust_remote_code=True)
 
     # --- Step 3: Enable audio encoder (if needed) ---
     if mode in ("audio", "full"):
@@ -327,7 +331,9 @@ def run_multimodal(mode="full", model_path=MODEL_PATH, compiled_path=COMPILED_PA
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": IMAGE_URL},
+                    # Constrain max_pixels so the image fits the compiled
+                    # vision bucket (pixels_per_image=1012 patches).
+                    {"type": "image", "image": IMAGE_URL, "max_pixels": 1012 * 14 * 14},
                     {"type": "text", "text": "Describe this image in detail."},
                 ],
             },
@@ -357,7 +363,9 @@ def run_multimodal(mode="full", model_path=MODEL_PATH, compiled_path=COMPILED_PA
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": IMAGE_URL},
+                    # Constrain max_pixels so the image fits the compiled
+                    # vision bucket (pixels_per_image=1012 patches).
+                    {"type": "image", "image": IMAGE_URL, "max_pixels": 1012 * 14 * 14},
                     {"type": "audio", "audio": AUDIO_URL},
                     {
                         "type": "text",
@@ -373,10 +381,13 @@ def run_multimodal(mode="full", model_path=MODEL_PATH, compiled_path=COMPILED_PA
         text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        # Qwen2_5OmniProcessor.__call__ takes `audio=` (singular). Passing
+        # `audios=` is silently dropped, leading to no audio tokens in
+        # input_ids.
         inputs = processor(
             text=[text],
             images=images if images else None,
-            audios=audios if audios else None,
+            audio=audios if audios else None,
             return_tensors="pt",
             padding=True,
         )
@@ -414,7 +425,7 @@ def run_multimodal(mode="full", model_path=MODEL_PATH, compiled_path=COMPILED_PA
     output_text = processor.batch_decode(
         output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-    print(f"\n  Output: {output_text[0].strip()[:500]}")
+    print(f"\n  Output: {output_text[0].strip()}")
 
     del model, adapter
     gc.collect()
