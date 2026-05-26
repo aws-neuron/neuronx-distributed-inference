@@ -288,6 +288,40 @@ pulls ahead. Talker's 5.1x per-step margin × the ~450 codec tokens of a
 typical reply is what keeps the full-utterance pipeline ahead of the
 H100 baseline.
 
+#### Why Token2Wav stays at TP=1
+
+Both DiT and BigVGAN are compiled with `torch_neuronx.trace` on a single
+NeuronCore. Promoting them to TP=4 (NxDI `ModelWrapper` style) is
+possible but not where the wins live:
+
+- **DiT**: 16 heads / 4 = 4 per rank divides cleanly, so the structure
+  permits it. But the absolute matmul cost per layer is already small at
+  this shape (B=2 CFG, dim=1024, S=1024) — H100 finishes one fp32
+  forward in 29.8 ms on one device, half of Trn2's 62.4 ms shared-core
+  number. Each Token2Wav call drives **22 blocks × 10 ODE × 2 CFG = 440
+  forward passes**; under TP=4, every linear in every block adds an
+  all-reduce. Dispatch and collective fixed cost would eat most of the
+  per-layer parallelism gain, especially because ODE accumulation
+  requires fp32 collectives (slower than bf16). A rough estimate is
+  1.3-1.5x, not 2.1x — i.e. it would not close the H100 gap. The
+  bigger lever is freeing DiT from the shared 4-core layout (the 8-core
+  split layout already does this for DiT and BigVGAN) and waiting on
+  SDK improvements to the fp32 path. Switching to TP=4 also requires
+  rewriting the trace path as an NxDI `ModelWrapper`, which is a
+  meaningful re-architecture.
+- **BigVGAN**: a pure convolutional upsample stack (6 ConvTranspose1d
+  stages + ResBlocks) is awkward to tensor-parallelize: channel-wise
+  splits need an all-gather between stages, and time-wise splits are
+  already capped by the T=256 NEFF limit. The current 3.1x gap vs H100
+  is dominated by "5 NEFF calls + 4 crossfades + Python dispatch", not
+  by per-NEFF compute. Lifting the T≥512 compile cap on a future
+  `neuronxcc` would let a single mel=1024 NEFF replace the chunk loop
+  and close most of the gap — that is the right next step, not TP.
+
+If a future workload needs much longer mel sequences (>3-4s of audio
+per call) where DiT compute starts dominating again, TP=4 DiT becomes
+worth re-evaluating.
+
 #### BigVGAN compile cap (neuronxcc <= 2.25) and chunked workaround
 
 `compile_bigvgan` traces one NEFF per mel_len bucket. On neuronxcc
