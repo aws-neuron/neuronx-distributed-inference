@@ -175,12 +175,12 @@ cores 0-3), `--greedy --seed 1234`, median of 3 runs:
 
 | Stage | Time | Notes |
 |-------|------|-------|
-| Thinker (7B, Neuron TP=4, greedy) | 0.26s | 25 text tokens, ~10ms TPOT |
-| Hidden state extraction (HF CPU) | 0.45s | one forward pass to harvest thinker states |
-| Talker prep (projection, conditioning) | 0.18s | CPU |
-| Talker (690M, Neuron TP=4, sampled, seeded) | 1.76s | 448 codec tokens, ~4ms TPOT, per-step thinker injection |
-| Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 6.10s | mel_len=896 → 4 BigVGAN chunks × T=256 NEFF + cos² crossfade |
-| **Pipeline total** | **8.76s** | **9.0s audio, RTF 0.97x** |
+| Thinker (7B, Neuron TP=4, greedy) | 0.23s | 24 text tokens, ~10ms TPOT, 256-token bucket |
+| Hidden state extraction (Neuron capture) | 0.02s | last-layer norm output side-banded as a NEFF output via `TensorCaptureConfig(modules_to_capture=["norm"])` |
+| Talker prep (projection, conditioning) | 0.17s | CPU |
+| Talker (690M, Neuron TP=4, sampled, seeded) | 1.45s | 375 codec tokens, ~4ms TPOT, per-step thinker injection |
+| Token2Wav (Neuron DiT + Neuron BigVGAN chunked) | 6.09s | mel_len=748 → 3 BigVGAN chunks × T=256 NEFF + cos² crossfade |
+| **Pipeline total** | **7.95s** | **7.5s audio, RTF 1.06x** |
 
 Model load (one-time cost, excluded from pipeline) takes ~5min on a cold
 NVMe cache (DiT trace dominates); subsequent loads from the on-disk NEFF
@@ -217,15 +217,14 @@ steady-state runs from `examples/generate_qwen25_omni_speech.py`:
 
 | Platform | Audio | Pipeline (steady-state) | RTF |
 |----------|-------|-------------------------|-----|
-| Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 9.0s | **8.76s** | **0.97x** |
+| Trn2 (trn2.48xlarge, TP=4, all-Neuron, 4-core shared) | 7.5s | **7.95s** | **1.06x** |
 | H100 80GB (single GPU, SDPA) | 7.18s | 9.55s | 1.33x |
 
-Trn2 finishes ~9% sooner in wall time and clears real-time (RTF < 1.0).
-The audio-length gap (9.0s vs 7.18s) is unavoidable: CUDA RNG ≠ CPU RNG
-and bf16 matmul numerics diverge across hardware, so the Trn2 talker
-draws a different — and in this run slightly longer — codec sequence
-even from identical prompts and parameters. The longer codec adds
-Token2Wav work, yet Trn2's faster Token2Wav still finishes first.
+Trn2 finishes ~17% sooner in wall time. The audio-length gap (7.5s vs
+7.18s) is unavoidable: CUDA RNG ≠ CPU RNG and bf16 matmul numerics
+diverge across hardware, so the Trn2 talker draws a different codec
+sequence even from identical prompts and parameters. Trn2's faster
+Token2Wav still finishes the longer codec ahead of H100.
 
 Reproduce with:
 
@@ -412,7 +411,7 @@ Verified on trn2.48xlarge with real Qwen2.5-Omni-7B weights:
 - **Config**: TP=4 head divisibility verified (Thinker 7/1, Audio 5, Vision 4 per rank)
 - **State dict**: All 2448 keys converted correctly (text=339, audio=489, vision=518, talker=293, token2wav=809)
 - **Text generation (TP=4)**: Compile + load + generate working, TPOT ~10ms, correct outputs verified
-- **Speech pipeline**: Full Thinker → Talker → Token2Wav verified end-to-end on Neuron, RTF 0.97x (see Performance)
+- **Speech pipeline**: Full Thinker → Talker → Token2Wav verified end-to-end on Neuron, RTF 1.06x (see Performance)
 
 ```bash
 # End-to-end multimodal test (text / image+text / audio+text / text→speech)
