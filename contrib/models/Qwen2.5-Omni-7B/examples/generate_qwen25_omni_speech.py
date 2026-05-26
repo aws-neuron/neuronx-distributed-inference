@@ -215,7 +215,7 @@ class Timer:
 
 def _compile_thinker(model_path, out_path, greedy=False):
     from neuronx_distributed_inference.models.config import (
-        NeuronConfig, OnDeviceSamplingConfig,
+        NeuronConfig, OnDeviceSamplingConfig, TensorCaptureConfig,
     )
     from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
     from modeling_qwen25_omni import (
@@ -229,6 +229,29 @@ def _compile_thinker(model_path, out_path, greedy=False):
             do_sample=True, temperature=0.7, top_k=20, top_p=0.8,
         )
     )
+    # Side-band the final RMSNorm output as a NEFF output so we no longer need
+    # the 1.66s HF CPU forward to recover hidden_states[-1] for the talker.
+    # NxDI auto-flips output_logits=True when this is set.
+    capture = TensorCaptureConfig(modules_to_capture=["norm"], capture_inputs=False)
+    # NxD's TensorRegistry.clear() wipes modules_to_capture at the end of every
+    # forward (model_base.py:1148 -> registry.clear() -> model_info reset to
+    # CapturedModelInfo([], 10, False)). enable_tensor_capture is only called
+    # once before bucket 0 traces; for bucket 1+ the hook still fires but
+    # register_tensor sees an empty modules_to_capture list and routes the
+    # tensor to manual_tensors instead, so the NEFFs for the larger buckets
+    # never expose the norm output. Patch clear() to preserve the capture
+    # config across forwards — drop tensor data only.
+    from neuronx_distributed.utils.tensor_capture.registry import (
+        CapturedModelInfo, TensorRegistry,
+    )
+    def _clear_preserve_config(self):
+        cfg = self.model_info
+        new = CapturedModelInfo(
+            list(cfg.modules_to_capture), cfg.max_tensors, cfg.capture_inputs,
+        )
+        new.hooks = cfg.hooks
+        self.model_info = new
+    TensorRegistry.clear = _clear_preserve_config
     nc = NeuronConfig(
         tp_degree=TP_DEGREE, batch_size=1,
         seq_len=THINKER_MAX_SEQ, max_context_length=THINKER_MAX_SEQ,
@@ -237,6 +260,7 @@ def _compile_thinker(model_path, out_path, greedy=False):
         context_encoding_buckets=THINKER_BUCKETS,
         token_generation_buckets=THINKER_BUCKETS,
         on_device_sampling_config=sampling,
+        tensor_capture_config=capture,
     )
     cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(model_path))
     model = NeuronQwen25OmniForCausalLM(model_path, cfg)
@@ -395,7 +419,7 @@ def load_thinker(model_path, compiled_path, greedy=False):
     deterministic across hardware.
     """
     from neuronx_distributed_inference.models.config import (
-        NeuronConfig, OnDeviceSamplingConfig,
+        NeuronConfig, OnDeviceSamplingConfig, TensorCaptureConfig,
     )
     from neuronx_distributed_inference.utils.hf_adapter import (
         load_pretrained_config, HuggingFaceGenerationAdapter,
@@ -412,6 +436,7 @@ def load_thinker(model_path, compiled_path, greedy=False):
             do_sample=True, temperature=0.7, top_k=20, top_p=0.8,
         )
     )
+    capture = TensorCaptureConfig(modules_to_capture=["norm"], capture_inputs=False)
     nc = NeuronConfig(
         tp_degree=TP_DEGREE, batch_size=1,
         seq_len=THINKER_MAX_SEQ, max_context_length=THINKER_MAX_SEQ,
@@ -420,6 +445,7 @@ def load_thinker(model_path, compiled_path, greedy=False):
         context_encoding_buckets=THINKER_BUCKETS,
         token_generation_buckets=THINKER_BUCKETS,
         on_device_sampling_config=sampling,
+        tensor_capture_config=capture,
     )
     cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(model_path))
     model = NeuronQwen25OmniForCausalLM(model_path, cfg)
@@ -601,24 +627,59 @@ def run_thinker(thinker_adapter, tokenizer, prompt, system_prompt):
     }
 
 
-def extract_hidden_states(hf_model, thinker_result):
-    """Phase 2: Run HF Thinker on CPU to capture hidden states.
+def extract_hidden_states(thinker_model, hf_model, thinker_result):
+    """Phase 2: Recover per-token hidden states the talker needs.
 
-    The compiled Neuron Thinker uses on-device sampling and only emits tokens,
-    not hidden states. The Talker needs the per-token last-layer hidden states
-    to condition on, so we re-run the prompt+reply through the HF CPU model in
-    bfloat16 — all downstream consumers already round back to bf16 so float32
-    here would be pure overhead.
+    The compiled Neuron Thinker emits sampled tokens only, but with
+    ``TensorCaptureConfig(modules_to_capture=["norm"])`` the NEFF also returns
+    the last-layer post-norm hidden states (= HF's ``outputs.hidden_states[-1]``).
+    We do one CTE forward over prompt+reply (~80ms at the 2048 bucket) and
+    read the captured tensor — replacing the 1.66s HF CPU forward.
+
+    The talker also wants ``hidden_states[0]`` (embedding output) but that is
+    just ``embed_tokens(input_ids)`` and is cheap on CPU — we compute it
+    locally rather than re-running the 7B transformer stack.
+
+    Returns a duck-typed object exposing ``.hidden_states`` so the rest of the
+    pipeline (``prepare_talker_input``) is unchanged.
     """
     full_ids = torch.tensor([thinker_result["all_ids"]], dtype=torch.long)
     prompt_len = thinker_result["prompt_len"]
+    total_len = full_ids.shape[1]
 
     t0 = time.time()
     with torch.no_grad():
-        outputs = hf_model.thinker(
-            input_ids=full_ids, output_hidden_states=True, return_dict=True,
+        thinker_model.reset()  # force CTE path (kv_cache_populated=False)
+        attention_mask = torch.ones_like(full_ids)
+        position_ids = torch.arange(total_len, dtype=torch.long).unsqueeze(0)
+        out = thinker_model(
+            input_ids=full_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
         )
+        captured = out.captured_tensors
+        if not captured or captured[0].dim() != 3:
+            raise RuntimeError(
+                "thinker NEFF did not expose the 'norm' output — recompile "
+                "after the TensorRegistry.clear() patch in _compile_thinker "
+                "(without it, only bucket 0 captures)."
+            )
+        last_hidden = captured[0][:, :total_len, :].to(torch.bfloat16)
+
+        embed_tokens = hf_model.thinker.get_input_embeddings()
+        embedding_output = embed_tokens(full_ids).to(torch.bfloat16)
+
+        # Reset the KV state before the next generate() so cte runs again.
+        thinker_model.reset()
     elapsed = time.time() - t0
+
+    class _HiddenStatesProxy:
+        __slots__ = ("hidden_states",)
+        def __init__(self, embed, last):
+            self.hidden_states = (embed, last)
+
+    outputs = _HiddenStatesProxy(embedding_output, last_hidden)
     return outputs, full_ids, prompt_len, elapsed
 
 
@@ -944,7 +1005,7 @@ def main():
         )
 
         outputs, full_ids, prompt_len, hidden_time = extract_hidden_states(
-            hf_model, thinker_result,
+            thinker_adapter.neuron_model, hf_model, thinker_result,
         )
         hidden_times.append(hidden_time)
         print(f"  [Hidden]    forward pass in {hidden_time:.2f}s")
