@@ -116,7 +116,13 @@ def run_text_only(model_path=MODEL_PATH, compiled_path=COMPILED_PATH):
     hf_config = load_pretrained_config(model_path)
     config = Qwen25OmniInferenceConfig(neuron_config, load_config=hf_config)
 
-    compiled_dir = os.path.join(compiled_path, "thinker_tp4")
+    # Use a dedicated NEFF subdir: examples/generate_qwen25_omni_speech.py
+    # writes to "thinker_tp4" with TensorCaptureConfig + sampled
+    # OnDeviceSampling. That NEFF returns extra captured_tensors and
+    # routes generate() through a different sampler branch that breaks
+    # the eos_token_id=[...] list-typed path used here. Keep this
+    # text-only thinker isolated.
+    compiled_dir = os.path.join(compiled_path, "thinker_text_only_tp4")
 
     with Timer("Create model"):
         model = NeuronQwen25OmniForCausalLM(model_path, config)
