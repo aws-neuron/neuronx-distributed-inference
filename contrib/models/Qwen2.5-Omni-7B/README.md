@@ -47,49 +47,13 @@ Key features:
 
 ### Text-only (Thinker)
 
-```python
-import sys
-from pathlib import Path
-
-# Make this contrib package's src/ importable (flat, per upstream contrib convention).
-sys.path.insert(0, str(Path("contrib/models/Qwen2.5-Omni-7B/src").resolve()))
-import _upstream_compat  # noqa: F401  (applies hf_adapter bug fix)
-
-import torch
-from transformers import AutoTokenizer
-from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
-from modeling_qwen25_omni import (
-    NeuronQwen25OmniForCausalLM,
-    Qwen25OmniInferenceConfig,
-)
-
-model_path = "/path/to/Qwen2.5-Omni-7B/"
-compiled_path = "/path/to/compiled/"
-
-neuron_config = NeuronConfig(
-    tp_degree=4,
-    batch_size=1,
-    seq_len=4096,
-    max_context_length=4096,
-    torch_dtype=torch.bfloat16,
-    on_device_sampling_config=OnDeviceSamplingConfig(
-        do_sample=True, temperature=0.6, top_k=20, top_p=0.95
-    ),
-)
-
-config = Qwen25OmniInferenceConfig(
-    neuron_config, load_config=load_pretrained_config(model_path)
-)
-
-model = NeuronQwen25OmniForCausalLM(model_path, config)
-model.compile(compiled_path)
-model.load(compiled_path)
-
-tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-adapter = HuggingFaceGenerationAdapter(model, tokenizer)
-output = adapter.generate("What is quantum computing?", max_new_tokens=256)
-```
+The Thinker is architecturally identical to `Qwen2.5-7B`; for pure-text inference,
+use the standalone `Qwen2.5-7B` checkpoint with `NeuronQwen2ForCausalLM` directly.
+If you specifically need the Omni Thinker (e.g. to share weights with the
+multimodal/speech pipeline), the runnable entrypoint is
+`examples/generate_qwen25_omni.py --mode text` (model class
+`NeuronQwen25OmniForCausalLM`, config `Qwen25OmniInferenceConfig`). For vLLM
+serving see [vLLM Integration](#vllm-integration) below.
 
 ### Multimodal (Vision + Audio + Speech)
 
