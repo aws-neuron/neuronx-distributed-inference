@@ -13,18 +13,19 @@ Video super-resolution (4x upscaling) on AWS Trainium using a streaming DiT arch
 
 ## Validation Results
 
-**Validated:** 2026-05-18
+**Validated:** 2026-05-26
 **Instance:** trn2.3xlarge (LNC=2, 4 logical NeuronCores)
-**SDK:** Neuron SDK 2.29, PyTorch 2.9, NKI 0.3.0
+**SDK:** Neuron SDK 2.29.1, PyTorch 2.9, NKI 0.3.0
 
 ### Benchmark Results
 
 | Metric | Value |
 |--------|-------|
-| End-to-end throughput | 8.27 FPS (768x1280 output, 85 frames) |
-| Total DiT time | ~4.0s (1 first chunk + 8 stream chunks) |
-| Total TCDecoder time (sequential) | ~4.5s (22 frames sequential) |
-| LQ Projection | ~0.80s (single pass, all frames) |
+| End-to-end throughput | **10.3 FPS** (768x1280 output, 85 frames) |
+| Total DiT time | 5.0s (1 first chunk + 8 stream chunks) |
+| Total TCDecoder time (NxDI, co-resident) | 2.4s (22 calls × 89ms, HBM state persistence) |
+| LQ Projection | 0.86s (single pass, all frames) |
+| Model loading | DiT 40s + TCDecoder 1.8s (one-time startup) |
 
 ### Accuracy Validation
 
@@ -33,7 +34,8 @@ Video super-resolution (4x upscaling) on AWS Trainium using a streaming DiT arch
 | DiT neuron_allclose vs CPU (rtol=0.05, atol=0.1) | PASS |
 | DiT max_rel_error | 0.025 |
 | DiT cosine similarity | 0.9997 |
-| DiT per-chunk latency (first chunk, f=6) | ~1540 ms |
+| DiT per-chunk latency (first chunk, f=6) | ~1720 ms |
+| DiT per-chunk latency (stream, f=2) | ~410 ms |
 | Full pipeline visual quality | Matches reference implementation (DMD single-step) |
 
 ## Usage
@@ -74,14 +76,16 @@ output_path = run_inference(
 
 ## Pipeline Architecture
 
-FlashVSR has three separately compiled Neuron components:
+FlashVSR has three separately compiled Neuron components, all co-resident in HBM:
 
 | Component | Compilation Method | TP Degree | Role |
 |-----------|-------------------|-----------|------|
 | DiT (first chunk) | NxDI ModelBuilder | TP=4 | Denoising, f=6 latent frames |
 | DiT (stream chunk) | NxDI ModelBuilder | TP=4 | Denoising, f=2 latent frames |
 | LQ Projection | torch_neuronx.trace | TP=1 | Generates conditioning tokens |
-| TCDecoder | torch_neuronx.trace | TP=1 | Latent-to-RGB (sequential mode) |
+| TCDecoder | NxDI ModelBuilder | TP=4 | Latent-to-RGB (HBM state persistence) |
+
+All models are loaded at startup and remain co-resident in HBM (total ~15 GB out of 96 GB available on trn2.3xlarge). This eliminates model transition overhead between pipeline stages.
 
 The streaming architecture processes video in chunks: first chunk (6 latent frames = 24 output frames) followed by overlapping stream chunks (2 latent frames = 8 output frames each).
 
@@ -89,14 +93,16 @@ The streaming architecture processes video in chunks: first chunk (6 latent fram
 
 - **NKI Flash Attention:** Uses `attention_cte` from nkilib -- tiles attention computation in SRAM, never materializes the full S*S attention matrix in HBM. Enables 23040-token sequences on trn2.3xlarge.
 - **DistributedRMSNorm:** QK-norm with all-reduce across TP ranks for global variance computation. Essential for accuracy at TP>1.
+- **Co-resident HBM models:** DiT (7.5 GB × 2) + TCDecoder (378 MB) all loaded simultaneously in 96 GB HBM. Eliminates model swap overhead between pipeline stages.
+- **TCDecoder HBM State Persistence:** Uses `input_output_aliases` to keep 9 MemBlock states in device HBM between sequential calls. No PCIe state transfer per frame. Output reshaped from `(4, 3, H, W)` to `(1, 12, H, W)` inside the NEFF to prevent TP from sharding the temporal dimension across ranks.
 - **Phase 2 LCSA (optional):** Block-sparse Locality-Constrained Sparse Attention behind `USE_BLOCK_SPARSE_LCSA` toggle. Generates per-layer sparse masks inside the traced graph via topk + index_select. Requires trn2.48xlarge with TP=16.
 - **Single-step DMD:** FlashVSR-v1.1 uses Distribution Matching Distillation for single-step denoising (timestep=1000).
 
 ## Compatibility Matrix
 
-| Instance/Config | SDK 2.29 | SDK 2.28 |
-|-----------------|----------|----------|
-| trn2.3xlarge, TP=4, LNC=2 | VALIDATED | Not tested |
+| Instance/Config | SDK 2.29.1 | SDK 2.29 | SDK 2.28 |
+|-----------------|------------|----------|----------|
+| trn2.3xlarge, TP=4, LNC=2 | **VALIDATED (10.3 FPS)** | VALIDATED (8.3 FPS) | Not tested |
 
 ## Example Checkpoints
 
@@ -116,7 +122,7 @@ pytest test/integration/test_pipeline_e2e.py -v
 
 - **Resolution constraint:** Input video must produce output dimensions divisible by 128 (e.g., 768x1280). Other resolutions require recompilation.
 - **Phase 2 LCSA:** Block-sparse attention requires trn2.48xlarge with TP=16 (not available on trn2.3xlarge). Production uses Phase 1 dense attention.
-- **TCDecoder sequential mode:** Each frame must be processed serially due to MemBlock temporal recurrence. Cannot be parallelized without quality loss.
+- **TCDecoder temporal recurrence:** Each frame must be processed serially due to MemBlock temporal dependencies. The NxDI HBM state persistence approach minimizes this cost (89ms/call vs 237ms with PCIe state transfer).
 - **Text embedding:** Uses a pre-computed positive prompt embedding (`posi_prompt.pth`). Custom prompts require running the T5 text encoder separately.
 
 ## Maintainer

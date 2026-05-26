@@ -463,13 +463,13 @@ def compile_pipeline(
         app.compile(dit_stream_dir)
         app.shard_weights(dit_stream_dir)
 
-    # Compile TCDecoder (NxDI with HBM state persistence)
+    # Compile TCDecoder (NxDI with HBM state persistence, co-resident with DiT)
     tcdecoder_dir = os.path.join(output_dir, "tcdecoder")
     if not os.path.exists(tcdecoder_dir):
         from .tcdecoder import TCDecoderApplication, TCDecoderConfig
 
         tcd_neuron_config = NeuronConfig(
-            tp_degree=1,
+            tp_degree=tp_degree,
             torch_dtype=torch.bfloat16,
             batch_size=1,
         )
@@ -575,7 +575,7 @@ def load_pipeline(
         dit_stream_app.load(config.compiled_dit_stream)
         pipeline.dit_stream_app = dit_stream_app
 
-        # Load TCDecoder (NxDI with HBM state persistence)
+        # Load TCDecoder (NxDI with HBM state persistence, co-resident with DiT)
         tcdecoder_compiled = os.path.join(compiled_dir, "tcdecoder")
         if os.path.exists(tcdecoder_compiled):
             from .tcdecoder import (
@@ -585,7 +585,7 @@ def load_pipeline(
             )
 
             tcd_neuron_config = NeuronConfig(
-                tp_degree=1,
+                tp_degree=tp_degree,
                 torch_dtype=torch.bfloat16,
                 batch_size=1,
             )
@@ -742,7 +742,7 @@ def run_inference(
         LQ_cur_idx = process_total_num * 8 + 21 if process_total_num > 0 else 21
 
         if isinstance(pipeline.tcdecoder_model, TCDecoderApplication):
-            # NxDI path: HBM state persistence (3.0x faster)
+            # NxDI path: HBM state persistence, co-resident with DiT
             frames = decode_video_nxdi(
                 pipeline.tcdecoder_model,
                 latents_out.transpose(1, 2),  # NCTHW -> NTCHW

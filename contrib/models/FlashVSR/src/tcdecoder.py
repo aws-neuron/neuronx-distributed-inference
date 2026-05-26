@@ -11,10 +11,17 @@ Two execution modes:
   - Legacy (torch_neuronx.trace): Sequential decode with explicit state I/O.
     States transferred via PCIe each call. ~237ms/frame.
   - NxDI (ModelBuilder + input_output_aliases): Sequential decode with HBM
-    state persistence. States remain in device memory between calls. ~79ms/frame.
-    3.0x faster than trace-based approach.
+    state persistence. States remain in device memory between calls. ~89ms/call
+    producing 4 output frames each (22ms/output_frame). Co-resident with DiT
+    in HBM — no model transition overhead.
 
 The NxDI mode is the default for new compilations.
+
+Performance (validated on trn2.3xlarge, SDK 2.29.1, TP=4):
+  - Per-call latency: 89ms (22 calls for 85 output frames)
+  - Total decode: 2.4s for 85 frames (768x1280)
+  - Co-resident with DiT: eliminates 3.2s model transition
+  - Overall pipeline: 10.3 FPS (vs 7.3 FPS with transition overhead)
 """
 
 import os
@@ -410,7 +417,9 @@ class NeuronTCDecoderStateful(nn.Module):
     Forward signature:
         Input:  x (1, C, H, W) — single latent frame
         Output: (frames, state_0, state_1, ..., state_8) — 10 tensors total
-                frames: (4, 3, H_out, W_out) RGB frames
+                frames: (1, 12, H_out, W_out) — 4 RGB frames flattened into
+                        channels to prevent TP sharding on temporal dim.
+                        Reshape to (4, 3, H_out, W_out) after extraction.
                 state_i: updated MemBlock states
     """
 
@@ -516,6 +525,9 @@ class NeuronTCDecoderStateful(nn.Module):
 
         Returns:
             Tuple of (output_frames, updated_state_0, ..., updated_state_8)
+            output_frames: (1, 12, H_out, W_out) — 4 RGB frames flattened into
+                           channels to prevent TP sharding on temporal dim.
+                           Reshape to (4, 3, H_out, W_out) after extraction.
         """
         mem_idx = 0
         updated_states = [None] * NUM_MEM_BLOCKS
@@ -532,6 +544,12 @@ class NeuronTCDecoderStateful(nn.Module):
                 x = layer(x)
             else:
                 x = layer(x)
+
+        # x is (4, 3, H_out, W_out) — 4 RGB frames from TGrow temporal expansion.
+        # Reshape to (1, 12, H_out, W_out) to prevent NxDI TP from sharding the
+        # temporal dimension (which would split 4 frames across 4 ranks at TP=4).
+        H_out, W_out = x.shape[2], x.shape[3]
+        x = x.reshape(1, 12, H_out, W_out)
 
         # Return frames + all updated states (aliased back to Parameters)
         return (x, *updated_states)
@@ -562,21 +580,24 @@ class TCDecoderApplication:
     Uses ModelBuilder directly with BaseModelInstance for input_output_aliases.
     States persist in device HBM between forward calls — no PCIe transfer.
 
-    Performance (validated on trn2.3xlarge, SDK 2.29):
-    - Per-frame latency: 79ms (vs 237ms trace baseline) = 3.0x faster
-    - Compilation: 10.4s (vs ~5min trace)
+    Performance (validated on trn2.3xlarge, SDK 2.29.1, TP=4):
+    - Per-call latency: 89ms (produces 4 output frames per call)
+    - 22 calls → 85 output frames (after trimming 3 warmup frames)
+    - Total decode: 2.4s for 85 frames at 768x1280
+    - Co-resident with DiT: no model transition overhead
+    - Overall pipeline FPS: 10.3
 
     Usage:
         from neuronx_distributed_inference.models.config import NeuronConfig
 
-        neuron_config = NeuronConfig(tp_degree=1, torch_dtype=torch.bfloat16, batch_size=1)
+        neuron_config = NeuronConfig(tp_degree=4, torch_dtype=torch.bfloat16, batch_size=1)
         config = TCDecoderConfig(neuron_config=neuron_config, height=768, width=1280)
         app = TCDecoderApplication(weights_dir="/path/to/weights", config=config)
         app.compile(output_dir)
         app.load(compiled_dir)
         app.reset_states()
         for frame in frames:
-            rgb = app(frame)  # States persist in HBM
+            rgb = app(frame)  # (4, 3, H, W) — states persist in HBM
     """
 
     def __init__(self, weights_dir: str, config: TCDecoderConfig):
@@ -606,7 +627,7 @@ class TCDecoderApplication:
         # Build and trace
         builder = ModelBuilder(
             router=None,
-            tp_degree=1,
+            tp_degree=self.config.neuron_config.tp_degree,
             checkpoint_loader=checkpoint_loader,
         )
         builder.add(
@@ -622,17 +643,17 @@ class TCDecoderApplication:
         torch.jit.save(traced_model, neff_path)
         del traced_model
 
-        # Shard and save weights (required for load-time initialization)
+        # Shard and save weights (one file per TP rank)
         weights_dir = os.path.join(output_dir, "weights")
         os.makedirs(weights_dir, exist_ok=True)
         sharded_weights = builder.shard_checkpoint()
-        # For TP=1, there's only one rank
         from safetensors.torch import save_file
 
-        save_file(
-            sharded_weights[0],
-            os.path.join(weights_dir, "tp0_sharded_checkpoint.safetensors"),
-        )
+        for rank, rank_weights in enumerate(sharded_weights):
+            save_file(
+                rank_weights,
+                os.path.join(weights_dir, f"tp{rank}_sharded_checkpoint.safetensors"),
+            )
 
     def load(self, compiled_dir: str):
         """Load compiled TCDecoder NEFF."""
@@ -641,11 +662,15 @@ class TCDecoderApplication:
         neff_path = os.path.join(compiled_dir, "model.pt")
         self._traced_model = torch.jit.load(neff_path)
 
-        # Load sharded weights and initialize the model
-        weights_path = os.path.join(
-            compiled_dir, "weights", "tp0_sharded_checkpoint.safetensors"
-        )
-        weights = [load_file(weights_path)]
+        # Load sharded weights for all TP ranks and initialize
+        weights_dir_path = os.path.join(compiled_dir, "weights")
+        tp_degree = self.config.neuron_config.tp_degree
+        weights = []
+        for rank in range(tp_degree):
+            rank_path = os.path.join(
+                weights_dir_path, f"tp{rank}_sharded_checkpoint.safetensors"
+            )
+            weights.append(load_file(rank_path))
         start_rank = torch.tensor([0], dtype=torch.int32)
         self._traced_model.nxd_model.initialize(weights, start_rank)
 
@@ -664,10 +689,14 @@ class TCDecoderApplication:
         outputs = self._traced_model(x)
         # The traced model returns (frames, state_0, ..., state_8) but with
         # input_output_aliases, states are written back to HBM internally.
-        # We only return the frames tensor.
+        # NxDI may return only the non-aliased output as a single tensor.
         if isinstance(outputs, (list, tuple)):
-            return outputs[0]
-        return outputs
+            frames_flat = outputs[0]
+        else:
+            frames_flat = outputs
+        # Reshape from (1, 12, H_out, W_out) → (4, 3, H_out, W_out)
+        H_out, W_out = frames_flat.shape[-2], frames_flat.shape[-1]
+        return frames_flat.reshape(4, 3, H_out, W_out)
 
     def reset_states(self):
         """Reset all MemBlock states to zero before processing a new video.
@@ -702,7 +731,12 @@ class TCDecoderApplication:
                     self.module = self.module.to(self.neuron_config.torch_dtype)
 
             def get(self, bucket_rank, **kwargs):
-                """Return module + aliases mapping state Parameters → output indices."""
+                """Return module + aliases mapping state Parameters → output indices.
+
+                Output layout: (frames, state_0, state_1, ..., state_8)
+                - output[0] = frames (1, 12, H_out, W_out) — flattened 4x3
+                - output[1..9] = updated MemBlock states
+                """
                 aliases = {}
                 output_index = 1  # output[0] = frames
                 for i in range(NUM_MEM_BLOCKS):
@@ -782,7 +816,10 @@ def decode_video_nxdi(
     """Decode video using NxDI TCDecoder with HBM state persistence.
 
     States persist in HBM between frames — no PCIe transfer per call.
-    3.0x faster than trace-based neuron_decode_video_sequential().
+    Each call produces 4 output frames (temporal upsampling via TGrow layers).
+
+    Performance: 22 calls × 89ms/call = 2.0s for 85 output frames (768x1280).
+    Co-resident with DiT in HBM — no model transition overhead.
 
     Args:
         app: TCDecoderApplication (compiled and loaded)
