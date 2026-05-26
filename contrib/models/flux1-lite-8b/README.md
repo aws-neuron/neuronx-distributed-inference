@@ -31,7 +31,8 @@ FLUX.1-lite-8B-alpha image generation model running on AWS Neuron using NxDI's f
 Because NxDI's FLUX.1 implementation reads `num_layers` and `num_single_layers` from the model's `config.json` at runtime (via `load_diffusers_config()`), it automatically adapts to FLUX.1-lite's configuration. **No custom modeling code is needed.**
 
 This contrib provides:
-- A standalone generation script (`src/generate_flux_lite.py`)
+- A standalone generation script (`src/generate_flux_lite.py`) for 1024x1024
+- A high-resolution script (`src/generate_flux_lite_highres.py`) for 2048x2048 and 4096x4096
 - Integration tests validating correct operation on Neuron
 - Benchmark results demonstrating the performance benefit of the lighter architecture
 
@@ -53,6 +54,65 @@ This contrib provides:
 | Pipeline steps/sec | 4.23 |
 | Backbone forward/sec | 4.49 |
 | Compilation time | ~128s (CLIP 69s + T5 5s + backbone 53s + VAE ~2s) |
+
+## High-Resolution Generation (2K, 4K)
+
+> **Note:** The original FLUX.1-lite-8B model was trained and validated at 1024x1024 only.
+> The original FLUX.1-dev/schnell models do not natively support 2K or 4K resolution either.
+> High-resolution generation is an extrapolation beyond the training distribution — image
+> quality may differ from native resolution. This capability is primarily useful for
+> customers who have fine-tuned their own models at higher resolutions or want to evaluate
+> the architecture's scaling behavior.
+
+### Results Summary
+
+| Resolution | Tokens | Latency | Instance | Strategy |
+|-----------|--------|---------|----------|----------|
+| 1024x1024 | 4,096 | **5.91s** | trn2.3xlarge | TP=4 |
+| 2048x2048 | 16,384 | **31.53s** | trn2.3xlarge | TP=4 + tiled VAE (4 tiles) |
+| 4096x4096 | 65,536 | **107.25s** | trn2.48xlarge | TP=4, CP=4 + tiled VAE (25 tiles) |
+
+### How It Works
+
+**2048x2048 (16,384 tokens):**
+- The backbone (transformer) is compiled directly at 2K resolution — the self-attention operates over 16,384 tokens with TP=4, which fits in HBM on trn2.3xlarge (24 GB/core with LNC=2).
+- The VAE decoder exceeds the 5M instruction limit at 2K, so it is compiled at 1024x1024 and the 256x256 latent is decoded with 4 overlapping tiles (128x128 each, 16px overlap).
+- No context parallelism needed. Same hardware as 1K.
+
+**4096x4096 (65,536 tokens):**
+- The 65,536-token self-attention exceeds per-core HBM capacity on trn2.3xlarge even with TP=4.
+- Solution: **Context Parallelism (CP=4)** splits the sequence across 4 groups, giving each shard 16,384 tokens (identical to the working 2K case).
+- Configuration: `TP=4, CP=4, world_size=16` on trn2.48xlarge using 16 of 64 logical cores.
+- The VAE decoder is compiled at 1024x1024 and decodes the 512x512 latent with 25 overlapping tiles.
+- **CRITICAL**: Must set `NEURON_RT_VISIBLE_CORES=0-15` to prevent the runtime from detecting all 64 cores and creating a 64-rank collective communicator (which deadlocks).
+
+### High-Resolution Usage
+
+```bash
+# 2K on trn2.3xlarge (same instance as 1K):
+python src/generate_flux_lite_highres.py \
+    --checkpoint_dir /shared/flux1-lite-8b \
+    --height 2048 --width 2048 \
+    --save_image --save_results
+
+# 4K on trn2.48xlarge (requires NEURON_RT_VISIBLE_CORES):
+NEURON_RT_VISIBLE_CORES=0-15 python src/generate_flux_lite_highres.py \
+    --checkpoint_dir /shared/flux1-lite-8b \
+    --height 4096 --width 4096 \
+    --save_image --save_results
+```
+
+### 4K Timing Breakdown
+
+| Phase | Time | Notes |
+|-------|------|-------|
+| Compilation (from scratch) | ~39 min | Backbone 25.8 min + VAE 7.3 min + encoders <1 min |
+| Compilation (from cache) | 0s | NEFFs cached in compile_workdir |
+| Model loading (cold) | ~40 min | 8B params across 16 cores from disk |
+| Model loading (warm) | ~11s | NEFFs already in device memory |
+| Backbone (25 steps) | 99.5s | 3.98s/step |
+| Tiled VAE decode (25 tiles) | 7.3s | 0.29s/tile |
+| **Total generation** | **107.25s** | Steady state (after warmup) |
 
 ## Usage
 
@@ -126,9 +186,11 @@ huggingface-cli download Freepik/flux.1-lite-8B-alpha \
 
 ## Compatibility Matrix
 
-| Instance/Version | SDK 2.29 | SDK 2.28 |
-|------------------|----------|----------|
-| trn2.3xlarge (LNC=2, TP=4) | VALIDATED | Not tested |
+| Instance | Resolution | SDK 2.29 | SDK 2.30 |
+|----------|-----------|----------|----------|
+| trn2.3xlarge (LNC=2, TP=4) | 1024x1024 | VALIDATED | VALIDATED |
+| trn2.3xlarge (LNC=2, TP=4) | 2048x2048 | VALIDATED | VALIDATED |
+| trn2.48xlarge (LNC=2, TP=4, CP=4) | 4096x4096 | Not tested | VALIDATED |
 
 ## Example Checkpoints
 
