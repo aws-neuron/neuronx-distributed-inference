@@ -15,9 +15,9 @@ NeuronX Distributed Inference implementation of [Qwen/Qwen2.5-Omni-7B](https://h
 |-----------|---------|-----|------------|
 | Thinker (text) | Neuron | 4 | hidden=3584, heads=28, kv_heads=4, layers=28 |
 | Vision encoder | Neuron | 4 | embed=1280, heads=16, depth=32, SwiGLU MLP |
-| Audio encoder | CPU+Neuron | 4 | d_model=1280, heads=20, layers=32, chunked attention |
+| Audio encoder | Neuron | 4 | d_model=1280, heads=20, layers=32, chunked attention |
 | Talker | Neuron | 4 | hidden=896, heads=12, kv_heads=4, head_dim=128, layers=24, vocab=8448, fused embed (8448→896) |
-| Token2Wav | CPU+Neuron (fp32) | N/A | DiT: dim=1024, 22 blocks (Neuron); BigVGAN: 6 upsample stages (Neuron, T=256 NEFF + chunked overlap-add) |
+| Token2Wav | Neuron | N/A | DiT: dim=1024, 22 blocks; BigVGAN: 6 upsample stages (T=256 NEFF + chunked overlap-add); fp32 ODE on CPU |
 
 **Total state dict keys:** 2448 (Text: 339, Vision: 518, Audio: 489, Talker: 293, Token2Wav: 809)
 
