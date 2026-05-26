@@ -145,9 +145,19 @@ def mla_attention_tkg(
         q_pe_col = nl.ndarray((d_rope, 1), dtype=q_pe.dtype, buffer=nl.sbuf)
         nisa.dma_transpose(dst=q_pe_col[0:d_rope, 0:1], src=q_pe[bh : bh + 1, 0:d_rope])
 
-        # Load q_nope full row for later use in score computation
-        # We'll load chunks directly from HBM as columns via dma_transpose
-        # (avoids SBUF nc_transpose which is limited to 32x32)
+        # OPTIMIZATION: Pre-load all q_nope chunks as columns [K_TILE, 1] ONCE,
+        # outside the cache tile loop. These are reused every iteration.
+        # (avoids repeated dma_transpose per cache tile - saves 4 DMA ops per tile)
+        q_nope_cols = [None] * num_k_tiles_dc
+        for k_idx in nl.affine_range(num_k_tiles_dc):
+            k_start = k_idx * K_TILE
+            q_nope_cols[k_idx] = nl.ndarray(
+                (K_TILE, 1), dtype=q_nope.dtype, buffer=nl.sbuf
+            )
+            nisa.dma_transpose(
+                dst=q_nope_cols[k_idx][0:K_TILE, 0:1],
+                src=q_nope[bh : bh + 1, k_start : k_start + K_TILE],
+            )
 
         # =====================================================================
         # Online softmax state: running_max, running_sum, v_accum
@@ -232,22 +242,12 @@ def mla_attention_tkg(
                     ],
                 )
 
-                # Load q_nope chunk as column [K_TILE, 1] via dma_transpose
-                # HBM src: q_nope[bh:bh+1, k_start:k_start+K_TILE] = [1, K_TILE]
-                # dma_transpose -> SBUF [K_TILE, 1]
-                q_nope_chunk_col = nl.ndarray(
-                    (K_TILE, 1), dtype=q_nope.dtype, buffer=nl.sbuf
-                )
-                nisa.dma_transpose(
-                    dst=q_nope_chunk_col[0:K_TILE, 0:1],
-                    src=q_nope[bh : bh + 1, k_start : k_start + K_TILE],
-                )
-
+                # Use pre-loaded q_nope column (hoisted out of cache tile loop)
                 # Matmul: stationary=[K_TILE, 1], moving=[K_TILE, s_size] -> [1, s_size]
                 # Accumulates into scores_psum (same dst = hardware PSUM accumulation)
                 nisa.nc_matmul(
                     dst=scores_psum[0:1, 0:s_size],
-                    stationary=q_nope_chunk_col[0:K_TILE, 0:1],
+                    stationary=q_nope_cols[k_idx][0:K_TILE, 0:1],
                     moving=c_kv_chunk[0:K_TILE, 0:s_size],
                 )
 
@@ -272,7 +272,10 @@ def mla_attention_tkg(
             # -----------------------------------------------------------------
             # Apply attention mask
             # Load mask for this tile: attn_mask[bh, s_start:s_start+s_size]
-            # Where mask=0, set scores to LARGE_NEG
+            # Where mask=0, add LARGE_NEG to scores (drives softmax weight to ~0)
+            # Formula: masked_scores = scores + (1 - mask) * LARGE_NEG
+            # For mask=1: scores + 0 = scores (unchanged)
+            # For mask=0: scores + LARGE_NEG (effectively -inf for softmax)
             # -----------------------------------------------------------------
 
             mask_sb = nl.ndarray((1, s_size), dtype=attn_mask.dtype, buffer=nl.sbuf)
@@ -285,45 +288,32 @@ def mla_attention_tkg(
             mask_f = nl.ndarray((1, s_size), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=mask_f[0:1, 0:s_size], src=mask_sb[0:1, 0:s_size])
 
-            # Compute masked scores: scores * mask + (1 - mask) * LARGE_NEG
-            # = scores * mask + LARGE_NEG - LARGE_NEG * mask
-            # = scores * mask - LARGE_NEG * mask + LARGE_NEG
-            # = (scores - LARGE_NEG) * mask + LARGE_NEG
-            # Simplified: where mask=1, keep scores; where mask=0, set to LARGE_NEG
-
-            # Step 1: inv_mask = 1.0 - mask_f (positions to mask out)
-            inv_mask = nl.ndarray((1, s_size), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_scalar(
-                dst=inv_mask[0:1, 0:s_size],
-                data=mask_f[0:1, 0:s_size],
-                op0=nl.multiply,
-                operand0=-1.0,
-            )
-            nisa.tensor_scalar(
-                dst=inv_mask[0:1, 0:s_size],
-                data=inv_mask[0:1, 0:s_size],
-                op0=nl.add,
-                operand0=1.0,
-            )
-
-            # Step 2: mask_penalty = inv_mask * LARGE_NEG
+            # OPTIMIZATION: Reduced from 5 ops to 3 ops.
+            # Compute mask_penalty = (1 - mask) * LARGE_NEG using fused ops:
+            # Step 1: mask_penalty = mask_f * (-LARGE_NEG) + LARGE_NEG
+            #   = mask * (-LARGE_NEG) + LARGE_NEG = LARGE_NEG * (1 - mask)
+            # Wait - we want (1-mask)*LARGE_NEG:
+            #   When mask=1: 0, when mask=0: LARGE_NEG
+            # Compute: penalty = mask * (-LARGE_NEG) + LARGE_NEG
+            #   When mask=1: -LARGE_NEG + LARGE_NEG = 0. When mask=0: 0 + LARGE_NEG = LARGE_NEG. Correct!
             mask_penalty = nl.ndarray((1, s_size), dtype=nl.float32, buffer=nl.sbuf)
+            # Fused: activation(data=mask_f, scale=-LARGE_NEG, bias=LARGE_NEG_as_bias)
+            # But activation needs an op like exp/sigmoid which we don't want here.
+            # Use tensor_scalar chain instead (still 2 ops, down from 3 for inv_mask):
             nisa.tensor_scalar(
                 dst=mask_penalty[0:1, 0:s_size],
-                data=inv_mask[0:1, 0:s_size],
+                data=mask_f[0:1, 0:s_size],
                 op0=nl.multiply,
+                operand0=-LARGE_NEG,
+            )
+            nisa.tensor_scalar(
+                dst=mask_penalty[0:1, 0:s_size],
+                data=mask_penalty[0:1, 0:s_size],
+                op0=nl.add,
                 operand0=LARGE_NEG,
             )
 
-            # Step 3: masked_scores = scores * mask + mask_penalty
-            # First: scores = scores * mask
-            nisa.tensor_tensor(
-                dst=scores_sb[0:1, 0:s_size],
-                data1=scores_sb[0:1, 0:s_size],
-                data2=mask_f[0:1, 0:s_size],
-                op=nl.multiply,
-            )
-            # Then: scores = scores + mask_penalty
+            # Step 2: scores = scores + mask_penalty
             nisa.tensor_tensor(
                 dst=scores_sb[0:1, 0:s_size],
                 data1=scores_sb[0:1, 0:s_size],
@@ -536,37 +526,32 @@ def mla_attention_tkg(
         # =====================================================================
 
         # Normalize: v_accum = v_accum / running_sum
-        inv_sum = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.reciprocal(dst=inv_sum[0:1, 0:1], data=running_sum[0:1, 0:1])
-
-        # Broadcast multiply: v_accum[1, d_c] *= inv_sum[1, 1]
-        # Create inv_sum_wide by replicating via activation(exp, zeros, bias=log(inv_sum))
-        # Simpler: directly compute 1/running_sum as wide vector
-        # Use activation(op=exp, data=dummy, scale=0.0, bias=log_inv_sum) where log_inv_sum = -log(running_sum)
-        # Actually simplest: negate running_sum log and exponentiate
-        # Or: just use tensor_scalar to multiply each element... but operand is tensor not literal
-        #
-        # Cleanest approach: replicate inv_sum to [1, d_c] using same trick as correction
+        # OPTIMIZATION: Use -log(running_sum) directly instead of reciprocal + log + exp.
+        # exp(-log(running_sum)) = 1/running_sum, broadcast via activation bias.
         neg_log_sum = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-        # log(inv_sum) = log(1/running_sum) = -log(running_sum)
-        # But we already have inv_sum. We need inv_sum replicated to [1, d_c].
-        # Use: inv_sum_wide = exp(zeros * 0 + log(inv_sum))
-        # log(inv_sum) = -log(running_sum)
-        log_inv_sum = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        # Compute log(running_sum)
         nisa.activation(
-            dst=log_inv_sum[0:1, 0:1],
+            dst=neg_log_sum[0:1, 0:1],
             op=nl.log,
-            data=inv_sum[0:1, 0:1],
+            data=running_sum[0:1, 0:1],
         )
+        # Negate: neg_log_sum = -log(running_sum)
+        nisa.tensor_scalar(
+            dst=neg_log_sum[0:1, 0:1],
+            data=neg_log_sum[0:1, 0:1],
+            op0=nl.multiply,
+            operand0=-1.0,
+        )
+        # Broadcast: inv_sum_wide = exp(0 + neg_log_sum) = 1/running_sum replicated to [1, d_c]
         inv_sum_wide = nl.ndarray((1, d_c), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(
             dst=inv_sum_wide[0:1, 0:d_c],
             op=nl.exp,
             data=v_accum[0:1, 0:d_c],  # dummy (scaled to 0)
             scale=0.0,
-            bias=log_inv_sum[0:1, 0:1],
+            bias=neg_log_sum[0:1, 0:1],
         )
-        # inv_sum_wide = exp(0 + log(inv_sum)) = inv_sum replicated
+        # v_accum *= inv_sum_wide
         nisa.tensor_tensor(
             dst=v_accum[0:1, 0:d_c],
             data1=v_accum[0:1, 0:d_c],
