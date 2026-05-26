@@ -190,6 +190,16 @@ def deltanet_fused_chunked_fwd(
     zero_11 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=zero_11, value=0.0)
 
+    # Pre-allocate constant buffers (hoisted from chunk loop — v19 optimization)
+    ones_PP = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones_PP, value=1.0)
+
+    g_padded = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=g_padded, value=0.0)
+
+    gc_padded = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=gc_padded, value=0.0)
+
     state = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=state, value=0.0)
 
@@ -231,8 +241,6 @@ def deltanet_fused_chunked_fwd(
         )
 
         # ---- Cumsum of g ----
-        g_padded = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=g_padded, value=0.0)
         nisa.tensor_copy(
             dst=g_padded[0:CHUNK_SIZE, 0:1], src=g_chunk_p[0:CHUNK_SIZE, 0:1]
         )
@@ -253,8 +261,6 @@ def deltanet_fused_chunked_fwd(
             op1=nl.add,
         )
 
-        gc_padded = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=gc_padded, value=0.0)
         nisa.tensor_copy(
             dst=gc_padded[0:1, 0:CHUNK_SIZE], src=gc_row[0:1, 0:CHUNK_SIZE]
         )
@@ -331,9 +337,6 @@ def deltanet_fused_chunked_fwd(
         )
 
         # ---- Build decay mask ----
-        ones_PP = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=ones_PP, value=1.0)
-
         gc_mat_rows = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
             dst=gc_mat_rows,
