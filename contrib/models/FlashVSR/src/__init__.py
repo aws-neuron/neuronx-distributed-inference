@@ -11,7 +11,13 @@ from .tcdecoder import (
     decode_video_nxdi,
 )
 from .lq_projection import NeuronLQProj
-from .pipeline import FlashVSRPipeline, compile_pipeline, load_pipeline, run_inference
+from .pipeline import (
+    FlashVSRPipeline,
+    compile_pipeline,
+    load_pipeline,
+    run_inference,
+    build_greedy_chunk_schedule,
+)
 
 __all__ = [
     "NeuronFlashVSRDiT",
@@ -25,4 +31,5 @@ __all__ = [
     "compile_pipeline",
     "load_pipeline",
     "run_inference",
+    "build_greedy_chunk_schedule",
 ]

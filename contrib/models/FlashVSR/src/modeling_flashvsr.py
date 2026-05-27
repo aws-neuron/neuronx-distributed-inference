@@ -24,6 +24,7 @@ Model: JunhaoZhuang/FlashVSR-v1.1
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -1114,6 +1115,15 @@ if HAS_NXDI_INFERENCE:
     FIRST_FRAME_COUNTS = [6]
     STREAM_FRAME_COUNTS = [2]
     ALL_FRAME_COUNTS = [6, 2]
+
+    # Multi-bucket stream frame counts for long-video optimization.
+    # Set via env var FLASHVSR_STREAM_BUCKETS (comma-separated, descending order).
+    # Example: FLASHVSR_STREAM_BUCKETS=8,4,2
+    # All bucket NEFFs are compiled and loaded co-resident (no swap overhead).
+    _stream_buckets_env = os.environ.get("FLASHVSR_STREAM_BUCKETS", "")
+    if _stream_buckets_env:
+        STREAM_FRAME_COUNTS = [int(x) for x in _stream_buckets_env.split(",")]
+        ALL_FRAME_COUNTS = FIRST_FRAME_COUNTS + STREAM_FRAME_COUNTS
 
     class FlashVSRModelWrapper(ModelWrapper):
         """NxDI ModelWrapper for FlashVSR compilation."""

@@ -92,6 +92,87 @@ def largest_8n1_leq(n):
     return 0 if n < 1 else ((n - 1) // 8) * 8 + 1
 
 
+def build_greedy_chunk_schedule(
+    num_latent_frames: int, stream_buckets: List[int] = None
+) -> List[int]:
+    """Build a greedy chunk schedule for DiT streaming.
+
+    Given total latent frames and available stream bucket sizes, returns
+    a list of frame counts per chunk that minimizes total call count.
+
+    The first chunk always consumes 6 latent frames. Remaining frames are
+    assigned greedily to the largest available bucket, then smaller buckets
+    for any remainder.
+
+    Args:
+        num_latent_frames: Total latent frames (= (input_frames - 1) // 4)
+        stream_buckets: Available stream bucket sizes, descending order.
+                       Default: [2] (original behavior).
+
+    Returns:
+        List of frame counts: [6, f_1, f_2, ...] where f_i is the frame
+        count for each stream chunk. The sum equals num_latent_frames
+        (with 4-frame overlap between first and first stream chunk).
+
+    Example:
+        >>> build_greedy_chunk_schedule(22, [8, 4, 2])
+        [6, 8, 8, 2]  # first + 2×f=8 + 1×f=2 = 6 + 2*(8-overlap) ...
+    """
+    if stream_buckets is None:
+        stream_buckets = [2]
+    stream_buckets = sorted(stream_buckets, reverse=True)
+
+    schedule = [6]  # First chunk always f=6
+
+    # After the first chunk, we've covered latent positions 0-5.
+    # Stream chunks overlap by 4 frames with the previous chunk.
+    # So stream chunk i starts at position 4 + sum_of_previous_stream_advances.
+    # Each stream chunk of size f advances the position by f (with 0 overlap
+    # between stream chunks themselves — only the first-to-stream transition overlaps by 4).
+    #
+    # Total latent positions to cover: num_latent_frames
+    # First chunk covers positions 0..5 (6 frames)
+    # Remaining to cover: positions 6..num_latent_frames-1
+    # But stream chunks start at offset 4 (overlap with first), then advance by f each.
+    # Position covered by stream chunk i: 4 + sum(schedule[1:i]) to 4 + sum(schedule[1:i+1]) - 1
+    # Need: 4 + sum(all stream chunks) >= num_latent_frames
+    # i.e., sum(stream chunks) >= num_latent_frames - 4
+
+    remaining = (
+        num_latent_frames - 4
+    )  # need to cover this many with stream chunks (starting from offset 4)
+    # Actually: the original f=2 formula gives process_total_num = (frames-1)//8 - 2 stream chunks
+    # each advancing by 2. Total stream advance = (process_total_num - 1) * 2.
+    # Let me use the simpler model: after the first chunk (6 frames), we need
+    # (num_latent_frames - 6) more frames, advanced 2 at a time with f=2.
+    # With larger buckets: advanced f at a time.
+
+    # Simpler: remaining latent frames after first chunk's unique contribution
+    # First chunk uniquely contributes 6 frames at positions 0-5.
+    # Stream chunks start at position 4 (overlap 2 with first chunk? No, overlap 4).
+    # Actually from the code: stream chunk i reads latents[:, :, 4+i*2 : 6+i*2]
+    # So with f=2: chunk 1 reads [4:6], chunk 2 reads [6:8], etc.
+    # The position advances by 2 each time.
+    # With f=f: chunk 1 reads [4:4+f], chunk 2 reads [4+f:4+2f], etc.
+    # Need: 4 + n*f >= num_latent_frames → n = ceil((num_latent_frames - 4) / f)
+
+    # For mixed buckets: greedily assign largest bucket while remaining >= bucket_size
+    remaining_after_first = num_latent_frames - 4  # positions 4 onward need coverage
+    covered = 0
+
+    for bucket in stream_buckets:
+        while covered + bucket <= remaining_after_first:
+            schedule.append(bucket)
+            covered += bucket
+
+    # Handle any leftover with the smallest bucket
+    if covered < remaining_after_first:
+        smallest = stream_buckets[-1]
+        schedule.append(smallest)
+
+    return schedule
+
+
 def compute_scaled_and_target_dims(w0, h0, scale=4.0, multiple=128):
     sW = int(round(w0 * scale))
     sH = int(round(h0 * scale))
