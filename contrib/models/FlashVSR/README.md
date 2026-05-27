@@ -40,13 +40,42 @@ Video super-resolution (4x upscaling) on AWS Trainium using a streaming DiT arch
 
 ## Usage
 
+### Recommended: Use the Notebook
+
+The easiest way to reproduce results is the end-to-end notebook at
+`notebooks/tcdecoder_benchmark.ipynb`. It includes all compilation, loading,
+inference, and color correction steps with expected outputs saved inline.
+
+A sample output video is provided at `notebooks/output_sample.mp4` for visual
+comparison. If your output looks washed out or blurry, see **Troubleshooting** below.
+
+### Quick Start (trn2.3xlarge, SDK 2.29.1+)
+
+```bash
+# 1. Activate the NxDI venv
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+
+# 2. Download weights
+python -m src.download_weights --output-dir ~/FlashVSR-v1.1
+
+# 3. Compile all models (one-time, ~30 min)
+python -m src.pipeline compile \
+    --weights-dir ~/FlashVSR-v1.1 \
+    --output-dir ~/compiled \
+    --height 768 --width 1280 --tp-degree 4
+
+# 4. Run the notebook
+jupyter nbconvert --to notebook --execute \
+    notebooks/tcdecoder_benchmark.ipynb \
+    --output tcdecoder_benchmark_executed.ipynb
+```
+
+### Programmatic API
+
 ```python
 from src.pipeline import compile_pipeline, load_pipeline, run_inference
 
-# Step 1: Download weights (one-time)
-# python -m src.download_weights --output-dir /path/to/FlashVSR-v1.1
-
-# Step 2: Compile models (one-time per resolution)
+# Step 1: Compile models (one-time per resolution)
 compile_pipeline(
     weights_dir="/path/to/FlashVSR-v1.1",
     output_dir="/path/to/compiled",
@@ -55,17 +84,15 @@ compile_pipeline(
     tp_degree=4,
 )
 
-# Step 3: Load compiled pipeline
+# Step 2: Load compiled pipeline
 pipeline = load_pipeline(
     compiled_dir="/path/to/compiled",
     weights_dir="/path/to/FlashVSR-v1.1",
     prompt_path="/path/to/FlashVSR-v1.1/posi_prompt.pth",
     tp_degree=4,
-    tcdecoder_path="/path/to/compiled/tcdecoder_seq.pt",
-    lq_proj_path="/path/to/compiled/lq_proj.pt",
 )
 
-# Step 4: Run inference
+# Step 3: Run inference
 output_path = run_inference(
     pipeline,
     input_video="/path/to/input.mp4",
@@ -124,6 +151,34 @@ pytest test/integration/test_pipeline_e2e.py -v
 - **Phase 2 LCSA:** Block-sparse attention requires trn2.48xlarge with TP=16 (not available on trn2.3xlarge). Production uses Phase 1 dense attention.
 - **TCDecoder temporal recurrence:** Each frame must be processed serially due to MemBlock temporal dependencies. The NxDI HBM state persistence approach minimizes this cost (89ms/call vs 237ms with PCIe state transfer).
 - **Text embedding:** Uses a pre-computed positive prompt embedding (`posi_prompt.pth`). Custom prompts require running the T5 text encoder separately.
+
+## Troubleshooting: Poor Output Quality
+
+If the upscaled video appears blurry, has color drift, or looks worse than expected:
+
+1. **Missing LQ projection conditioning.** The LQ projection provides per-token guidance
+   from the low-quality input. Without it, the DiT produces generic denoised output without
+   content fidelity. Verify that `lq_proj_model` is loaded and `all_lq_tokens` is passed
+   to each DiT chunk via the `lq_residual_0` parameter.
+
+2. **Missing color correction.** The DiT + TCDecoder output has correct structure but may
+   have color drift from BF16 quantization. The AdaIN color correction step (Stage 4 in the
+   notebook) aligns color distribution with the LQ reference. Without it, output may appear
+   washed out or have shifted hues.
+
+3. **TCDecoder state not reset.** The TCDecoder uses 9 stateful MemBlocks that persist across
+   calls. You **must** call `tcd_app.reset_states()` before processing a new video. Leftover
+   state from a previous video or warmup will corrupt output.
+
+4. **Frame count mismatch.** The input must be in `8n+1` format (e.g., 89 frames). The number
+   of LQ conditioning frames for TCDecoder must equal `latents_T * 4` (the pixel shuffle
+   temporal factor). Using the wrong frame count leads to misaligned conditioning.
+
+5. **Wrong prompt embedding.** The model expects the pre-computed `posi_prompt.pth` from the
+   FlashVSR-v1.1 weights. Using a different or missing prompt drastically reduces quality.
+
+**Reference output:** Compare against `notebooks/output_sample.mp4` (85 frames, 768x1280,
+generated from the included test video `example0_cropped_192x320.mp4`).
 
 ## Maintainer
 
