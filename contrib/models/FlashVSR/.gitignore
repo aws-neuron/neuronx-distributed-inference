@@ -1,0 +1,11 @@
+# Internal documents - do not commit
+notebooks/customer_response_draft.md
+
+# Compiled artifacts
+__pycache__/
+*.pyc
+*.neff
+compiled/
+
+# Temporary files
+tmp/

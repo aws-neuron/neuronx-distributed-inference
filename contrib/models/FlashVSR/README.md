@@ -127,9 +127,32 @@ The streaming architecture processes video in chunks: first chunk (6 latent fram
 
 ## Compatibility Matrix
 
-| Instance/Config | SDK 2.29.1 | SDK 2.29 | SDK 2.28 |
-|-----------------|------------|----------|----------|
-| trn2.3xlarge, TP=4, LNC=2 | **VALIDATED (10.3 FPS)** | VALIDATED (8.3 FPS) | Not tested |
+| Instance/Config | SDK 2.30 | SDK 2.29.1 | SDK 2.29 | SDK 2.28 |
+|-----------------|----------|------------|----------|----------|
+| trn2.3xlarge, TP=4, LNC=2 | **VALIDATED (12.6 FPS)** | VALIDATED (10.3 FPS) | VALIDATED (8.3 FPS) | Not tested |
+
+**SDK 2.30 gives a 22% DiT speedup** (f=2 stream: 416ms → 325ms) with zero code changes — just recompile on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260522`.
+
+## Multi-Bucket Streaming (Tested, Not Recommended)
+
+The codebase includes support for multi-bucket DiT streaming via `FLASHVSR_STREAM_BUCKETS=8,4,2`.
+This compiles f=8, f=4, and f=2 NEFFs co-resident in HBM and uses a greedy scheduler to
+minimize the number of DiT calls for long videos.
+
+**Benchmark result: larger buckets are SLOWER for this model.**
+
+| Bucket | Per-Frame Latency | vs f=2 |
+|--------|------------------|--------|
+| f=2    | 162.5 ms         | baseline |
+| f=4    | 197.2 ms         | 21% slower |
+| f=8    | 287.7 ms         | 77% slower |
+
+FlashVSR uses full temporal self-attention (not tiled/windowed), so attention cost scales
+super-linearly with frame count. The per-call overhead savings are overwhelmed by quadratic
+attention growth. **Use the default `FLASHVSR_STREAM_BUCKETS=2` for optimal throughput.**
+
+The multi-bucket code is retained as a reference implementation for models with windowed/tiled
+attention where larger batches DO reduce per-frame cost.
 
 ## Example Checkpoints
 
