@@ -270,7 +270,8 @@ def _get_tp_degree() -> int:
     if HAS_NXDI:
         try:
             return get_tensor_model_parallel_size()
-        except Exception:
+        except RuntimeError:
+            # Parallel context not initialized (e.g. running outside NxDI)
             return 1
     return 1
 
@@ -340,7 +341,11 @@ class DistributedRMSNorm(nn.Module):
 
 
 # Register DistributedRMSNorm as a supported sharded module for NxD tracing.
-if HAS_NXDI:
+# Without this, NxD ModelBuilder raises "unsupported sharded module" during compile.
+# NOTE: This accesses a private attribute; if NxDI refactors this registry,
+# the registration will silently fail (guarded by hasattr) and compilation
+# will surface the error explicitly.
+if HAS_NXDI and hasattr(_nxd_trace, "__SUPPORTED_SHARDED_MODULES"):
     _nxd_trace.__SUPPORTED_SHARDED_MODULES = (
         *_nxd_trace.__SUPPORTED_SHARDED_MODULES,
         DistributedRMSNorm,

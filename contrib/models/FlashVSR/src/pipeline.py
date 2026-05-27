@@ -527,7 +527,12 @@ def load_pipeline(
 
     pipeline = FlashVSRPipeline(config=config)
 
-    # Patch ThreadPoolExecutor for NxDI load
+    # Patch ThreadPoolExecutor for NxDI load.
+    # NxDI ModelBuilder uses ThreadPoolExecutor internally to load weights in
+    # parallel across TP ranks. In a single-process configuration (no torchrun),
+    # all ranks share one process and the default thread pool can deadlock or
+    # race on shared state. Limiting to 1 worker serializes rank loading and
+    # avoids these issues. Restored after load completes.
     original_init = concurrent.futures.ThreadPoolExecutor.__init__
 
     def patched_init(self, *args, **kwargs):
@@ -677,7 +682,16 @@ def run_inference(
         gc.collect()
 
     # Step 3: Streaming DiT inference
+    # Formula: first chunk covers 6 latent frames (24 input frames + 1 overlap),
+    # each stream chunk covers 2 latent frames (8 input frames). The -2 accounts
+    # for the first chunk consuming the equivalent of 3 stream chunks (6/2=3, minus 1
+    # for the overlap). Minimum valid input: 25 frames (process_total_num=1).
     process_total_num = (num_frames - 1) // 8 - 2
+    if process_total_num < 1:
+        raise ValueError(
+            f"Input video too short ({num_frames} frames). "
+            f"FlashVSR requires at least 25 frames (8n+1 format with n>=3)."
+        )
     if max_chunks > 0:
         process_total_num = min(process_total_num, max_chunks)
 
