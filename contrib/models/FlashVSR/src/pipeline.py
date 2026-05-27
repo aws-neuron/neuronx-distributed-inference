@@ -383,6 +383,7 @@ def neuron_dit_forward(
     width: int,
     cur_process_idx: int,
     lq_residual_0: Optional[torch.Tensor] = None,
+    temporal_offset: Optional[int] = None,
 ) -> torch.Tensor:
     """Run compiled Neuron DiT forward pass for one chunk.
 
@@ -394,6 +395,8 @@ def neuron_dit_forward(
         height, width: target resolution
         cur_process_idx: chunk index (0 = first, >0 = stream)
         lq_residual_0: (1, S, 1536) or None
+        temporal_offset: explicit temporal offset for RoPE. If None,
+            uses legacy formula (4 + cur_process_idx * 2) for f=2 streaming.
 
     Returns:
         noise_pred: (1, 16, f, H_lat, W_lat)
@@ -408,7 +411,8 @@ def neuron_dit_forward(
     seq_len = post_f * post_h * post_w
 
     # Temporal offset for RoPE
-    temporal_offset = 0 if cur_process_idx == 0 else (4 + cur_process_idx * 2)
+    if temporal_offset is None:
+        temporal_offset = 0 if cur_process_idx == 0 else (4 + cur_process_idx * 2)
 
     rope_cos, rope_sin = build_rope_for_grid(
         *base_freqs,
