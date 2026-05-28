@@ -209,6 +209,10 @@ class Gemma4E2BVLMInferenceConfig(ImageToTextInferenceConfig):
             else:
                 tc.layer_intermediate_sizes.append(base_intermediate * 2)
 
+        # Pre-load layer_scalar values: populated from checkpoint during model init.
+        # Must exist on text_config before NeuronGemma4E2BTextModel accesses it.
+        tc._layer_scalar_values = None
+
         # Ensure rope_parameters is a plain dict (may be SimpleNamespace from config loading)
         if hasattr(tc, "rope_parameters"):
             rp = tc.rope_parameters

@@ -491,6 +491,11 @@ class Gemma4E2BInferenceConfig(InferenceConfig):
             else:
                 self.layer_intermediate_sizes.append(base_intermediate * 2)
 
+        # Pre-load layer_scalar values from checkpoint for baking into trace.
+        # These get set as register_buffer in decoder layers (NOT nn.Parameter),
+        # so they must be available at model construction time.
+        self._layer_scalar_values = None  # Will be populated below if model path available
+
         self.add_derived_config()
         self.validate_config()
 
@@ -562,9 +567,56 @@ def get_updated_configs(config: Gemma4E2BInferenceConfig):
                 "partial_rotary_factor", 0.25
             )
 
+        # Layer scalar value (baked as buffer during trace)
+        if hasattr(config, '_layer_scalar_values') and config._layer_scalar_values is not None:
+            layer_config._layer_scalar = config._layer_scalar_values[i]
+        else:
+            layer_config._layer_scalar = 1.0  # fallback (will produce wrong results)
+
         updated_configs.append(layer_config)
 
     return updated_configs
+
+
+def _load_layer_scalar_values(model_path: str, num_layers: int):
+    """
+    Load layer_scalar values from the model checkpoint.
+    
+    Called during model construction to provide layer_scalar values for
+    register_buffer (baked as constants during trace). This is necessary
+    because NxDI's shard_children() only loads parameters for supported
+    parallel module types (ColumnParallelLinear, etc.), and nn.Parameter
+    scalars on arbitrary modules are silently skipped.
+    """
+    import os
+    from safetensors import safe_open
+    
+    safetensors_path = os.path.join(model_path, "model.safetensors")
+    if not os.path.exists(safetensors_path):
+        # Try index file
+        import glob
+        shard_files = sorted(glob.glob(os.path.join(model_path, "model-*.safetensors")))
+        if not shard_files:
+            return [1.0] * num_layers  # fallback
+    
+    values = [1.0] * num_layers
+    
+    if os.path.exists(safetensors_path):
+        with safe_open(safetensors_path, framework="pt") as f:
+            for i in range(num_layers):
+                key = f"model.language_model.layers.{i}.layer_scalar"
+                if key in f.keys():
+                    values[i] = f.get_tensor(key).item()
+    else:
+        # Multi-shard checkpoint
+        for shard_file in shard_files:
+            with safe_open(shard_file, framework="pt") as f:
+                for i in range(num_layers):
+                    key = f"model.language_model.layers.{i}.layer_scalar"
+                    if key in f.keys():
+                        values[i] = f.get_tensor(key).item()
+    
+    return values
 
 
 # ====================================================================================
@@ -660,7 +712,8 @@ class NeuronGemma4E2BAttention(NeuronAttentionBase):
         self.q_layernorm = get_rmsnorm_cls()(dim=head_dim, eps=config.rms_norm_eps)
         self.k_layernorm = get_rmsnorm_cls()(dim=head_dim, eps=config.rms_norm_eps)
 
-        # No v_norm in E2B (unlike 31B which has Gemma4VNorm)
+        # V normalization (with_scale=False: pure normalization, no learned weight)
+        self._v_norm_eps = config.rms_norm_eps
 
         # Store layer properties
         self._is_sliding = is_sliding
@@ -708,7 +761,7 @@ class NeuronGemma4E2BAttention(NeuronAttentionBase):
         return Q, K, cos_cache, sin_cache
 
     # forward() is inherited from NeuronAttentionBase -- no override needed.
-    # E2B has no v_norm, so we do NOT override prep_qkv_tensors (unlike 31B).
+    # E2B DOES have v_norm (scale-free RMSNorm on V). Applied in prep_qkv_tensors.
 
     def prep_qkv_tensors(
         self,
@@ -778,7 +831,7 @@ class NeuronGemma4E2BAttention(NeuronAttentionBase):
             return Q, K_shared, V_shared, cos_cache, sin_cache, residual
 
         # Default: compute full Q, K, V (non-shared layers)
-        return super().prep_qkv_tensors(
+        Q, K, V, cos_cache, sin_cache, residual = super().prep_qkv_tensors(
             position_ids,
             hidden_states,
             past_key_value,
@@ -790,6 +843,14 @@ class NeuronGemma4E2BAttention(NeuronAttentionBase):
             residual=residual,
             use_polar_compatible_rope=use_polar_compatible_rope,
         )
+
+        # Apply v_norm (scale-free RMSNorm): V / RMS(V)
+        # V is in BHSD layout at this point
+        V_float = V.float()
+        V_normed = V_float * torch.rsqrt(V_float.pow(2).mean(-1, keepdim=True) + self._v_norm_eps)
+        V = V_normed.type_as(V)
+
+        return Q, K, V, cos_cache, sin_cache, residual
 
 
 # ====================================================================================
@@ -911,9 +972,15 @@ class NeuronGemma4E2BDecoderLayer(nn.Module):
         self.ple_act_fn = nn.GELU(approximate="tanh")
 
         # layer_scalar: learned per-layer scaling factor applied at the end.
-        # Must be nn.Parameter (not buffer) so NxDI's weight loading populates it
-        # from the checkpoint. Buffers are baked as constants at trace time.
-        self.layer_scalar = nn.Parameter(torch.ones(1), requires_grad=False)
+        # CRITICAL: Must initialize with the CORRECT value from the checkpoint
+        # (not 1.0), because the XLA compiler optimizes away "x * 1.0" as dead code.
+        # If traced with 1.0, the multiply is eliminated and loading correct values
+        # post-trace has no effect. By initializing with the actual value, the
+        # compiler preserves the multiply operation in the HLO graph.
+        scalar_value = getattr(config, '_layer_scalar', 1.0)
+        self.layer_scalar = nn.Parameter(
+            torch.tensor([scalar_value], dtype=torch.float32), requires_grad=False
+        )
 
     def forward(
         self,
@@ -1154,6 +1221,14 @@ class NeuronGemma4E2BTextModel(NeuronBaseModel):
         )
 
         # ======== Decoder layers ========
+        # Pre-load layer_scalar values from checkpoint into config.
+        # These are baked as register_buffer constants during trace.
+        if config._layer_scalar_values is None:
+            model_path = getattr(config, '_name_or_path', None)
+            if model_path:
+                config._layer_scalar_values = _load_layer_scalar_values(
+                    model_path, config.num_hidden_layers
+                )
         # Per-layer configs for heterogeneous SWA/global shapes and intermediate sizes
         updated_configs = get_updated_configs(config)
         self.layers = nn.ModuleList(
