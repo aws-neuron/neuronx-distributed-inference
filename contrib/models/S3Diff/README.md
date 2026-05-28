@@ -37,6 +37,12 @@ This contrib uses `torch_neuronx.trace()` rather than NxDI tensor parallelism, w
 | 128x128 | 512x512 | 1 | 0.545s | 1.8 img/s |
 | 256x256 | 1024x1024 | 9 | 4.809s | 0.21 img/s |
 | 512x512 | 2048x2048 | 25 | 13.346s | 0.075 img/s |
+| 1024x1024 | 4096x4096 | 121 | 64.09s | 0.016 img/s |
+
+> **Note:** The original S3Diff model was trained on 128x128 → 512x512 crops only. Higher
+> resolution outputs (2K, 4K) use tiled processing with the same compiled 512x512 NEFFs —
+> no recompilation is needed. Per-tile latency is constant at ~0.530s regardless of total
+> image size. Scaling is linear: latency = tiles x 0.530s + overhead.
 
 ### Component Timing (single tile, 512x512 output)
 
@@ -97,12 +103,17 @@ python src/generate_s3diff.py \
     --input_image input_256.png \
     --output_image output_1024.png
 
-# Custom tile settings
+# 1024x1024 -> 4096x4096 (121 tiles, ~64s)
+python src/generate_s3diff.py \
+    --input_image input_1024.png \
+    --output_image output_4096.png
+
+# Custom tile settings (increase overlap for fewer seams at 4K)
 python src/generate_s3diff.py \
     --input_image input.png \
     --output_image output.png \
     --tile_size 512 \
-    --tile_overlap 128
+    --tile_overlap 192
 ```
 
 ## Setup
@@ -137,9 +148,9 @@ This approach avoids recompilation for different resolutions and produces seamle
 
 ## Compatibility Matrix
 
-| Instance/Version | SDK 2.29 | SDK 2.28 |
+| Instance/Version | SDK 2.29 | SDK 2.30 |
 |------------------|----------|----------|
-| trn2.3xlarge | VALIDATED | Not tested |
+| trn2.3xlarge | VALIDATED | VALIDATED |
 
 ## Example Checkpoints
 
