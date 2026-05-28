@@ -1,6 +1,6 @@
 # Contrib Model: FLUX.2-klein-base-9B
 
-FLUX.2-klein-base-9B image generation model running on AWS Neuron with NxD Inference tensor parallelism.
+FLUX.2-klein-base-9B image generation model running on AWS Neuron with NxD Inference tensor parallelism. Supports up to 2048x2048 resolution (model maximum).
 
 ## Model Information
 
@@ -50,6 +50,42 @@ FLUX.2-klein differs from FLUX.1 in several important ways:
 | Max absolute difference | 0.15 |
 | Mean absolute difference | 0.022 |
 
+## High-Resolution Generation (2K, 4K)
+
+### 2048x2048 Results
+
+| Metric | Value |
+|--------|-------|
+| Resolution | 2048x2048 |
+| Inference steps | 50 |
+| TP Degree | 4 |
+| E2E generation time | 191.44s/img (10/10 seeds pass) |
+| HBM usage | ~40 GB |
+| Compilation time | ~795s (cacheable) |
+| Weight load time | ~136s |
+| $/image | $0.1189 (7% cheaper than H100 BF16: $0.1286) |
+
+**Tested by:** xniwang (external SA), on trn2.3xlarge, SDK 2.29.
+
+The backbone compiles natively at 2048x2048 (16,384 tokens) with TP=4 — no context
+parallelism or tiling needed. The model produces coherent high-quality images at 2K.
+
+### 4096x4096: NOT SUPPORTED (Model Limitation)
+
+> **IMPORTANT:** FLUX.2-klein does NOT support 4096x4096 generation. This is a fundamental
+> model limitation, NOT a hardware constraint. The model produces noise/gray images at 4K
+> on ALL devices, including NVIDIA H100.
+
+**Root cause:** The FLUX.2-klein model specification defines `max_area=4194304` (4 megapixels),
+which caps the maximum supported resolution at 2048x2048. Generating beyond this limit
+produces degenerate output regardless of hardware.
+
+This was confirmed on both Neuron (trn2) and GPU (H100) — 4K produces noise/gray on both.
+The limitation is architectural (likely in the RoPE positional encoding and training
+distribution), not a compilation or memory issue.
+
+**Maximum supported resolution: 2048x2048.**
+
 ## Usage
 
 ```python
@@ -97,10 +133,11 @@ result.images[0].save("output.png")
 
 ## Compatibility Matrix
 
-| Instance | SDK 2.29 | SDK 2.28 |
-|----------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | Validated | Not tested |
-| trn2.48xlarge (TP=4, LNC=2) | Not tested | Not tested |
+| Instance | Resolution | SDK 2.29 | SDK 2.30 |
+|----------|-----------|----------|----------|
+| trn2.3xlarge (TP=4, LNC=2) | 1024x1024 | VALIDATED | Not tested |
+| trn2.3xlarge (TP=4, LNC=2) | 2048x2048 | VALIDATED | Not tested |
+| Any | 4096x4096 | **Not supported (model limitation)** | N/A |
 
 ## Example Checkpoints
 
