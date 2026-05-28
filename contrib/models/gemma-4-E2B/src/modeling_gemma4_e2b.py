@@ -59,6 +59,7 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseModel,
 )
 from neuronx_distributed_inference.modules.attention.attention_base import (
+    FlashAttentionStrategy,
     NeuronAttentionBase,
     move_heads_front,
 )
@@ -110,6 +111,14 @@ from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
     KVCacheManager,
 )
 from neuronx_distributed_inference.modules.kvcache.utils import get_kv_shapes
+
+# NKI flash attention kernel for head_dim=256 SWA layers
+try:
+    from nki_flash_attn_d256_swa import flash_attn_d256_swa as _nki_flash_attn_d256_swa
+
+    _HAS_NKI_SWA_KERNEL = True
+except ImportError:
+    _HAS_NKI_SWA_KERNEL = False
 
 
 # ====================================================================================
@@ -494,7 +503,9 @@ class Gemma4E2BInferenceConfig(InferenceConfig):
         # Pre-load layer_scalar values from checkpoint for baking into trace.
         # These get set as register_buffer in decoder layers (NOT nn.Parameter),
         # so they must be available at model construction time.
-        self._layer_scalar_values = None  # Will be populated below if model path available
+        self._layer_scalar_values = (
+            None  # Will be populated below if model path available
+        )
 
         self.add_derived_config()
         self.validate_config()
@@ -531,8 +542,9 @@ def get_updated_configs(config: Gemma4E2BInferenceConfig):
 
     Each layer also gets its own intermediate_size from config.layer_intermediate_sizes.
 
-    NKI flash attention kernel limit is head_dim=128, so both layer types
-    must use decomposed attention (attn_kernel_enabled=False).
+    NKI flash attention: SWA layers (head_dim=256) use a custom d=256 NKI kernel
+    with sliding window mask. Global layers (head_dim=512) use decomposed attention
+    (attn_kernel_enabled=False) since no d=512 kernel exists yet.
     """
     updated_configs = []
 
@@ -568,7 +580,10 @@ def get_updated_configs(config: Gemma4E2BInferenceConfig):
             )
 
         # Layer scalar value (baked as buffer during trace)
-        if hasattr(config, '_layer_scalar_values') and config._layer_scalar_values is not None:
+        if (
+            hasattr(config, "_layer_scalar_values")
+            and config._layer_scalar_values is not None
+        ):
             layer_config._layer_scalar = config._layer_scalar_values[i]
         else:
             layer_config._layer_scalar = 1.0  # fallback (will produce wrong results)
@@ -581,7 +596,7 @@ def get_updated_configs(config: Gemma4E2BInferenceConfig):
 def _load_layer_scalar_values(model_path: str, num_layers: int):
     """
     Load layer_scalar values from the model checkpoint.
-    
+
     Called during model construction to provide layer_scalar values for
     register_buffer (baked as constants during trace). This is necessary
     because NxDI's shard_children() only loads parameters for supported
@@ -590,17 +605,18 @@ def _load_layer_scalar_values(model_path: str, num_layers: int):
     """
     import os
     from safetensors import safe_open
-    
+
     safetensors_path = os.path.join(model_path, "model.safetensors")
     if not os.path.exists(safetensors_path):
         # Try index file
         import glob
+
         shard_files = sorted(glob.glob(os.path.join(model_path, "model-*.safetensors")))
         if not shard_files:
             return [1.0] * num_layers  # fallback
-    
+
     values = [1.0] * num_layers
-    
+
     if os.path.exists(safetensors_path):
         with safe_open(safetensors_path, framework="pt") as f:
             for i in range(num_layers):
@@ -615,7 +631,7 @@ def _load_layer_scalar_values(model_path: str, num_layers: int):
                     key = f"model.language_model.layers.{i}.layer_scalar"
                     if key in f.keys():
                         values[i] = f.get_tensor(key).item()
-    
+
     return values
 
 
@@ -763,6 +779,68 @@ class NeuronGemma4E2BAttention(NeuronAttentionBase):
     # forward() is inherited from NeuronAttentionBase -- no override needed.
     # E2B DOES have v_norm (scale-free RMSNorm on V). Applied in prep_qkv_tensors.
 
+    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
+        """Override to use custom NKI flash attention for SWA layers (head_dim=256).
+
+        The standard NxDI NKI kernel is limited to head_dim<=128. For SWA layers
+        with head_dim=256, we use our custom d=256 kernel with sliding window mask.
+
+        For global layers (head_dim=512) or when the kernel is unavailable, falls
+        back to decomposed attention (softmax path).
+
+        Input layout: Q (B, H, S, D), K (B, Hkv, S, D), V (B, Hkv, S, D) — BHSD
+        Output layout: (B, H, S, D) — BHSD, with FlashAttentionStrategy.NONE
+        """
+        # Only use NKI kernel for SWA layers with head_dim=256 and sufficient seq_len
+        if (
+            _HAS_NKI_SWA_KERNEL
+            and self._is_sliding
+            and self._head_dim == 256
+            and q_len >= 128  # minimum tile size
+        ):
+            # Q: (B, H, S, 256), K: (B, 1, S, 256), V: (B, 1, S, 256)
+            q_kernel = Q.to(self.torch_dtype)
+            k_kernel = K.to(self.torch_dtype)
+            v_kernel = V.to(self.torch_dtype)
+
+            n_kv_heads = K.shape[1]
+            n_q_heads = Q.shape[1]
+            q_h_per_kv = n_q_heads // n_kv_heads
+            window_size = 512  # E2B SWA window size
+
+            # Process per (batch, kv_head) — kernel handles one KV head at a time
+            out_parts = []
+            for b in range(bsz):
+                for kv_h in range(n_kv_heads):
+                    q_slice = q_kernel[
+                        b : b + 1, kv_h * q_h_per_kv : (kv_h + 1) * q_h_per_kv, :, :
+                    ]
+                    k_slice = k_kernel[b : b + 1, kv_h : kv_h + 1, :, :]
+                    v_slice = v_kernel[b : b + 1, kv_h : kv_h + 1, :, :]
+                    o_part = _nki_flash_attn_d256_swa(
+                        q_slice,
+                        k_slice,
+                        v_slice,
+                        q_h_per_k_h=q_h_per_kv,
+                        n_kv_heads=1,
+                        seqlen_q=q_len,
+                        seqlen_kv=q_len,
+                        window_size=window_size,
+                    )
+                    out_parts.append(o_part)
+
+            # Reassemble: each o_part is (1, q_h_per_kv, S, D)
+            attn_output = torch.cat(out_parts, dim=1)  # (1, total_heads, S, D)
+            if bsz > 1:
+                # Stack batch dimension properly
+                attn_output = attn_output.reshape(bsz, n_q_heads, q_len, self._head_dim)
+
+            # Return BHSD with NONE strategy — caller transposes to BSHD
+            return attn_output, FlashAttentionStrategy.NONE
+
+        # Fallback: decomposed attention (global layers or kernel unavailable)
+        return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+
     def prep_qkv_tensors(
         self,
         position_ids,
@@ -847,7 +925,9 @@ class NeuronGemma4E2BAttention(NeuronAttentionBase):
         # Apply v_norm (scale-free RMSNorm): V / RMS(V)
         # V is in BHSD layout at this point
         V_float = V.float()
-        V_normed = V_float * torch.rsqrt(V_float.pow(2).mean(-1, keepdim=True) + self._v_norm_eps)
+        V_normed = V_float * torch.rsqrt(
+            V_float.pow(2).mean(-1, keepdim=True) + self._v_norm_eps
+        )
         V = V_normed.type_as(V)
 
         return Q, K, V, cos_cache, sin_cache, residual
@@ -977,7 +1057,7 @@ class NeuronGemma4E2BDecoderLayer(nn.Module):
         # If traced with 1.0, the multiply is eliminated and loading correct values
         # post-trace has no effect. By initializing with the actual value, the
         # compiler preserves the multiply operation in the HLO graph.
-        scalar_value = getattr(config, '_layer_scalar', 1.0)
+        scalar_value = getattr(config, "_layer_scalar", 1.0)
         self.layer_scalar = nn.Parameter(
             torch.tensor([scalar_value], dtype=torch.float32), requires_grad=False
         )
@@ -1224,7 +1304,7 @@ class NeuronGemma4E2BTextModel(NeuronBaseModel):
         # Pre-load layer_scalar values from checkpoint into config.
         # These are baked as register_buffer constants during trace.
         if config._layer_scalar_values is None:
-            model_path = getattr(config, '_name_or_path', None)
+            model_path = getattr(config, "_name_or_path", None)
             if model_path:
                 config._layer_scalar_values = _load_layer_scalar_values(
                     model_path, config.num_hidden_layers
