@@ -53,6 +53,7 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseModel,
 )
 from neuronx_distributed_inference.modules.attention.attention_base import (
+    FlashAttentionStrategy,
     NeuronAttentionBase,
 )
 from neuronx_distributed_inference.modules.attention.utils import (
@@ -67,6 +68,14 @@ from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
     KVCacheManager,
 )
 from neuronx_distributed_inference.modules.kvcache.utils import get_kv_shapes
+
+# NKI flash attention kernel for head_dim=256 SWA layers
+try:
+    from nki_flash_attn_d256_swa import flash_attn_d256_swa as _nki_flash_attn_d256_swa
+
+    _HAS_NKI_SWA_KERNEL = True
+except ImportError:
+    _HAS_NKI_SWA_KERNEL = False
 
 
 # ====================================================================================
@@ -326,8 +335,9 @@ def get_updated_configs(config: Gemma4InferenceConfig):
     SWA layers: head_dim=256, num_key_value_heads=16, sliding_window=1024
     Global layers: head_dim=512, num_key_value_heads=4, sliding_window=None, attention_k_eq_v=True
 
-    NKI flash attention kernel limit is head_dim=128, so both layer types
-    must use decomposed attention (attn_kernel_enabled=False).
+    NKI flash attention: SWA layers (head_dim=256) use a custom d=256 NKI kernel
+    with sliding window mask (window=1024). Global layers (head_dim=512) use
+    decomposed attention (attn_kernel_enabled=False).
     """
     updated_configs = []
 
@@ -470,6 +480,61 @@ class NeuronGemma4Attention(NeuronAttentionBase):
 
     # forward() is inherited from NeuronAttentionBase -- no override needed.
     # The v_norm injection happens in prep_qkv_tensors below.
+
+    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
+        """Override to use custom NKI flash attention for SWA layers (head_dim=256).
+
+        The standard NxDI NKI kernel is limited to head_dim<=128. For SWA layers
+        with head_dim=256, we use our custom d=256 kernel with sliding window mask.
+
+        For global layers (head_dim=512), falls back to decomposed attention.
+
+        Input layout: Q (B, H, S, D), K (B, Hkv, S, D), V (B, Hkv, S, D) -- BHSD
+        Output layout: (B, H, S, D) -- BHSD, with FlashAttentionStrategy.NONE
+        """
+        if (
+            _HAS_NKI_SWA_KERNEL
+            and self._is_sliding
+            and self._head_dim == 256
+            and q_len >= 128
+        ):
+            q_kernel = Q.to(self.torch_dtype)
+            k_kernel = K.to(self.torch_dtype)
+            v_kernel = V.to(self.torch_dtype)
+
+            n_kv_heads = K.shape[1]
+            n_q_heads = Q.shape[1]
+            q_h_per_kv = n_q_heads // n_kv_heads
+            window_size = 1024  # 31B SWA window size
+
+            out_parts = []
+            for b in range(bsz):
+                for kv_h in range(n_kv_heads):
+                    q_slice = q_kernel[
+                        b : b + 1, kv_h * q_h_per_kv : (kv_h + 1) * q_h_per_kv, :, :
+                    ]
+                    k_slice = k_kernel[b : b + 1, kv_h : kv_h + 1, :, :]
+                    v_slice = v_kernel[b : b + 1, kv_h : kv_h + 1, :, :]
+                    o_part = _nki_flash_attn_d256_swa(
+                        q_slice,
+                        k_slice,
+                        v_slice,
+                        q_h_per_k_h=q_h_per_kv,
+                        n_kv_heads=1,
+                        seqlen_q=q_len,
+                        seqlen_kv=q_len,
+                        window_size=window_size,
+                    )
+                    out_parts.append(o_part)
+
+            attn_output = torch.cat(out_parts, dim=1)
+            if bsz > 1:
+                attn_output = attn_output.reshape(bsz, n_q_heads, q_len, self._head_dim)
+
+            return attn_output, FlashAttentionStrategy.NONE
+
+        # Fallback: decomposed attention (global layers or kernel unavailable)
+        return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
 
     def prep_qkv_tensors(
         self,
