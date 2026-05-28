@@ -415,7 +415,8 @@ class NeuronApplicationBase(torch.nn.Module):
         self.traced_model.nxd_model.initialize(weights, start_rank_tensor)
 
         if self.neuron_config.lora_config and self.neuron_config.lora_config.dynamic_multi_lora:
-            self.lora_model_manager.init_dynamic_multi_lora(lora_cpu_weights)
+            cte_model = self.get_cte_model()
+            self.lora_model_manager.init_dynamic_multi_lora(lora_cpu_weights, cte_model)
 
         logger.info(f"Finished weights loading in {time.monotonic() - start_time} seconds")
 

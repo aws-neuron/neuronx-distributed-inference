@@ -197,13 +197,17 @@ jobs:
 
       - name: Apply labels to issue
         if: steps.analyze_content.outputs.has_labels == 'true'
+        uses: actions/github-script@v7
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          REPO: ${{ github.repository }}
           LABELS: ${{ steps.analyze_content.outputs.labels }}
-        run: |
-          IFS=',' read -ra LABEL_ARRAY <<< "$LABELS"
-          for label in "${LABEL_ARRAY[@]}"; do
-            gh issue edit "$ISSUE_NUMBER" --add-label "$label" -R "$REPO"
-          done
+        with:
+          script: |
+            const labels = process.env.LABELS.split(',').filter(l => l.trim());
+            if (labels.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: labels
+              });
+            }
