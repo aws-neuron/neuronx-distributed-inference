@@ -20,7 +20,29 @@ NeuronX Distributed Inference implementation of Google's Gemma 4 E2B (Everything
 - Double-wide MLP: layers 15-34 have intermediate_size=12288 (2x the 6144 of layers 0-14)
 - QK normalization via RMSNorm (standard weight scaling)
 - Final logit softcapping: `30 * tanh(logits / 30)`
-- No v_norm, no attention_k_eq_v (unlike the 31B variant)
+- No attention_k_eq_v (unlike the 31B variant)
+- V normalization (scale-free RMSNorm, `with_scale=False`) on all non-shared layers
+
+### NKI Flash Attention Kernel (SWA layers)
+
+A custom NKI kernel (`nki_flash_attn_d256_swa.py`) accelerates the CTE prefill phase for SWA layers (head_dim=256). The standard NxDI flash attention kernel is limited to head_dim<=128.
+
+- **Architecture**: 2x128 QK tiling, sliding window mask via dual `affine_select`, tile-skip optimization
+- **Activation**: Automatic for SWA layers when `seq_len >= 128` (via `perform_prefill` override)
+- **Correctness**: cosine > 0.999 vs CPU reference at all tested sequence lengths
+- **Tested up to**: seq_len=16384 (128 Q groups, 48ms latency, window=512)
+
+| seq_len | Latency (per KV head, GQA 8:1) |
+|---------|-------------------------------|
+| 128 | 0.81 ms |
+| 512 | 0.71 ms |
+| 1024 | 0.75 ms |
+| 2048 | 1.59 ms |
+| 4096 | 5.46 ms |
+| 8192 | 13.30 ms |
+| 16384 | 48.02 ms |
+
+Global layers (head_dim=512) continue using decomposed attention.
 
 ### Vision Encoder
 - 16 layers, hidden_size=768, 12 attention heads, head_dim=64
@@ -52,13 +74,9 @@ NeuronX Distributed Inference implementation of Google's Gemma 4 E2B (Everything
 
 ## Known Limitations
 
-### VLM Compilation Blocked by NCC_ITEN404
-
-The vision-language model (VLM) pipeline is architecturally complete but cannot currently be compiled due to an internal compiler error (`NCC_ITEN404`) in `neuronx-cc` 2.23. The error occurs during the `TensorInitialization` pass when compiling the context encoding (CTE) NEFF with vision inputs.
-
-- **Text-only inference works correctly** -- compile and run without vision inputs
-- **VLM code is included** (`modeling_gemma4_e2b_vlm.py`, `modeling_gemma4_vision.py`) and ready for testing once the compiler issue is resolved
-- The same vision encoder architecture compiles and runs successfully on the Gemma4-31B variant
+- **SDK 2.29/2.29.1**: CTE compilation fails with NCC_INLA001 (neuronx-cc 2.24.x regression). Use SDK 2.30+.
+- **Global attention NKI kernel**: No custom kernel for head_dim=512 global layers yet; these use decomposed attention.
+- **NKI kernel compile time**: Increases with sequence length due to loop unrolling (16K takes ~200s first compile, cached thereafter).
 
 ## Usage
 
@@ -148,10 +166,12 @@ model.load(compiled_path)
 
 ## Compatibility Matrix
 
-| Instance/Version | SDK 2.28+ | SDK 2.27 |
-|------------------|-----------|----------|
-| Trn2 (text-only) | PASS | Not tested |
-| Trn2 (VLM) | Blocked (NCC_ITEN404) | Blocked (NCC_EVRF023) |
+| Instance/Version | SDK 2.30 | SDK 2.29/2.29.1 | SDK 2.28 |
+|------------------|----------|-----------------|----------|
+| Trn2 (text-only) | PASS | FAIL (NCC_INLA001) | PASS |
+| Trn2 (VLM) | PASS | FAIL | Blocked (NCC_ITEN404) |
+
+**Minimum SDK**: 2.30 (neuronx-cc 2.25+). SDK 2.29.x has a compiler regression (NCC_INLA001) that prevents CTE compilation.
 
 ## File Structure
 
@@ -160,9 +180,10 @@ gemma-4-E2B/
 ├── README.md
 ├── src/
 │   ├── __init__.py                     # Text + VLM exports
-│   ├── modeling_gemma4_e2b.py          # Text decoder (~1750 lines)
+│   ├── modeling_gemma4_e2b.py          # Text decoder (~1900 lines)
 │   ├── modeling_gemma4_e2b_vlm.py      # VLM wrapper (~857 lines)
 │   ├── modeling_gemma4_vision.py       # Vision encoder (~770 lines)
+│   ├── nki_flash_attn_d256_swa.py     # NKI flash attention kernel (d=256, SWA)
 │   └── ndxi_patch.py                  # NxDI compatibility patches
 └── test/
     └── integration/
@@ -192,4 +213,4 @@ python3 test/integration/test_model.py
 
 Community contribution
 
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-05-28
