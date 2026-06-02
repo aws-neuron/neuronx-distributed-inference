@@ -2,12 +2,14 @@
 
 NeuronX adaptation of [alibaba-pai/Qwen-Image-Edit-2509](https://huggingface.co/alibaba-pai/Qwen-Image-Edit-2509) for AWS Trainium2 inference.
 
-> **Latency-optimized config (recommended):** TP=4 × CP=4 (world=16) + WLO runs the
-> 896×1184 / 8-step / CFG=1 virtual try-on at **~4.5 s end-to-end on trn2.48xlarge**, beating
-> the H100 vLLM-Omni reference (4.99 s), lossless. See [`OPTIMIZATION.md`](OPTIMIZATION.md) for
-> the full optimization writeup (VAE batched-tile, bf16 TP all-reduce, WLO, CP scaling — each
-> with measured latency deltas) and [`release_v3cp4_wlo/`](release_v3cp4_wlo/) for the
-> ready-to-run production config (compile / run / quality-test scripts + sample outputs).
+> **Latency-optimized config (recommended for few-step / CFG=1):** TP=4 × CP=4 (world=16) +
+> WLO runs the 896×1184 / 8-step / **CFG=1** virtual try-on (few-step distillation–finetuned
+> checkpoint) at **~4.5 s end-to-end on trn2.48xlarge**, beating the H100 vLLM-Omni reference
+> (4.99 s), lossless. This regime is what the optimizations target — with CFG=1 a single
+> forward per step makes Context Parallel the right lever; for CFG>1 use the V3 CFG (DP=2) path
+> instead. See [`OPTIMIZATION.md`](OPTIMIZATION.md) for the full writeup (VAE batched-tile,
+> bf16 TP all-reduce, WLO, CP scaling — each with measured latency deltas) and
+> [`release_v3cp4_wlo/`](release_v3cp4_wlo/) for the ready-to-run production config.
 
 ## Model Information
 
