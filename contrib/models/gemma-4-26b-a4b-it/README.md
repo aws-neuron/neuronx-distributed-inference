@@ -82,6 +82,46 @@ MoE compile requires `--internal-hlo2tensorizer-options='--verify-hlo=false'`
 | Throughput | 114 tok/s |
 | Status | **PASS** (coherence smoke; greedy + base-style continuation, no chat template) |
 
+### Stage 5 — Canonical Gemma-4 chat validation (added 2026-06-03)
+
+Replaces the Stage 3 "smoke only" caveat with full canonical validation
+following the official HF Gemma-4 pattern: `processor.apply_chat_template`
+(both `enable_thinking=False` and `=True`) plus `processor.parse_response`.
+
+Compared the Trainium 2 port head-to-head against `Gemma4ForConditionalGeneration`
+on CPU bf16 (transformers 5.10.0.dev0). 3 prompts × {greedy, sampled} × {thinking off, on}.
+
+| prompt | thinking | greedy | sampled |
+|---|---|---|---|
+| `Write a short joke about saving RAM.` | off | **16/16 (100%)** | 16/16 (100%) |
+| `Write a short joke about saving RAM.` | on  | **16/16 (100%)** | 16/16 (100%) |
+| `What is the capital of France?`       | off | **9/9 (100%)** EOS | 9/9 (100%) EOS |
+| `What is the capital of France?`       | on  | **16/16 (100%)** | 14/16 (87.5%) |
+| `Explain quantum entanglement in two sentences.` | off | **16/16 (100%)** | 16/16 (100%) |
+| `Explain quantum entanglement in two sentences.` | on  | **16/16 (100%)** | 16/16 (100%) |
+
+Match = first-16-tokens equal vs HF CPU bf16 reference. **11/12 cases at
+100%; the lone 87.5% is sampling RNG divergence (different framework on
+each backend with the same seed) — greedy at the same setup is 100%.**
+
+`enable_thinking=True` exercises the full multi-channel response path
+(`<|channel>thought\n...<channel|>`) through the MoE router. Both backends
+emit identical tokens and `parse_response` returns the same
+`{role, thinking, content}` dict, e.g.:
+
+```python
+{'role': 'assistant',
+ 'thinking': 'The user is asking for the capital of France.\n'
+             'The capital of France is Paris.\nState the answer clearly.',
+ 'content':  'The capital of France is **Paris**.'}
+```
+
+Latency on Trainium 2 (TP=8, BF16, seq=256): TTFT ~303 ms, TPOT ~8.3 ms
+(~120 tok/s greedy). See
+[`agent_artifacts/round4/STAGE5_CANONICAL_VALIDATION.md`](https://github.com/xniwangaws/NeuronStuff/blob/main/gemma4-port-26b-a4b/agent_artifacts/round4/STAGE5_CANONICAL_VALIDATION.md)
+on the upstream reference repo for full output, raw JSON, and
+comparator script.
+
 ## What was reused from existing NxDI
 
 - `NeuronAttentionBase` — Q/K/V/o projections, KV cache, GQA sharding, mask
@@ -124,9 +164,10 @@ MoE compile requires `--internal-hlo2tensorizer-options='--verify-hlo=false'`
 
 ## Open issues / known limitations
 
-- **Smoke-test only**: greedy + no chat template ⇒ Stage 3 output repeats.
-  Token-match accuracy vs HF reference still pending (sampling +
-  chat-formatted prompts).
+- **Validated as of Stage 5** (2026-06-03): canonical chat (`apply_chat_template` + `parse_response`,
+  including `enable_thinking={False,True}`) matches HF CPU bf16 at 100% token agreement
+  for 11/12 greedy/sample combos (the 12th is sampling RNG divergence; greedy is 100%).
+  See Stage 5 above.
 - **AutoTokenizer fix**: HF transformers ≤ 4.45 trips on gemma-4's
   special-tokens list-vs-dict shape; `scripts/smoke_inference.py` falls
   back to the raw `tokenizers` Rust backend.
