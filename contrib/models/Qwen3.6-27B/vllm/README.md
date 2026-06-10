@@ -4,8 +4,10 @@ This folder contains the first-pass vLLM integration helpers for the
 Qwen3.6-27B contrib model.
 
 The current goal is **vLLM serving through the Neuron/NxDI plugin** for the
-validated Qwen3.6 artifact, including long prompts through vLLM's native
-chunked-prefill scheduler.
+validated coherent Qwen3.6 artifact. The validated fast long-context path uses
+the compiled Neuron-native chunking contract captured in the artifact config;
+the launcher should mirror that contract instead of relying on generic vLLM
+chunk slicing.
 
 ## Which vLLM Neuron Package?
 
@@ -136,71 +138,37 @@ contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --port 8000
 ```
 
-Precompiled artifact path:
+Current 256K precompiled artifact path:
 
 ```bash
 contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
-  --max-model-len 131072 \
-  --seq-len 131072 \
-  --cte-buckets 128,256,512 \
-  --port 8000
-```
-
-Cold-prefill bucket waste is the first performance target. CTE buckets must stay
-128-aligned because the fused DeltaNet CTE path operates in 128-token chunks.
-Use one of the explicit profiles when compiling artifacts:
-
-```bash
-# Short-prompt latency
---cte-bucket-profile short     # [128,256,512,1024]
-
-# General production
---cte-bucket-profile general   # [256,512,1024,2048]
-
-# Long-context artifact
---cte-bucket-profile long      # [4096,8192,16384,32768]
-
-# 262K load experiment
---cte-bucket-profile 262k      # [256]
-```
-
-`--cold-zero-conv-fast-path` is only for a cold-only CTE artifact whose suffix
-prefill always starts at position 0. Leave it disabled for APC or partial-prefix
-serving because restored GDN conv state must be consumed exactly.
-
-Long-prompt precompiled artifact path:
-
-```bash
-contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
-  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
-  --max-model-len 131072 \
-  --seq-len 131072 \
-  --cte-buckets 256,512 \
+  --compiled-artifacts /mnt/trainium_artifacts/qwen_artifacts/qwen36_256k_fp8_loadfix_lmheadbf16_gatesbf16_kvbf16_qkvnki_segmented_cte512_gdnseg512_cte2048_pfx256k_pa1025_slots64_20260608T195113Z_256k_loadfix_segcte2048_chatfix_hostsampling_kkt_hier_scan7 \
+  --max-model-len 262144 \
+  --seq-len 262144 \
+  --cte-bucket 2048 \
   --block-size 256 \
-  --enable-vllm-chunked-prefill \
+  --num-gpu-blocks-override 1024 \
   --port 8000
 ```
 
-Native vLLM prefix-cache experiment:
+Prefix-cache experiment:
 
 ```bash
 contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
-  --max-model-len 131072 \
-  --seq-len 131072 \
-  --cte-buckets 256,512 \
-  --block-size 128 \
-  --enable-vllm-chunked-prefill \
+  --compiled-artifacts /mnt/trainium_artifacts/qwen_artifacts/qwen36_256k_fp8_loadfix_lmheadbf16_gatesbf16_kvbf16_qkvnki_segmented_cte512_gdnseg512_cte2048_pfx256k_pa1025_slots64_20260608T195113Z_256k_loadfix_segcte2048_chatfix_hostsampling_kkt_hier_scan7 \
+  --max-model-len 262144 \
+  --seq-len 262144 \
+  --cte-bucket 2048 \
+  --block-size 256 \
   --enable-prefix-caching \
   --gdn-checkpoint-interval 256 \
   --hybrid-gdn-recurrent-cache-dtype float32 \
   --hybrid-gdn-conv-cache-dtype bfloat16 \
   --mamba-cache-mode all \
   --mamba-ssm-cache-dtype float32 \
+  --num-gpu-blocks-override 1024 \
   --port 8000
 ```
 
@@ -211,32 +179,17 @@ cumulative prefix hash. If native APC does not produce exact greedy matches and
 a clear warm-hit speedup, the next step is a hybrid APC path that restores those
 GDN checkpoints alongside attention KV.
 
-For APC experiments, do not treat `256` as the only block size. It can be useful
-for long-context amortization, but it is coarse for chat-style prefix reuse.
-Run explicit sweeps at `64` and `128`; include `32` when hit granularity matters
-enough to justify possible block-table/layout overhead. Keep the GDN checkpoint
-interval separate from the attention block size.
-
-Immediate Trainium experiments:
-
-```text
-262K TP=4, block_size=256, CTE buckets [256]
-262K TP=4, block_size=128, CTE buckets [256]
-128K TP=4, block_size=128, CTE buckets [256,512]
-128K TP=4, block_size=256, CTE buckets [256,512]
-```
-
 Production chat proxy:
 
 ```bash
 contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
-  --max-model-len 131072 \
-  --seq-len 131072 \
-  --cte-bucket 512 \
+  --compiled-artifacts /mnt/trainium_artifacts/qwen_artifacts/qwen36_256k_fp8_loadfix_lmheadbf16_gatesbf16_kvbf16_qkvnki_segmented_cte512_gdnseg512_cte2048_pfx256k_pa1025_slots64_20260608T195113Z_256k_loadfix_segcte2048_chatfix_hostsampling_kkt_hier_scan7 \
+  --max-model-len 262144 \
+  --seq-len 262144 \
+  --cte-bucket 2048 \
   --block-size 256 \
-  --enable-vllm-chunked-prefill \
+  --num-gpu-blocks-override 1024 \
   --port 8001
 ```
 
@@ -265,12 +218,11 @@ Offline long-prompt smoke:
 ```bash
 python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
-  --max-model-len 131072 \
-  --seq-len 131072 \
-  --cte-bucket 512 \
+  --compiled-artifacts /mnt/trainium_artifacts/qwen_artifacts/qwen36_256k_fp8_loadfix_lmheadbf16_gatesbf16_kvbf16_qkvnki_segmented_cte512_gdnseg512_cte2048_pfx256k_pa1025_slots64_20260608T195113Z_256k_loadfix_segcte2048_chatfix_hostsampling_kkt_hier_scan7 \
+  --max-model-len 262144 \
+  --seq-len 262144 \
+  --cte-bucket 2048 \
   --block-size 256 \
-  --enable-vllm-chunked-prefill \
   --chat \
   --prompt "$(python - <<'PY'
 print('Summarize this document in one paragraph. ' + 'Neuron inference ' * 700)
@@ -278,206 +230,45 @@ PY
 )"
 ```
 
-Offline token-exact prefix-cache validation:
+Optional Hybrid APC validation should be artifact-specific. The acceptance gate
+is strict: repeated greedy calls must produce identical output, warm-hit latency
+should be materially lower than cold-fill latency, and GDN recurrent/conv state
+must be proven exact alongside attention KV cache hits. Attention-only prefix
+cache hits are not sufficient for this hybrid model.
 
-```bash
-python validation_scripts/qwen36_vllm_prefix_cache_offline.py \
-  --repo-root /home/ubuntu/inferentia-gdn \
-  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
-  --max-model-len 131072 \
-  --seq-len 131072 \
-  --cte-bucket 512 \
-  --block-size 128 \
-  --enable-vllm-chunked-prefill \
-  --mamba-cache-mode all
-```
+Current validation run on Trn2 with the 256K loadfix artifact:
 
-Offline partial-prefix validation:
-
-```bash
-python validation_scripts/qwen36_vllm_prefix_cache_partial_offline.py \
-  --repo-root /home/ubuntu/inferentia-gdn \
-  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
-  --max-model-len 131072 \
-  --seq-len 131072 \
-  --cte-bucket 512 \
-  --block-size 128 \
-  --enable-vllm-chunked-prefill \
-  --mamba-cache-mode all
-```
-
-Server-side prefix-cache validation through the guarded proxy:
-
-```bash
-python validation_scripts/qwen36_prefix_cache_validation.py \
-  --base-url http://127.0.0.1:8000 \
-  --model qwen3.6-27b-neuron-128k-fp8-mlp
-```
-
-The acceptance gate is strict: repeated greedy calls must produce identical
-output, and warm-hit latency should be materially lower than cold-fill latency.
-For hybrid Qwen3.6, prefix-cache validation is not complete until the GDN
-recurrent/conv state behavior is proven, not just attention KV cache hits.
-
-Hybrid APC exactness and HBM harness:
-
-```bash
-python validation_scripts/qwen36_hybrid_apc_validation.py exactness \
-  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_hybrid_apc \
-  --seq-len 2048 \
-  --cte-buckets 256,512 \
-  --block-size 256 \
-  --gdn-checkpoint-interval 256 \
-  --enable-vllm-chunked-prefill
-
-python validation_scripts/qwen36_hybrid_apc_validation.py hbm \
-  --context-lens 131072 262144 \
-  --checkpoint-intervals 128 256 512
-```
-
-Native APC validation run on Trn2 with the FP8 128K artifact:
-
-- server exact-repeat, `~10.8K` prompt tokens: `26.68s` cold to `1.67s` warm,
-  `16.0x` speedup, exact greedy text match;
-- offline exact-repeat, token IDs exposed: `26.19s` cold to `2.38s` warm,
-  `11.0x` speedup, exact greedy token-ID match;
-- offline partial-prefix reuse, token IDs exposed: `25.52s` no-cache target to
-  `1.70s` APC target after a different shared-prefix warmup request, `15.0x`
-  speedup, exact greedy token-ID match.
-- server hardening, exact repeat: `25.38s` cold to `1.55s` warm, `16.35x`
-  speedup, exact text match;
-- server hardening, cross-prefix reuse after unrelated prefix: `25.17s` cold to
-  `1.36s` warm, exact text match;
-- shared-prefix concurrency at 1/2/4 requests returned all requested markers
-  exactly; the artifact still queues because it is compiled for `max_num_seqs=1`.
-
-Validation run on Trn2 with the FP8 128K artifact:
-
-- state-reset artifact: `/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1`;
-- OpenAI-compatible `/v1/chat/completions` behind the proxy passes focused
-  quality checks without callers passing `chat_template_kwargs`;
-- repeated short-after-long validation passes after 32K and 64K requests,
-  confirming DeltaNet recurrent/conv state is reset for new requests;
-- 32K and 64K needle retrieval prompts return all expected codes;
-- measured prefill is `404-428 tok/s` from 512 through 64K prompt tokens;
-- measured decode is `26.3-26.6 tok/s`;
-- peak Neuron device memory is about `53.25 GB` decimal for the 64K eval.
+- 16K native-chunk run: `16,374` prompt tokens, `6.8379s` TTFT,
+  `2,394.6 tok/s` usage-accounted, `pass=true`, thinking enabled.
+- Long-context native-chunk run: `242,864` `usage.prompt_tokens`, `235.9819s`
+  TTFT, `1,029.2 tok/s` usage-accounted, `pass=true`, thinking enabled.
+- The same long-context run has tokenizer-estimated prompt length `253,899`,
+  which gives `1,075.9 tok/s`; keep that separate from usage-accounted
+  throughput.
+- `log_scan_empty.txt` contains no invalid-token, fallback, NaN, NRT, or
+  traceback markers.
 
 Raw `/v1/completions` prompts are not chat-templated and can pollute the hybrid
 state if sent directly to the backend. Keep the backend private and expose the
 proxy on the public port for production calls.
-
-4K BF16 Hybrid APC boundary/server probes:
-
-```bash
-# Artifact/config audit before spending a Trn2 run. This flags oversized PA
-# blocks, low block headroom, strict-gate boundary pressure, and nki_chunked CTE.
-python validation_scripts/qwen36_artifact_config_audit.py \
-  /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_4096_bf16_hybrid_apc_nki_chunked_prefix4096_ctx2_tkg2_r7i_20260520T082342Z \
-  --compile-log /home/ubuntu/validation_logs/hybrid_apc_real_tokens/qwen36_4k_bf16_hybrid_apc_nki_chunked_prefix4096_20260520T082342Z_compile.log
-
-# Boundary-aligned APC proof. Run this directly against vLLM or a proxy started
-# with --allow-completions because exact token-ID prompt lengths are required.
-python validation_scripts/qwen36_openai_boundary_apc_probe.py \
-  --base-url http://127.0.0.1:8000 \
-  --model-path /home/ubuntu/models/Qwen3.6-27B \
-  --lengths 256,512,1024,2048,4096 \
-  --repeats 3 \
-  --require-prefix-cache-query \
-  --output-jsonl /home/ubuntu/validation_logs/hybrid_apc_real_tokens/boundary_apc_probe.jsonl
-
-# Cold prefill ctx-batch utilization check. Compare --concurrency 1 and 2 with
-# --unique-per-request to avoid warm-cache reuse.
-python validation_scripts/qwen36_chat_completion_context_bench.py \
-  --base-url http://127.0.0.1:8000 \
-  --model /home/ubuntu/models/Qwen3.6-27B \
-  --model-path /home/ubuntu/models/Qwen3.6-27B \
-  --lengths 4096 \
-  --turns 8 \
-  --repeats 3 \
-  --concurrency 2 \
-  --unique-per-request \
-  --no-stream \
-  --output-json /home/ubuntu/validation_logs/hybrid_apc_real_tokens/chat_4k_concurrency2.json
-```
-
-4K BF16 compile controls for the current investigation:
-
-```bash
-# Single-request cold-prefill latency control: smaller PA blocks, usable block
-# headroom, and fused DeltaNet CTE. Use a fresh compiled path and workdir.
-python contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
-  --repo-root /home/ubuntu/inferentia-gdn-experimental \
-  --model-path /home/ubuntu/models/Qwen3.6-27B \
-  --compiled-path /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_4096_bf16_hybrid_apc_fused_block32_ctx1 \
-  --base-compile-work-dir /mnt/trainium_artifacts/qwen_artifacts/_work_qwen36_4k_fused_block32_ctx1 \
-  --weight-dtype bf16_control \
-  --seq-len 4096 \
-  --max-context-length 4096 \
-  --cte-buckets 256,512,1024,2048,4096 \
-  --prefix-buckets 4096 \
-  --block-size 32 \
-  --pa-headroom-blocks 64 \
-  --tp-degree 4 \
-  --logical-nc-config 2 \
-  --max-num-seqs 1 \
-  --ctx-batch-size 1 \
-  --skip-warmup \
-  --enable-prefix-caching \
-  --enable-hybrid-apc \
-  --enable-vllm-chunked-prefill \
-  --deltanet-cte-backend fused \
-  --gdn-checkpoint-interval 32 \
-  --max-gdn-checkpoint-slots 160 \
-  --hybrid-apc-require-vllm-metadata \
-  --hybrid-apc-enable-backed-prefix-reads
-```
-
-The `block_size=32` control follows Neuron's prefix-cache performance guidance,
-but it also increases the number of prefix boundaries the strict Hybrid APC gate
-must prove. Without boundary chunk commits, a full 4096-token prompt has 128
-possible attention-hit boundaries at block size 32, so `max_gdn_checkpoint_slots`
-must be sized accordingly or the safe gate will keep skipping APC reads.
 
 ## Offline Smoke
 
 ```bash
 python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
-  --max-model-len 131072 \
-  --seq-len 131072 \
-  --cte-buckets 128,256,512 \
+  --compiled-artifacts /mnt/trainium_artifacts/qwen_artifacts/qwen36_256k_fp8_loadfix_lmheadbf16_gatesbf16_kvbf16_qkvnki_segmented_cte512_gdnseg512_cte2048_pfx256k_pa1025_slots64_20260608T195113Z_256k_loadfix_segcte2048_chatfix_hostsampling_kkt_hier_scan7 \
+  --max-model-len 262144 \
+  --seq-len 262144 \
+  --cte-buckets 2048 \
   --chat \
   --prompt "What is 17 * 23? Answer with the number only."
 ```
 
 ## Next Milestone
 
-For cold-prefill latency, fix bucket waste before speculative decode or cache
-quantization. The serving entrypoints now support multi-bucket CTE artifacts,
-text-only CTE inputs, compact CTE masks, context-batch profiles, and attention
-tile overrides.
-
 For warm-prefix production APC, the required contract remains a unified
 prefix-cache object whose attention KV, GDN recurrent state, and GDN conv state
-are jointly addressable, evictable, restorable, and exact under continuous
-batching.
-
-Recommended order:
-
-1. Dynamic CTE buckets: start with `[128,256,512]` for 2K short-prompt tests,
-   `[256,512]` for 128K, and `[256]` for the 262K TP=4 load experiment.
-2. Fused GDN CTE path validation: qwen chunked-prefill should use fused
-   DeltaNet with restored initial state by default.
-3. Text-only CTE and compact-mask validation: no full dummy vision reductions
-   and no dense 4D causal masks in normal text serving.
-4. Hybrid APC exactness: cold vs warm greedy token IDs, partial-prefix reuse,
-   multi-hit chat history, continuous batching movement, and eviction pressure.
-5. Attention block-size sweeps at `64` and `128`, with `32` included for
-   granularity-sensitive chat workloads.
-6. FP8 KV/cache only after the BF16/FP32 baseline is exact.
-7. MTP/spec decode after recurrent-state rollback semantics are explicit.
+are jointly addressable, evictable, restorable, and exact. Speculation, FP8
+cache variants, resident row-IO experiments, and continuous-batching extensions
+are intentionally outside this baseline contribution.

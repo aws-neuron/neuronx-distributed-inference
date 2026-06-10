@@ -225,7 +225,10 @@ The DeltaNet forward path can be controlled via environment variables:
 
 ## Caveats
 
-1. **BF16 HBM pressure at TP=4:** The pure BF16 model consumes nearly all HBM on trn2.3xlarge. Use the FP8/vLLM path for the validated 128K artifact, or a larger instance for additional batching/headroom.
+1. **HBM pressure at TP=4:** The 27B text decoder is memory-constrained on
+   `trn2.3xlarge`. The current validated long-context path uses selective FP8
+   weights while keeping sensitive KV, LM-head, gate, and GDN state paths in
+   BF16/FP32. Larger instances are recommended for batching/headroom.
 
 2. **SDK 2.29+ required:** The NKI DeltaNet kernels require NKI 0.3.0 (SDK 2.29). No library modifications needed -- runs on stock SDK 2.29 DLAMI (`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/`).
 
@@ -233,7 +236,9 @@ The DeltaNet forward path can be controlled via environment variables:
 
 4. **Vision encoder runs on CPU:** The ViT cannot be placed on Neuron because HBM is fully consumed by the text decoder. This adds ~918ms latency per image. Future optimization: quantize text decoder to free HBM, or use larger instance.
 
-5. **Compilation time:** The short-context BF16 path compiles in roughly 13 minutes. The validated 128K FP8/vLLM artifact takes longer because it includes long-context cache shapes and presharded checkpoints.
+5. **Compilation time:** Long-context artifacts take substantially longer than
+   short smoke artifacts because they include long-context cache shapes,
+   segmented CTE graphs, and presharded checkpoints.
 
 6. **+1 RMSNorm convention:** Qwen3.5/3.6 uses `output = norm(x) * (1 + weight)` for most RMSNorm layers, but DeltaNet internal norms use standard `output = norm(x) * weight`. The weight conversion handles this automatically, but custom weight loading must be aware of both conventions.
 
@@ -245,21 +250,20 @@ The DeltaNet forward path can be controlled via environment variables:
 
 | seq_len | Path | Status | Notes |
 |---------|------|--------|-------|
-| 128 | BF16 NxDI | **PASS** | BF16 baseline/quality checks |
-| 256 | BF16 NxDI | **PASS** | BF16 benchmark bucket |
-| 512 | BF16 NxDI | **PASS** | 4 DeltaNet chunks |
-| 65,536 | FP8/vLLM | **PASS** | chunked prefill, quality, and state-reset validation |
-| 131,072 | FP8/vLLM | **PASS** | compiled and served with 512-token CTE bucket |
+| 16,384 | 256K native-chunk loadfix | **PASS** | 2,394.6 usage-accounted prompt tok/s |
+| 242,864 usage-accounted | 256K native-chunk loadfix | **PASS** | 1,029.2 usage-accounted prompt tok/s |
+| 253,899 estimated | 256K native-chunk loadfix | **PASS** | tokenizer-derived estimate for the same long-context run |
 
-For production long-context serving on trn2.3xlarge, use the FP8/vLLM artifact
-and 512-token context encoding bucket. Larger instances are recommended for
-larger batches or additional serving headroom.
+For production long-context serving on `trn2.3xlarge`, use the validated 256K
+loadfix artifact contract: segmented CTE512, CTE bucket 2048, BF16 KV, BF16 LM
+head, BF16 gates, FP32 GDN recurrent state, BF16 GDN conv state, and host
+sampling.
 
 ## Compatibility Matrix
 
 | Instance | TP | LNC | Status | Notes |
 |----------|-----|-----|--------|-------|
-| trn2.3xlarge | 4 | 2 | **PASS** | BF16 short-context and FP8 128K vLLM/APC validated |
+| trn2.3xlarge | 4 | 2 | **PASS** | 256K native-chunk loadfix validation passed at 16K and long context |
 | trn2.12xlarge | 16 | 2 | Expected PASS | Untested, recommended for batching/headroom |
 
 ### SDK Configuration
