@@ -159,6 +159,12 @@ def generate_buckets_for_cte(inference_config: InferenceConfig):
     if inference_config.neuron_config.is_chunked_prefill:
         return generate_buckets_for_chunked_prefill_cte(inference_config)
 
+    if (
+        inference_config.neuron_config.is_prefix_caching
+        and inference_config.neuron_config.context_encoding_bucket_pairs is not None
+    ):
+        return inference_config.neuron_config.context_encoding_bucket_pairs
+
     if not inference_config.neuron_config.enable_bucketing:
         if inference_config.neuron_config.is_prefix_caching:
             buckets = generate_2d_buckets_for_prefix_caching(

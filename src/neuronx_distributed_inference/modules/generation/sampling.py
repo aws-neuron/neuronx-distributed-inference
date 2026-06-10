@@ -369,23 +369,41 @@ class Sampler(torch.nn.Module):
         counts = torch.sum(greater_than_rand, dim=dim).unsqueeze(dim)
         return counts
 
-    def _argmax_sample(self, token_logits, return_values, dim):
-        if self.neuron_config.on_cpu:
-            return torch.argmax(token_logits, dim=dim)
-        else:
-            # distributed argmax
-            tokens = nxd_argmax(
-                tensor=token_logits,
-                dim=dim,
-                gather_dim=dim,
-                keepdim=False,
-                process_group=self.process_group,
-                disable_argmax_kernel=self.neuron_config.disable_argmax_kernel
-            )
-            values = torch.ones(tokens.shape, dtype=token_logits.dtype, device=tokens.device)
+    def _argmax_sample(
+        self,
+        token_logits,
+        return_values,
+        dim,
+        disable_argmax_kernel_override=None,
+    ):
+        if self.neuron_config.on_cpu or not getattr(
+            self.neuron_config, "vocab_parallel", False
+        ):
+            tokens = torch.argmax(token_logits, dim=dim).to(torch.int32)
             if return_values:
+                values = torch.ones(
+                    tokens.shape, dtype=token_logits.dtype, device=tokens.device
+                )
                 return tokens, values
             return tokens
+
+        # Distributed argmax is only needed when the vocab dimension is sharded.
+        tokens = nxd_argmax(
+            tensor=token_logits,
+            dim=dim,
+            gather_dim=dim,
+            keepdim=False,
+            process_group=self.process_group,
+            disable_argmax_kernel=(
+                self.neuron_config.disable_argmax_kernel
+                if disable_argmax_kernel_override is None
+                else disable_argmax_kernel_override
+            ),
+        )
+        values = torch.ones(tokens.shape, dtype=token_logits.dtype, device=tokens.device)
+        if return_values:
+            return tokens, values
+        return tokens
 
     def _multinomial_sample(self, token_logits, sampling_params, return_values, dim, rank_id):
         batch_size = token_logits.shape[0]
@@ -432,7 +450,14 @@ class Sampler(torch.nn.Module):
         counts = self._multinomial(probs_soft_max, dim)
         return torch.gather(input=top_k_logits_indices, dim=dim, index=counts).flatten()
 
-    def forward(self, token_logits, sampling_params, return_values=False, rank_id=None):
+    def forward(
+        self,
+        token_logits,
+        sampling_params,
+        return_values=False,
+        rank_id=None,
+        disable_argmax_kernel_override=None,
+    ):
         """
         forward to perform topk, topp, temperature and multinomial sampling.
 
@@ -461,7 +486,12 @@ class Sampler(torch.nn.Module):
                 token_logits, sampling_params, return_values, dim, rank_id
             )
         else:
-            return self._argmax_sample(token_logits, return_values, dim)
+            return self._argmax_sample(
+                token_logits,
+                return_values,
+                dim,
+                disable_argmax_kernel_override=disable_argmax_kernel_override,
+            )
 
 
 class DataParallelSampler(Sampler):
@@ -564,9 +594,22 @@ class DataParallelSampler(Sampler):
         sorted_logits = sorted_logits.masked_fill_(mask, self.IGNORED_LOGITS_VALUE)
         return sorted_logits, indices
 
-    def forward(self, token_logits, sampling_params, return_values=False, rank_id=None):
+    def forward(
+        self,
+        token_logits,
+        sampling_params,
+        return_values=False,
+        rank_id=None,
+        disable_argmax_kernel_override=None,
+    ):
         # Override forward to handle final gathering
-        results = super().forward(token_logits, sampling_params, return_values, rank_id)
+        results = super().forward(
+            token_logits,
+            sampling_params,
+            return_values,
+            rank_id,
+            disable_argmax_kernel_override=disable_argmax_kernel_override,
+        )
         if return_values:
             top_k_logits_indices, probs_soft_max = results[0], results[1]
             if self.do_sample or self.dynamic or self.is_medusa:

@@ -131,10 +131,6 @@ class BlockKVCacheManager(KVCacheManager):
     def get_kv_by_layer_id(self, idx, active_block_table, kvcache_buffer=None, **kwargs):
         k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer=kvcache_buffer)
 
-        if self.kv_quant_config:
-            k_cache = self._dequantize_cache(k_cache, idx, is_key=True)
-            v_cache = self._dequantize_cache(v_cache, idx, is_key=False)
-
         if self.is_prefix_caching:
             key_state = self._get_block_cache_and_reshape_bhsd(k_cache, active_block_table)
             value_state = self._get_block_cache_and_reshape_bhsd(v_cache, active_block_table)
@@ -145,7 +141,31 @@ class BlockKVCacheManager(KVCacheManager):
         else:
             raise ValueError("Can't find a proper way to read block KV cache.")
 
+        if self.kv_quant_config:
+            key_state = self._dequantize_cache(key_state, idx, is_key=True)
+            value_state = self._dequantize_cache(value_state, idx, is_key=False)
+
         return key_state, value_state
+
+    @staticmethod
+    def _safe_active_block_table(active_block_table: Tensor, num_blocks: int) -> Tensor:
+        """Map padded/invalid block ids to the reserved padding block."""
+        pad_block_id = torch.full_like(active_block_table, num_blocks - 1)
+        valid_block = torch.logical_and(
+            active_block_table >= 0,
+            active_block_table < num_blocks,
+        )
+        return torch.where(valid_block, active_block_table, pad_block_id)
+
+    def get_raw_kv_by_layer_id(self, idx, kvcache_buffer=None, **kwargs):
+        """Return the block-layout KV cache without flattening through a block table."""
+        k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer=kvcache_buffer)
+
+        if self.kv_quant_config:
+            k_cache = self._dequantize_cache(k_cache, idx, is_key=True)
+            v_cache = self._dequantize_cache(v_cache, idx, is_key=False)
+
+        return k_cache, v_cache
 
     def _get_block_cache_and_reshape_bhsd(self, cache: Tensor, active_block_table: Tensor):
         """
@@ -165,14 +185,27 @@ class BlockKVCacheManager(KVCacheManager):
         batch_size, _ = active_block_table.shape
 
         if self.block_tiling:
-            _, _, num_block_tiles, num_heads_per_rank, head_dimension = cache.shape
+            num_blocks, _, num_block_tiles, num_heads_per_rank, head_dimension = cache.shape
+            active_block_table = self._safe_active_block_table(
+                active_block_table,
+                num_blocks,
+            )
             cache_reshaped = cache.reshape(-1, num_block_tiles, num_heads_per_rank, head_dimension)
             index_array = active_block_table.reshape(-1) * self.block_tiling_factor
-            index_array = index_array.unsqueeze(-1) + torch.arange(self.block_tiling_factor)
+            index_array = index_array.unsqueeze(-1) + torch.arange(
+                self.block_tiling_factor,
+                device=active_block_table.device,
+                dtype=active_block_table.dtype,
+            )
             selected_cache = cache_reshaped.index_select(
                 dim=0, index=index_array.reshape(-1)
             ).reshape(batch_size, -1, num_heads_per_rank, head_dimension)
         else:
+            num_blocks = cache.shape[0]
+            active_block_table = self._safe_active_block_table(
+                active_block_table,
+                num_blocks,
+            )
             selected_cache = cache.index_select(
                 dim=0, index=active_block_table.reshape(-1)
             ).reshape(batch_size, -1, num_heads_per_rank, head_dimension)
@@ -200,10 +233,18 @@ class BlockKVCacheManager(KVCacheManager):
         # TKG usecase
         batch_size, _ = active_block_table.shape
         num_blocks, num_heads_per_rank, block_size, head_dimension = cache.shape
+        active_block_table = self._safe_active_block_table(
+            active_block_table,
+            num_blocks,
+        )
 
         cache = cache.reshape(num_blocks * num_heads_per_rank, block_size * head_dimension)
 
-        indices = torch.arange(num_heads_per_rank).reshape(1, -1, 1) \
+        indices = torch.arange(
+            num_heads_per_rank,
+            dtype=active_block_table.dtype,
+            device=active_block_table.device,
+        ).reshape(1, -1, 1) \
             + active_block_table.reshape(batch_size, 1, -1) * num_heads_per_rank
         indices = indices.reshape(-1)
 
@@ -309,11 +350,9 @@ class BlockKVCacheManager(KVCacheManager):
         else:
             pad_dest_index = torch.tensor((num_blocks - 1) * block_size, device=device, dtype=dtype)
 
-        slot_mapping = torch.where(
-            slot_mapping == padding_id,
-            pad_dest_index,
-            slot_mapping,
-        )
+        max_slot_index = torch.tensor(cache.shape[0], device=device, dtype=dtype)
+        valid_slot = torch.logical_and(slot_mapping >= 0, slot_mapping < max_slot_index)
+        slot_mapping = torch.where(valid_slot, slot_mapping, pad_dest_index)
         slot_mapping = slot_mapping.expand(
             (batch_size * n_active_tokens, num_heads_per_rank * head_dim)
         )
@@ -347,11 +386,9 @@ class BlockKVCacheManager(KVCacheManager):
 
         pad_dest_index = torch.tensor(num_blocks * block_size - 1, device=device, dtype=dtype)
 
-        slot_mapping = torch.where(
-            slot_mapping == padding_id,
-            pad_dest_index,
-            slot_mapping,
-        )
+        max_slot_index = torch.tensor(num_blocks * block_size, device=device, dtype=dtype)
+        valid_slot = torch.logical_and(slot_mapping >= 0, slot_mapping < max_slot_index)
+        slot_mapping = torch.where(valid_slot, slot_mapping, pad_dest_index)
 
         block_id = slot_mapping // self.pa_block_size
         block_id = block_id.view(batch_size, 1, n_active_tokens)
@@ -380,21 +417,34 @@ def generate_tokengen_slot_mapping(
         block_size: torch.Tensor,
 ):
     B = position_ids.shape[0]
+    if block_table.shape[0] == 0 or block_table.shape[1] == 0:
+        return torch.ones_like(slot_mapping) * -1
 
     # Determine active sequences from slot mapping -1 pad
     active_mask = (slot_mapping >= 0)
 
     row_indices = torch.arange(B, dtype=position_ids.dtype, device=position_ids.device)
+    safe_row_indices = row_indices.clamp(min=0, max=block_table.shape[0] - 1)
     block_indices = (position_ids // block_size).squeeze(dim=1)
+    valid_block_index = torch.logical_and(
+        block_indices >= 0,
+        block_indices < block_table.shape[1],
+    )
+    safe_block_indices = block_indices.clamp(min=0, max=block_table.shape[1] - 1)
 
-    block_number = block_table[row_indices, block_indices]
+    block_number = block_table[safe_row_indices, safe_block_indices]
+    valid_block_number = block_number >= 0
     block_offset = (position_ids % block_size).squeeze(dim=1)
     cur_slots = block_size * block_number + block_offset
     cur_slots = cur_slots.unsqueeze(dim=1)
 
-    # Mask out inactive sequences
+    # Mask out inactive/padded rows before any invalid table entry can become a slot.
     inactive_slots = torch.ones_like(cur_slots) * -1
-    final_slots = torch.where(active_mask, cur_slots, inactive_slots)
+    valid_generated_slot = torch.logical_and(
+        active_mask,
+        torch.logical_and(valid_block_index.unsqueeze(dim=1), valid_block_number.unsqueeze(dim=1)),
+    )
+    final_slots = torch.where(valid_generated_slot, cur_slots, inactive_slots)
 
     return final_slots
 
@@ -407,6 +457,8 @@ def generate_fusedspec_slot_mapping(
 ):
     B = position_ids.shape[0]
     speculation_length = slot_mapping.shape[1]
+    if block_table.shape[0] == 0 or block_table.shape[1] == 0:
+        return torch.ones_like(slot_mapping) * -1
 
     # Determine active sequences from slot mapping -1 pad
     active_mask = ~torch.all(slot_mapping < 0, dim=1).unsqueeze(dim=1)
@@ -417,15 +469,30 @@ def generate_fusedspec_slot_mapping(
     expanded_positions = position_ids + relative_speculative_positions
 
     row_indices = torch.arange(B, dtype=position_ids.dtype, device=position_ids.device).unsqueeze(dim=1)
+    safe_row_indices = row_indices.clamp(min=0, max=block_table.shape[0] - 1)
     expanded_row_indices = torch.tile(row_indices, (1, speculation_length))
+    expanded_safe_row_indices = torch.tile(safe_row_indices, (1, speculation_length))
 
     expanded_block_indices = (expanded_positions // block_size)
-    block_number = block_table[expanded_row_indices, expanded_block_indices]
+    valid_block_index = torch.logical_and(
+        expanded_block_indices >= 0,
+        expanded_block_indices < block_table.shape[1],
+    )
+    expanded_safe_block_indices = expanded_block_indices.clamp(
+        min=0,
+        max=block_table.shape[1] - 1,
+    )
+    block_number = block_table[expanded_safe_row_indices, expanded_safe_block_indices]
+    valid_block_number = block_number >= 0
     block_offset = (expanded_positions % block_size)
     cur_slots = block_size * block_number + block_offset
 
-    # Mask out inactive sequences
+    # Mask out inactive/padded rows before any invalid table entry can become a slot.
     inactive_slots = torch.ones_like(cur_slots) * -1
-    final_slots = torch.where(expanded_active_mask, cur_slots, inactive_slots)
+    valid_generated_slot = torch.logical_and(
+        expanded_active_mask,
+        torch.logical_and(valid_block_index, valid_block_number),
+    )
+    final_slots = torch.where(valid_generated_slot, cur_slots, inactive_slots)
 
     return final_slots

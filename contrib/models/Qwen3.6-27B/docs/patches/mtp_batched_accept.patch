@@ -1,0 +1,154 @@
+From: Deepankar Singh
+Subject: [PATCH] Qwen3.6-27B OpenAI server: consume all fused-spec accepted tokens per host loop
+
+The decode loop currently calls _token_scalar(out.tokens) which flattens the
+output and returns only the first token. For non-spec inference this is
+correct (out.tokens has shape (1,1)). For fused-spec MTP it discards all
+accepted tokens after the first, causing the host to advance only one token
+per Python iteration even when the device accepted multiple.
+
+Root cause of the observed 1.6x MTP gain vs the expected 2-2.5x:
+  - spec length = 2 in the artifact
+  - device returns N accepted tokens per forward (N in 1..2 typically)
+  - server keeps only tokens[0], requeues the rest implicitly by feeding
+    tokens[0] back as the next input
+  - effective speedup = 1 + (P_accept_2)*0.5 ~= 1.6x at high acceptance
+
+Fix:
+  - Add _accepted_tokens() that returns the prefix of in-vocab non-pad tokens
+  - Rewrite the decode loop as a while-loop that runs one forward per
+    iteration and commits ALL accepted tokens (up to max_tokens, stopping at
+    first EOS).
+  - Pre-allocate decode_ids / decode_position_ids / decode_attention_mask
+    (already done in the current code; preserved).
+  - Position-id update uses the position of the most recently committed
+    token: pos_value = prompt_tokens + len(new_ids) - 1.
+
+Expected result: decode 1.6x -> 2.0-2.4x on the same artifact, no recompile.
+
+---
+ contrib/models/Qwen3.6-27B/scripts/openai_compat_server.py | 75 +++++++++++++--------
+ 1 file changed, 47 insertions(+), 28 deletions(-)
+
+diff --git a/contrib/models/Qwen3.6-27B/scripts/openai_compat_server.py b/contrib/models/Qwen3.6-27B/scripts/openai_compat_server.py
+--- a/contrib/models/Qwen3.6-27B/scripts/openai_compat_server.py
++++ b/contrib/models/Qwen3.6-27B/scripts/openai_compat_server.py
+@@ -50,6 +50,7 @@
+     return str(prompt)
+
+
++# Legacy: keep for prefill path which always returns a single token.
+ def _token_scalar(tokens: Any) -> int:
+     if hasattr(tokens, "detach"):
+         tokens = tokens.detach().cpu()
+@@ -58,6 +59,36 @@ def _token_scalar(tokens: Any) -> int:
+     return int(tokens.reshape(-1)[0].item())
+
+
++def _accepted_tokens(
++    tokens: Any,
++    vocab_size: int,
++    pad_id: Any = None,
++) -> List[int]:
++    """Return the prefix of legitimately-accepted tokens from a fused-spec output.
++
++    For non-spec inference, ``out.tokens`` is shape (1, 1) and this returns a
++    1-element list. For fused-spec MTP with speculation length K, ``out.tokens``
++    is shape (1, K) where unused slots are padded with -1 or pad_token_id.
++    Scan left-to-right; the first out-of-vocab or pad value marks the boundary.
++    """
++    if hasattr(tokens, "detach"):
++        tokens = tokens.detach().cpu()
++    if hasattr(tokens, "ndim") and tokens.ndim == 0:
++        v = int(tokens.item())
++        if 0 <= v < vocab_size and (pad_id is None or v != pad_id):
++            return [v]
++        return []
++    flat = tokens.reshape(-1).tolist()
++    accepted: List[int] = []
++    for raw in flat:
++        v = int(raw)
++        if v < 0 or v >= vocab_size:
++            break
++        if pad_id is not None and v == pad_id:
++            break
++        accepted.append(v)
++    return accepted
++
++
+ class QwenOpenAIServer:
+     def __init__(self, args: argparse.Namespace):
+         self.args = args
+@@ -187,8 +218,7 @@ class QwenOpenAIServer:
+             if first_token is None:
+                 raise RuntimeError("prefill produced no token")
+
+-            new_ids = []
+-            current_token = first_token
++            new_ids: List[int] = []
+             vocab_size = len(self.tokenizer)
+             raw_eos_id = self.tokenizer.eos_token_id
+             eos_ids = (
+@@ -196,6 +226,7 @@ class QwenOpenAIServer:
+                 if isinstance(raw_eos_id, (list, tuple, set))
+                 else {raw_eos_id}
+             )
++            pad_id = self.tokenizer.pad_token_id
+             decode_ids = torch.empty((1, 1), dtype=torch.int32)
+             decode_position_ids = torch.empty((1, 1), dtype=torch.int32)
+             decode_attention_mask = torch.ones(
+@@ -203,21 +234,24 @@ class QwenOpenAIServer:
+                 dtype=torch.int32,
+             )
+             finish_reason = "length"
++
++            # Bootstrap: commit the prefill token at position prompt_tokens.
++            if first_token < 0 or first_token >= vocab_size:
++                raise RuntimeError(f"prefill generated invalid token id: {first_token}")
++            new_ids.append(first_token)
++            if first_token in eos_ids:
++                finish_reason = "stop"
++
++            # Decode loop: one forward per iteration, consume ALL accepted tokens.
++            # For non-spec, accepted is length 1. For fused-spec MTP, accepted may
++            # be length up to (speculation_length + 1).
+             with torch.no_grad():
+-                for step in range(max_tokens):
+-                    if current_token in eos_ids:
+-                        finish_reason = "stop"
+-                        break
+-                    if current_token < 0 or current_token >= vocab_size:
+-                        raise RuntimeError(f"model generated invalid token id: {current_token}")
+-                    new_ids.append(current_token)
+-                    if step == max_tokens - 1:
+-                        break
+-
+-                    pos_value = prompt_tokens + step
+-                    decode_ids[0, 0] = current_token
++                while len(new_ids) < max_tokens and finish_reason == "length":
++                    last_token = new_ids[-1]
++                    pos_value = prompt_tokens + len(new_ids) - 1
++                    decode_ids[0, 0] = last_token
+                     decode_position_ids[0, 0] = pos_value
+                     active_attention_mask = decode_attention_mask[:, : pos_value + 1]
+                     out = self.model(
+                         input_ids=decode_ids,
+                         attention_mask=active_attention_mask,
+@@ -226,7 +260,17 @@ class QwenOpenAIServer:
+                         sampling_params=sampling_params,
+                         return_dict=True,
+                     )
+-                    current_token = _token_scalar(out.tokens)
++                    accepted = _accepted_tokens(out.tokens, vocab_size, pad_id=pad_id)
++                    if not accepted:
++                        raise RuntimeError("model produced no accepted tokens in decode step")
++                    for tok in accepted:
++                        if len(new_ids) >= max_tokens:
++                            break
++                        if tok < 0 or tok >= vocab_size:
++                            raise RuntimeError(f"model generated invalid token id: {tok}")
++                        new_ids.append(tok)
++                        if tok in eos_ids:
++                            finish_reason = "stop"
++                            break
+             elapsed = time.perf_counter() - t0

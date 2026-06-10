@@ -66,3 +66,18 @@ MODEL_TYPES = {
     "qwen3_vl": {"causal-lm": NeuronQwen3VLForCausalLM,
                  "image-encoding": NeuronQwen3VLForImageEncoding},
 }
+
+# QWEN36_CONTRIB_VLLM_REGISTER_BEGIN
+# Registered by contrib/models/Qwen3.6-27B/vllm/install_qwen36_vllm.sh.
+# Requires PYTHONPATH to include the Qwen3.6-27B contrib directory at runtime.
+try:
+    from src.modeling_qwen35 import (
+        NeuronQwen35ForCausalLM as _Qwen36ContribForCausalLM,
+    )
+except Exception:
+    _Qwen36ContribForCausalLM = None
+
+if _Qwen36ContribForCausalLM is not None:
+    MODEL_TYPES.setdefault("qwen3_5", {})["causal-lm"] = _Qwen36ContribForCausalLM
+    MODEL_TYPES.setdefault("qwen3_5_text", {})["causal-lm"] = _Qwen36ContribForCausalLM
+# QWEN36_CONTRIB_VLLM_REGISTER_END
