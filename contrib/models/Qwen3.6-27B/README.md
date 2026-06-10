@@ -83,80 +83,46 @@ Unit tests are architecture-level and do not depend on weights. Coverage include
 | Capital of Japan | Tokyo | PASS |
 | sqrt(144) | 12 | PASS |
 
-## Performance Benchmarks
+## Current Validation Evidence
 
-### Qwen3.6-27B on trn2.3xlarge (TP=4, LNC=2, SDK 2.29, BF16)
+The current publishable baseline is the coherent 256K native-chunk loadfix
+lineage on `trn2.3xlarge` with TP=4, LNC=2, SDK 2.29, host sampling, BF16 KV,
+BF16 LM head, BF16 gates, QKV NKI enabled, segmented CTE512, GDN segment 512,
+and CTE bucket 2048.
 
-**TTFT (Time To First Token)**
+Validation evidence is included in
+`validation_outputs/qwen36_nativechunk_baseline_20260609T000000Z/`.
 
-| Input Length | P50 (ms) | P95 (ms) |
-|-------------|----------|----------|
-| 16 tokens | 305.3 | 305.6 |
-| 64 tokens | 305.4 | 305.9 |
-| 128 tokens | 306.6 | 306.8 |
-| 256 tokens | 306.2 | 306.3 |
+| Case | Prompt tokens | TTFT | Prefill tok/s | Source |
+|------|--------------:|-----:|--------------:|--------|
+| 16K native chunk | 16,374 | 6.8379 s | 2,394.6 | `qwen36_256k_nativechunk_crossguard_clean16k_probe_20260609T000000Z.jsonl` |
+| Long context, usage-accounted | 242,864 | 235.9819 s | 1,029.2 | `qwen36_256k_nativechunk_crossguard_258k_probe_20260609T000000Z.jsonl` |
+| Same long-context run, estimated target prompt | 253,899 estimated | 235.9819 s | 1,075.9 | tokenizer-derived fallback, not usage-accounted |
 
-**TPOT / Throughput**
+`baseline_summary.json` marks the run coherent, target recovered, and
+materially faster. `log_scan_empty.txt` contains no invalid-token, fallback,
+NaN, NRT, or traceback markers.
 
-| Output Length | TPOT P50 (ms) | tok/s P50 | E2E P50 (ms) |
-|--------------|---------------|-----------|---------------|
-| 16 | 54.3 | 18.4 | 1,121 |
-| 32 | 54.4 | 18.4 | 1,993 |
-| 64 | 54.2 | 18.5 | 3,720 |
-| 128 | 54.2 | 18.5 | 4,912 |
+### Correctness Evidence
 
-### Comparison with Qwen3.5-27B
-
-| Metric | Qwen3.5-27B | Qwen3.6-27B | Delta |
-|--------|------------|------------|-------|
-| TPOT P50 | 53 ms | 54.2 ms | +2.3% |
-| Throughput | 18.9 tok/s | 18.5 tok/s | -2.1% |
-| TTFT (128 tok) | 576 ms | 306.6 ms | -47% * |
-
-\* TTFT improvement is due to compilation config differences (256-token bucket vs 128-token bucket), not model differences. Architectural performance is equivalent.
-
-### Long-Context vLLM Baseline
-
-A 128K FP8-MLP artifact was validated on trn2.3xlarge (TP=4, LNC=2, SDK 2.29)
-with the vLLM Neuron plugin, Qwen chunked prefill, and native vLLM APC enabled.
-
-| Metric | Result |
-|--------|--------|
-| Max model length | 131,072 tokens |
-| Context encoding bucket | 512 |
-| Prefill throughput | 404-428 tok/s from 512 through 64K prompt tokens |
-| Decode throughput | 26.3-26.6 tok/s |
-| 64K quality | needle retrieval prompts returned all expected codes |
-| State reset | repeated short-after-long validation passed after 32K and 64K requests |
-| Peak Neuron device memory | ~53.25 GB decimal during the 64K eval |
-
-TTFT/TPOT details for the same 128K FP8/vLLM artifact:
-
-| Metric | Result | Notes |
-|--------|--------|-------|
-| Decode TPOT | ~37.6-38.0 ms/token | Derived from 26.3-26.6 tok/s decode |
-| Cold 512-token TTFT | ~1.2-1.3s | Derived from measured prefill throughput plus one decode step |
-| Cold 32K-token TTFT | ~76.6-81.1s | Derived from measured prefill throughput plus one decode step |
-| Cold 64K-token TTFT | ~153-162s | Derived from measured prefill throughput plus one decode step |
-| Warm APC latency, ~10.8K prompt | 1.36-2.38s | Exact-repeat, partial-prefix, and cross-prefix validation runs |
-| Cold APC baseline, ~10.8K prompt | 25.17-26.68s | Same prompts with prefix cache disabled or cold |
-
-Native vLLM prefix caching/APC was also validated with exact greedy output
-matches:
-
-| APC Scenario | Cold | Warm | Speedup | Result |
-|--------------|------|------|---------|--------|
-| Server exact-repeat, ~10.8K prompt tokens | 26.68s | 1.67s | 16.0x | exact text match |
-| Offline exact-repeat | 26.19s | 2.38s | 11.0x | exact token-ID match |
-| Offline partial-prefix reuse | 25.52s | 1.70s | 15.0x | exact token-ID match |
-| Server cross-prefix reuse | 25.17s | 1.36s | 18.5x | exact text match |
+- BF16 smoke tests: 7/7 text-only quality prompts passed with
+  `enable_thinking=False`.
+- HF greedy comparison: 156/160 token positions matched HF greedy (97.5%),
+  and 9/10 prompts matched exactly for all 16 generated tokens.
+- Strict Hybrid APC exactness passed for full-prefix, partial-prefix, and
+  real-token generation cases.
+- Current native-chunk validation has `pass=true`, thinking enabled, coherent
+  first text, and an empty bad-marker log scan.
 
 ### Key Observations
 
-- **BF16 TP=4 is HBM-limited:** The pure BF16 path is limited to short contexts on trn2.3xlarge. The validated 128K baseline uses MLP-only FP8 weights plus the hybrid cache manager.
-- **DeltaNet enables efficient TKG:** Token generation uses O(1) per-token recurrence instead of O(n) KV cache attention for 48/64 layers.
-- **vLLM APC is high leverage:** Repeated-prefix requests avoid replaying long chunked prefill and are the largest observed latency win for chat/RAG-style workloads.
-- **Performance equivalent to Qwen3.5-27B:** The BF16 TPOT difference is within measurement noise. Expected since architectures are identical.
+- **Qwen3.6 is hybrid, not transformer-only:** 48 of 64 layers use DeltaNet/GDN
+  recurrent state, so standard KV-only prefix caching is insufficient.
+- **Safe Hybrid APC needs three-way agreement:** reusable prefix length is the
+  intersection of attention KV hits, GDN recurrent checkpoints, and GDN
+  convolution checkpoints.
+- **Native Neuron chunking is required for the current coherent fast path:**
+  generic vLLM chunking is not the validated path for this model on Neuron.
 
 ## Usage
 
