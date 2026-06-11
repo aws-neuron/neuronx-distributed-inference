@@ -1,0 +1,172 @@
+{
+  "cold_full": {
+    "elapsed_seconds": 1.61777906000043,
+    "tokens": [
+      271,
+      248068,
+      198,
+      8160,
+      579,
+      264,
+      7047,
+      1817
+    ]
+  },
+  "cold_partial": {
+    "elapsed_seconds": 1.6215280520000306,
+    "tokens": [
+      271,
+      248068,
+      198,
+      8160,
+      579,
+      264,
+      7047,
+      1817
+    ]
+  },
+  "full_prefix_exact": true,
+  "negative_tests": {
+    "missing_gdn_state_fallback": "requires scheduler fault injection",
+    "zeroed_conv_state": "requires model debug hook"
+  },
+  "partial_prefix_exact": true,
+  "real_generated_token_checks": {
+    "cold_full": {
+      "dummy_token_ids": [
+        0
+      ],
+      "generated_token_count": 8,
+      "label": "cold_full",
+      "non_dummy_token_count": 8,
+      "passed": true,
+      "unique_token_ids": [
+        198,
+        264,
+        271,
+        579,
+        1817,
+        7047,
+        8160,
+        248068
+      ]
+    },
+    "cold_partial": {
+      "dummy_token_ids": [
+        0
+      ],
+      "generated_token_count": 8,
+      "label": "cold_partial",
+      "non_dummy_token_count": 8,
+      "passed": true,
+      "unique_token_ids": [
+        198,
+        264,
+        271,
+        579,
+        1817,
+        7047,
+        8160,
+        248068
+      ]
+    },
+    "warm_full": {
+      "dummy_token_ids": [
+        0
+      ],
+      "generated_token_count": 8,
+      "label": "warm_full",
+      "non_dummy_token_count": 8,
+      "passed": true,
+      "unique_token_ids": [
+        198,
+        264,
+        271,
+        579,
+        1817,
+        7047,
+        8160,
+        248068
+      ]
+    },
+    "warm_partial": {
+      "dummy_token_ids": [
+        0
+      ],
+      "generated_token_count": 8,
+      "label": "warm_partial",
+      "non_dummy_token_count": 8,
+      "passed": true,
+      "unique_token_ids": [
+        198,
+        264,
+        271,
+        579,
+        1817,
+        7047,
+        8160,
+        248068
+      ]
+    },
+    "warmup_full": {
+      "dummy_token_ids": [
+        0
+      ],
+      "generated_token_count": 8,
+      "label": "warmup_full",
+      "non_dummy_token_count": 8,
+      "passed": true,
+      "unique_token_ids": [
+        198,
+        264,
+        271,
+        579,
+        1817,
+        7047,
+        8160,
+        248068
+      ]
+    }
+  },
+  "real_generated_tokens_passed": true,
+  "real_generated_tokens_required": true,
+  "warm_full": {
+    "elapsed_seconds": 0.7333461709999938,
+    "tokens": [
+      271,
+      248068,
+      198,
+      8160,
+      579,
+      264,
+      7047,
+      1817
+    ]
+  },
+  "warm_partial": {
+    "elapsed_seconds": 0.7324717420001434,
+    "tokens": [
+      271,
+      248068,
+      198,
+      8160,
+      579,
+      264,
+      7047,
+      1817
+    ]
+  },
+  "warmup_full": {
+    "elapsed_seconds": 1.6242725189999874,
+    "tokens": [
+      271,
+      248068,
+      198,
+      8160,
+      579,
+      264,
+      7047,
+      1817
+    ]
+  }
+}

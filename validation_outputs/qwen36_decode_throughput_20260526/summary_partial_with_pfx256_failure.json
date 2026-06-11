@@ -1,0 +1,149 @@
+{
+  "chat": {
+    "pfx128k": [
+      {
+        "completion_tokens": 64,
+        "decode_tokens_per_second": 5.750944384463,
+        "prompt_tokens": 130810,
+        "repeat": 0,
+        "status": 200,
+        "target_tokens": 130816,
+        "total_seconds": 309.5049864600005,
+        "tpot_seconds": 0.17388448455555286,
+        "ttft_seconds": 298.5502639330007
+      },
+      {
+        "completion_tokens": 64,
+        "decode_tokens_per_second": 5.766799725693522,
+        "prompt_tokens": 130810,
+        "repeat": 1,
+        "status": 200,
+        "target_tokens": 130816,
+        "total_seconds": 18.175070594999852,
+        "tpot_seconds": 0.17340640347619127,
+        "ttft_seconds": 7.250467175999802
+      }
+    ],
+    "pfx32k_64k": [
+      {
+        "completion_tokens": 64,
+        "decode_tokens_per_second": 12.551749488428095,
+        "prompt_tokens": 32764,
+        "repeat": 0,
+        "status": 200,
+        "target_tokens": 32768,
+        "total_seconds": 64.932291531999,
+        "tpot_seconds": 0.07967016876188739,
+        "ttft_seconds": 59.91307090000009
+      },
+      {
+        "completion_tokens": 64,
+        "decode_tokens_per_second": 12.762071211221095,
+        "prompt_tokens": 32764,
+        "repeat": 1,
+        "status": 200,
+        "target_tokens": 32768,
+        "total_seconds": 10.485850058001233,
+        "tpot_seconds": 0.07835718696826786,
+        "ttft_seconds": 5.549347279000358
+      },
+      {
+        "completion_tokens": 64,
+        "decode_tokens_per_second": 11.953287279613436,
+        "prompt_tokens": 65277,
+        "repeat": 0,
+        "status": 200,
+        "target_tokens": 65280,
+        "total_seconds": 73.22963060099937,
+        "tpot_seconds": 0.08365899493652423,
+        "ttft_seconds": 67.95911391999834
+      },
+      {
+        "completion_tokens": 64,
+        "decode_tokens_per_second": 11.97545651173657,
+        "prompt_tokens": 65277,
+        "repeat": 1,
+        "status": 200,
+        "target_tokens": 65280,
+        "total_seconds": 11.045279834999747,
+        "tpot_seconds": 0.08350412353967032,
+        "ttft_seconds": 5.784520052000516
+      }
+    ]
+  },
+  "errors": [
+    {
+      "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_256k_fp8_full_lmheadbf16_hybrid_apc_prod_pfx256k_nki_fusedstable_directsolve_hostlogits_b256_cte3072_pfx256k_pa1024_slots64_tkg262144_async_20260526T132620Z_tierfix_pfx256k",
+      "error": "NRT_RESOURCE in nrt_load_util; Failed to allocate 1.000GB shared scratchpad; Failed to load context_encoding_model/_tp0_bk0/model...neff, err: 4",
+      "evidence": "TDRV memory table showed per-HBM TOTAL 22.056GB with Model Tensors 12.052GB and Shared Scratchpad 10.000GB in the original run.",
+      "hypothesis": "256k context-encoding NEFF footprint plus scratchpad reservation exceeds/alignment-fragments the 24GB physical HBM slice on trn2.3xlarge LNC2; reducing the debug scratchpad placement did not reduce total HBM enough.",
+      "inputs": "seq_len=262144 pa_num_blocks=1024 length=261888 cte_pair=3072:262144 tkg=262144",
+      "retry": "Retried with NEURON_RT_DBG_SCRATCHPAD_ON_SINGLE_CORE=0; still failed with NRT_RESOURCE and per-HBM TOTAL 22.056GB, split as 12.052GB tensors + 7GB scratchpad on one logical core + 3GB on sibling.",
+      "what_failed": "256k tier prefill load"
+    },
+    {
+      "error": "NRT_RESOURCE in nrt_load_util; Failed to allocate 512.000MB shared scratchpad; Failed to load context_encoding_model/_tp0_bk0/model...neff, err: 4",
+      "evidence": "TDRV memory table showed per-HBM TOTAL 23.056GB with Model Tensors 12.052GB and Shared Scratchpad 11.000GB; page size changed rounding but did not fit.",
+      "hypothesis": "Current 256k NEFF requires recompilation with lower scratchpad/tensor footprint; runtime env changes alone are insufficient on trn2.3xlarge LNC2.",
+      "inputs": "NEURON_RT_DBG_SCRATCHPAD_ON_SINGLE_CORE=0 NEURON_SCRATCHPAD_PAGE_SIZE=512 seq_len=262144 pa_num_blocks=1024 length=1024 cte_pair=3072:262144",
+      "what_failed": "256k tier 1k load probe with smaller scratchpad page"
+    }
+  ],
+  "memory": {
+    "pfx128k_chat": {
+      "note": "Neuron sysfs total category appears duplicated across logical cores; use TDRV table for 256k failure.",
+      "peak_host_rss_gib": 33.75197982788086,
+      "peak_neuron_total_category_gib": 143.0457763671875
+    },
+    "pfx128k_prefill": {
+      "note": "Neuron sysfs total category appears duplicated across logical cores; use TDRV table for 256k failure.",
+      "peak_host_rss_gib": 1.0820083618164062,
+      "peak_neuron_total_category_gib": 143.04058837890625
+    },
+    "pfx32k_64k_chat": {
+      "note": "Neuron sysfs total category appears duplicated across logical cores; use TDRV table for 256k failure.",
+      "peak_host_rss_gib": 34.04149627685547,
+      "peak_neuron_total_category_gib": 129.38055419921875
+    },
+    "pfx32k_64k_prefill": {
+      "note": "Neuron sysfs total category appears duplicated across logical cores; use TDRV table for 256k failure.",
+      "peak_host_rss_gib": 1.0854454040527344,
+      "peak_neuron_total_category_gib": 129.39923095703125
+    }
+  },
+  "out_root": "/home/ubuntu/validation_logs/fp8_256k/tierfix_validation_20260526T152617Z",
+  "pfx256_retry_root": "/home/ubuntu/validation_logs/fp8_256k/tierfix_validation_pfx256_dbg0_20260526T160225Z",
+  "prefill": {
+    "pfx128k": [
+      {
+        "cold_prompt_tps": 438.4569648455064,
+        "cold_seconds": 298.3553928630008,
+        "prefix_warmup_seconds": 298.1146618639996,
+        "real_tokens_passed": true,
+        "target_prompt_tokens": 130816,
+        "warm_refill_prompt_tps": 18762.73631831029,
+        "warm_refill_seconds": 6.972117380999407
+      }
+    ],
+    "pfx32k_64k": [
+      {
+        "cold_prompt_tps": 540.7653404787703,
+        "cold_seconds": 60.59559950900075,
+        "prefix_warmup_seconds": 59.39553882300061,
+        "real_tokens_passed": true,
+        "target_prompt_tokens": 32768,
+        "warm_refill_prompt_tps": 5979.189282806355,
+        "warm_refill_seconds": 5.4803416399990965
+      },
+      {
+        "cold_prompt_tps": 536.2426918768522,
+        "cold_seconds": 121.73592477599959,
+        "prefix_warmup_seconds": 121.6053157819988,
+        "real_tokens_passed": true,
+        "target_prompt_tokens": 65280,
+        "warm_refill_prompt_tps": 11519.062509579056,
+        "warm_refill_seconds": 5.667127853999773
+      }
+    ]
+  }
+}

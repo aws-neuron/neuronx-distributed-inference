@@ -49,7 +49,7 @@ Qwen3.6 weights.
 
 - **Hybrid DeltaNet + GQA:** 48 of 64 layers use Gated DeltaNet (linear recurrent attention), 16 layers use standard GQA with KV cache. The pattern repeats every 4 layers: 3 DeltaNet + 1 GQA.
 - **DeltaNet Linear Attention:** Uses the delta rule for recurrent state updates with gated decay. Per-step: `state *= exp(g); delta = (v - state^T @ k) * beta; state += outer(k, delta); output = state^T @ q`. Runs as a chunked algorithm for context encoding, per-token recurrence for token generation.
-- **Custom NKI Kernels:** Three NKI kernels implement the DeltaNet forward pass on Neuron: a per-token recurrent kernel (TKG), a per-chunk kernel (legacy), and a fused single-kernel chunked forward (CTE). The fused kernel uses a Neumann series for intra-chunk correction with state persistence in SBUF across chunks.
+- **Custom NKI Kernels:** Three NKI kernels implement the DeltaNet forward pass on Neuron: a per-token recurrent kernel (TKG), a per-chunk kernel (legacy), and a fused single-kernel chunked forward (CTE). The fused kernel uses a **direct blocked triangular solve** for the intra-chunk correction — each diagonal block of `(I - A)` is inverted exactly by power-doubling, which is exact (not an approximation) because the block is strictly lower-triangular and therefore nilpotent — with recurrent state persisted in SBUF across chunks. The legacy per-chunk kernel used a Neumann-series approximation; the fused (default) path does not.
 - **GQA Output Gate:** Attention layers use a sigmoid output gate. `q_proj` is 2x sized and interleaved: `[head0_query | head0_gate | head1_query | ...]`. The gate is split during weight conversion and applied after attention.
 - **Partial RoPE:** Only 25% of head_dim (64 of 256 dimensions) receives rotary embeddings. The remaining 192 dimensions are identity (no rotation).
 - **+1 RMSNorm Convention:** HF weights use `output = norm(x) * (1 + weight)` where weight is initialized to zeros. Converted to standard `output = norm(x) * weight` during loading by adding 1.0 to all RMSNorm weights (except DeltaNet internal norms, which use standard convention).
@@ -103,16 +103,65 @@ Validation evidence is included in
 materially faster. `log_scan_empty.txt` contains no invalid-token, fallback,
 NaN, NRT, or traceback markers.
 
+**Scope of "coherent":** the long-context cases above verify successful prefill
+(TTFT) plus a coherent *first* generated segment (16 completion tokens) with
+finite logits and no degenerate repetition. They do not yet validate sustained
+long-form generation at long context. A **PASS** at a given length in the
+Maximum Sequence Length table therefore means "prefill + first-token coherence
+verified at that length," not "256K tokens of validated output."
+
 ### Correctness Evidence
 
+- **HF greedy comparison: 156/160 token positions matched HF greedy (97.5%),
+  9/10 prompts exact over all 16 generated tokens.** The single divergence is
+  case 8 at position 12 (Neuron `34099` vs HF `1826`), a benign FP8 sampling
+  divergence. Artifact:
+  `validation_outputs/qwen36_hf_greedy_match_20260523/qwen36_hf_match_20260523T140704Z.json`
+  (2026-05-23, FP8 128K hybrid-APC artifact, 16-token greedy generations).
+- **Hybrid APC exactness passed for full-prefix, partial-prefix, and real-token
+  generation cases.** This verifies *cache-reuse self-consistency* (warm and
+  partial-prefix runs reproduce the cold full-prefix tokens exactly), not a
+  match against an external golden; the fault-injection negative tests (missing
+  GDN state, zeroed conv state) are not yet automated. Artifacts:
+  `validation_outputs/qwen36_hybrid_apc_exactness_20260521_20260523/`.
 - BF16 smoke tests: 7/7 text-only quality prompts passed with
   `enable_thinking=False`.
-- HF greedy comparison: 156/160 token positions matched HF greedy (97.5%),
-  and 9/10 prompts matched exactly for all 16 generated tokens.
-- Strict Hybrid APC exactness passed for full-prefix, partial-prefix, and
-  real-token generation cases.
+- Decode throughput: ~7.5 tok/s single-stream (batch=1), near-flat across
+  context — see the Decode Throughput section below.
 - Current native-chunk validation has `pass=true`, thinking enabled, coherent
-  first text, and an empty bad-marker log scan.
+  first text, and an empty bad-marker log scan (see "Scope of coherent" above).
+
+### Decode Throughput
+
+Single-stream (batch=1) decode, measured live against the running vLLM server on
+the same `trn2.3xlarge` (2026-06-11), streaming with `ignore_eos` so each case
+emits an exact token count (rate = 1 / TPOT). Artifacts:
+`validation_outputs/qwen36_live_decode_sweep_20260611/` (live) and
+`validation_outputs/qwen36_decode_throughput_20260526/` (earlier multi-bucket run).
+
+| Prefix tokens | TTFT | Decode tok/s | TPOT |
+|--------------:|-----:|-------------:|-----:|
+| 11 | 0.77 s | 7.63 | 131 ms |
+| 2,018 | 0.78 s | 7.65 | 131 ms |
+| 8,162 | 3.15 s | 7.62 | 131 ms |
+| 16,354 | 6.63 s | 7.59 | 132 ms |
+| 32,738 | 14.57 s | 7.53 | 133 ms |
+| 65,506 | 34.38 s | 7.39 | 135 ms |
+
+**Decode is near-flat (~7.4–7.65 tok/s) from 11 to 65K tokens of context** — only
+~3% slower at 64K. This is the expected hybrid signature: 48 of 64 layers are
+Gated DeltaNet with O(1) recurrent state (context-independent decode), so only the
+16 GQA layers carry a growing KV cache.
+
+The absolute rate reflects the **coherence-validated** serving artifact, which is
+deliberately conservative for correctness: host sampling, BF16 LM head, BF16 KV,
+FP32 GDN recurrent state, and a single 262K token-generation bucket. A separate
+**speed-optimized** artifact (on-device sampling, FP8 LM head, FP8 KV, BF16 GDN
+state, split-QKV decode kernel) logged **30.67 tok/s at 16K and 35.69 tok/s at
+512** (2026-05-28) but has not yet passed a coherence/quality gate, so it is not
+the published serving path. Closing that ~4x gap on the validated path is the
+main decode optimization opportunity; on-device sampling (avoiding the
+248,320-vocab logits round-trip to host every token) is the largest single lever.
 
 ### Key Observations
 
@@ -311,4 +360,4 @@ Note: The env var is `QWEN35_MODEL_PATH` (not `QWEN36`) because the code uses th
 
 AWS Neuron
 
-**Last Updated:** 2026-04-23
+**Last Updated:** 2026-06-11
