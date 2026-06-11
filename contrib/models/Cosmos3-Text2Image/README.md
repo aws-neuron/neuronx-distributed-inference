@@ -42,13 +42,13 @@ Cosmos3 uses a **Mixture-of-Transformers (MoT)** architecture:
 
 ### Cosmos3-Nano (trn2.3xlarge, TP=4)
 
-| Metric | 512x512 (35 steps) | 1024x1024 (50 steps) |
-|--------|-------|-------|
-| Backbone latency | 33.4 ms/call | 167.9 ms/call |
-| E2E generation | **2.79s** | **8.63s** |
-| Per-step latency | 78.2 ms | 167.9 ms |
-| VAE decode | 50 ms | 231 ms |
-| Image quality | High fidelity | High fidelity |
+| Metric | 512x512 (35 steps) | 512x512 CFG-parallel | 1024x1024 (50 steps) | 1024x1024 CFG-parallel |
+|--------|-------|-------|-------|-------|
+| Backbone latency | 33.4 ms/call | 49.7 ms (batch=2) | 167.9 ms/call | 131.1 ms (batch=2) |
+| E2E generation | **2.79s** | **2.23s** | **8.63s** | **6.79s** |
+| Per-step latency | 78.2 ms | 62.2 ms | 167.9 ms | 131.1 ms |
+| VAE decode | 50 ms | 50 ms | 231 ms | 231 ms |
+| Speedup vs sequential | - | 20% | - | 21% |
 
 ### Cosmos3-Super-Text2Image (trn2.48xlarge, TP=8)
 
@@ -120,6 +120,17 @@ python examples/compile.py \
     --tp 8 \
     --height 1024 --width 1024 \
     --output /home/ubuntu/compiled_cosmos3_super_1024
+
+# CFG-parallel (batch=2, ~20% faster generation):
+python examples/compile.py \
+    --model-path /home/ubuntu/Cosmos3-Nano \
+    --tp 4 --cfg-parallel \
+    --output /home/ubuntu/compiled_cosmos3_nano_cfgp
+
+python examples/compile.py \
+    --model-path /home/ubuntu/Cosmos3-Nano \
+    --tp 4 --height 1024 --width 1024 --cfg-parallel \
+    --output /home/ubuntu/compiled_cosmos3_nano_1024_cfgp
 ```
 
 ### 2. Compile VAE
@@ -168,6 +179,15 @@ python examples/generate.py \
     --tp 8 \
     --prompt "A majestic snow-covered mountain at sunrise with golden light" \
     --output mountain.png
+
+# CFG-parallel mode (requires backbone compiled with --cfg-parallel):
+python examples/generate.py \
+    --model-path /home/ubuntu/Cosmos3-Nano \
+    --compiled-path /home/ubuntu/compiled_cosmos3_nano_cfgp \
+    --vae-path /home/ubuntu/compiled_vae/vae_512.pt \
+    --tp 4 --cfg-parallel \
+    --prompt "A golden retriever in autumn leaves" \
+    --output dog_cfgp.png
 ```
 
 ### Python API

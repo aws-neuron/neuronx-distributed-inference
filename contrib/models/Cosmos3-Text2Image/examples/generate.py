@@ -88,6 +88,11 @@ def main():
     parser.add_argument("--height", type=int, default=512, help="Output height")
     parser.add_argument("--width", type=int, default=512, help="Output width")
     parser.add_argument("--max-text-len", type=int, default=256, help="Max text tokens")
+    parser.add_argument(
+        "--cfg-parallel",
+        action="store_true",
+        help="Use CFG-parallel mode (backbone compiled with --cfg-parallel)",
+    )
     args = parser.parse_args()
 
     MAX_TEXT = args.max_text_len
@@ -117,6 +122,7 @@ def main():
     )
     config = Cosmos3BackboneInferenceConfig(
         neuron_config=neuron_config,
+        cfg_parallel_enabled=args.cfg_parallel,
         hidden_size=hidden_size,
         intermediate_size=model_cfg.get("intermediate_size", 12288),
         num_hidden_layers=model_cfg.get("num_hidden_layers", 36),
@@ -173,11 +179,22 @@ def main():
     # --- Warmup ---
     print("\n[4/4] Warming up backbone (both CFG paths)...")
     t0 = time.time()
-    dummy_patches = torch.randn(1, NUM_VIS, 192, dtype=torch.bfloat16)
-    dummy_ts = torch.tensor([0.5], dtype=torch.bfloat16)
-    for _ in range(2):
-        _ = app(cond_ids, dummy_patches, dummy_ts, cond_pos)
-        _ = app(uncond_ids, dummy_patches, dummy_ts, uncond_pos)
+    if args.cfg_parallel:
+        dummy_patches = torch.randn(2, NUM_VIS, 192, dtype=torch.bfloat16)
+        dummy_ts = torch.tensor([0.5, 0.5], dtype=torch.bfloat16)
+        for _ in range(2):
+            _ = app(
+                torch.cat([cond_ids, uncond_ids], dim=0),
+                dummy_patches,
+                dummy_ts,
+                cond_pos,
+            )
+    else:
+        dummy_patches = torch.randn(1, NUM_VIS, 192, dtype=torch.bfloat16)
+        dummy_ts = torch.tensor([0.5], dtype=torch.bfloat16)
+        for _ in range(2):
+            _ = app(cond_ids, dummy_patches, dummy_ts, cond_pos)
+            _ = app(uncond_ids, dummy_patches, dummy_ts, uncond_pos)
     print(f"  Warmup done in {time.time() - t0:.1f}s")
 
     # --- Generate ---
@@ -208,6 +225,7 @@ def main():
         latents=latents,
         num_steps=args.steps,
         cfg_scale=args.cfg_scale,
+        cfg_parallel=args.cfg_parallel,
     )
 
     # --- Denormalize + VAE decode ---

@@ -106,6 +106,11 @@ def main():
         default=None,
         help="Override: number of vision patches (auto-calculated from height/width if not set)",
     )
+    parser.add_argument(
+        "--cfg-parallel",
+        action="store_true",
+        help="Enable CFG-parallel (batch=2): pack cond+uncond in a single call for ~20%% speedup",
+    )
     args = parser.parse_args()
 
     # Calculate vision patches from resolution
@@ -141,6 +146,27 @@ def main():
     print(f"  Resolution: {args.height}x{args.width}")
     print(
         f"  Vision patches: {num_vision_patches} (patch grid: {args.height // 32}x{args.width // 32})"
+    )
+    print(
+        f"  Total sequence length: {total_seq} (text={args.max_text_len} + vision={num_vision_patches})"
+    )
+    if args.cfg_parallel:
+        print(f"  CFG-parallel: ENABLED (batch=2, cond+uncond in single call)")
+
+    # Create config
+    neuron_config = NeuronConfig(
+        tp_degree=tp, world_size=tp, torch_dtype=torch.bfloat16
+    )
+    config = Cosmos3BackboneInferenceConfig(
+        neuron_config=neuron_config,
+        cfg_parallel_enabled=args.cfg_parallel,
+        head_dim=128,
+        vocab_size=151936,
+        patch_channels=192,
+        latent_channels=48,
+        rope_theta=5000000.0,
+        mrope_section=[24, 20, 20],
+        **model_cfg,
     )
     print(
         f"  Total sequence length: {total_seq} (text={args.max_text_len} + vision={num_vision_patches})"

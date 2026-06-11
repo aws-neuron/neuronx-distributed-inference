@@ -240,6 +240,7 @@ def denoise(
     cfg_scale: float = 6.0,
     latent_channels: int = 48,
     patch_size: int = 2,
+    cfg_parallel: bool = False,
 ) -> torch.Tensor:
     """
     Run the denoising loop with CFG.
@@ -248,6 +249,7 @@ def denoise(
     - Pre-computes timestep tensors
     - Uses return_dict=False for scheduler
     - Keeps CFG math in bf16
+    - Optionally uses CFG-parallel (batch=2 single call)
 
     Args:
         backbone: compiled NeuronCosmos3BackboneApplication
@@ -261,6 +263,7 @@ def denoise(
         cfg_scale: classifier-free guidance scale
         latent_channels: number of VAE latent channels (48)
         patch_size: spatial patch size (2)
+        cfg_parallel: if True, pack cond+uncond into batch=2 single call
 
     Returns:
         latents: [1, C, T, H, W] - denoised latents (float32)
@@ -272,16 +275,31 @@ def denoise(
     latents = latents * scheduler.init_noise_sigma
 
     # Pre-compute timestep tensors
-    ts_tensors = [
-        torch.tensor([t.item() * 0.001], dtype=torch.bfloat16) for t in timesteps
-    ]
+    if cfg_parallel:
+        ts_tensors = [
+            torch.tensor([t.item() * 0.001, t.item() * 0.001], dtype=torch.bfloat16)
+            for t in timesteps
+        ]
+        # Pack text IDs into batch=2
+        text_ids_batch = torch.cat([cond_ids, uncond_ids], dim=0)  # [2, max_text_len]
+    else:
+        ts_tensors = [
+            torch.tensor([t.item() * 0.001], dtype=torch.bfloat16) for t in timesteps
+        ]
 
     start = time.time()
     for i, t_val in enumerate(timesteps):
         vis_patches = patchify(latents.to(torch.bfloat16), patch_size=patch_size)
 
-        v_cond = backbone(cond_ids, vis_patches, ts_tensors[i], cond_pos)
-        v_uncond = backbone(uncond_ids, vis_patches, ts_tensors[i], uncond_pos)
+        if cfg_parallel:
+            # Single call with batch=2: [cond_patches, uncond_patches]
+            vis_batch = vis_patches.expand(2, -1, -1).contiguous()
+            output = backbone(text_ids_batch, vis_batch, ts_tensors[i], cond_pos)
+            v_cond = output[0:1]
+            v_uncond = output[1:2]
+        else:
+            v_cond = backbone(cond_ids, vis_patches, ts_tensors[i], cond_pos)
+            v_uncond = backbone(uncond_ids, vis_patches, ts_tensors[i], uncond_pos)
 
         velocity = v_uncond + cfg_scale * (v_cond - v_uncond)
         vel_latent = unpatchify(
@@ -302,8 +320,9 @@ def denoise(
             )
 
     elapsed = time.time() - start
+    mode_str = "CFG-parallel" if cfg_parallel else "sequential"
     logger.info(
-        f"  Denoising: {elapsed:.2f}s ({elapsed / num_steps * 1000:.1f}ms/step)"
+        f"  Denoising ({mode_str}): {elapsed:.2f}s ({elapsed / num_steps * 1000:.1f}ms/step)"
     )
 
     return latents
