@@ -5,11 +5,17 @@ Compile Cosmos3 backbone for Neuron.
 Supports both Cosmos3-Nano (16B, TP=4) and Cosmos3-Super-Text2Image (65B, TP=8).
 
 Usage:
-    # Nano on trn2.3xlarge (TP=4):
+    # Nano at 512x512 on trn2.3xlarge (TP=4):
     python compile.py --model-path /path/to/Cosmos3-Nano --tp 4 --output /path/to/compiled
 
-    # Super on trn2.48xlarge (TP=8):
+    # Nano at 1024x1024:
+    python compile.py --model-path /path/to/Cosmos3-Nano --tp 4 --height 1024 --width 1024 --output /path/to/compiled_1024p
+
+    # Super at 512x512 on trn2.48xlarge (TP=8):
     python compile.py --model-path /path/to/Cosmos3-Super-Text2Image --tp 8 --output /path/to/compiled
+
+    # Super at 1024x1024:
+    python compile.py --model-path /path/to/Cosmos3-Super-Text2Image --tp 8 --height 1024 --width 1024 --output /path/to/compiled_1024p
 
 Environment:
     source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
@@ -53,6 +59,15 @@ MODEL_CONFIGS = {
     },
 }
 
+# Resolution presets (height, width) -> num_vision_patches
+# Formula: num_patches = (height // 32) * (width // 32)
+# Where 32 = scale_factor_spatial(16) * patch_size(2)
+RESOLUTION_PRESETS = {
+    "512x512": (512, 512, 256),  # 16×16 = 256 patches
+    "768x768": (768, 768, 576),  # 24×24 = 576 patches
+    "1024x1024": (1024, 1024, 1024),  # 32×32 = 1024 patches
+}
+
 
 def detect_model_variant(model_path: str) -> str:
     """Detect model variant from config.json."""
@@ -80,12 +95,35 @@ def main():
         "--max-text-len", type=int, default=256, help="Max text token length"
     )
     parser.add_argument(
+        "--height", type=int, default=512, help="Target image height in pixels"
+    )
+    parser.add_argument(
+        "--width", type=int, default=512, help="Target image width in pixels"
+    )
+    parser.add_argument(
         "--num-vision-patches",
         type=int,
-        default=256,
-        help="Number of vision patches (256 for 512x512)",
+        default=None,
+        help="Override: number of vision patches (auto-calculated from height/width if not set)",
     )
     args = parser.parse_args()
+
+    # Calculate vision patches from resolution
+    if args.num_vision_patches is not None:
+        num_vision_patches = args.num_vision_patches
+    else:
+        # Formula: (height / scale_factor_spatial / patch_size) * (width / scale_factor_spatial / patch_size)
+        # = (height / 32) * (width / 32)
+        pH = args.height // 32
+        pW = args.width // 32
+        num_vision_patches = pH * pW
+        if args.height % 32 != 0 or args.width % 32 != 0:
+            raise ValueError(
+                f"Height ({args.height}) and width ({args.width}) must be divisible by 32 "
+                f"(scale_factor_spatial=16 × patch_size=2)"
+            )
+
+    total_seq = args.max_text_len + num_vision_patches
 
     # Detect model variant
     variant = detect_model_variant(args.model_path)
@@ -100,6 +138,13 @@ def main():
     if tp is None:
         tp = 4 if variant == "Cosmos3-Nano" else 8
     print(f"  TP degree: {tp}")
+    print(f"  Resolution: {args.height}x{args.width}")
+    print(
+        f"  Vision patches: {num_vision_patches} (patch grid: {args.height // 32}x{args.width // 32})"
+    )
+    print(
+        f"  Total sequence length: {total_seq} (text={args.max_text_len} + vision={num_vision_patches})"
+    )
 
     # Create config
     neuron_config = NeuronConfig(
@@ -116,7 +161,7 @@ def main():
         **model_cfg,
     )
     config.max_text_len = args.max_text_len
-    config.num_vision_patches = args.num_vision_patches
+    config.num_vision_patches = num_vision_patches
 
     # Compile
     transformer_path = os.path.join(args.model_path, "transformer")
@@ -131,6 +176,12 @@ def main():
 
     print(f"\nCompilation complete in {elapsed:.1f}s")
     print(f"Compiled model saved to: {args.output}")
+    print(f"\nTo generate images at {args.height}x{args.width}, run:")
+    print(f"  python generate.py --model-path {args.model_path} \\")
+    print(f"    --compiled-path {args.output} \\")
+    print(f"    --vae-path <path_to_vae>/vae_decoder.pt \\")
+    print(f"    --height {args.height} --width {args.width} \\")
+    print(f'    --prompt "your prompt"')
 
 
 if __name__ == "__main__":

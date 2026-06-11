@@ -8,7 +8,7 @@ Mixture-of-Transformers (MoT) for text-to-image generation.
 - **Models:** Cosmos3-Nano (16B), Cosmos3-Super-Text2Image (65B)
 - **HuggingFace ID:** `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super-Text2Image`
 - **Model Type:** Diffusion Transformer (MoT architecture)
-- **Task:** Text-to-Image Generation (512x512)
+- **Task:** Text-to-Image Generation (512x512, 1024x1024)
 - **License:** Check HuggingFace model card
 
 ## Architecture Details
@@ -42,23 +42,23 @@ Cosmos3 uses a **Mixture-of-Transformers (MoT)** architecture:
 
 ### Cosmos3-Nano (trn2.3xlarge, TP=4)
 
-| Metric | Value |
-|--------|-------|
-| Backbone latency | 33.4 ms/call |
-| E2E generation (35 steps) | **2.79s** |
-| Per-step latency | 78.2 ms |
-| VAE decode | 50 ms |
-| Image quality | High fidelity, prompt-aligned |
+| Metric | 512x512 (35 steps) | 1024x1024 (50 steps) |
+|--------|-------|-------|
+| Backbone latency | 33.4 ms/call | 167.9 ms/call |
+| E2E generation | **2.79s** | **8.63s** |
+| Per-step latency | 78.2 ms | 167.9 ms |
+| VAE decode | 50 ms | 231 ms |
+| Image quality | High fidelity | High fidelity |
 
 ### Cosmos3-Super-Text2Image (trn2.48xlarge, TP=8)
 
-| Metric | Value |
+| Metric | 512x512 (35 steps) |
 |--------|-------|
 | Backbone latency | 79.5 ms/call |
-| E2E generation (35 steps) | **5.81s** |
+| E2E generation | **5.81s** |
 | Per-step latency | 164.6 ms |
 | VAE decode | 50 ms |
-| Image quality | High fidelity, prompt-aligned |
+| Image quality | High fidelity |
 
 **Status:** VALIDATED (both variants)
 
@@ -95,46 +95,76 @@ huggingface-cli download nvidia/Cosmos3-Super-Text2Image --local-dir /home/ubunt
 ### 1. Compile Backbone
 
 ```bash
-# Nano (TP=4, ~3 min compile)
+# Nano at 512x512 (TP=4, ~2 min compile)
 python examples/compile.py \
     --model-path /home/ubuntu/Cosmos3-Nano \
     --tp 4 \
     --output /home/ubuntu/compiled_cosmos3_nano
 
-# Super (TP=8, ~5 min compile)
+# Nano at 1024x1024 (TP=4, ~2 min compile)
+python examples/compile.py \
+    --model-path /home/ubuntu/Cosmos3-Nano \
+    --tp 4 \
+    --height 1024 --width 1024 \
+    --output /home/ubuntu/compiled_cosmos3_nano_1024
+
+# Super at 512x512 (TP=8, ~5 min compile)
 python examples/compile.py \
     --model-path /home/ubuntu/Cosmos3-Super-Text2Image \
     --tp 8 \
     --output /home/ubuntu/compiled_cosmos3_super
+
+# Super at 1024x1024 (TP=8, ~5 min compile)
+python examples/compile.py \
+    --model-path /home/ubuntu/Cosmos3-Super-Text2Image \
+    --tp 8 \
+    --height 1024 --width 1024 \
+    --output /home/ubuntu/compiled_cosmos3_super_1024
 ```
 
 ### 2. Compile VAE
 
 ```bash
+# For 512x512 output
 python examples/compile_vae.py \
     --model-path /home/ubuntu/Cosmos3-Nano \
-    --output /home/ubuntu/compiled_vae/vae_decoder.pt
+    --output /home/ubuntu/compiled_vae/vae_512.pt
+
+# For 1024x1024 output (~10 min compile)
+python examples/compile_vae.py \
+    --model-path /home/ubuntu/Cosmos3-Nano \
+    --height 1024 --width 1024 \
+    --output /home/ubuntu/compiled_vae/vae_1024.pt
 ```
 
-Note: The same compiled VAE works for both Nano and Super (same architecture).
+Note: The same compiled VAE works for both Nano and Super at the same resolution (same architecture).
 
 ### 3. Generate Images
 
 ```bash
-# Nano
+# Nano at 512x512
 python examples/generate.py \
     --model-path /home/ubuntu/Cosmos3-Nano \
     --compiled-path /home/ubuntu/compiled_cosmos3_nano \
-    --vae-path /home/ubuntu/compiled_vae/vae_decoder.pt \
+    --vae-path /home/ubuntu/compiled_vae/vae_512.pt \
     --tp 4 \
     --prompt "A cat sitting on a windowsill watching birds" \
-    --output cat.png
+    --output cat_512.png
 
-# Super
+# Nano at 1024x1024
+python examples/generate.py \
+    --model-path /home/ubuntu/Cosmos3-Nano \
+    --compiled-path /home/ubuntu/compiled_cosmos3_nano_1024 \
+    --vae-path /home/ubuntu/compiled_vae/vae_1024.pt \
+    --tp 4 --height 1024 --width 1024 --steps 50 \
+    --prompt "A majestic snow-covered mountain at sunrise" \
+    --output mountain_1024.png
+
+# Super at 512x512
 python examples/generate.py \
     --model-path /home/ubuntu/Cosmos3-Super-Text2Image \
     --compiled-path /home/ubuntu/compiled_cosmos3_super \
-    --vae-path /home/ubuntu/compiled_vae/vae_decoder.pt \
+    --vae-path /home/ubuntu/compiled_vae/vae_512.pt \
     --tp 8 \
     --prompt "A majestic snow-covered mountain at sunrise with golden light" \
     --output mountain.png
@@ -226,8 +256,21 @@ python test/integration/test_model.py
 
 | Instance | Nano (TP=4) | Super (TP=8) |
 |----------|-------------|--------------|
-| trn2.3xlarge (LNC=2) | **Working** | N/A (HBM limit) |
-| trn2.48xlarge (LNC=2) | Working | **Working** |
+| trn2.3xlarge (LNC=2) | **Working** (512, 1024) | N/A (HBM limit) |
+| trn2.48xlarge (LNC=2) | Working | **Working** (512, 1024) |
+
+## Supported Resolutions
+
+The backbone can be compiled at any resolution divisible by 32. Compile time and
+latency scale with sequence length (number of vision patches).
+
+| Resolution | Vision Patches | Total Seq Len | Compile Time (Nano) | Latency/Step (Nano) |
+|-----------|---------------|---------------|--------------------|--------------------|
+| 512x512 | 256 | 512 | ~2 min | 33.4 ms |
+| 768x768 | 576 | 832 | ~2 min | ~50 ms |
+| 1024x1024 | 1024 | 1280 | ~2 min | 80.6 ms |
+
+The VAE must be compiled separately for each target resolution.
 
 ## Maintainer
 
