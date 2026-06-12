@@ -10,6 +10,7 @@ from .modeling_yolo26 import (
     get_neuron_core_count,
     VARIANT_DTYPES,
     INPUT_SHAPE,
+    LAYER0_PAD_CHANNELS,
     COSINE_SIM_THRESHOLDS,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "get_neuron_core_count",
     "VARIANT_DTYPES",
     "INPUT_SHAPE",
+    "LAYER0_PAD_CHANNELS",
     "COSINE_SIM_THRESHOLDS",
 ]

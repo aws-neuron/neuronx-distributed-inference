@@ -12,13 +12,26 @@ Detect head) with a small C2PSA self-attention block. The DFL layer is
 
 Neuron Strategy
 ---------------
-- ``torch_neuronx.trace()`` with fixed [B, 3, 640, 640] input shape
+- ``torch_neuronx.trace()`` with fixed input shape (configurable resolution)
 - ``end2end=False`` before ``fuse()`` — ``topk``/``sort`` not supported on trn2
 - FP32 for n/s variants; BF16 required for m/l/x (FP32 exceeds SB allocation)
 - No ``--auto-cast`` flags — ``matmult`` produces NaN for Conv2d-dominant models
 - Data Parallelism across NeuronCores for throughput scaling
 - ``--lnc 1`` compiler flag required when running on LNC=1 mode
 - Batch sizes > 1 supported (C2PSA .split() bug fixed via .chunk() workaround)
+- Layer 0 input channel padding (3→16) for 22% throughput improvement
+
+Layer 0 Padding Optimization
+-----------------------------
+The first conv layer (Conv2d(3→64, 3×3, stride=2)) wastes 97% of TensorE's
+P_DIM=128 tile because C_in=3 gives K_dim=27 (far below 128). The Neuron
+compiler falls back to a spill-heavy depthwise path (37% DMA, 7.5MB spill).
+
+Padding the input to 16 channels (K_dim=144≥128) triggers the clean im2col→
+matmul path: zero spill, 2 DMA transfers, 22% full-model speedup. This is
+enabled by default via ``pad_channels=16``. The padding adds 13 zero channels
+to the input and expands Layer 0's weight tensor accordingly — the output is
+mathematically identical.
 
 Key Results (trn2.3xlarge, LNC=1, DP=8)
 ----------------------------------------
@@ -26,6 +39,10 @@ Key Results (trn2.3xlarge, LNC=1, DP=8)
 - YOLO26m: 1,267 img/s (2.67x vs A10G compiled)
 - YOLO26l: 1,093 img/s (2.95x vs A10G compiled)
 - YOLO26x:   876 img/s (4.49x vs A10G compiled)
+
+inf2.xlarge Results (DP=2, 384×640, 16ch pad)
+----------------------------------------------
+- YOLO26l: ~192 img/s per core, ~405 img/s DP=2 (22% improvement over no-pad)
 """
 
 import os
@@ -66,6 +83,14 @@ VARIANT_DTYPES = {
 }
 
 INPUT_SHAPE = (3, 640, 640)  # C, H, W
+
+# Optimal input channel padding for Layer 0 on NeuronCores.
+# The compiler cannot form efficient TensorE matmuls with C_in=3 (wastes 97%
+# of P_DIM=128 tile). Padding to 16 channels triggers the clean im2col->matmul
+# path: zero spill, 2 DMA transfers, 1.71x faster Layer 0, 22% faster full model.
+# Values 4-12 are WORSE than 3 (trigger pathological compiler code paths).
+# Value 32 works but is suboptimal (extra DMA for larger input).
+LAYER0_PAD_CHANNELS = 16
 
 DEFAULT_COMPILER_ARGS = []  # No autocast for YOLO26
 
@@ -213,6 +238,93 @@ def prepare_yolo26(weight_path: str, dtype: torch.dtype = torch.float32) -> nn.M
     return pytorch_model
 
 
+class _PaddedLayer0Model(nn.Module):
+    """Wrapper that pads Layer 0's input channels for better NeuronCore efficiency.
+
+    The Neuron compiler cannot form efficient TensorE matmuls when C_in < 16
+    (K_dim = C_in * K * K < P_DIM=128). For C_in=3 (standard RGB), the compiler
+    falls back to a spill-heavy depthwise path that wastes 37% of execution time
+    on DMA. Padding to 16 channels (K_dim=144 >= 128) enables the clean matmul
+    path: zero spill, 22% faster full-model inference.
+
+    This wrapper:
+    1. Creates a Conv2d(16, C_out, 3x3) with zero-padded weights
+    2. Accepts [B, 16, H, W] input (caller pads RGB to 16 channels)
+    3. Runs the padded conv + SiLU as Layer 0
+    4. Feeds the output through the remaining layers unchanged
+    """
+
+    def __init__(
+        self, full_model: nn.Module, target_channels: int = LAYER0_PAD_CHANNELS
+    ):
+        super().__init__()
+        self.full_model = full_model
+        self.target_channels = target_channels
+
+        # Extract original Layer 0 (Conv + SiLU)
+        layer0 = full_model.model[0]
+        orig_conv = layer0.conv
+        orig_weight = orig_conv.weight.data  # [C_out, 3, K, K]
+        C_out, C_in, K, K2 = orig_weight.shape
+
+        # Create padded conv
+        self.padded_conv = nn.Conv2d(
+            target_channels,
+            C_out,
+            kernel_size=K,
+            stride=orig_conv.stride,
+            padding=orig_conv.padding,
+            bias=orig_conv.bias is not None,
+        )
+
+        # Zero-pad weights: [C_out, 3, K, K] -> [C_out, target_channels, K, K]
+        new_weight = torch.zeros(C_out, target_channels, K, K2, dtype=orig_weight.dtype)
+        new_weight[:, :C_in, :, :] = orig_weight
+        self.padded_conv.weight.data = new_weight
+
+        if orig_conv.bias is not None:
+            self.padded_conv.bias.data = orig_conv.bias.data.clone()
+
+        self.act = nn.SiLU()
+
+        # Precompute which layers need their outputs saved for skip connections
+        self._save_set = set(full_model.save)
+        for i, m in enumerate(full_model.model):
+            if isinstance(m.f, list):
+                for j in m.f:
+                    if j >= 0:
+                        self._save_set.add(j)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with padded Layer 0.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input of shape [B, target_channels, H, W] (zero-padded RGB).
+        """
+        # Run padded Layer 0
+        l0_out = self.act(self.padded_conv(x))
+
+        # Run remaining layers (1 through N)
+        model = self.full_model
+        y = [None] * len(model.model)
+        y[0] = l0_out
+        x_cur = l0_out
+
+        for i in range(1, len(model.model)):
+            m = model.model[i]
+            if m.f != -1:
+                if isinstance(m.f, int):
+                    x_cur = y[m.f] if m.f >= 0 else x_cur
+                else:
+                    x_cur = [(y[j] if j >= 0 else x_cur) for j in m.f]
+            x_cur = m(x_cur)
+            y[i] = x_cur if i in self._save_set else None
+
+        return x_cur
+
+
 def get_variant_dtype(variant: str) -> torch.dtype:
     """Return the recommended dtype for a YOLO26 variant.
 
@@ -241,6 +353,8 @@ def compile_yolo26(
     save_path: str | None = None,
     lnc: int | None = None,
     compiler_args: list[str] | None = None,
+    input_shape: tuple[int, int] = (640, 640),
+    pad_channels: int | None = LAYER0_PAD_CHANNELS,
 ) -> torch.jit.ScriptModule:
     """Compile a YOLO26 model for Neuron inference.
 
@@ -258,11 +372,19 @@ def compile_yolo26(
         Logical NeuronCore config (1 or 2). Adds ``--lnc`` compiler flag if set.
     compiler_args : list[str], optional
         Additional compiler arguments. Defaults to no autocast flags.
+    input_shape : tuple[int, int]
+        (H, W) input resolution. Default (640, 640).
+    pad_channels : int or None
+        Pad Layer 0 input channels for better NeuronCore TensorE utilization.
+        Default 16 (22% speedup). Set to ``None`` to disable padding (uses
+        standard 3-channel input). Values 4-12 are pathological -- do NOT use.
 
     Returns
     -------
     torch.jit.ScriptModule
-        The traced Neuron model.
+        The traced Neuron model. If ``pad_channels`` is set, the model expects
+        input of shape ``[B, pad_channels, H, W]`` with RGB in channels 0-2
+        and zeros in channels 3+.
     """
     if torch_neuronx is None:
         raise RuntimeError("torch_neuronx is not installed. Run on a Neuron instance.")
@@ -274,7 +396,14 @@ def compile_yolo26(
 
     model = prepare_yolo26(weight_path, dtype=dtype)
 
-    dummy = torch.randn(batch_size, *INPUT_SHAPE, dtype=dtype)
+    H, W = input_shape
+    input_channels = pad_channels if pad_channels else 3
+
+    if pad_channels and pad_channels > 3:
+        # Wrap model with padded Layer 0 for better TensorE utilization
+        model = _PaddedLayer0Model(model, target_channels=pad_channels)
+
+    dummy = torch.randn(batch_size, input_channels, H, W, dtype=dtype)
     with torch.no_grad():
         _ = model(dummy)  # dry run to populate anchors
 
@@ -314,13 +443,18 @@ class YOLO26NeuronModel:
         Logical NeuronCore config (1 or 2). Detected from environment if not set.
     num_cores : int, optional
         Number of NeuronCores for data parallelism. If > 1, wraps in DataParallel.
+    input_shape : tuple[int, int], optional
+        (H, W) input resolution. Default (640, 640).
+    pad_channels : int or None, optional
+        Pad Layer 0 input channels for 22% speedup. Default 16. Set to None to
+        disable. The model automatically handles padding in ``__call__``.
 
     Examples
     --------
-    >>> model = YOLO26NeuronModel("s", batch_size=8, num_cores=4)
-    >>> output = model(torch.randn(32, 3, 640, 640))
+    >>> model = YOLO26NeuronModel("l", batch_size=1, num_cores=2, input_shape=(384, 640))
+    >>> output = model(torch.randn(2, 3, 384, 640))  # 3ch input — padding is automatic
     >>> output.shape
-    torch.Size([32, 84, 8400])
+    torch.Size([2, 84, 5040])
     """
 
     def __init__(
@@ -330,19 +464,28 @@ class YOLO26NeuronModel:
         cache_dir: str = "compiled",
         lnc: int | None = None,
         num_cores: int = 1,
+        input_shape: tuple[int, int] = (640, 640),
+        pad_channels: int | None = LAYER0_PAD_CHANNELS,
     ):
         self.variant = variant
         self.batch_size = batch_size
         self.dtype = get_variant_dtype(variant)
         self.dtype_name = "bf16" if self.dtype == torch.bfloat16 else "fp32"
         self.num_cores = num_cores
+        self.input_shape = input_shape
+        self.pad_channels = pad_channels
 
         if lnc is None:
             lnc = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
         self.lnc = lnc
 
         weight_path = f"yolo26{variant}.pt"
-        neff_name = f"yolo26{variant}_{self.dtype_name}_bs{batch_size}_lnc{lnc}.pt"
+        H, W = input_shape
+        pad_str = f"_pad{pad_channels}" if pad_channels else ""
+        neff_name = (
+            f"yolo26{variant}_{self.dtype_name}_bs{batch_size}"
+            f"_{H}x{W}{pad_str}_lnc{lnc}.pt"
+        )
         save_path = os.path.join(cache_dir, neff_name)
 
         if os.path.exists(save_path):
@@ -354,6 +497,8 @@ class YOLO26NeuronModel:
                 dtype=self.dtype,
                 save_path=save_path,
                 lnc=lnc,
+                input_shape=input_shape,
+                pad_channels=pad_channels,
             )
 
         if num_cores > 1 and torch_neuronx is not None:
@@ -366,18 +511,32 @@ class YOLO26NeuronModel:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """Run inference.
 
+        Accepts standard 3-channel RGB input. If ``pad_channels`` is set,
+        padding is applied automatically before inference.
+
         Parameters
         ----------
         x : torch.Tensor
-            Input tensor of shape ``[B, 3, 640, 640]``.
+            Input tensor of shape ``[B, 3, H, W]``.
 
         Returns
         -------
         torch.Tensor
-            Raw detection output ``[B, 84, 8400]``.
+            Raw detection output ``[B, 84, N]`` where N depends on resolution.
         """
+        x = x.to(self.dtype)
+
+        if self.pad_channels and self.pad_channels > 3:
+            # Pad input channels: [B, 3, H, W] -> [B, pad_channels, H, W]
+            B, C, H, W = x.shape
+            padded = torch.zeros(
+                B, self.pad_channels, H, W, dtype=x.dtype, device=x.device
+            )
+            padded[:, :C, :, :] = x
+            x = padded
+
         with torch.no_grad():
-            return self._model(x.to(self.dtype))
+            return self._model(x)
 
     def benchmark(self, warmup: int = 10, iterations: int = 50) -> dict:
         """Measure throughput and latency.
@@ -390,7 +549,8 @@ class YOLO26NeuronModel:
         import numpy as np
 
         total_bs = self.batch_size * self.num_cores
-        dummy = torch.randn(total_bs, *INPUT_SHAPE, dtype=self.dtype)
+        H, W = self.input_shape
+        dummy = torch.randn(total_bs, 3, H, W, dtype=self.dtype)
 
         for _ in range(warmup):
             self(dummy)
@@ -420,6 +580,7 @@ def validate_accuracy(
     weight_path: str,
     neuron_model: torch.jit.ScriptModule | YOLO26NeuronModel,
     dtype: torch.dtype | None = None,
+    input_shape: tuple[int, int] = (640, 640),
     seed: int = 42,
 ) -> dict:
     """Compare Neuron output against CPU reference.
@@ -432,6 +593,8 @@ def validate_accuracy(
         The compiled Neuron model.
     dtype : torch.dtype, optional
         Input dtype. Inferred from variant if ``None``.
+    input_shape : tuple[int, int]
+        (H, W) input resolution. Default (640, 640).
     seed : int
         Random seed for reproducibility.
 
@@ -444,8 +607,9 @@ def validate_accuracy(
     if dtype is None:
         dtype = get_variant_dtype(variant) if variant else torch.float32
 
+    H, W = input_shape
     torch.manual_seed(seed)
-    dummy = torch.randn(1, *INPUT_SHAPE, dtype=dtype)
+    dummy = torch.randn(1, 3, H, W, dtype=dtype)
 
     cpu_model = prepare_yolo26(weight_path, dtype=dtype)
     with torch.no_grad():
