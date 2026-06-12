@@ -8,7 +8,7 @@ Mixture-of-Transformers (MoT) for text-to-image generation.
 - **Models:** Cosmos3-Nano (16B), Cosmos3-Super-Text2Image (65B)
 - **HuggingFace ID:** `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super-Text2Image`
 - **Model Type:** Diffusion Transformer (MoT architecture)
-- **Task:** Text-to-Image Generation (512x512, 1024x1024)
+- **Task:** Text-to-Image/Video Generation (512x512, 1024x1024, video up to 61 frames)
 - **License:** Check HuggingFace model card
 
 ## Architecture Details
@@ -37,7 +37,7 @@ Cosmos3 uses a **Mixture-of-Transformers (MoT)** architecture:
 
 ## Validation Results
 
-**Validated:** 2026-06-11
+**Validated:** 2026-06-12
 **SDK:** 2.30 (torch-neuronx 2.9.0.2.14.27725)
 
 ### Cosmos3-Nano (trn2.3xlarge, TP=4)
@@ -279,6 +279,68 @@ python test/integration/test_model.py
 | trn2.3xlarge (LNC=2) | **Working** (512, 1024) | N/A (HBM limit) |
 | trn2.48xlarge (LNC=2) | Working | **Working** (512, 1024) |
 
+## Video Generation (Experimental)
+
+The Cosmos3 backbone is **modality-agnostic** — the same compiled model that generates
+images can generate video by providing temporal position IDs (T > 1 in the M-RoPE
+encoding). No recompilation is needed if the total patch count matches an existing
+compiled model.
+
+### How It Works
+
+The backbone processes a flat sequence of text + vision patches. For images, vision
+patches come from a 2D spatial grid. For video, patches span a 3D grid (T × H × W):
+
+| Modality | T_lat | pH × pW | Total Patches | Use Compiled Model |
+|----------|-------|---------|---------------|--------------------|
+| Image 512×512 | 1 | 16×16 | 256 | compile at `--height 512 --width 512` |
+| Image 1024×1024 | 1 | 32×32 | 1024 | compile at `--height 1024 --width 1024` |
+| Video 13f@512 | 4 | 16×16 | 1024 | **Reuse 1024p image model!** |
+| Video 29f@512 | 8 | 16×16 | 2048 | compile at 2048 patches |
+| Video 61f@512 | 16 | 16×16 | 4096 | compile at 4096 patches |
+
+The temporal latent count is: `T_lat = (raw_frames - 1) // 4 + 1` (VAE temporal
+compression factor = 4).
+
+### Example: Generate Video with Existing 1024p Model
+
+```python
+from src.pipeline import build_position_ids, patchify, unpatchify, denoise
+
+# Use T_lat=4 (13 raw frames) at 512x512 → 4×16×16 = 1024 patches
+# Same compiled model as 1024x1024 image generation!
+T_lat = 4
+pH, pW = 16, 16
+
+# Build video position IDs (temporal axis spans T_lat values)
+cond_pos = build_position_ids(256, actual_text_len, T=T_lat, pH=pH, pW=pW)
+uncond_pos = build_position_ids(256, uncond_text_len, T=T_lat, pH=pH, pW=pW)
+
+# Initial noise with temporal dimension
+latents = torch.randn(1, 48, T_lat, 32, 32, dtype=torch.float32)
+
+# Denoise (pipeline handles patchify/unpatchify with T>1 automatically)
+latents = denoise(backbone, cond_ids, uncond_ids, cond_pos, uncond_pos,
+                  scheduler, latents, num_steps=35)
+```
+
+### Measured Video Performance (Nano, TP=4, trn2.3xlarge)
+
+| Video Config | Raw Frames | T_lat | Patches | Per-call Latency | Total (35 steps) |
+|-------------|-----------|-------|---------|-----------------|-------------------|
+| 13f @ 512×512 | 13 | 4 | 1024 | ~83 ms | 5.83s |
+| 29f @ 512×512 | 29 | 8 | 2048 | ~121 ms | 8.45s |
+| 61f @ 512×512 | 61 | 16 | 4096 | ~239 ms | 16.73s |
+
+### Limitations
+
+- **VAE decode**: The compiled image VAE only handles T=1. Per-frame decoding works as
+  an approximation. A proper 3D video VAE compilation is needed for production quality.
+- **Maximum sequence length**: Tested up to 8192 patches (seq_len=8448) on trn2.3xlarge.
+  Longer videos (189 frames = 41k patches) require context parallelism.
+- **Video quality**: Without the proper 3D VAE, temporal consistency between decoded
+  frames depends on the per-frame decode approximation.
+
 ## Supported Resolutions
 
 The backbone can be compiled at any resolution divisible by 32. Compile time and
@@ -292,8 +354,9 @@ latency scale with sequence length (number of vision patches).
 
 The VAE must be compiled separately for each target resolution.
 
+
 ## Maintainer
 
 Annapurna Labs
 
-**Last Updated:** 2026-06-11
+**Last Updated:** 2026-06-12
