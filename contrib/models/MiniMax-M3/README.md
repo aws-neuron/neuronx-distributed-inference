@@ -1,0 +1,489 @@
+# Contrib Model: MiniMax-M3 (text backbone)
+
+NeuronX Distributed Inference port of the [MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) **text backbone**.
+
+The release is a vision-language MoE with ~428B total / ~23B active parameters. This contrib port targets the **text-only causal LM** portion of the model — the vision tower, the multimodal projector, and the Multi-Token Prediction (MTP) modules are not included. The text backbone alone is large enough to be interesting on Trn2 and is the part that drives TTFT/ITL.
+
+## Model Information
+
+- **HuggingFace ID**: `MiniMaxAI/MiniMax-M3`
+- **Model Type**: Vision-language MoE; this port targets the text decoder (`MiniMaxM3SparseForCausalLM`).
+- **License**: See LICENSE on the model card.
+
+## Architecture Details (text backbone)
+
+| Field | Value |
+|---|---|
+| Hidden size | 6144 |
+| Layers | 60 |
+| Attention heads (Q / KV) | 64 / 4 (GQA) |
+| Head dim | 128 |
+| Rotary dim | 64 (partial RoPE, first half of each head) |
+| RoPE theta | 5,000,000 |
+| Max position embeddings | 1,048,576 |
+| Vocab size | 200,064 |
+| Routed experts | 128, top-4 (sigmoid + correction bias) |
+| Shared experts | 1 (intermediate=3072) |
+| Dense MLP intermediate | 12,288 (used by first 3 layers) |
+| MoE expert intermediate | 3,072 |
+| Routed scaling factor | 2.0 |
+| Activation | SwiGLU-OAI (`alpha=1.702`, `limit=7.0`) |
+| Norm | Gemma-style RMSNorm (scale = 1 + weight), `eps=1e-6` |
+
+## What this port supports
+
+- ✅ GQA attention with per-head Gemma RMSNorm on Q/K and partial RoPE.
+- ✅ SwiGLU-OAI activation **everywhere** (dense MLP, shared experts, AND routed
+  MoE experts via NxDI's SWIGLU path with `hidden_act=sigmoid`,
+  `hidden_act_scaling_factor=1.702`, `hidden_act_bias=1.0`, clamp at ±7.0).
+- ✅ MoE block: 128 experts, top-4 sigmoid routing **with `e_score_correction_bias`**
+  loaded as `nn.Parameter` so the trained values aren't constant-folded.
+- ✅ Shared expert (1 per MoE layer, `shared_intermediate_size=3072`) runs as
+  a sibling `MiniMaxM3DenseMLP` and is added **after** scaling the routed
+  branch by `routed_scaling_factor=2.0`.
+- ✅ Fused `gate_up_proj` uses **`stride=2`** ColumnParallel sharding so each
+  TP rank holds interleaved (gate, up) chunks rather than "all gate" or
+  "all up" — critical for TP=64 / 2I=6144 (per-rank-per-half = 48 < 96).
+- ✅ HF state-dict converter (`language_model.model.*` → `*`, fuse `w1/w3` per
+  expert, stack `w2` into `down_proj`, route `e_score_correction_bias` to
+  `block_sparse_moe.router.e_score_correction_bias`).
+- ✅ Compile + 64-rank shard + load + warmup + TTFT all succeed on the full
+  60-layer / 128-expert / 854 GB model with TP=64, EP_outer=1, moe_ep=64,
+  moe_tp=1, batch=32, seq_len=512.
+
+## What this port does NOT yet do
+
+- ❌ **Generates coherent text**. After 4 iterations of modeling fixes
+  (v3 → v6), output is still gibberish, though progressively closer to
+  realistic token distributions:
+
+  | Version | Sample output (first ~10 generated tokens) |
+  |---|---|
+  | v3 (fused QKV, NxDI shared experts, scale-both) | `'isasezasezasezasez...'` |
+  | v4 (no fused QKV, rest same as v3) | identical to v3 |
+  | v5 (+ custom shared expert, scale routed only) | `'is"면서""면서""면서"...'` |
+  | v6 (+ `stride=2` on fused gate_up_proj) | `' prejuí Juvent prejuí proverbial prejuí...'` |
+  | v7 (+ `e_score_correction_bias` fp32 instead of bf16) | `'asez prejuí kmall prejuí ianak kmall asez kmall ㈱...'` (≈ v6) |
+  | v8 (+ Gemma-style `(1+w)` pre-shift on ALL RMSNorm weights) | PENDING — CPU-validated fix |
+
+  v6's sample 0 contains real-looking distinct token sequences; samples 1
+  and 2 still collapse to repetition (`' prejuí asez asez ...'`). The
+  collapse to high-vocab-id tokens (e.g. `prejuí`=90875 vs `Paris`=8261)
+  hints at a systematic offset in the hidden state space rather than a
+  topology error.
+
+### Numerical verification (on CPU, no compile)
+
+The following checks against the HF M3-VL reference (from
+`transformers/models/minimax_m3_vl/modeling_minimax_m3_vl.py`) pass with
+**0.0 max-abs-diff** in float32:
+
+* `MiniMaxM3PartialRotaryEmbedding.forward(x, position_ids)` — cos/sin
+  identical to HF's `MiniMaxM3VLRotaryEmbedding.forward`.
+* `apply_minimax_m3_rotary(q, k, cos, sin)` — Q/K after partial RoPE
+  identical to HF's `apply_rotary_pos_emb`.
+* `MiniMaxM3GemmaRMSNorm.forward(x)` — output identical to HF's
+  `MiniMaxM3VLRMSNorm`.
+
+So **modeling-code-level numerics match HF**. The remaining gibberish is
+either in: (a) NxDI's compile-time NEFF transformations of these
+operations, (b) the NxDI MoE / GQA framework code paths that aren't part
+of our overrides, or (c) a structural cross-batch contamination (sample 0
+of `[prompt]*32` differs from samples 1 and 2 — greedy decode should be
+deterministic given identical input).
+
+### Root cause identified (2026-06-29) — RMSNorm `(1+w)` mismatch with NxDI kernels
+
+After exhausting modeling-code suspects, the v3-v7 gibberish was traced
+to a **mismatch between M3's Gemma-style RMSNorm and NxDI's fused kernels**:
+
+* M3 (per HF reference `MiniMaxM3VLRMSNorm`) scales by `(1 + weight)` —
+  the "Gemma trick" so `weight=0` is identity.
+* NxDI's `CustomRMSNorm` and `attention_block_tkg` fused TKG kernel both
+  apply **plain `x_norm * w`** — no `+1`.
+* The previous modeling code overrode the eager-mode RMSNorm to compute
+  `(1+w)` correctly, but **the fused TKG attention kernel still read
+  the raw weight and applied plain `x_norm * w` during decode**.
+* Worse, the input/post-attention/final RMSNorms used NxDI's
+  `CustomRMSNorm` directly (with raw `w`) — every layer's input norm
+  was scaling activations by ~ `-0.94` instead of the correct `+0.05`
+  (M3's `input_layernorm.weight` is ≈ −0.94 in the released checkpoint,
+  designed for `(1+w)` ≈ 0.06 scale).
+
+**Fix**: same trick `neuronx_distributed_inference.models.gemma3` uses
+— pre-add `+1.0` to **every** RMSNorm weight (`input_layernorm`,
+`post_attention_layernorm`, `q_layernorm`, `k_layernorm`, final `norm`)
+in the state-dict converter, and use plain `x_norm * w` everywhere in
+modeling. The pre-shift bakes the `+1` into the loaded weights so the
+fused kernel sees `1+w_orig`.
+
+**CPU-validated** with the actual M3 checkpoint weights (`/mnt/nvme/models/MiniMax-M3`):
+
+| RMSNorm | w_orig mean | Without fix max-abs-diff | With fix max-abs-diff |
+|---|---|---|---|
+| `input_layernorm` | −0.94 | **3.41** (catastrophic) | 0.00 |
+| `post_attention_layernorm` | −0.40 | — | 1.6e-2 (bf16 rounding) |
+| `q_norm` / `k_norm` | +0.10 / +0.11 | — | 1.6e-2 (bf16 rounding) |
+
+This explains *all* of the v3-v7 symptoms: heavy activation amplification
+through every input_layernorm (scale −0.94 vs +0.05 → 15× too big with
+flipped sign) propagates as noise that the model never recovers from.
+
+### Reproducibility
+
+Test scripts in `test/integration/`:
+
+* `test_full_model.py` — full compile + load + TTFT + ITL (v6 config). Set
+  `M3_MODEL_PATH=/path/to/MiniMax-M3` and run. ~100 min on trn2.48xlarge.
+* `test_generate.py` — load cached NEFF + run HF `generate` adapter to
+  produce text. ~3 min on cached NEFF.
+* `test_partial_real.py` — first-N-layers test (faster iteration).
+* `test_mxfp8_real.py` — MXFP8 checkpoint test.
+* `smoke_test_synthetic.py` — random-weight smoke test (no checkpoint
+  needed).
+
+### Remaining bug candidates (in priority order)
+
+1. **Partial RoPE numerics**. Suspect: dtype-cast order in cos/sin
+   computation vs the HF reference's `compute_default_rope_parameters`.
+   Would need a small CPU comparison (load 1 layer of HF M3 + my Neuron
+   module, compare `cos[0, :, :8]`, `sin[0, :, :8]`).
+2. **Q/K weight orientation under GQA REPLICATE_TO_TP_DEGREE**. With
+   `num_kv_heads=4`, `tp_degree=64`, NxDI replicates K/V 16× and the
+   per-rank head ordering may not match the HF reference's
+   `repeat_kv(num_key_value_groups=16)` expectation.
+3. **`e_score_correction_bias` dtype mismatch**. Loaded as bfloat16 to
+   match `RouterTopKWithBias`'s init dtype, but the activation path
+   (`apply_activation_fn` in fp64) might lose precision. Try fp32.
+4. **MoE expert weights w1/w3 order**. Mixtral convention is
+   `w1=gate, w3=up`; verified my converter does
+   `gate_up[..., :I]=w1`, `gate_up[..., I:]=w3`. If M3 swapped the
+   convention (`w1=up, w3=gate`) the model would still produce semi-real
+   tokens — worth testing by swapping.
+
+## What this port does NOT support (yet)
+
+- ❌ MiniMax Sparse Attention (MSA) / Lightning Indexer. **Sparse layers run as dense GQA** in this port — this matches model semantics on moderate context lengths, but does not deliver the long-context compute savings of MSA. Marked `TODO` in the modeling code; an MSA implementation needs a custom block-sparse attention kernel on Neuron.
+- ❌ Vision tower, multi-modal projector, patch merger.
+- ❌ Multi-Token Prediction (`mtp.*`) modules. These weights are filtered out in the state dict converter.
+- ❌ `e_score_correction_bias` is currently dropped — the MVP path uses an unbiased top-k. Adding it requires a `GroupLimitedRouter`-style custom router.
+
+## Validation Status
+
+**This is an MVP port.** Token-by-token output matching against the HF reference has **not** been validated — the MSA stand-in (dense GQA), the SwiGLU→SwiGLU-OAI approximation in MoE experts, and the dropped `e_score_correction_bias` will produce different logits than the HF reference at the same prompt.
+
+### Real-checkpoint Trn2 validation (2026-06-25)
+
+**Configuration**: real MiniMax-M3 checkpoint, **first 6 layers** (3 dense + 3 MoE),
+`trn2.48xlarge`, TP=32, LNC=2, bf16, batch=1, seq_len=512.
+
+The first-N-layers truncation is a workaround for HBM headroom — see "Full 60-layer
+HBM constraint" below. The modeling code itself supports the full 60-layer config.
+
+#### BF16 checkpoint (MiniMaxAI/MiniMax-M3, 854 GB)
+
+| Metric | Value |
+|---|---|
+| Compile time | 172.2 s |
+| Load time (state dict → 32 sharded ranks) | 1573.9 s (~26 min) |
+| **TTFT** (5-token prompt) | **46.41 ms** |
+| **ITL** (decode) | **46.53 ms/token** (~21.5 tok/s) |
+
+#### MXFP8 checkpoint (MiniMaxAI/MiniMax-M3-MXFP8, 444 GB)
+
+The converter dequantizes MXFP8 → BF16 on the host before sharding (NxDI's
+mainstream MoE path doesn't yet consume on-device MXFP8 GeMM). On-device
+representation is bf16 either way, so TTFT/ITL match the bf16 run.
+
+| Metric | Value |
+|---|---|
+| Compile time | 175.7 s |
+| Load time (dequant + shard) | 800.1 s (~13 min, **2× faster** than bf16) |
+| **TTFT** (5-token prompt) | **46.50 ms** |
+| **ITL** (decode) | **46.31 ms/token** (~21.6 tok/s) |
+| Disk footprint | 414 GB (vs 796 GB bf16) |
+
+**MXFP8 trade-offs in this port**: ~½ disk and download cost, ~2× faster load,
+**no on-device HBM savings** (dequantized to bf16 before transfer) and no
+compute speedup. To realise the full FP8 win, NxDI would need a native FP8
+MoE GeMM path — currently only experimental for GPT-OSS-style models.
+
+This validates the full pipeline on real M3 weights: partial RoPE, Gemma-style RMSNorm,
+per-head QK-norm, sigmoid-routed MoE with 128 experts + 1 shared expert, dense vs MoE
+layer mix, HF state-dict converter, sharded weight loading, and prefill+decode on Neuron.
+
+Generated output is semantically wrong with only 6 layers of real weights (the
+remaining 54 layers are missing); accuracy comparison against HF requires the full
+60-layer model.
+
+### Full 60-layer HBM constraint
+
+#### Initial attempt (TP-only)
+
+First attempts at the full 60-layer model **compiled successfully** but
+**failed at runtime** with each NeuronCore's 24GB HBM saturated by replicated
+weights:
+
+```
+[ERROR] Failed to allocate 144MB on ND 1:NC 1: 23.971GB in use of 24GB available
+```
+
+The issue: with TP-only, 128 expert weights are replicated to every rank, so
+even at TP=64 each rank needs 13.3GB weights but pairs of NeuronCores share
+the same physical 24GB pool → 26.6GB on 24GB.
+
+#### Working configuration (M2-style hybrid sharding)
+
+Inspired by the [MiniMax-M2 PR (aws-neuron/neuronx-distributed-inference#138)](https://github.com/aws-neuron/neuronx-distributed-inference/pull/138),
+the working recipe splits experts across ranks (Expert Parallelism for the
+MoE layers only):
+
+| Knob | Value | Why |
+|---|---|---|
+| `tp_degree` | 64 | full TP across 64 logical cores (LNC=2) |
+| `ep_degree` (outer) | 1 | NEVER >1 — would multiply world_size beyond 64 |
+| `moe_tp_degree` | 1 | each expert stays on one rank |
+| `moe_ep_degree` | 64 | 128 experts / 64 ranks = 2 experts per rank |
+| `fused_qkv` | True | avoids per-rank QKV activation blowup |
+| `batch_size` | ≥ 32 | NxDI requires `batch >= num_experts/top_k = 128/4 = 32` for EP |
+| `blockwise_matmul_config.use_shard_on_block_dynamic_while` | True | required by SDK 2.29 MoE kernel |
+| `blockwise_matmul_config.block_sharding_strategy` | "PING_PONG" | |
+| `save_sharded_checkpoint` | True | persists 854GB sharded weights to disk for re-loads |
+
+#### Full 60-layer M3 on Trn2 — measured results (2026-06-25)
+
+**Configuration**: real BF16 checkpoint, all 60 decoder layers, all 128 experts,
+batch=32, seq_len=512, LNC=2.
+
+| Stage | Time |
+|---|---|
+| Compile (HLO + neuron-cc + 64-rank shard write) | **11,678 s (~3h 14m, first run only)** |
+| Weight load from /mnt/data EBS → 64-rank sharded files on /mnt/scratch NVMe | included in compile time above |
+| Pre-sharded weight load on subsequent runs | **27 s** |
+| Warmup | 5 s |
+| **TTFT** (prefill, batch=32, 5-token prompt padded to 512) | **7,949 ms** |
+| **Throughput at prefill** | ~2,061 tok/s effective (32 × 512 / 7.95s) |
+
+**End-to-end generation (after two recompiles): runs without crashing, but
+produces semantically wrong text.** Output collapses to repeated tokens:
+
+```
+The capital of France isasezasezasezasezasezasezasez...    # v3 with SwiGLU-OAI fix
+```
+
+Tracing shows generation is **completing successfully** — full HF `generate()`
+adapter runs 20 decode steps at ~446 ms/step (~72 tok/s across batch=32). The
+infrastructure works; the modeling has remaining bugs.
+
+### Known remaining bugs (block accuracy)
+
+1. **Shared-expert activation is wrong.** NxDI's `SharedExperts` module hard-codes
+   the activation as `act_fn(gate) * up`. We set `hidden_act="sigmoid"` so the
+   routed MoE experts get the right SwiGLU-OAI formula
+   (`gate * sigmoid(α·gate) * (up + 1)`), but `SharedExperts` then becomes
+   `sigmoid(gate) * up` — not SwiGLU-OAI at all. 57 shared experts × 60 layers
+   compounds into wrong logits. Fix: replace `SharedExperts` with a custom
+   `MiniMaxM3DenseMLP`-style module inside `initialize_minimax_m3_moe_module`.
+
+2. **`routed_scaling_factor` scales the wrong path.** M3 multiplies only the
+   routed (top-k) output by 2.0; the shared-expert output should be unscaled.
+   The current code multiplies the combined `MoE(...)[0]` (routed + shared) by
+   2.0, doubling the shared contribution. Fix: have `block_sparse_moe` return
+   routed and shared separately, scale the routed only, then sum.
+
+3. **Logit divergence vs HF not verified.** A teacher-forced match against an
+   HF reference run (à la DeepSeek-V3 contrib) is still needed once 1 and 2
+   are fixed.
+
+### Recompile observations (v2 → v6, ~3h per cycle)
+
+| Version | Fix applied | Sample 0 (first 10 tokens) | TTFT |
+|---|---|---|---|
+| v2 | fused_qkv=True, plain SWIGLU | (script bug) | 7949 ms |
+| v3 | + SwiGLU-OAI (sigmoid + bias=1.0) | `'isasezasezasez...'` | 9770 ms |
+| v4 | fused_qkv=False (rest same as v3) | `'isasezasezasez...'` (identical to v3) | 9799 ms |
+| v5 | + custom shared expert + scale only routed | `'is"면서""면서""면서"...'` | 10553 ms |
+| v6 | + `stride=2` on dense MLP / shared expert ColumnParallel | `' prejuí Juvent prejuí proverbial...'` | 10566 ms |
+
+The progression shows fixes have measurable effect on logits — `asez` →
+`면서` → `prejuí`. v6's sample 0 even contains real-looking token sequences
+(e.g. `' prejuí Juvent prejuí proverbial prejuí...'`) suggesting the
+modeling is getting closer to correctness, but **none of v3-v6 produces
+coherent text**. Samples 1 and 2 of v6 still collapse to `asez` repetition,
+indicating remaining state bugs.
+
+### Confirmed-good infrastructure in v6
+
+* `RouterTopKWithBias` correctly loads `e_score_correction_bias` (~4-5
+  range in bf16, verified in sharded checkpoint).
+* `MiniMaxM3GemmaRMSNorm` per-head q/k norm correctly loaded (weight mean
+  ~0.1-0.3, sane for Gemma).
+* Shared experts under each MoE layer carry separate `gate_proj` + `up_proj`
+  + `down_proj` sized to `shared_intermediate_size / TP = 48` per rank,
+  using `stride=2` fused ColumnParallel (same trick as routed experts).
+* Dense MLP (first 3 layers) uses the same `stride=2` fused
+  ColumnParallel.
+* MoE block returns routed only (`n_shared_experts=0` inside NxDI MoE);
+  decoder layer applies `routed_scaling_factor=2.0` to the routed
+  branch then adds the shared output.
+* All 60 layers + 128 experts + lm_head load without `Removing redundant
+  keys` warnings for the architecture-relevant tensors.
+
+### Remaining bug candidates (in priority)
+
+1. **Partial RoPE numerics**. `rotary_dim=64`, `rope_theta=5_000_000`. My
+   `MiniMaxM3PartialRotaryEmbedding` matches the HF reference *structurally*
+   (`inv_freq` over the first 64 dims, `emb=cat(freqs, freqs)`,
+   `cos/sin` then split into the first half of each head via
+   `apply_minimax_m3_rotary`), but the exact dtype-cast order and float32
+   vs bfloat16 may differ. Worth a head-on numerical comparison against
+   a 1-layer CPU forward.
+2. **Q/K weight orientation across TP=64 / num_kv_heads=4 GQA**. NxDI uses
+   `REPLICATE_TO_TP_DEGREE` (4 → 64 via 16× repeat) but the exact head
+   ordering after `_replicate_kv` may not match the HF reference's
+   `repeat_kv(num_key_value_groups=16)` expectation in attention.
+3. **Hidden global scale**. M2 has `attention_value_scale=0.707`; M3
+   config doesn't expose it but the HF reference may apply something
+   similar inline. Verified against
+   `transformers/models/minimax_m3_vl/modeling_minimax_m3_vl.py`:
+   `scaling = head_dim**-0.5 = 128**-0.5`, plain — no extra factor —
+   so this is probably ruled out.
+4. **Per-layer `attention_output_gate`** — M3 config has
+   `attention_output_gate: False`, but a similar `attn_output_scale`
+   would also affect things.
+
+### Iteration cost
+
+Each modeling change requires a full recompile + reshard cycle. Measured
+times on `trn2.48xlarge` with the model on local NVMe (`/mnt/nvme`,
+RAID0 across 3× 1.7TB instance-store NVMes — `/mnt/data` EBS gp3 is 10×
+slower):
+
+| Stage | Time |
+|---|---|
+| HLO + neuron-cc | ~5 min |
+| State dict load + conversion + 64-rank shard write | ~95 min |
+| Pre-sharded weight load | ~30 sec |
+| Warmup + TTFT (5 prefill calls) + generate (20 tokens, batch=32) | ~2 min |
+| **End-to-end per recompile** | **~100 min** |
+
+### Iteration cost
+
+Each modeling change requires a full recompile + reshard cycle. Measured times:
+* `model.compile()`: ~5 min (HLO + neuron-cc)
+* Shard weights to 64 ranks on /mnt/scratch NVMe: ~2h 47min (CPU-bound, single-threaded)
+* Pre-sharded weight load on subsequent runs: 27 s
+
+So one modeling fix → new TTFT/generation result is ~3 hours wall time.
+
+### Measured numbers across recompiles
+
+| Version | SwiGLU formula in MoE experts | TTFT (bsz=32, seq=512) | Output |
+|---|---|---|---|
+| v2 | `gate * silu(gate) * up` (plain SWIGLU) | 7949 ms | (not measured — script bug) |
+| v3 | `gate * sigmoid(1.702·gate) * (up+1)` (SwiGLU-OAI) | 9770 ms | `'isasezasezasezasez...'` (repetition collapse) |
+
+The ~23% TTFT slowdown from v2→v3 is consistent with SwiGLU-OAI's extra clamp +
+bias-add on each MoE forward pass.
+
+### Accuracy validation TODO
+
+1. Implement the Lightning Indexer + block-sparse attention path.
+2. Add a SwiGLU-OAI activation to NxDI `ExpertMLPsV2` (or move expert MLPs out of `ExpertMLPsV2` to a custom implementation).
+3. Restore the routing correction bias via a custom router (à la `DeepseekV3Router`).
+4. Validate logits against the HF reference under the same RNG seed (will require the full 60-layer model — see "Full 60-layer HBM constraint" above).
+
+## Usage
+
+```python
+import torch
+from transformers import AutoTokenizer
+from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+
+# Make `src/` importable
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path("contrib/models/MiniMax-M3/src")))
+from modeling_minimax_m3 import (
+    NeuronMiniMaxM3ForCausalLM, MiniMaxM3InferenceConfig,
+)
+
+MODEL_PATH = "/home/ubuntu/models/MiniMax-M3/"
+COMPILED_PATH = "/home/ubuntu/neuron_models/MiniMax-M3/"
+
+neuron_config = NeuronConfig(
+    tp_degree=32,
+    batch_size=1,
+    seq_len=512,
+    max_context_length=512,
+    torch_dtype=torch.bfloat16,
+)
+config = MiniMaxM3InferenceConfig(
+    neuron_config,
+    load_config=load_pretrained_config(MODEL_PATH),
+)
+
+model = NeuronMiniMaxM3ForCausalLM(MODEL_PATH, config)
+model.compile(COMPILED_PATH)
+model.load(COMPILED_PATH)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+# ...generate (see test/integration/test_model.py for a full loop)
+```
+
+## Compatibility Matrix
+
+| Instance / SDK | Status |
+|---|---|
+| Trn2.48xlarge | MVP only — sparse attention runs as dense GQA. The model weights (~854GB) require TP≥16 for activation storage and large host memory for weight loading; TP=32 recommended. |
+| Trn1 | Not tested; the model is unlikely to fit. |
+| Inf2 | Not tested. |
+
+NeuronX SDK: tested against the `aws_neuronx_venv_pytorch_2_9_nxd_inference` venv at `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` (transformers 4.57+).
+
+## Testing
+
+### Synthetic smoke test (no checkpoint needed)
+
+Validates the modeling code end-to-end on Neuron hardware against a tiny
+M3-shaped config built from random weights. Useful when iterating on the
+modeling code or before paying the 854GB download cost.
+
+```bash
+PATH=/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin:$PATH \
+  /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/python \
+  contrib/models/MiniMax-M3/test/integration/smoke_test_synthetic.py
+```
+
+### Full integration test (real checkpoint)
+
+```bash
+# Download the checkpoint (854GB). With hf_transfer this takes ~2-3 hours.
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download MiniMaxAI/MiniMax-M3 \
+  --local-dir /mnt/data/models/MiniMax-M3/
+
+# Run the integration test (compiles on first run, then exercises TTFT / ITL).
+M3_MODEL_PATH=/mnt/data/models/MiniMax-M3 \
+M3_COMPILED_PATH=/mnt/data/neuron_models/MiniMax-M3 \
+M3_TP_DEGREE=32 \
+  /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/python \
+  contrib/models/MiniMax-M3/test/integration/test_model.py
+```
+
+Useful environment variables (all optional):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `M3_MODEL_PATH` | `/home/ubuntu/models/MiniMax-M3/` | HF checkpoint path |
+| `M3_COMPILED_PATH` | `/home/ubuntu/neuron_models/MiniMax-M3/` | NEFF cache path |
+| `M3_TP_DEGREE` | `32` | Tensor parallel degree |
+| `M3_BATCH_SIZE` | `1` | |
+| `M3_SEQ_LEN` | `512` | Compile context length |
+| `M3_NUM_LAYERS` | `0` | If > 0, override `num_hidden_layers` (smoke testing) |
+| `M3_NUM_EXPERTS` | `0` | If > 0, override `num_local_experts` (smoke testing) |
+
+## Maintainer
+
+Contributed by community via the NxDI contrib folder. See `CONTRIBUTING.md`.
+
+**Last Updated**: 2026-06-25
