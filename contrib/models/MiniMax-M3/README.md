@@ -64,7 +64,17 @@ The release is a vision-language MoE with ~428B total / ~23B active parameters. 
   | v5 (+ custom shared expert, scale routed only) | `'is"면서""면서""면서"...'` |
   | v6 (+ `stride=2` on fused gate_up_proj) | `' prejuí Juvent prejuí proverbial prejuí...'` |
   | v7 (+ `e_score_correction_bias` fp32 instead of bf16) | `'asez prejuí kmall prejuí ianak kmall asez kmall ㈱...'` (≈ v6) |
-  | v8 (+ Gemma-style `(1+w)` pre-shift on ALL RMSNorm weights) | PENDING — CPU-validated fix |
+  | v8 (+ Gemma-style `(1+w)` pre-shift on ALL RMSNorm weights) | `'告诉好友'` (real Chinese token "tell friends") + meaningful word salad |
+
+  v8 result: massive improvement over v3-v7. Prefill is now `100%
+  self-consistent across batch` (verified: logits max-abs-diff=0.0 across
+  all 32 batch positions). All weights match HF byte-for-byte (verified:
+  expert 0 gate first 3 values identical to HF `w1`). But the model still
+  predicts wrong top-1 token (`告诉好友` instead of `Paris`), pointing to
+  a residual bug not yet isolated — likely a remaining numerical
+  divergence in one of: partial RoPE per-token application, GQA head
+  ordering after `REPLICATE_TO_TP_DEGREE`, or MoE routing precision
+  effects under bf16 bias.
 
   v6's sample 0 contains real-looking distinct token sequences; samples 1
   and 2 still collapse to repetition (`' prejuí asez asez ...'`). The
