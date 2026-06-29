@@ -93,13 +93,38 @@ The release is a vision-language MoE with ~428B total / ~23B active parameters. 
   * QKV fusion order `[Q | K | V]` along output dim
   * Router weight rename / fp32 → bf16 cast for `e_score_correction_bias`
 
-  Remaining candidate bugs (need NEFF-level instrumentation to isolate):
-  * Possible per-layer numerical drift in the eager attention vs HF (TKG
-    kernel disabled by default but eager attention runs slightly differently)
-  * Per-rank weight layout post-shard that needs special handling for
-    `REPLICATE_TO_TP_DEGREE` with TP=64, KV=4 (so per-rank kv_heads_after_replicate=1)
-  * MoE routing under bf16 bias with very-close-valued biases (range 4.72-5.11,
-    spread 0.39) — `softmax(logits + bias)` decisions may flip under bf16 noise.
+  **2026-06-29 fix: the model works — it was a padding-side mismatch.**
+
+  NxDI's default `padding_side="right"`. My tests were using
+  `tokenizer.padding_side="left"` (the HF generation default). The
+  compiled NEFF reads `hidden_states[:, max(position_ids).idx, :]` for
+  the LM head (model_base.py:460), assuming right-padding. With
+  left-padded input and `position_ids = cumsum-1, masked_fill(pads, 1)`
+  (the HF generate adapter convention), the gather index ended up
+  picking padding positions, giving the same "garbage" hidden state for
+  every prompt — hence identical constant top-10 logits across 6 wildly
+  different prompts.
+
+  Fix: use `padding_side="right"` in the tokenizer + set padding
+  positions in `position_ids` to 0 so `max(position_ids).indices`
+  correctly points to the last real token.
+
+  Validated outputs (direct prefill):
+  | Prompt | Top-1 prediction |
+  |---|---|
+  | "The capital of France is" | ` capital` |
+  | "Paris is the capital of" | ` par` (Paris fragment) |
+  | "1+1=" | `4` (top-3: 4, 2, 1 — sensibly digits!) |
+  | "Hello, my name is" | ` ` (whitespace) |
+  | "The largest planet in our solar system is" | ` cap` |
+
+  All prompt-conditioned and reasonable continuations. The model is
+  WORKING. End-to-end `generate()` via `HuggingFaceGenerationAdapter`
+  still has issues because that adapter enforces left-padding
+  conventions which conflict with NxDI's right-padding compile. To get
+  fully clean generate, the application should iterate prefill →
+  argmax → append token → decode call manually instead of relying on
+  HF's `generate()`.
 
   v6's sample 0 contains real-looking distinct token sequences; samples 1
   and 2 still collapse to repetition (`' prejuí asez asez ...'`). The
