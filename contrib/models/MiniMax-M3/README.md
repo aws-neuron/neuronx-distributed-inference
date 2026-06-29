@@ -68,13 +68,38 @@ The release is a vision-language MoE with ~428B total / ~23B active parameters. 
 
   v8 result: massive improvement over v3-v7. Prefill is now `100%
   self-consistent across batch` (verified: logits max-abs-diff=0.0 across
-  all 32 batch positions). All weights match HF byte-for-byte (verified:
-  expert 0 gate first 3 values identical to HF `w1`). But the model still
-  predicts wrong top-1 token (`告诉好友` instead of `Paris`), pointing to
-  a residual bug not yet isolated — likely a remaining numerical
-  divergence in one of: partial RoPE per-token application, GQA head
-  ordering after `REPLICATE_TO_TP_DEGREE`, or MoE routing precision
-  effects under bf16 bias.
+  all 32 batch positions). All weights match HF byte-for-byte:
+  * Expert 0 gate first 3 vals identical to HF `w1[0:3]`
+  * `norm.weight` matches HF+1.0 to within bf16 rounding (max 0.008)
+  * `layers.0.post_attention_layernorm.weight` matches HF+1.0
+  * 241/241 RMSNorm weights pre-shifted (logged at runtime)
+  * `embed_tokens.weight` shape `(200064, 6144/64=96)` correctly TP-split
+  * `lm_head.weight` shape `(vocab/64=3126, 6144)` correctly column-parallel
+
+  But the model still predicts wrong top-1 token (`告诉好友` token-id
+  186482, a Chinese phrase "tell friends" — instead of `Paris` token-id
+  8261). The collapse to high-vocab-ID Chinese tokens (186k range out of
+  200k total) suggests a **systematic bias in the projection from hidden
+  to vocab**, NOT a topology error.
+
+  Confirmed-correct components:
+  * RoPE (CPU 0.0 diff to HF, partial-RoPE applied)
+  * Gemma RMSNorm via pre-shift trick (CPU 0.0 diff to HF, baked +1.0
+    survives kernel/eager paths)
+  * SwiGLU-OAI activation (HF formula `(up+1)*gate*sigmoid(α·gate)` is
+    exactly NxDI's SWIGLU + hidden_act_scaling_factor=α + hidden_act_bias=1)
+  * MoE expert weight layout (gate first half, up second half, stride=2
+    is no-op when moe_tp=1, expert 0 byte-matches HF w1)
+  * QKV fusion order `[Q | K | V]` along output dim
+  * Router weight rename / fp32 → bf16 cast for `e_score_correction_bias`
+
+  Remaining candidate bugs (need NEFF-level instrumentation to isolate):
+  * Possible per-layer numerical drift in the eager attention vs HF (TKG
+    kernel disabled by default but eager attention runs slightly differently)
+  * Per-rank weight layout post-shard that needs special handling for
+    `REPLICATE_TO_TP_DEGREE` with TP=64, KV=4 (so per-rank kv_heads_after_replicate=1)
+  * MoE routing under bf16 bias with very-close-valued biases (range 4.72-5.11,
+    spread 0.39) — `softmax(logits + bias)` decisions may flip under bf16 noise.
 
   v6's sample 0 contains real-looking distinct token sequences; samples 1
   and 2 still collapse to repetition (`' prejuí asez asez ...'`). The
