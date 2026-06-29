@@ -109,6 +109,8 @@ The release is a vision-language MoE with ~428B total / ~23B active parameters. 
   positions in `position_ids` to 0 so `max(position_ids).indices`
   correctly points to the last real token.
 
+  Working test script: `test/integration/test_generate_right_pad.py`.
+
   Validated outputs (direct prefill):
   | Prompt | Top-1 prediction |
   |---|---|
