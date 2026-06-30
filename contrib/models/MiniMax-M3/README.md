@@ -219,6 +219,44 @@ non-batch-zero samples produce identical output (s15==s31), confirming this
 isolation. Sample 0 still differs slightly — likely due to remaining
 batch-position effects in expert routing.
 
+### Chat template control tokens have tiny embeddings (2026-06-30)
+
+Per the HF docs (`https://huggingface.co/docs/transformers/model_doc/minimax_m3_vl`),
+M3 uses these tokens for chat structure:
+
+| Token | ID | HF embed norm | Purpose |
+|---|---|---|---|
+| `]!p~[` | 200000 | 3.25 | pad |
+| `]~b]` | 200019 | **0.49** | begin-of-sequence/role marker |
+| `[e~[` | 200020 | **0.47** | end-of-sequence |
+| `]~!b[` | 200034 | 2.18 | begin-of-document |
+| `<mm:think>` | 200059 | **0.17** | thinking-mode start |
+| `</mm:think>` | 200060 | **0.17** | thinking-mode end |
+
+**The role/control tokens (200019, 200020, 200059, 200060) have embedding
+norms 4-20× smaller** than normal vocabulary tokens (Paris=1.89,
+`告诉好友`=1.70). HF doc-style chat templates use these heavily, but their
+near-zero embeddings make the resulting hidden states dominated by surrounding
+non-control tokens. Any small numerical noise (e.g., MoE bf16 accumulation)
+disproportionately affects the model's response to these control signals.
+
+We verified the embeddings byte-match HF (max diff 0.0) — the issue is
+intrinsic: chat template inference requires more numerical precision than
+our path provides.
+
+**With raw text** (no chat template), prefill top-5 is correct:
+* `"The capital of France is"` → top-5 includes ` capital`
+* `"1+1="` → top-5 = [`1`,`2`,`4`,`3`,`0`]
+* `"The sky is blue. The grass is"` → top-1 ` skin` (semantically related!)
+
+**With chat template**, prefill top-5 degrades to `p`, ` |`, ` part`, `pt` —
+generic high-frequency fragment tokens — suggesting hidden states cluster
+at the vocabulary geometric centroid.
+
+Goal `结果准确` status: **raw text prefill produces correct top-k semantically
+related candidates**, but chat-template-based multi-token generation needs
+fp32 MoE accumulation or NKI kernel fixes beyond contrib model scope.
+
   Validated outputs (direct prefill):
   | Prompt | Top-1 prediction |
   |---|---|
