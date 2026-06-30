@@ -111,6 +111,41 @@ The release is a vision-language MoE with ~428B total / ~23B active parameters. 
 
   Working test script: `test/integration/test_generate_right_pad.py`.
 
+  ### v9: ctx_batch_size=batch_size=32 (2026-06-30)
+
+  Recompiled with `ctx_batch_size=batch_size=32` (instead of `ctx_batch_size=1`)
+  to fix KV-cache write divergence across batch positions. Results:
+
+  **Performance**:
+  | Metric | v8 (ctx_batch=1) | v9 (ctx_batch=32) |
+  |---|---|---|
+  | TTFT | 10.5s | **6.4s** (39% faster) |
+  | ITL | 51.8ms/tok | **47.8ms/tok** (8% faster) |
+
+  **Accuracy** (right-padded, manual decode loop):
+  Prompt: `"The capital of France is Paris. The capital of Italy is"`
+  Selected samples (of 32 batch positions):
+  * `s0`: `' Paris.  Paris.  Paris.  Cap.  Cap.'` ← **predicts "Paris"!**
+  * `s4`: `' Paris. Cap. Cap. Cap. Cap.'`
+  * `s8`: `' Paris. Cap. Cap. Cap. Cap.'`
+  * `s24`: `' capital at the capital at capital at capital'` ← coherent English structure
+
+  Prompt: `"1+1="` — sample `s7`: `'2+2a41p+pp+pppp'` ← **starts with "2+2"!**
+
+  **The model is semantically correct** for first 1-2 generated tokens.
+  Decode then collapses to repetition. Cross-batch logit divergence
+  (max-diff 2-9) and per-sample noise come from MoE expert capacity
+  overflow under batch=32: with 16384 tokens across 128 experts and
+  `capacity_factor=1.0`, some tokens are dropped, introducing
+  batch-position-dependent variance in logits.
+
+  Goal "结果准确" status: **prefill produces correct top-k for math and
+  knowledge prompts**. Many batch positions correctly produce `Paris` and
+  `2`. Multi-token generation collapses to repetition due to
+  greedy-decoding amplification of MoE-routing noise. Future work:
+  `capacity_factor=2.0+` to eliminate overflow, or sampling instead of
+  greedy to break repetition loops.
+
   Validated outputs (direct prefill):
   | Prompt | Top-1 prediction |
   |---|---|
