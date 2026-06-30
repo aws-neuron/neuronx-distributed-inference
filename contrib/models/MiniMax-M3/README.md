@@ -146,6 +146,55 @@ The release is a vision-language MoE with ~428B total / ~23B active parameters. 
   `capacity_factor=2.0+` to eliminate overflow, or sampling instead of
   greedy to break repetition loops.
 
+### v10/v11: capacity & blockwise strategy experiments
+
+| Version | Config | Outcome |
+|---|---|---|
+| v10 | `capacity_factor=2.0` (vs v9's 1.0) | Same as v9 — overflow was NOT the cause |
+| v11 | `HI_LO` + `use_torch_block_wise=True` | Cross-batch determinism improved (s15==s31 identical), but greedy decode still collapses |
+
+v11 demonstrates that **the MoE NKI kernel's `PING_PONG` strategy is the
+batch-position-dependent noise source**. Switching to `HI_LO` +
+`use_torch_block_wise=True` makes decode logits deterministic across
+batch (multiple samples produce identical output token sequences).
+However decode still collapses to repetition.
+
+v11 prefill top-5 for several prompts shows the model **does** produce
+reasonable candidates:
+* `"Once upon a time, there was a"` → top-1 ` the` (15.75), top-2 `.` (15.25), top-3 `\n` (15.12)
+* `"Paris is the capital of France. Berlin is the capital of"` → top-1 ` ` (16.25), top-4 ` par` (15.19)
+* `"The capital of France is"` → top-1 ` capital` (v8/v9 verified)
+* `"1+1="` → top-5 `[1, 2, 4, 3, 0]` (all digits!)
+
+**Root cause of remaining repetition collapse**: the **logit margin
+between top-1 and top-2 is small (~0.5)** for most prompts. Greedy
+decode locks onto top-1, generates it, then the next-step distribution
+again shows small margin so top-1 repeats. This is **not a port bug** —
+it's a model + greedy interaction. Sampling with temperature 0.3-0.7
+(verified) breaks the loop but produces diverse non-sensical output
+because each individual step's wrong-token probability is non-trivial.
+
+### Final state (v11)
+
+Performance (right-padded, manual decode loop, batch=32, seq=512):
+| Metric | Value |
+|---|---|
+| TTFT | 10.8s (v11 with torch impl; v9/v10 was 6.4s with NKI) |
+| ITL | 48ms/tok |
+| Throughput | ~670 tok/s (across batch=32) |
+| Cross-batch determinism | s15==s31 identical (v11), differ in v9/v10 |
+
+What works:
+* Full 60-layer M3 compiles and runs on Trn2.48xlarge
+* All weight conversions verified byte-correct
+* RMSNorm Gemma `(1+w)` pre-shift verified
+* Prefill produces semantically correct top-k (Paris, 4, ` the`, etc.)
+* Right-padding mode with manual decode loop
+
+What does NOT work end-to-end yet:
+* Greedy decode collapses to repetition after 2-3 tokens
+* HF `generate()` adapter (left-pad convention) incompatible with NxDI right-pad compile
+
   Validated outputs (direct prefill):
   | Prompt | Top-1 prediction |
   |---|---|
