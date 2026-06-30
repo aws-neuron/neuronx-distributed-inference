@@ -195,6 +195,30 @@ What does NOT work end-to-end yet:
 * Greedy decode collapses to repetition after 2-3 tokens
 * HF `generate()` adapter (left-pad convention) incompatible with NxDI right-pad compile
 
+### KV cache investigation (2026-06-30)
+
+Investigated 5 hypotheses for batch-position-dependent decode noise:
+
+1. **K/V transpose layout mismatch** — Both prefill and decode share `KVCacheManager`
+   with the same `k_cache_transposed=False`, shapes `(32, 1, 512, 128)`. ✓ correct.
+2. **GQA repeat_kv mismatch** — REPLICATE_TO_TP_DEGREE makes per-rank
+   `num_kv_heads=1` and `num_attention_heads=1`, so `num_key_value_groups=1`,
+   `repeat_kv` is a no-op. ✓ correct.
+3. **Batch/head dim confusion** — KV cache is `(B=32, H=1, S=512, D=128)`. Decode
+   reads via `past_key_value[0]` → `(B, H, S, D)`. Q from prep is `(B=32, H=1,
+   S=1, D=128)`. `matmul(Q, K.T)` properly aligns batch. ✓ correct.
+4. **K_prior transpose(2,3) mismatch** — Done conditionally on
+   `k_cache_transposed` flag, consistent between prefill and decode. ✓ correct.
+5. **stride=2 misapplied to attention** — Only MoE `gate_up_proj` uses stride=2;
+   attention `Wqkv` uses default stride=1. ✓ correct.
+
+The KV cache logic is verified correct. The cross-batch noise is **NOT a KV cache
+bug** — it comes from the MoE blockwise_matmul kernel packing tokens into
+blocks. Switching to `HI_LO + use_torch_block_wise=True` (v11) made
+non-batch-zero samples produce identical output (s15==s31), confirming this
+isolation. Sample 0 still differs slightly — likely due to remaining
+batch-position effects in expert routing.
+
   Validated outputs (direct prefill):
   | Prompt | Top-1 prediction |
   |---|---|
