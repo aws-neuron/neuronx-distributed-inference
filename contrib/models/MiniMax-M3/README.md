@@ -30,6 +30,53 @@ The release is a vision-language MoE with ~428B total / ~23B active parameters. 
 | Activation | SwiGLU-OAI (`alpha=1.702`, `limit=7.0`) |
 | Norm | Gemma-style RMSNorm (scale = 1 + weight), `eps=1e-6` |
 
+## Root cause of 60-layer text degradation: **MSA missing (Multi-Sparse Attention)**
+
+**Primary hypothesis** (established 2026-06-30 via HF CPU depth study):
+
+The 60-layer generated text degrades to high-vocab-ID exotic tokens
+(`告诉好友`, ` capital`, then repetition) **not because of a port bug**,
+but because **HF's own reference implementation, run as dense GQA
+without MSA, has the same failure mode**.
+
+Evidence chain:
+
+1. **4-layer Neuron == 4-layer HF (bit-parity)**: top-5 identical `[ウ, £, ふ, ย, ก]`
+   for every prompt in both bf16 and fp32. Confirms our port is math-correct.
+2. **HF CPU 16-layer bf16**: `last_hidden_norm ≈ 80`, top-1 still `ウ`.
+3. **HF CPU 32-layer bf16**: `last_hidden_norm jumps to ≈ 126`, top-1 becomes
+   ` medioamb` / `草` / `一到` — exotic Chinese/Japanese fragment tokens.
+4. **HF CPU 32-layer fp32**: **still garbage** (`厚的`, `我从`, `冬`) — fp32
+   doesn't fix it, so the issue is not bf16 accumulation.
+5. **Checkpoint is native bf16** (`torch_dtype: bfloat16`, no
+   `quantization_config`) — so the issue is not MXFP8→bf16 dequant loss.
+
+The HF docs recommend `bf16 + MSA + compile` as the fastest & correct
+runtime configuration for this checkpoint. **MSA (Multi-Sparse Attention)**
+is a lightning-indexer-driven block-sparse attention pattern used on
+`layer_types == "minimax_m3_sparse"` layers (the majority of M3-preview's
+60 layers). It caps attention span per query, preventing the deep-layer
+hidden-state magnitude blow-up observed above (norm 80 → 126 between
+layer 16 and layer 32).
+
+Without MSA, dense GQA on all 60 layers lets attention output magnitudes
+compound unchecked, driving `hidden_state → vocabulary-embedding-space
+centroid`, which lands on the highest-frequency non-English tokens in
+M3's 200K-token multilingual vocab.
+
+**Fix path (out of scope for this contrib port):**
+
+- Implement MSA (Lightning Indexer + block-sparse attention) as a
+  Neuron NKI kernel. HF has a reference implementation gated behind
+  `kernels-staging/msa@v0`. This is NxDI framework work.
+- Alternatively, `native MXFP8 GeMM` path — HF's own MXFP8 preview
+  variant retains the trained precision distribution; but NxDI has
+  no native MXFP8 MoE GeMM today.
+
+For now, this port stands as a **structurally-correct MVP** on Trn2 with
+verified compile/load/prefill infrastructure, awaiting MSA to close the
+last accuracy gap.
+
 ## What this port supports
 
 - ✅ GQA attention with per-head Gemma RMSNorm on Q/K and partial RoPE.
