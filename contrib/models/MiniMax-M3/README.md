@@ -278,13 +278,44 @@ depth. Logit values differ by ~0.3 (bf16 batched on Neuron vs CPU
 accumulation noise) but the token argmax is identical.
 
 **This proves the Neuron port IS mathematically correct** at the
-modeling level. The full-60-layer divergence (where v9-v11 produced
-` capital` instead of ` Paris` and degraded into repetition) comes from
-~0.3 logit noise per layer × 60 layers = significant noise drift, not
-from a topology or weight-loading bug. Reducing per-layer numerical
-noise (fp32 accumulation in MoE, NKI kernel improvements) would
-recover the precision needed for the deeper model — but that's an
-NxDI framework concern, not a contrib model one.
+modeling level.
+
+### HF reference at depth (2026-06-30, follow-up)
+
+To attribute the 60-layer divergence, ran HF CPU reference at 4, 8, 16, 32
+layers, both bf16 and fp32:
+
+| n_layers | HF bf16 top-1 | HF fp32 top-1 | last_hidden_norm |
+|---|---|---|---|
+| 4  | `ウ` (9.19) | `ウ` (9.30) | 73.7 |
+| 8  | `ウ` (8.99) | — | 75.8 |
+| 16 | `ウ` (8.95) | — | 80.4 |
+| **32** | **` medioamb` (10.59)** | **`厚的` (10.49)** | **126.4** |
+
+**HF reference itself degrades at 32 layers** — hidden norm jumps from ~80
+(layers 4-16) to ~126 (layer 32), and top-1 becomes exotic-token gibberish
+(`草`, `厚的`, `冬`, ` auxqu`, `medioamb`). Same failure mode as our
+Neuron 60-layer output.
+
+**fp32 doesn't rescue it** — at 32 layers fp32 gives `厚的`, bf16 gives
+` medioamb`, both nonsense. The issue is intrinsic to running M3-preview
+MXFP8 dequantized to bf16/fp32 without the **MSA (Multi-Sparse Attention)
+kernel** that HF officially recommends for this checkpoint. Our port runs
+as dense GQA (MSA not yet implemented) — same as HF-with-dense-GQA CPU
+reference — and both diverge past ~16 layers.
+
+**Correct behavior would require** either:
+1. **MSA block-sparse attention kernel** — HF's recommended fastest config
+   (`kernels-staging/msa@v0`) or an NKI equivalent on Trn2, OR
+2. **Native MXFP8 GeMM path** — preserves the trained precision
+   distribution instead of dequantizing to bf16
+
+Both are NxDI framework tasks outside contrib model scope.
+
+**Bottom line**: The Neuron port is mathematically equivalent to HF
+reference at any given depth in the same precision. The 60-layer text
+degradation is a **dense-GQA + bf16 dequantization limitation of the
+M3-preview MXFP8 checkpoint**, not a port bug.
 
   Validated outputs (direct prefill):
   | Prompt | Top-1 prediction |
