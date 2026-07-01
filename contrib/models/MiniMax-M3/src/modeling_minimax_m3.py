@@ -54,6 +54,7 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseModel,
 )
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.kvcache.utils import dynamic_update_slice
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
@@ -189,10 +190,13 @@ class MiniMaxM3Indexer(nn.Module):
       * ``q_norm``, ``k_norm``: RMSNorm(head_dim=128) applied per head
       * partial RoPE on the first ``index_head_dim`` channels of idx_q / idx_k
 
-    Forward returns the sparse causal mask ``(B, num_heads, S_q, S_k)`` (0 for
-    kept, -inf for dropped) so the caller can pass it straight to attention.
-    ``num_heads`` is the full ``config.num_attention_heads`` — the indexer's
-    per-block verdict is broadcast to every query head within the GQA group.
+    Forward returns the sparse causal mask ``(B, 1, S_q, S_k)`` (0 for
+    kept, -inf for dropped). The head dim is collapsed to 1 via
+    ``block_keep.any(dim=1)`` because per-rank ``num_attention_heads == 1``
+    with REPLICATE_TO_TP_DEGREE.
+
+    Runs on prefill only in this MVP (S > 1). Decode-side MSA requires an
+    idx_k KV cache with NxDI output-aliasing, which is out of contrib scope.
 
     The `+1` Gemma pre-shift on q_norm/k_norm weights is handled by the
     checkpoint converter, so we use plain RMSNorm here.
@@ -209,6 +213,8 @@ class MiniMaxM3Indexer(nn.Module):
         num_attention_heads: int,
         rms_norm_eps: float,
         dtype: torch.dtype,
+        max_seq_len: int = 512,
+        batch_size: int = 32,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -218,6 +224,7 @@ class MiniMaxM3Indexer(nn.Module):
         self.topk_blocks = topk_blocks
         self.local_blocks = local_blocks
         self.num_attention_heads = num_attention_heads
+        self.max_seq_len = max_seq_len
         self.q_proj = ColumnParallelLinear(
             hidden_size, index_n_heads * index_head_dim, bias=False,
             gather_output=True, dtype=dtype,
@@ -236,7 +243,7 @@ class MiniMaxM3Indexer(nn.Module):
         sin: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Returns sparse causal mask ``(B, num_attention_heads, S_q, S_k)``."""
+        """Returns sparse causal mask ``(B, 1, S_q, S_k)``. Prefill only."""
         B, S, _ = hidden_states.shape
         idx_q = self.q_proj(hidden_states).view(B, S, self.n_heads, self.head_dim)
         idx_q = self.q_norm(idx_q).transpose(1, 2)  # (B, n_heads, S, D_idx)
@@ -248,16 +255,20 @@ class MiniMaxM3Indexer(nn.Module):
             idx_q, idx_k, cos[..., : self.head_dim], sin[..., : self.head_dim]
         )
 
-        # Score qk in fp32
         k_len = idx_k.shape[2]
         num_key_blocks = (k_len + self.block_size - 1) // self.block_size
-        pad = num_key_blocks * self.block_size - k_len
+        idx_k_full = idx_k
 
-        scores = torch.matmul(idx_q.float(), idx_k.float().transpose(-1, -2))
+        # Score qk in fp32
+        scores = torch.matmul(idx_q.float(), idx_k_full.float().transpose(-1, -2))
+        # Broadcast: scores (B, n_heads, S_q, S_max)
+
         k_positions = torch.arange(k_len, device=idx_q.device)
-        # Future mask
+        # Future mask: key k > query's position
         token_future = k_positions[None, None, None, :] > position_ids[:, None, :, None]
         scores = scores.masked_fill(token_future, float("-inf"))
+
+        pad = num_key_blocks * self.block_size - k_len
         if pad:
             scores = F.pad(scores, (0, pad), value=float("-inf"))
 
@@ -276,7 +287,6 @@ class MiniMaxM3Indexer(nn.Module):
         # Top-K blocks
         topk = min(self.topk_blocks, num_key_blocks)
         topk_scores, topk_indices = block_scores.topk(topk, dim=-1)
-        # Invalidate slots whose top-k score is still -inf
         topk_indices = topk_indices.masked_fill(topk_scores == float("-inf"), -1)
 
         # Expand top-K block indices to a `(B, num_att_heads, S_q, S_k)` mask
@@ -290,15 +300,20 @@ class MiniMaxM3Indexer(nn.Module):
         bias.scatter_(-1, safe, 0.0)
         bias = bias[..., :num_key_blocks]
 
-        # Repeat per-block to per-key, then broadcast per-idx-head to all attention heads
+        # Repeat per-block to per-key (dim=-1). Keep head dim = n_heads (=4);
+        # attention path will broadcast to per-rank num_heads. Since per-rank
+        # num_att_heads = 1 (with REPLICATE_TO_TP_DEGREE) and per-rank
+        # num_kv_heads = 1, we further reduce the head dim to 1 by max-pooling
+        # over the n_heads indexer heads (union-of-selected-blocks). This
+        # matches the HF logic conceptually: any indexer head that keeps a
+        # block → keep it in the shared attention mask.
         block_keep = (bias == 0.0).repeat_interleave(self.block_size, dim=-1)[..., :k_len]
-        block_keep = block_keep.repeat_interleave(
-            self.num_attention_heads // self.n_heads, dim=1
-        )  # (B, num_att_heads, S_q, S_k)
+        # Union across indexer heads: (B, n_heads, S_q, S_k) → (B, 1, S_q, S_k)
+        block_keep = block_keep.any(dim=1, keepdim=True)
 
-        # Compose with causal mask
-        keep = block_keep & ~token_future
-        # Emit additive mask
+        # token_future was per idx-head; collapse to (B, 1, S_q, S_k) too
+        tf = token_future  # (B, 1, S_q, S_k) — already 1 in head dim
+        keep = block_keep & ~tf
         min_val = torch.finfo(hidden_states.dtype).min
         mask = torch.zeros_like(keep, dtype=hidden_states.dtype).masked_fill(~keep, min_val)
         return mask
@@ -695,6 +710,8 @@ class NeuronMiniMaxM3Attention(NeuronAttentionBase):
                 num_attention_heads=config.num_attention_heads,
                 rms_norm_eps=config.rms_norm_eps,
                 dtype=config.neuron_config.torch_dtype,
+                max_seq_len=config.neuron_config.seq_len,
+                batch_size=config.neuron_config.batch_size,
             )
 
         if not parallel_state.model_parallel_is_initialized():
@@ -853,13 +870,11 @@ class NeuronMiniMaxM3DecoderLayer(nn.Module):
             else:
                 hidden_states = self.input_layernorm(hidden_states)
 
-        # MSA: if this attention layer is sparse AND we're in prefill
-        # (multi-token forward), run the indexer on the normalized hidden
-        # states and build a block-sparse causal mask that overrides the
-        # ordinary causal `attention_mask` from the caller. Decode steps
-        # (S==1) fall back to dense causal — attention over KV cache stays
-        # unchanged. This is a simplification for MVP; a full MSA impl
-        # would need to score against cached indexer keys during decode.
+        # MSA: on sparse layers during prefill (S > 1), run the indexer and
+        # build a block-sparse causal mask that overrides the ordinary
+        # attention_mask. Decode (S == 1) falls back to dense causal via the
+        # default NxDI attention path — full decode-side MSA needs an
+        # NxDI-integrated idx_k KV cache (out of contrib scope).
         if (
             getattr(self.self_attn, "indexer", None) is not None
             and position_ids is not None
