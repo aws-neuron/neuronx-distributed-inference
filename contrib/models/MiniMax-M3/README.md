@@ -52,17 +52,37 @@ Evidence chain:
    `quantization_config`) — so the issue is not MXFP8→bf16 dequant loss.
 
 The HF docs recommend `bf16 + MSA + compile` as the fastest & correct
-runtime configuration for this checkpoint. **MSA (Multi-Sparse Attention)**
-is a lightning-indexer-driven block-sparse attention pattern used on
-`layer_types == "minimax_m3_sparse"` layers (the majority of M3-preview's
-60 layers). It caps attention span per query, preventing the deep-layer
-hidden-state magnitude blow-up observed above (norm 80 → 126 between
-layer 16 and layer 32).
+runtime configuration for this checkpoint. **MSA (MiniMax Sparse
+Attention)** is a lightning-indexer-driven block-sparse attention
+pattern used on `layer_types == "minimax_m3_sparse"` layers (the
+majority of M3-preview's 60 layers). It caps attention span per query,
+preventing the deep-layer hidden-state magnitude blow-up observed
+above (norm 80 → 126 between layer 16 and layer 32).
 
 Without MSA, dense GQA on all 60 layers lets attention output magnitudes
 compound unchecked, driving `hidden_state → vocabulary-embedding-space
 centroid`, which lands on the highest-frequency non-English tokens in
 M3's 200K-token multilingual vocab.
+
+**CONFIRMED by HF CPU 60-layer + MSA experiment (2026-06-30):**
+
+Running the same checkpoint through the HF reference `MiniMaxM3VLTextModel`
+with `layer_types` set to `"minimax_m3_sparse"` on layers 3-59 (enables
+the `MiniMaxM3VLIndexer` + block-sparse mask path), full 60 layers, bf16:
+
+| Prompt | HF 60L + MSA top-1 (logit) | hidden_norm |
+|---|---|---|
+| "The capital of France is" | ` ` space (16.04) | **95** |
+| "Paris is the capital of" | `-` (15.84) | 95 |
+| "1+1=" | ` `, `201`, `3`, `4`, `5` — all digits/space | 115 |
+| "Hello, my name is" | ` `, ` g`, ` r`, ` h`, `,`, `.`, ` a` | 96 |
+
+The hidden state norm at layer 60 drops from ~126 (32L dense) back down
+to ~95 (60L + MSA) — **MSA is what stops the magnitude blow-up**. Top-1
+tokens become low-vocab-ID sensible continuations (space, punctuation,
+digits for math prompt). Compare to our Neuron dense-GQA 60L output
+which produced ` capital` / `告诉好友` / `capute` etc — the exact
+failure mode HF reference reproduces without MSA and fixes with MSA.
 
 **Fix path (out of scope for this contrib port):**
 
