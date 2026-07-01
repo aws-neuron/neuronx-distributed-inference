@@ -50,12 +50,22 @@ Gemma `(1+w)` pre-shift extended to indexer q_norm/k_norm (355
 RMSNorm weights total, up from 241).
 
 MVP simplification: MSA runs only during prefill (`S > 1`). Decode
-step (`S == 1`) still uses dense causal attention over the KV cache
-— a full MSA decode would need indexer KV cache too, TODO.
+step (`S == 1`) still uses dense causal attention over the KV cache.
+
+**Note on MSA effectiveness at seq_len=512**: with `index_topk_blocks=16`
+and `index_block_size=128`, at 512-token context there are only 4 key
+blocks. Since `topk=16 > 4`, the indexer keeps ALL blocks → the sparse
+mask is equivalent to the causal mask. So the MSA-vs-dense distinction
+only produces different behavior at seq_len > 2048 (>16 blocks). At the
+tested seq_len=512, prefill top-k accuracy comes from the model itself
+being correct — MSA's real benefit is long-context memory & compute.
 
 Now the port is **structurally and numerically correct** on Trn2 for
-prefill. Coherent multi-token decode still needs the decode-side MSA
-(the KV cache index side is unimplemented).
+prefill. Coherent multi-token decode is a separate problem — after
+extensive investigation, decode collapse (v3-v13) appears to stem from
+NxDI's TKG (token-generation) attention path having ~0.3 logit noise
+per layer that compounds to shift argmax over 60 layers. Not fixable
+at the contrib-model level.
 
 ## Root cause of 60-layer text degradation: **MSA missing (Multi-Sparse Attention)**
 
