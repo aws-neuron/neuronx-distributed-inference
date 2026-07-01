@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
@@ -174,6 +175,133 @@ def apply_minimax_m3_rotary(
         torch.cat([q_embed, q_pass], dim=-1),
         torch.cat([k_embed, k_pass], dim=-1),
     )
+
+
+# -----------------------------------------------------------------------------
+# MSA (MiniMax Sparse Attention) Lightning Indexer
+# -----------------------------------------------------------------------------
+class MiniMaxM3Indexer(nn.Module):
+    """Lightning Indexer for MSA — selects per-query top-K key blocks.
+
+    Mirrors HF's ``MiniMaxM3VLIndexer``:
+      * ``q_proj``: hidden → ``index_n_heads * index_head_dim`` (4 * 128 = 512)
+      * ``k_proj``: hidden → ``index_head_dim`` (128) — single indexer key head
+      * ``q_norm``, ``k_norm``: RMSNorm(head_dim=128) applied per head
+      * partial RoPE on the first ``index_head_dim`` channels of idx_q / idx_k
+
+    Forward returns the sparse causal mask ``(B, num_heads, S_q, S_k)`` (0 for
+    kept, -inf for dropped) so the caller can pass it straight to attention.
+    ``num_heads`` is the full ``config.num_attention_heads`` — the indexer's
+    per-block verdict is broadcast to every query head within the GQA group.
+
+    The `+1` Gemma pre-shift on q_norm/k_norm weights is handled by the
+    checkpoint converter, so we use plain RMSNorm here.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        index_n_heads: int,
+        index_head_dim: int,
+        block_size: int,
+        topk_blocks: int,
+        local_blocks: int,
+        num_attention_heads: int,
+        rms_norm_eps: float,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.n_heads = index_n_heads
+        self.head_dim = index_head_dim
+        self.block_size = block_size
+        self.topk_blocks = topk_blocks
+        self.local_blocks = local_blocks
+        self.num_attention_heads = num_attention_heads
+        self.q_proj = ColumnParallelLinear(
+            hidden_size, index_n_heads * index_head_dim, bias=False,
+            gather_output=True, dtype=dtype,
+        )
+        self.k_proj = ColumnParallelLinear(
+            hidden_size, index_head_dim, bias=False,
+            gather_output=True, dtype=dtype,
+        )
+        self.q_norm = get_rmsnorm_cls()(hidden_size=index_head_dim, eps=rms_norm_eps)
+        self.k_norm = get_rmsnorm_cls()(hidden_size=index_head_dim, eps=rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns sparse causal mask ``(B, num_attention_heads, S_q, S_k)``."""
+        B, S, _ = hidden_states.shape
+        idx_q = self.q_proj(hidden_states).view(B, S, self.n_heads, self.head_dim)
+        idx_q = self.q_norm(idx_q).transpose(1, 2)  # (B, n_heads, S, D_idx)
+        idx_k = self.k_proj(hidden_states).view(B, S, 1, self.head_dim)
+        idx_k = self.k_norm(idx_k).transpose(1, 2)  # (B, 1, S, D_idx)
+
+        # partial RoPE on first head_dim channels of cos/sin
+        idx_q, idx_k = apply_minimax_m3_rotary(
+            idx_q, idx_k, cos[..., : self.head_dim], sin[..., : self.head_dim]
+        )
+
+        # Score qk in fp32
+        k_len = idx_k.shape[2]
+        num_key_blocks = (k_len + self.block_size - 1) // self.block_size
+        pad = num_key_blocks * self.block_size - k_len
+
+        scores = torch.matmul(idx_q.float(), idx_k.float().transpose(-1, -2))
+        k_positions = torch.arange(k_len, device=idx_q.device)
+        # Future mask
+        token_future = k_positions[None, None, None, :] > position_ids[:, None, :, None]
+        scores = scores.masked_fill(token_future, float("-inf"))
+        if pad:
+            scores = F.pad(scores, (0, pad), value=float("-inf"))
+
+        # Max-pool per block
+        scores = scores.view(B, self.n_heads, S, num_key_blocks, self.block_size)
+        block_scores = scores.amax(dim=-1)  # (B, n_heads, S, num_blocks)
+
+        # Force local blocks (last N before query's own block) to always keep
+        q_block = (position_ids // self.block_size)  # (B, S)
+        if self.local_blocks > 0:
+            local = torch.arange(self.local_blocks, device=idx_q.device)
+            local_idx = (q_block[..., None] - local.view(1, 1, -1)).clamp(min=0)
+            local_idx = local_idx.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
+            block_scores = block_scores.scatter(-1, local_idx, float("inf"))
+
+        # Top-K blocks
+        topk = min(self.topk_blocks, num_key_blocks)
+        topk_scores, topk_indices = block_scores.topk(topk, dim=-1)
+        # Invalidate slots whose top-k score is still -inf
+        topk_indices = topk_indices.masked_fill(topk_scores == float("-inf"), -1)
+
+        # Expand top-K block indices to a `(B, num_att_heads, S_q, S_k)` mask
+        safe = topk_indices.masked_fill(topk_indices < 0, num_key_blocks)
+        bias = torch.full(
+            (B, self.n_heads, S, num_key_blocks + 1),
+            float("-inf"),
+            device=idx_q.device,
+            dtype=torch.float32,
+        )
+        bias.scatter_(-1, safe, 0.0)
+        bias = bias[..., :num_key_blocks]
+
+        # Repeat per-block to per-key, then broadcast per-idx-head to all attention heads
+        block_keep = (bias == 0.0).repeat_interleave(self.block_size, dim=-1)[..., :k_len]
+        block_keep = block_keep.repeat_interleave(
+            self.num_attention_heads // self.n_heads, dim=1
+        )  # (B, num_att_heads, S_q, S_k)
+
+        # Compose with causal mask
+        keep = block_keep & ~token_future
+        # Emit additive mask
+        min_val = torch.finfo(hidden_states.dtype).min
+        mask = torch.zeros_like(keep, dtype=hidden_states.dtype).masked_fill(~keep, min_val)
+        return mask
 
 
 # -----------------------------------------------------------------------------
@@ -418,6 +546,20 @@ class MiniMaxM3InferenceConfig(InferenceConfig):
         if not hasattr(self, "n_shared_experts") or self.n_shared_experts is None:
             self.n_shared_experts = 0
 
+        # MSA (MiniMax Sparse Attention) config — indexer params.
+        # `sparse_attention_config` is a nested dict; promote its fields to
+        # flat attributes so the modeling code can `getattr(config, ...)`.
+        sac = getattr(self, "sparse_attention_config", None)
+        if isinstance(sac, dict):
+            self.sparse_attention_freq = sac.get("sparse_attention_freq", [0] * self.num_hidden_layers)
+            self.index_n_heads = sac.get("sparse_num_index_heads", 4)
+            self.index_head_dim = sac.get("sparse_index_dim", 128)
+            self.index_block_size = sac.get("sparse_block_size", 128)
+            self.index_topk_blocks = sac.get("sparse_topk_blocks", 16)
+            self.index_local_blocks = sac.get("sparse_local_block", 1)
+        else:
+            self.sparse_attention_freq = [0] * self.num_hidden_layers
+
         # The MoE module reads `intermediate_size` for per-expert FFN size.
         # Keep `dense_intermediate_size` to size the dense layers.
         self.intermediate_size = self.moe_intermediate_size
@@ -538,6 +680,22 @@ class NeuronMiniMaxM3Attention(NeuronAttentionBase):
 
         self.layer_idx = layer_idx
         self.rotary_dim = rotary_dim
+
+        # MSA indexer if this is a sparse layer
+        self.is_sparse = bool(getattr(config, "sparse_attention_freq", [0]*60)[layer_idx])
+        self.indexer = None
+        if self.is_sparse:
+            self.indexer = MiniMaxM3Indexer(
+                hidden_size=config.hidden_size,
+                index_n_heads=getattr(config, "index_n_heads", 4),
+                index_head_dim=getattr(config, "index_head_dim", 128),
+                block_size=getattr(config, "index_block_size", 128),
+                topk_blocks=getattr(config, "index_topk_blocks", 16),
+                local_blocks=getattr(config, "index_local_blocks", 1),
+                num_attention_heads=config.num_attention_heads,
+                rms_norm_eps=config.rms_norm_eps,
+                dtype=config.neuron_config.torch_dtype,
+            )
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
@@ -694,6 +852,27 @@ class NeuronMiniMaxM3DecoderLayer(nn.Module):
                 qkv_fused_rmsnorm = self.input_layernorm
             else:
                 hidden_states = self.input_layernorm(hidden_states)
+
+        # MSA: if this attention layer is sparse AND we're in prefill
+        # (multi-token forward), run the indexer on the normalized hidden
+        # states and build a block-sparse causal mask that overrides the
+        # ordinary causal `attention_mask` from the caller. Decode steps
+        # (S==1) fall back to dense causal — attention over KV cache stays
+        # unchanged. This is a simplification for MVP; a full MSA impl
+        # would need to score against cached indexer keys during decode.
+        if (
+            getattr(self.self_attn, "indexer", None) is not None
+            and position_ids is not None
+            and hidden_states.shape[1] > 1
+        ):
+            hs_for_idx = hidden_states
+            if qkv_fused_rmsnorm is not None:
+                hs_for_idx = self.input_layernorm(hidden_states)
+            # Get cos/sin for the indexer's RoPE (uses same base as main RoPE)
+            idx_cos, idx_sin = self.self_attn.rotary_emb(hs_for_idx, position_ids)
+            attention_mask = self.self_attn.indexer(
+                hs_for_idx, idx_cos, idx_sin, position_ids
+            )
 
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
             hidden_states=hidden_states,
@@ -899,19 +1078,14 @@ def convert_minimax_m3_hf_to_neuron_state_dict(
 
     def _is_skip(k: str) -> bool:
         # vision_tower, multi_modal_projector, patch_merge_mlp, mtp, etc.
-        # Also skip Lightning Indexer params (`index_q_proj`, `index_k_proj`,
-        # `index_q_norm`, `index_k_norm`) — we run sparse layers as dense GQA
-        # so these are unused.
+        # Indexer weights (`index_q_proj`, `index_k_proj`, `index_q_norm`,
+        # `index_k_norm`) are KEPT — needed for MSA.
         for tag in (
             "vision_tower",
             "multi_modal_projector",
             "patch_merge_mlp",
             ".mtp.",
             "mtp.",
-            "index_q_proj",
-            "index_k_proj",
-            "index_q_norm",
-            "index_k_norm",
         ):
             if tag in k:
                 return True
@@ -977,6 +1151,23 @@ def convert_minimax_m3_hf_to_neuron_state_dict(
 
         # M3 stores per-head Q/K norms as `self_attn.q_norm` / `self_attn.k_norm`.
         # NeuronAttentionBase expects them as `q_layernorm` / `k_layernorm`.
+        # Order matters — check `index_q_norm` before `q_norm`.
+        if ".self_attn.index_q_norm." in key:
+            new_key = key.replace(".self_attn.index_q_norm.", ".self_attn.indexer.q_norm.")
+            new_state[new_key] = value.detach().clone()
+            continue
+        if ".self_attn.index_k_norm." in key:
+            new_key = key.replace(".self_attn.index_k_norm.", ".self_attn.indexer.k_norm.")
+            new_state[new_key] = value.detach().clone()
+            continue
+        if ".self_attn.index_q_proj." in key:
+            new_key = key.replace(".self_attn.index_q_proj.", ".self_attn.indexer.q_proj.")
+            new_state[new_key] = value.detach().clone()
+            continue
+        if ".self_attn.index_k_proj." in key:
+            new_key = key.replace(".self_attn.index_k_proj.", ".self_attn.indexer.k_proj.")
+            new_state[new_key] = value.detach().clone()
+            continue
         if ".self_attn.q_norm." in key:
             new_key = key.replace(".self_attn.q_norm.", ".self_attn.q_layernorm.")
             new_state[new_key] = value.detach().clone()
@@ -1104,6 +1295,8 @@ def convert_minimax_m3_hf_to_neuron_state_dict(
         ".post_attention_layernorm.weight",
         ".q_layernorm.weight",
         ".k_layernorm.weight",
+        ".indexer.q_norm.weight",
+        ".indexer.k_norm.weight",
     )
     shifted = 0
     for k in list(new_state.keys()):

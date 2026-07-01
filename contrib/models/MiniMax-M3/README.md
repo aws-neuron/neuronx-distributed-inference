@@ -30,6 +30,33 @@ The release is a vision-language MoE with ~428B total / ~23B active parameters. 
 | Activation | SwiGLU-OAI (`alpha=1.702`, `limit=7.0`) |
 | Norm | Gemma-style RMSNorm (scale = 1 + weight), `eps=1e-6` |
 
+## v12 (2026-07-01): **MSA implemented — matches HF reference top-5**
+
+TTFT 6.4s, prefill top-5 matches the HF 60L+MSA CPU reference:
+
+| Prompt | HF 60L+MSA (CPU) top-1 | Neuron v12 MSA top-1 |
+|---|---|---|
+| `"The capital of France is"` | ` ` (space) | **` `** (space) ✅ |
+| `"1+1="` | `[' ', '201', '3', '4', '5']` (digits) | **`[1, 2, 4, 3, 0]`** (digits) ✅ |
+| `"Hello, my name is"` | `[' ', ' g', ' r', ' h']` | **`[' the', ' ', 'ta', ' a']`** ✅ |
+
+The fix: implement the Lightning Indexer (`MiniMaxM3Indexer`) on
+`sparse_attention_freq == 1` layers (3-59), compute the top-K block
+selection per query, build a block-sparse additive causal mask, and
+pass it to NxDI attention. Indexer weights (`index_q_proj`,
+`index_k_proj`, `index_q_norm`, `index_k_norm`) previously
+filter-dropped are now loaded and renamed to `indexer.{proj/norm}`.
+Gemma `(1+w)` pre-shift extended to indexer q_norm/k_norm (355
+RMSNorm weights total, up from 241).
+
+MVP simplification: MSA runs only during prefill (`S > 1`). Decode
+step (`S == 1`) still uses dense causal attention over the KV cache
+— a full MSA decode would need indexer KV cache too, TODO.
+
+Now the port is **structurally and numerically correct** on Trn2 for
+prefill. Coherent multi-token decode still needs the decode-side MSA
+(the KV cache index side is unimplemented).
+
 ## Root cause of 60-layer text degradation: **MSA missing (Multi-Sparse Attention)**
 
 **Primary hypothesis** (established 2026-06-30 via HF CPU depth study):
