@@ -30,7 +30,38 @@ The release is a vision-language MoE with ~428B total / ~23B active parameters. 
 | Activation | SwiGLU-OAI (`alpha=1.702`, `limit=7.0`) |
 | Norm | Gemma-style RMSNorm (scale = 1 + weight), `eps=1e-6` |
 
-## v12 (2026-07-01): **MSA implemented — matches HF reference top-5**
+## v15 (2026-07-02): **root cause found — MoE experts were missing SwiGLU-OAI `(up+1)` bias**
+
+Coherent, correct greedy generation across all test prompts:
+
+| Prompt | Neuron v15 top-1 | Neuron v15 generation |
+|---|---|---|
+| `"1+1="` | **`2`** ✅ | `2\) and \(2+1=3\). So the answer is 3.` |
+| `"The capital of France is"` | **` Paris`** ✅ | ` Paris.\nThe the capital of France is Paris...` |
+| `"Paris is ...Berlin is the capital of"` | **` Germany`** ✅ | ` Germany. Madrid is the capital of Spain. Rome is ... Italy. London is the capital of England. Lisbon...` |
+| `"The largest planet in our solar system is"` | **` Jupiter`** ✅ | ` Jupiter. It is the fifth planet from the Sun and is a gas giant.` |
+
+**Root cause.** NxDI's `ExpertMLPsV2` block-sparse NKI kernel path only
+sends `gate_up_proj.bias` and `down_proj.bias` to the kernel when
+`routed_experts_mlp_config.bias=True`. With `bias=False` (the value
+we had since v3), the `hidden_act_bias=1.0` config value is silently
+dropped — the kernel computes `gate * sigmoid(alpha*gate) * up`
+instead of the SwiGLU-OAI formula
+`gate * sigmoid(alpha*gate) * (up + 1.0)`. Systematic error across
+all 57 MoE layers (layers 3-59). The three dense-MLP layers (0-2)
+were correct (they use our own `MiniMaxM3DenseMLP` which does the
+`(up + 1.0)` explicitly), which is why the 4-layer bit-parity test
+earlier didn't catch this — it only exercised dense layers.
+
+**Fix.** Flip `bias=True` on `RoutedExpertsMLPOpsConfig`, and inject
+zero `gate_up_proj.bias` and `down_proj.bias` tensors in the
+state-dict converter for every MoE layer. NxDI's `preshard_hook`
+then adds `hidden_act_bias` (= 1.0) into the up-half of the
+`gate_up` bias so the kernel now applies `(up + 1.0)` correctly.
+
+Performance: TTFT=6.6s (batch=32, seq_len=512), ITL=51ms/tok.
+
+## v12 (2026-07-01): MSA implemented — matches HF reference top-5
 
 TTFT 6.4s, prefill top-5 matches the HF 60L+MSA CPU reference:
 
