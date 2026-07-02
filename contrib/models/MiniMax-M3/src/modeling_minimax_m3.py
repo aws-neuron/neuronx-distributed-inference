@@ -402,6 +402,15 @@ def initialize_minimax_m3_moe_module(
     hidden_size_actual = getattr(config, "original_hidden_size", None)
     intermediate_size_actual = getattr(config, "original_intermediate_size", None)
 
+    # bias=True is required so the block-sparse NKI kernel path receives a
+    # per-expert `gate_up_proj.bias` and `down_proj.bias`. NxDI's preshard
+    # hook then injects `+hidden_act_bias` (= 1.0 for M3) into the up-half of
+    # gate_up bias, giving us the SwiGLU-OAI `(up + 1.0)` term. With
+    # `bias=False` the kernel drops `hidden_act_bias` on the floor (see
+    # blockwise NKI call: bias arg is passed as None), so the routed experts
+    # were computing `gate * sigmoid(alpha*gate) * up` instead of
+    # `gate * sigmoid(alpha*gate) * (up + 1)`. The bias tensors are all
+    # zeros in the checkpoint; we inject them in the state-dict converter.
     expert_mlps = ExpertMLPsV2(
         routed_experts_mlp_config=RoutedExpertsMLPOpsConfig(
             num_experts=config.num_local_experts,
@@ -413,7 +422,7 @@ def initialize_minimax_m3_moe_module(
             is_intermediate_dim_shuffled=config.neuron_config.is_intermediate_dim_shuffled,
             top_k=config.num_experts_per_tok,
             hidden_act=config.hidden_act,
-            bias=False,
+            bias=True,
             glu_mlp=config.neuron_config.glu_mlp,
             glu_type=config.neuron_config.glu_type,
             hidden_act_scaling_factor=config.neuron_config.hidden_act_scaling_factor,
@@ -1248,6 +1257,24 @@ def convert_minimax_m3_hf_to_neuron_state_dict(
         new_state[
             f"layers.{l_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.weight"
         ] = down
+
+        # Bias tensors required by ExpertMLPsV2 with bias=True. HF checkpoint
+        # has no expert biases (SwiGLU-OAI's `+1.0` on the `up` half is a
+        # constant, not a learned param). We seed zeros here; NxDI's preshard
+        # hook then adds `hidden_act_bias` (= 1.0) into the up-half of
+        # gate_up bias so the kernel computes `gate * sigmoid(a*gate) * (up + 1)`.
+        gate_up_bias = torch.zeros(
+            num_experts, 2 * moe_inter, dtype=dtype, device=device
+        )
+        down_bias = torch.zeros(
+            num_experts, hidden_size, dtype=dtype, device=device
+        )
+        new_state[
+            f"layers.{l_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.bias"
+        ] = gate_up_bias
+        new_state[
+            f"layers.{l_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.bias"
+        ] = down_bias
 
     # Fused dense MLP gate+up. The ColumnParallelLinear uses stride=2 so
     # the global `[gate | up]` layout shards correctly across ranks.
