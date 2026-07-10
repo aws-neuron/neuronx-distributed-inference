@@ -17,10 +17,9 @@ installed NxDI library are required** — everything runs on the stock
 `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/` DLAMI venv (Neuron SDK 2.29
 / NKI 0.3.0).
 
-**Status:** text-only inference is validated end-to-end (TTFT, TPOT, greedy
-accuracy vs. HuggingFace). The vision path is scaffolded but **not working**
-— see the "Vision" section for details. Do not use this contrib for image
-inputs yet.
+**Status:** text-only and vision-language inference are both validated
+end-to-end on `trn2.48xlarge`. VL requires the legacy-direct DeltaNet CTE
+kernel — see the "Vision" section.
 
 ## Contents
 
@@ -127,50 +126,58 @@ after one differing token — expected for a `bf16` accumulate path against an
 independent `bf16` CPU implementation. The generated text is qualitatively
 coherent on all five prompts.
 
-## Vision (image → text) — **NOT WORKING, WIP**
+## Vision (image → text)
 
-The VL path in this contrib is **not validated** and currently produces
-degenerate output (e.g., repeated tokens) on real images. It is committed as a
-scaffold, not a working solution. Do not rely on it for accuracy.
+VL runs end-to-end: image → CPU vision encoder → Neuron text decoder → text
+output. Sample run on a real cat image (960×686, ~630 merged vision tokens):
 
-What is verified to work in isolation:
-- **Vision encoder** (CPU path via `NeuronQwen35VisionModelWrapper.load_cpu_model`):
-  cosine similarity **0.99** vs. HuggingFace `Qwen3_5VisionModel` on a real
-  image (960×686 → 630 merged tokens × 2048 out_hidden).
-- **`get_rope_index`** (3-D mRoPE computation): **100% token-position match**
-  vs. HuggingFace `compute_3d_position_ids` on the same input (all three axes,
-  654 positions).
-- **Text decoder** with `use_text_only_cte_inputs=False` compiles and loads
-  successfully at `seq_len=2048`.
+```
+prompt   : "What is in this image? Describe it briefly."
+output   : "This image features a fluffy, light-colored cat with a distinctive
+            appearance. It has a thick, woolly coat that gives it a
+            soft, cloud-like look. The cat's fur is predominantly white
+            or very light cream, with some darker patches"
+elapsed  : ~9 s for 48 new tokens (CPU vision + Neuron text)
+```
 
-What is broken:
-- The scatter-and-forward pipeline in `NeuronQwen35VLForCausalLM.generate`
-  produces `_quantity`-style degenerate output when real vision embeddings are
-  wired in. The root cause has not been isolated — likely candidates are the
-  `has_real_vision_inputs = shape[1] != seq_length` gating in
-  `NeuronQwen35Model.get_model_output` (which suppresses the scatter under
-  the current padding scheme), the `padded_seq_len-1` fill value used for
-  `vision_mask` pad slots (which overwrites a real text-token position with
-  vision garbage in the traced graph), or an interaction between the DeltaNet
-  `deltanet_padding_mask` and the vision-scatter path.
-- The `modeling_qwen35_vl.py` / `modeling_qwen35_vision.py` files are copied
-  as-is from PR #173 (Qwen3.6-27B). That PR only validates text-only paths on
-  Trn2; its VL orchestrator is unverified upstream.
-- The ViT itself is **not** traced to Neuron. It runs on CPU via
-  `CPUVisionModel`.
+Verified components:
+- **CPU vision encoder** (`NeuronQwen35VisionModelWrapper.load_cpu_model`):
+  cosine similarity **0.99** vs. HuggingFace `Qwen3_5VisionModel`.
+- **`get_rope_index`** (3-D mRoPE): **100% token-position match** vs. HF
+  `compute_3d_position_ids`.
+- **Scatter path** into text model using `index_put_(accumulate=False)` at
+  image-token positions (same pattern as upstream `qwen3_vl` in NxDI).
+- **Text decoder** compiled with `use_text_only_cte_inputs=False` and
+  **`QWEN36_DELTANET_CTE_IMPL=legacy_direct`** — the fused-multihead DeltaNet
+  NKI kernel (the default) is numerically unstable on real vision embeddings
+  and produces degenerate output (repeated tokens); the legacy-direct kernel
+  is stable and is now the default for `run_vl_smoke.py`.
 
-Scripts left in place for iteration:
-- `test/integration/run_vl_smoke.py` — compiles the vision-aware text model
-  and drives the CPU-vision-plus-Neuron-text pipeline. Reproduces the bug.
+Run:
 
-Suggested next steps:
-1. Reproduce with `run_vl_smoke.py --image /path/to/img --skip-compile` after
-   pre-compiling once (~90 s).
-2. Compare `inputs_embeds` after `encode_vision_to_input` on Neuron vs. the
-   HF reference `inputs_embeds` at the same positions (a hidden-state dump
-   layer-by-layer will pinpoint where the numerics diverge).
-3. Once accuracy is verified, port the ViT to Neuron via `torch_neuronx.trace`
-   with a bucket set matching `vision_seq_len_buckets` (default `[1024, 4096, 16384]`).
+```bash
+python contrib/models/Qwen3.5-2B/test/integration/run_vl_smoke.py \
+    --model-path    /mnt/nvme/models/Qwen3.5-2B \
+    --compiled-path /tmp/qwen35_2b_vl_traced \
+    --image         /path/to/image.jpg \
+    --prompt        "Describe this image." \
+    --tp 8 --seq-len 2048 --max-new-tokens 48
+```
+
+The script sets `QWEN36_DELTANET_CTE_IMPL=legacy_direct` and
+`QWEN36_DELTANET_MULTIHEAD_CTE=0` before compile; do not override these unless
+debugging the fused kernel.
+
+Not yet done:
+- ViT encoder is on CPU. Tracing it to Neuron via `torch_neuronx.trace` with
+  buckets matching `vision_seq_len_buckets` (default `[1024, 4096, 16384]`) is
+  the natural next step.
+- Investigating why the default fused-multihead DeltaNet kernel fails on
+  vision embeddings but passes on text-only inputs at std ≈ 0.011. Random
+  vectors of std 0.17 also decode cleanly through it, but real HF vision
+  embeddings with std 0.17 and per-dim mean ≈ 2.88 do not. The root cause is
+  likely a specific numeric interaction in the fused NKI kernel with the
+  structured signal, not overall magnitude.
 
 ## HF reference on CPU
 
@@ -213,17 +220,11 @@ pytest contrib/models/Qwen3.5-2B/test/integration/test_model.py -s
 
 ## Known limitations / follow-ups
 
-- **VL is not working** — see "Vision" section above. Vision encoder,
-  mRoPE, and text-decoder tracing each pass in isolation, but the wired-up
-  scatter path produces degenerate output. Debug pointer: the
-  `has_real_vision_inputs = ...shape[1] != seq_length` check in
-  `NeuronQwen35Model.get_model_output` (`modeling_qwen35.py` line ~5747)
-  conflicts with the `_prepare_vision_args_for_padded_seq` (`~L7076`)
-  which pads vision inputs to `padded_seq_len`; those two invariants
-  contradict each other.
-- The ViT encoder currently runs on CPU. Tracing it to Neuron (via
-  `torch_neuronx.trace` per vision-sequence-length bucket) is TODO once
-  the VL scatter path is fixed.
+- ViT encoder runs on CPU. Tracing to Neuron via `torch_neuronx.trace` per
+  vision-sequence-length bucket is a natural next step.
+- VL requires `QWEN36_DELTANET_CTE_IMPL=legacy_direct` because the default
+  fused-multihead NKI kernel is numerically unstable on structured vision
+  embeddings. `run_vl_smoke.py` sets this automatically before compile.
 - Only batch size 1 is validated; hybrid DeltaNet state buffers are indexed by
   `seq_ids` for continuous batching but that path has not been exercised at
   2B.

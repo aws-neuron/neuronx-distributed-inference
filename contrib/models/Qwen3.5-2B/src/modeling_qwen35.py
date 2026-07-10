@@ -5665,11 +5665,26 @@ class NeuronQwen35Model(NeuronBaseModel):
         return self.hybrid_gdn_checkpoint_cache.checkpoint_params
 
     def encode_vision_to_input(self, inputs_embeds, vision_embeddings, vision_mask):
-        """Scatter vision embeddings into text input embeddings at image token positions."""
+        """Scatter vision embeddings into text input embeddings at image-token
+        positions, using exactly the Qwen3-VL upstream pattern.
+
+        vision_embeddings: (1, seq_len, hidden). Real vision embeddings live in
+            slots i < n_vis; pad slots i >= n_vis are ZEROS.
+        vision_mask: (1, seq_len, 1) int32. Real slots (i < n_vis) hold image-token
+            positions in [0, seq_len). Pad slots (i >= n_vis) hold seq_len-1
+            (the last padding position of input_ids), so scatter writes zero to
+            a single padding slot — safe because that position has
+            attention_mask == 0.
+
+        The scatter uses PyTorch index_put_(accumulate=False), matching
+        `scatter_by_index_put` in neuronx_distributed_inference.models.llama4.
+        """
         _, max_positions, embedding_dim = inputs_embeds.shape
         h_new = inputs_embeds.clone()
-        vision_flat = vision_embeddings.view(-1, embedding_dim)
-        positions_flat = vision_mask.view(-1)
+        vision_flat = vision_embeddings.reshape(-1, embedding_dim)
+        positions_flat = vision_mask.reshape(-1)
+        num_positions = positions_flat.shape[0]
+        vision_flat = vision_flat[:num_positions]
         h_new.view(-1, embedding_dim).index_put_(
             (positions_flat,), vision_flat, accumulate=False
         )
@@ -5733,20 +5748,29 @@ class NeuronQwen35Model(NeuronBaseModel):
         if is_for_context_encoding:
             inputs_embeds = inputs_embeds * deltanet_padding_mask
 
-        # Vision embedding injection. Text-only calls still pass dummy vision
-        # tensors to keep the traced input signature stable; those tensors have
-        # one dummy entry per text token and must not overwrite text embeddings.
+        # Vision embedding injection. When use_text_only_cte_inputs=False we
+        # always trace the scatter into the graph. The input generator makes
+        # sure "dummy" (text-only) vision inputs are IDEMPOTENT: every pad slot
+        # points to the same target position and carries the same value, so
+        # scattering them repeatedly does not corrupt real embeddings.
+        #
+        # NOTE: the gate MUST be Python-static (trace-time) since the two
+        # branches produce different graphs. `shape[1] != seq_length` is not a
+        # reliable proxy because the input generator pads vision inputs to
+        # seq_length; instead we look at the compile-time config flag.
         if (vision_embeddings is not None) and (vision_mask is not None):
             if vision_embeddings.dtype != self.config.neuron_config.torch_dtype:
                 vision_embeddings = vision_embeddings.to(
                     self.config.neuron_config.torch_dtype
                 )
-            has_real_vision_inputs = (
-                vision_embeddings.ndim == 3
+            traced_with_vision = (
+                not getattr(self.config, "use_text_only_cte_inputs", True)
+                and vision_embeddings.ndim == 3
                 and vision_mask.ndim == 3
-                and vision_embeddings.shape[1] != seq_length
+                and vision_embeddings.shape[1] == seq_length
+                and vision_mask.shape[1] == seq_length
             )
-            if is_for_context_encoding and has_real_vision_inputs:
+            if is_for_context_encoding and traced_with_vision:
                 inputs_embeds = self.encode_vision_to_input(
                     inputs_embeds, vision_embeddings, vision_mask
                 )
@@ -7070,12 +7094,14 @@ class Qwen35ModelWrapper(ModelWrapper):
                     and current_vis_emb.ndim == 3
                     and current_vis_emb.shape[1] < padded_seq_len
                 ):
+                    # Qwen3-VL pad convention: pad slots of vision_embeddings
+                    # are zeros; pad slots of vision_mask (below) point at
+                    # padded_seq_len-1 which is guaranteed to be a padded
+                    # (attention_mask==0) input position — so scatter writes
+                    # zero to a masked slot with no downstream effect.
+                    pad_len = padded_seq_len - current_vis_emb.shape[1]
                     pad_emb = torch.zeros(
-                        (
-                            batch_size,
-                            padded_seq_len - current_vis_emb.shape[1],
-                            current_vis_emb.shape[2],
-                        ),
+                        (batch_size, pad_len, current_vis_emb.shape[2]),
                         dtype=current_vis_emb.dtype,
                     )
                     vision_embeddings = torch.cat([current_vis_emb, pad_emb], dim=1)
@@ -7086,6 +7112,9 @@ class Qwen35ModelWrapper(ModelWrapper):
                         (0,), dtype=self.config.neuron_config.torch_dtype
                     )
                 else:
+                    # Dummy vision inputs for text-only calls when graph was
+                    # traced with vision inputs. Zeros are fine because mask
+                    # sends them all to the padding-position at padded_seq_len-1.
                     vision_embeddings = torch.zeros(
                         (batch_size, padded_seq_len, self.config.hidden_size),
                         dtype=self.config.neuron_config.torch_dtype,
@@ -7096,8 +7125,11 @@ class Qwen35ModelWrapper(ModelWrapper):
                     and current_vis_mask.ndim == 3
                     and current_vis_mask.shape[1] < padded_seq_len
                 ):
+                    # Qwen3-VL pad convention: pad slots of vision_mask point
+                    # at padded_seq_len-1 (a padded input slot).
+                    pad_len = padded_seq_len - current_vis_mask.shape[1]
                     pad_mask = torch.full(
-                        (batch_size, padded_seq_len - current_vis_mask.shape[1], 1),
+                        (batch_size, pad_len, 1),
                         fill_value=padded_seq_len - 1,
                         dtype=torch.int32,
                     )
@@ -7107,6 +7139,11 @@ class Qwen35ModelWrapper(ModelWrapper):
                 elif getattr(self.config, "use_text_only_cte_inputs", True):
                     vision_mask = torch.zeros((0,), dtype=torch.int32)
                 else:
+                    # Dummy mask for text-only forward on a vision-traced graph.
+                    # All slots target padded_seq_len-1 (the last position, always
+                    # a padded/eos slot). Combined with zero vision_emb the scatter
+                    # overwrites that one position with zeros — harmless because
+                    # attention_mask=0 there.
                     vision_mask = torch.full(
                         (batch_size, padded_seq_len, 1),
                         fill_value=padded_seq_len - 1,

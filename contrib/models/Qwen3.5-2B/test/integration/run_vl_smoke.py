@@ -34,6 +34,13 @@ import os
 import sys
 import time
 
+# IMPORTANT: The default fused-multihead DeltaNet NKI kernel produces numerically
+# unstable output on real vision embeddings (VL forward degenerates to repeated
+# tokens). The legacy direct kernel is stable on VL inputs. Set these env vars
+# BEFORE importing src.modeling_qwen35 so they apply during trace+compile.
+os.environ.setdefault("QWEN36_DELTANET_CTE_IMPL", "legacy_direct")
+os.environ.setdefault("QWEN36_DELTANET_MULTIHEAD_CTE", "0")
+
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
