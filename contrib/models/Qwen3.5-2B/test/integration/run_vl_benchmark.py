@@ -99,7 +99,8 @@ def build_vl_config(model_path: str, tp: int, max_seq_len: int, buckets):
     return text_config, vl_config
 
 
-def compile_and_load(model_path, compiled_path, text_config, vl_config, skip_compile):
+def compile_and_load(model_path, compiled_path, text_config, vl_config,
+                     skip_compile, vision_compiled_dir=None):
     from src.modeling_qwen35 import NeuronQwen35ForCausalLM
     from src.modeling_qwen35_vl import NeuronQwen35VLForCausalLM
 
@@ -121,9 +122,19 @@ def compile_and_load(model_path, compiled_path, text_config, vl_config, skip_com
         vision_config=vl_config,
     )
     vl_model.text_model.load(text_path)
-    print("[load-vision] loading CPU vision encoder weights")
-    vl_model.vision_model_wrapper.load_cpu_model(model_path)
-    vl_model.vision_model_wrapper.load_vision_weights_from_hf(model_path)
+
+    if vision_compiled_dir and os.path.isdir(vision_compiled_dir):
+        # Neuron-compiled vision encoder (multi-bucket .pt files)
+        # Also load CPU model as a fallback for seq_lens exceeding compiled buckets.
+        print(f"[load-vision] loading Neuron vision encoder from {vision_compiled_dir}")
+        vl_model.vision_model_wrapper.load_compiled(vision_compiled_dir)
+        vl_model.vision_model_wrapper.load_vision_weights_from_hf(model_path)
+        print("[load-vision] loading CPU vision encoder as oversize fallback")
+        vl_model.vision_model_wrapper.load_cpu_model(model_path)
+    else:
+        print("[load-vision] loading CPU vision encoder weights")
+        vl_model.vision_model_wrapper.load_cpu_model(model_path)
+        vl_model.vision_model_wrapper.load_vision_weights_from_hf(model_path)
     return vl_model
 
 
@@ -177,6 +188,10 @@ def main():
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--prompt", default=DEFAULT_PROMPT)
     ap.add_argument("--skip-compile", action="store_true")
+    ap.add_argument("--vision-compiled-dir", default=None,
+                    help="Directory containing vision_encoder_<bucket>.pt files "
+                         "produced by compile_vision_encoder.py; if omitted, "
+                         "runs vision encoder on CPU")
     ap.add_argument("--out-json", default=None)
     args = ap.parse_args()
 
@@ -184,7 +199,10 @@ def main():
     print(f"[bench] buckets={args.buckets}, max_seq={max_seq}, tp={args.tp}")
 
     text_config, vl_config = build_vl_config(args.model_path, args.tp, max_seq, args.buckets)
-    vl_model = compile_and_load(args.model_path, args.compiled_path, text_config, vl_config, args.skip_compile)
+    vl_model = compile_and_load(
+        args.model_path, args.compiled_path, text_config, vl_config,
+        args.skip_compile, vision_compiled_dir=args.vision_compiled_dir,
+    )
 
     from transformers import AutoProcessor, AutoTokenizer
     from PIL import Image

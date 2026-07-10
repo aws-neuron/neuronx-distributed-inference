@@ -756,14 +756,12 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
             attention_mask = mask
 
         # 6. Run vision model (Neuron compiled or CPU fallback)
-        if self._compiled_buckets is not None:
-            # Multi-bucket mode: select the compiled model for this bucket
-            if bucket_len not in self._compiled_buckets:
-                raise RuntimeError(
-                    f"No compiled vision encoder for bucket size {bucket_len}. "
-                    f"Available buckets: {sorted(self._compiled_buckets.keys())}. "
-                    f"Input seq_len={seq_len} requires bucket {bucket_len}."
-                )
+        use_neuron_bucket = (
+            self._compiled_buckets is not None
+            and bucket_len in self._compiled_buckets
+            and seq_len <= bucket_len
+        )
+        if use_neuron_bucket:
             compiled_model = self._compiled_buckets[bucket_len]
             vision_output = compiled_model(
                 hidden_states.to(torch.bfloat16),
@@ -771,6 +769,19 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
                 cos.to(torch.bfloat16),
                 sin.to(torch.bfloat16),
             )
+        elif self._compiled_buckets is not None and self._cpu_model is not None:
+            # seq_len too large for any compiled bucket — fall back to CPU
+            logger.warning(
+                f"seq_len={seq_len} exceeds all compiled buckets "
+                f"{sorted(self._compiled_buckets.keys())}; using CPU vision fallback."
+            )
+            with torch.no_grad():
+                vision_output = self._cpu_model(
+                    hidden_states.to(torch.bfloat16),
+                    attention_mask.to(torch.bfloat16),
+                    cos.to(torch.bfloat16),
+                    sin.to(torch.bfloat16),
+                )
         elif self._compiled_model is not None:
             # Single compiled model (legacy)
             vision_output = self._compiled_model(

@@ -175,16 +175,44 @@ debugging the fused kernel.
 512×512, 1024×1024, 2048×2048 versions of the same source image
 (same prompt: *"What is in this image? Describe it briefly."*).
 
+**CPU vision baseline:**
+
 | image     | vision tokens | TTFT (ms, median) | TPOT (ms, median) | tok/s |
 |-----------|--------------:|------------------:|------------------:|------:|
 | 512×512   |           256 |           **169** |             4.1   |   242 |
 | 1024×1024 |         1,024 |         **1,091** |             4.3   |   232 |
 | 2048×2048 |         4,096 |         **5,025** |             3.9   |   197 |
 
-TTFT is dominated by the CPU vision encoder; TPOT is essentially flat because
-the text decoder is O(1)-state DeltaNet for 18/24 layers. Neuron text-CTE
-alone would be far below 200 ms even at 4k tokens — tracing the vision
-encoder to Neuron is the biggest remaining win.
+**Neuron vision encoder** (compiled at patch-token buckets `[1024, 4096]`;
+16384 bucket exceeds trn2 single-core HBM and falls back to CPU):
+
+| image     | TTFT (ms) | vs CPU-VE | TPOT (ms) |     |
+|-----------|----------:|----------:|----------:|-----|
+| 512×512   |    **86** | **2.0× ↓**|      4.2  | Neuron VE (bucket 1024)  |
+| 1024×1024 |   **526** | **2.1× ↓**|      4.1  | Neuron VE (bucket 4096)  |
+| 2048×2048 |     4,823 |      1.0× |      4.0  | CPU VE fallback (see below) |
+
+TTFT halves on the sizes we can fit on Neuron; TPOT is flat because text
+decode is Neuron-only regardless. The 2048×2048 case (16,384 patch tokens
+→ a 512 MB bf16 attention mask) does not fit in a single Neuron core's HBM,
+so the wrapper transparently falls back to the CPU vision encoder. Compiling
+that bucket with vision-model TP or windowed attention is a follow-up.
+
+Compile the Neuron vision buckets once with `compile_vision_encoder.py`:
+
+```bash
+python contrib/models/Qwen3.5-2B/test/integration/compile_vision_encoder.py \
+    --model-path /mnt/nvme/models/Qwen3.5-2B \
+    --out-dir    /tmp/qwen35_2b_vl_bench/vision \
+    --buckets    1024 4096   # 16384 currently OOMs on trn2 single-core
+
+python contrib/models/Qwen3.5-2B/test/integration/run_vl_benchmark.py \
+    --model-path /mnt/nvme/models/Qwen3.5-2B \
+    --compiled-path /tmp/qwen35_2b_vl_bench \
+    --vision-compiled-dir /tmp/qwen35_2b_vl_bench/vision \
+    --tp 8 --images 512 1024 2048 \
+    --max-new-tokens 48 --repeats 3
+```
 
 **Accuracy note (vs HuggingFace CPU bf16 greedy on the same 3 sizes):** HF
 identifies "Pallas's cat" at all 3 sizes. Neuron identifies "Pallas's cat"
@@ -247,8 +275,10 @@ pytest contrib/models/Qwen3.5-2B/test/integration/test_model.py -s
 
 ## Known limitations / follow-ups
 
-- ViT encoder runs on CPU. Tracing to Neuron via `torch_neuronx.trace` per
-  vision-sequence-length bucket is a natural next step.
+- ViT encoder Neuron-compiled at buckets `{1024, 4096}` patch tokens. The
+  16,384 bucket (for 2048×2048 images) OOMs on trn2 single-core HBM; the
+  wrapper falls back to CPU vision for that size. Compiling this bucket
+  requires TP-ing the vision model or using windowed attention.
 - VL requires `QWEN36_DELTANET_CTE_IMPL=legacy_direct` because the default
   fused-multihead NKI kernel is numerically unstable on structured vision
   embeddings. `run_vl_smoke.py` sets this automatically before compile.
