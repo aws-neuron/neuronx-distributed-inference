@@ -468,7 +468,8 @@ class NeuronQwen35VLForCausalLM:
             seq_len = input_ids.shape[1]
             pad_limit = cte_bucket
 
-            # Pad vision_embeddings to (1, pad_limit, hidden_size)
+            # Pad vision_embeddings to (1, pad_limit, hidden_size).
+            # NOTE: this VL path is not fully validated — see README "VL is WIP".
             if n_vis < pad_limit:
                 pad_emb = torch.zeros(
                     (1, pad_limit - n_vis, hidden_size),
@@ -482,8 +483,6 @@ class NeuronQwen35VLForCausalLM:
             # CRITICAL: fill_value must be a valid index (within [0, pad_limit-1]).
             # Using pad_limit-1 targets the last position (always a padding slot)
             # so index_put_ scatters zero embeddings there harmlessly.
-            # NOTE: Do NOT use large sentinel values (e.g., 2**30) as they cause
-            # DGE out-of-bounds crashes in the Neuron runtime.
             positions_padded = torch.full(
                 (1, pad_limit, 1),
                 fill_value=pad_limit - 1,
