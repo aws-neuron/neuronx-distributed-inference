@@ -7056,6 +7056,50 @@ class Qwen35ModelWrapper(ModelWrapper):
             orig_commit_slots = None
             orig_commit_mask = None
 
+        # Pre-pad/truncate vision args to match the target CTE bucket so the
+        # upstream super().pad_inputs() shape check at model_wrapper.py:801
+        # does not replace them with dummies. Bucket is determined by input
+        # length; we compute it the same way upstream does.
+        if (
+            self.tag == CONTEXT_ENCODING_MODEL_TAG
+            and len(args) >= 24
+            and orig_vis_mask is not None
+            and orig_vis_mask.ndim == 3
+        ):
+            try:
+                target_bucket = self.get_target_bucket(*args, strategy=pad_type)
+                if isinstance(target_bucket, list):
+                    target_bucket = target_bucket[1]
+                target_len = int(target_bucket)
+            except Exception:
+                target_len = None
+            if target_len is not None:
+                def _fit_seq(t, target, fill_dim0=False, fill_value=None):
+                    if t is None or t.ndim != 3:
+                        return t
+                    cur = t.shape[1]
+                    if cur == target:
+                        return t
+                    if cur < target:
+                        pad_shape = list(t.shape)
+                        pad_shape[1] = target - cur
+                        if fill_value is not None:
+                            pad = torch.full(pad_shape, fill_value=fill_value, dtype=t.dtype)
+                        else:
+                            pad = torch.zeros(pad_shape, dtype=t.dtype)
+                        return torch.cat([t, pad], dim=1)
+                    return t[:, :target].contiguous()
+
+                new_vis_emb = _fit_seq(orig_vis_emb, target_len)
+                new_vis_mask = _fit_seq(orig_vis_mask, target_len, fill_value=target_len - 1)
+                if new_vis_emb is not None or new_vis_mask is not None:
+                    args = list(args)
+                    if new_vis_emb is not None:
+                        args[22] = new_vis_emb
+                    if new_vis_mask is not None:
+                        args[23] = new_vis_mask
+                    args = tuple(args)
+
         padded_args = super().pad_inputs(*args, pad_type=pad_type)
 
         if len(padded_args) >= 24 and orig_mrope is not None:
@@ -7070,7 +7114,7 @@ class Qwen35ModelWrapper(ModelWrapper):
 
                 if (
                     current_mrope.ndim == 3
-                    and current_mrope.shape[-1] != padded_seq_len
+                    and current_mrope.shape[-1] < padded_seq_len
                 ):
                     pad_size = padded_seq_len - current_mrope.shape[-1]
                     last_pos = current_mrope[:, :, -1:]
@@ -7078,6 +7122,12 @@ class Qwen35ModelWrapper(ModelWrapper):
                     # advance mRoPE into fake future positions.
                     mrope_pad = last_pos.expand(3, batch_size, pad_size)
                     mrope_position_ids = torch.cat([current_mrope, mrope_pad], dim=-1)
+                elif (
+                    current_mrope.ndim == 3
+                    and current_mrope.shape[-1] > padded_seq_len
+                ):
+                    # Bucket smaller than caller-provided mrope; truncate.
+                    mrope_position_ids = current_mrope[:, :, :padded_seq_len].contiguous()
                 elif current_mrope.ndim == 3:
                     mrope_position_ids = current_mrope
                 else:

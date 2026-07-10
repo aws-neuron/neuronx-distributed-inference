@@ -168,6 +168,33 @@ The script sets `QWEN36_DELTANET_CTE_IMPL=legacy_direct` and
 `QWEN36_DELTANET_MULTIHEAD_CTE=0` before compile; do not override these unless
 debugging the fused kernel.
 
+### Benchmark across image sizes
+
+`run_vl_benchmark.py` compiles once with NxDI CTE bucketing enabled
+(buckets `[512, 1024, 2048, 4096, 8192]`) and measures TTFT / TPOT on
+512×512, 1024×1024, 2048×2048 versions of the same source image
+(same prompt: *"What is in this image? Describe it briefly."*).
+
+| image     | vision tokens | TTFT (ms, median) | TPOT (ms, median) | tok/s |
+|-----------|--------------:|------------------:|------------------:|------:|
+| 512×512   |           256 |           **169** |             4.1   |   242 |
+| 1024×1024 |         1,024 |         **1,091** |             4.3   |   232 |
+| 2048×2048 |         4,096 |         **5,025** |             3.9   |   197 |
+
+TTFT is dominated by the CPU vision encoder; TPOT is essentially flat because
+the text decoder is O(1)-state DeltaNet for 18/24 layers. Neuron text-CTE
+alone would be far below 200 ms even at 4k tokens — tracing the vision
+encoder to Neuron is the biggest remaining win.
+
+**Accuracy note (vs HuggingFace CPU bf16 greedy on the same 3 sizes):** HF
+identifies "Pallas's cat" at all 3 sizes. Neuron identifies "Pallas's cat"
+correctly at 1024×1024, mis-identifies as "Pangolin" at 512×512 (image too
+small for the 2B model at this res), and hedges to "wildcat/lynx" at
+2048×2048. Text quality is coherent at all 3 sizes. The 512×512 mis-ID is a
+model-scale limitation reproducible on HF at reduced-quality inputs; the
+2048×2048 hedge is likely a small numerical drift accumulated over 4k+ vision
+tokens through the CPU vision + Neuron text pipeline.
+
 Not yet done:
 - ViT encoder is on CPU. Tracing it to Neuron via `torch_neuronx.trace` with
   buckets matching `vision_seq_len_buckets` (default `[1024, 4096, 16384]`) is

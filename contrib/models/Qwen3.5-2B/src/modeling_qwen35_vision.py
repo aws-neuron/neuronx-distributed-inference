@@ -327,11 +327,22 @@ class CPUVisionModel(nn.Module):
         k = k.transpose(0, 1).unsqueeze(0)
         v = v.transpose(0, 1).unsqueeze(0)
 
-        attn_weights = torch.matmul(q, k.transpose(-1, -2)) * attn.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(attn_weights, v)
+        # Use PyTorch's fused SDPA (efficient CPU implementation with memory-
+        # efficient attention). Falls back to eager on very old torch.
+        # attention_mask here is additive (bf16 with -large at masked positions).
+        try:
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                scale=attn.scaling,
+            )
+        except Exception:
+            attn_weights = torch.matmul(q, k.transpose(-1, -2)) * attn.scaling
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            out = torch.matmul(attn_weights, v)
         out = out.squeeze(0).transpose(0, 1).reshape(seq_len, -1)
         return attn.proj(out)
 
