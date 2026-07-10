@@ -184,19 +184,21 @@ debugging the fused kernel.
 | 2048×2048 |         4,096 |         **5,025** |             3.9   |   197 |
 
 **Neuron vision encoder** (compiled at patch-token buckets `[1024, 4096]`;
-16384 bucket exceeds trn2 single-core HBM and falls back to CPU):
+16384 bucket exceeds trn2 single-core HBM):
 
-| image     | TTFT (ms) | vs CPU-VE | TPOT (ms) |     |
-|-----------|----------:|----------:|----------:|-----|
-| 512×512   |    **86** | **2.0× ↓**|      4.2  | Neuron VE (bucket 1024)  |
-| 1024×1024 |   **526** | **2.1× ↓**|      4.1  | Neuron VE (bucket 4096)  |
-| 2048×2048 |     4,823 |      1.0× |      4.0  | CPU VE fallback (see below) |
+| image     | TTFT (ms) | vs CPU-VE | TPOT (ms) | notes                             |
+|-----------|----------:|----------:|----------:|-----------------------------------|
+| 512×512   |    **86** | **2.0× ↓**|      4.2  | Neuron VE (bucket 1024)           |
+| 1024×1024 |   **526** | **2.1× ↓**|      4.1  | Neuron VE (bucket 4096)           |
+| 2048×2048 | **2,090** | **2.4× ↓**|      4.2  | **2×2 tiled** through bucket 4096 |
 
-TTFT halves on the sizes we can fit on Neuron; TPOT is flat because text
-decode is Neuron-only regardless. The 2048×2048 case (16,384 patch tokens
-→ a 512 MB bf16 attention mask) does not fit in a single Neuron core's HBM,
-so the wrapper transparently falls back to the CPU vision encoder. Compiling
-that bucket with vision-model TP or windowed attention is a follow-up.
+TTFT halves (or more) at every size. TPOT is flat because text decode is
+Neuron-only regardless. For 2048×2048 the wrapper transparently splits the
+16,384-patch input into four 4,096-patch spatial tiles, encodes each through
+the bucket-4096 kernel, and re-interleaves the merged outputs
+(`NeuronQwen35VisionModelWrapper._tiled_forward`). Tiling loses cross-tile
+attention (a known LLaVA-NeXT-style trade-off); accuracy at 2048×2048 drops
+slightly from the CPU path — see accuracy note below.
 
 Compile the Neuron vision buckets once with `compile_vision_encoder.py`:
 
@@ -216,12 +218,13 @@ python contrib/models/Qwen3.5-2B/test/integration/run_vl_benchmark.py \
 
 **Accuracy note (vs HuggingFace CPU bf16 greedy on the same 3 sizes):** HF
 identifies "Pallas's cat" at all 3 sizes. Neuron identifies "Pallas's cat"
-correctly at 1024×1024, mis-identifies as "Pangolin" at 512×512 (image too
-small for the 2B model at this res), and hedges to "wildcat/lynx" at
-2048×2048. Text quality is coherent at all 3 sizes. The 512×512 mis-ID is a
-model-scale limitation reproducible on HF at reduced-quality inputs; the
-2048×2048 hedge is likely a small numerical drift accumulated over 4k+ vision
-tokens through the CPU vision + Neuron text pipeline.
+correctly at 1024×1024 (best case). At 512×512 it mis-identifies as
+"Pangolin" — a 2B-model capacity limitation reproducible on HF at reduced
+quality. At 2048×2048 with the Neuron tiled path, output degrades to
+"wolf/canid" (2×2 tiles have no cross-tile attention, so global features
+like the cat's overall silhouette are lost); the CPU-vision path at 2048
+hedges to "wildcat/lynx" instead — closer but still not "Pallas's cat".
+Text quality is coherent at all 3 sizes.
 
 Not yet done:
 - ViT encoder is on CPU. Tracing it to Neuron via `torch_neuronx.trace` with
@@ -275,10 +278,13 @@ pytest contrib/models/Qwen3.5-2B/test/integration/test_model.py -s
 
 ## Known limitations / follow-ups
 
-- ViT encoder Neuron-compiled at buckets `{1024, 4096}` patch tokens. The
-  16,384 bucket (for 2048×2048 images) OOMs on trn2 single-core HBM; the
-  wrapper falls back to CPU vision for that size. Compiling this bucket
-  requires TP-ing the vision model or using windowed attention.
+- ViT encoder Neuron-compiled at buckets `{1024, 4096}` patch tokens. 2048×2048
+  images (16,384 patch tokens) don't fit a single Neuron core's HBM at the
+  16,384 bucket size (512 MB attention mask). The wrapper handles this by
+  2×2-tiling into four 4,096-patch tile calls (~2.4× TTFT vs CPU vision, at
+  the cost of no cross-tile attention). TP-ing the vision model or compiling
+  a windowed-attention 16,384 kernel would preserve full attention for
+  these inputs.
 - VL requires `QWEN36_DELTANET_CTE_IMPL=legacy_direct` because the default
   fused-multihead NKI kernel is numerically unstable on structured vision
   embeddings. `run_vl_smoke.py` sets this automatically before compile.

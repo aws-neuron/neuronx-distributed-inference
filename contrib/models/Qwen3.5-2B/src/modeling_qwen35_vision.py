@@ -722,6 +722,33 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
         Returns:
             vision_embeddings: (total_merged_tokens, out_hidden_size)
         """
+        # 0. Tile path: if input exceeds all compiled Neuron buckets and tiling
+        # is enabled, split pixel_values into 2×2 spatial tiles of the
+        # (H, W) patch grid, encode each tile independently (each tile has
+        # 1/4 the tokens → fits in a smaller bucket), and re-interleave the
+        # merged outputs. Trade-off: no cross-tile attention.
+        seq_len_probe = pixel_values.shape[0]
+        max_neuron_bucket = (
+            max(self._compiled_buckets.keys())
+            if self._compiled_buckets is not None
+            else 0
+        )
+        gthw_list = image_grid_thw.tolist()
+        can_tile = (
+            self._compiled_buckets is not None
+            and seq_len_probe > max_neuron_bucket
+            and len(gthw_list) == 1
+            and gthw_list[0][1] % 2 == 0
+            and gthw_list[0][2] % 2 == 0
+            and (seq_len_probe // 4) <= max_neuron_bucket
+        )
+        if can_tile:
+            logger.info(
+                f"seq_len={seq_len_probe} exceeds max compiled bucket "
+                f"{max_neuron_bucket}; using 2×2 tiled vision path."
+            )
+            return self._tiled_forward(pixel_values, image_grid_thw)
+
         # 1. Patch embedding (CPU, Conv3d)
         hidden_states = self.patch_embed(pixel_values)
 
@@ -815,6 +842,67 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
         vision_output = vision_output[:total_merged_tokens]
 
         return vision_output
+
+    def _tiled_forward(self, pixel_values, image_grid_thw):
+        """Split a single-image (T=1, H, W) input into 2×2 spatial tiles of
+        (H/2, W/2) patches each. Encode each tile independently through
+        `forward`, then re-interleave the merged outputs so the returned
+        sequence matches the full-image row-major merged ordering that the
+        text model expects at image-token positions.
+
+        Requires image_grid_thw shape (1, 3) with H and W both divisible by
+        2 * spatial_merge_size. Each tile has (H/2)*(W/2) patch tokens and
+        must fit in a compiled bucket.
+        """
+        assert image_grid_thw.shape[0] == 1, "tiled path supports single-image inputs"
+        T, H, W = image_grid_thw[0].tolist()
+        assert T == 1, "tiled path supports T=1 (still images)"
+        merge = self.vision_config.spatial_merge_size
+        assert H % (2 * merge) == 0 and W % (2 * merge) == 0, (
+            f"H={H}, W={W} must be divisible by 2*spatial_merge_size={2 * merge}"
+        )
+        Ht, Wt = H // 2, W // 2  # per-tile patch dims
+
+        # Reshape pixel_values (H*W, patch_dim) into (H, W, patch_dim), split
+        # into 4 spatial quadrants, and flatten each back to (Ht*Wt, patch_dim).
+        patch_dim = pixel_values.shape[1]
+        pv_hw = pixel_values.reshape(H, W, patch_dim)
+        tiles = []
+        for h_off in (0, Ht):
+            for w_off in (0, Wt):
+                tile_hw = pv_hw[h_off:h_off + Ht, w_off:w_off + Wt, :]
+                tiles.append(tile_hw.reshape(Ht * Wt, patch_dim))
+
+        # Encode each tile with tile-local grid_thw. Vision-internal RoPE runs
+        # per-tile with positions restarting at 0; the text model's global
+        # mRoPE (computed from the full image_grid_thw upstream) handles
+        # cross-tile positioning at scatter time.
+        tile_gthw = torch.tensor([[1, Ht, Wt]], dtype=image_grid_thw.dtype,
+                                 device=image_grid_thw.device)
+        tile_merged = []
+        for tile_pv in tiles:
+            merged = self.forward(tile_pv, tile_gthw)
+            tile_merged.append(merged)  # each (Ht/merge * Wt/merge, out_hidden)
+
+        # Re-interleave merged tokens back into row-major order over the full
+        # (H/merge, W/merge) merged grid. Merged tiles produced by tile_i
+        # correspond to merged-block quadrants of the full grid.
+        mH_full, mW_full = H // merge, W // merge
+        mHt, mWt = Ht // merge, Wt // merge  # per-tile merged dims
+        out_hidden = tile_merged[0].shape[-1]
+
+        full = torch.zeros(
+            (mH_full, mW_full, out_hidden),
+            dtype=tile_merged[0].dtype,
+            device=tile_merged[0].device,
+        )
+        for idx, (h_off, w_off) in enumerate(
+            [(0, 0), (0, mWt), (mHt, 0), (mHt, mWt)]
+        ):
+            full[h_off:h_off + mHt, w_off:w_off + mWt] = \
+                tile_merged[idx].reshape(mHt, mWt, out_hidden)
+
+        return full.reshape(mH_full * mW_full, out_hidden)
 
 
 class NeuronQwen35VisionForImageEncoding(NeuronApplicationBase):
