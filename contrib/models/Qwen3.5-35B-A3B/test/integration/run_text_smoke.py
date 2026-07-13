@@ -56,7 +56,10 @@ def build_config(model_path: str, tp: int, seq_len: int):
         moe_tp_degree=tp,
         moe_ep_degree=1,
         normalize_top_k_affinities=True,
-        blockwise_matmul_config={"use_torch_block_wise": True},
+        # Try the shard-on-intermediate LNC=2 NKI kernel — if it exists in the
+        # shipped SDK it beats the pure-torch fallback. If it errors out with
+        # a "not available" ImportError, revert to use_torch_block_wise=True.
+        blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": True},
     )
     # Qwen3.5-MoE uses softmax over router logits.
     if hasattr(neuron_config, "router_config"):

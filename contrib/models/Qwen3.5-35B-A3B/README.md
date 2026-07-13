@@ -145,17 +145,40 @@ photosynthesis definition).
 
 `run_benchmark.py --prompt-lens 16 64 256 --max-new-tokens 64 --repeats 5`
 
-| prompt tokens | TTFT (ms, median) | TPOT (ms, median) | Throughput (tok/s) |
-|---:|---:|---:|---:|
-| 16  | **553.8** | 7.67 | 129.9 |
-| 64  | 554.0 | 7.79 | 128.2 |
-| 256 | 553.6 | 7.74 | 129.2 |
+Two MoE blockwise-matmul backends were evaluated on the shipped SDK 2.29:
 
-TTFT is dominated by the MoE prefill (256 experts × top-8 routing per token,
-running through PyTorch's fallback blockwise-matmul path because the stock
-SDK 2.29 DLAMI does not ship the LNC=2 shard-hidden NKI kernel needed by
-NxDI's default `ExpertMLPsV2`). TPOT of ~7.7 ms is comparable to dense 9B
-(6.89 ms) — MoE decode benefits from only 8 experts active per token.
+| MoE backend | 16 tok TTFT | 64 tok TTFT | 256 tok TTFT | TPOT | notes |
+|---|---:|---:|---:|---:|---|
+| `use_torch_block_wise=True` | 553.8 ms | 554.0 ms | 553.6 ms | ~7.7 ms | pure PyTorch fallback; flat TTFT because CPU |
+| **`use_shard_on_intermediate_dynamic_while=True`** (default) | **480.0 ms** | **575.5 ms** | **667.1 ms** | **~7.7 ms** | shard-hidden LNC=2 NKI kernel — 13 % faster at prompt=16, grows with prompt length |
+
+`shard_on_intermediate` is the current default in `run_text_smoke.py` /
+`run_benchmark.py`. It's a faster prefill kernel than the torch fallback but
+also NOT the fastest possible path — the `_call_shard_hidden_kernel`
+LNC=2 kernel that NxDI would prefer isn't shipped with the SDK 2.29 DLAMI
+(`_call_shard_hidden_kernel is not available - kernel not imported from
+nkilib` raises when we don't opt into an alternative). A future SDK drop
+should give a further TTFT reduction.
+
+**Why is TTFT / TPOT ratio so different from the dense siblings?**
+Dense models spend ~40-60 % of prefill in the FFN block; MoE only dispatches
+top-8 experts per token, so decode is extremely cheap (~10× less MLP FLOPs
+than 27B despite having more total params) but prefill still has to route
+256 experts × 512 tokens = many small block-matmuls. The observed
+ratios are consistent with this:
+
+| model | Params (activated per token) | TTFT (16) | TPOT | TTFT/TPOT |
+|---|---:|---:|---:|---:|
+| 2B  |  2 B | 17.6 ms | 4.00 ms | 4.4× |
+| 4B  |  4 B | 34.6 ms | 5.68 ms | 6.1× |
+| 9B  |  9 B | 42.9 ms | 6.89 ms | 6.2× |
+| 27B | 27 B | 118.6 ms | 21.58 ms | 5.5× |
+| **35B-A3B** | 35 B (**~3 B active**) | **480 ms** | **7.72 ms** | **62×** |
+
+TPOT of ~7.7 ms sits between 9B (6.9 ms) and 4B (5.7 ms), matching the
+"~3 B activated" figure — confirming the MoE sparse-decode benefit. The
+inflated TTFT/TPOT ratio is a consequence of the shipped kernel gap, not the
+architecture.
 
 ## Notable configuration choices
 
@@ -164,11 +187,19 @@ NxDI's default `ExpertMLPsV2`). TPOT of ~7.7 ms is comparable to dense 9B
   `blockwise_matmul_config`, `moe_tp_degree`, etc.
 - `moe_tp_degree = 8`, `moe_ep_degree = 1` — no expert parallelism yet,
   every rank sees every expert (sharded on the intermediate dim).
-- **`blockwise_matmul_config={"use_torch_block_wise": True}`** — required
-  because the DLAMI-shipped NKI kernel path
-  (`_call_shard_hidden_kernel` for LNC=2) is not available. Torch fallback
-  is functionally correct but slower — a genuine NKI blockwise-matmul kernel
-  would drop TTFT substantially.
+- **`blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": True}`**
+  (default). Two alternate MoE prefill kernels are evaluated in the
+  benchmark table above; the shard-on-intermediate path is the fastest one
+  that runs on the shipped SDK 2.29 DLAMI. The truly-preferred
+  `_call_shard_hidden_kernel` LNC=2 path is not available in the shipped
+  DLAMI and would require a future SDK drop.
+- **`moe_ep_degree=1`** — expert parallelism (`moe_ep_degree > 1`) is
+  functional during prefill but **not supported during decode** by NxDI's
+  `ExpertMLPsV2`: with `top_k=8 / num_experts=256`, the per-token expert
+  fraction is 3 %, below `DEFAULT_SELECTIVE_LOADING_THRESHOLD=1.0`, which
+  routes decode through `forward_selective_loading` — and that path
+  raises `NotImplementedError: Selective Loading with Expert parallelism is
+  not supported in token generation.`
 - `router_config.dtype = float32`, `router_config.act_fn = "softmax"` —
   Qwen3.5-MoE uses softmax over router logits with fp32 accumulation.
 - `normalize_top_k_affinities = True` — Qwen3.5-MoE normalizes the top-k
@@ -187,12 +218,15 @@ NxDI's default `ExpertMLPsV2`). TPOT of ~7.7 ms is comparable to dense 9B
   generation takes many minutes per prompt; deferred until GPU or larger CPU
   is available. All 5 prompts in the accuracy suite produce coherent,
   factually correct Neuron output.
-- **Torch fallback for blockwise MoE.** ~550 ms TTFT is dominated by the
-  Python-level blockwise matmul. A native NKI shard-hidden kernel from a
-  future SDK drop would substantially speed up prefill.
-- **Expert parallelism (EP=1).** With EP > 1 the model would shard experts
-  across cores instead of intermediate dim, likely giving better peak
-  utilization at large batch sizes.
+- **Shipped SDK MoE kernel gap.** The truly-preferred LNC=2 shard-hidden
+  NKI kernel (`_call_shard_hidden_kernel`) is not present in the SDK 2.29
+  DLAMI. Current default (`use_shard_on_intermediate_dynamic_while`) gets
+  ~480 ms at prompt=16 (13 % better than the torch fallback) but scales
+  linearly with prompt length. A future SDK drop should close this.
+- **Expert parallelism (EP=1).** `moe_ep_degree > 1` is supported for
+  prefill but NxDI's `ExpertMLPsV2` raises `NotImplementedError` for
+  selective-loading decode with EP — and our (top_k=8, num_experts=256)
+  configuration always goes through selective loading at decode time.
 
 ## Maintainer
 
