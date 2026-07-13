@@ -81,9 +81,9 @@ from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
 from neuronx_distributed.utils import cpu_mode
 
 try:
-    from nki import jit as nki_jit  # NKI 0.3.0+ (SDK 2.29)
+    from nki import jit as nki_jit  # standalone nki package (>=0.3.0)
 except ImportError:
-    from torch_neuronx.xla_impl.ops import nki_jit  # NKI 0.2.x (SDK 2.28)
+    from torch_neuronx.xla_impl.ops import nki_jit  # legacy embedded path
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 from src.nki_kernels.nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
@@ -370,8 +370,9 @@ except ImportError:
 
 def _patch_nxd_shard_hidden_kernel():
     """Monkey-patch NxD's `_call_shard_hidden_kernel` to use the nkilib
-    blockwise-matmul-shard-on-H NKI kernel present in SDK 2.29's `nkilib`
-    package. Upstream NxD gates the fastest MoE blockwise path on a
+    blockwise-matmul-shard-on-H NKI kernel present in the shipped `nkilib`
+    package (neuronx-cc 2.26.6360). Upstream NxD gates the fastest MoE
+    blockwise path on a
     `neuronxcc.nki._private.blockwise_mm` module which is absent from the
     DLAMI; falling through, it raises NotImplementedError. But the same
     kernel exists at `nkilib.experimental.moe.forward.bwmm_shard_on_H.

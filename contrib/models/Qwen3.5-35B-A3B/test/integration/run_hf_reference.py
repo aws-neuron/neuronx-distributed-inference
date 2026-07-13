@@ -5,7 +5,7 @@
 """
 Run the HuggingFace Qwen3.5-35B-A3B reference on CPU and dump greedy outputs to JSON.
 
-Because transformers 4.57.6 (shipped with NxDI SDK 2.29) predates Qwen3.5
+Because transformers 4.57.6 (shipped with the current NxDI DLAMI) predates Qwen3.5
 support, this must be run in an isolated venv with transformers>=5.13:
 
     python3 -m venv /tmp/hf_ref_venv

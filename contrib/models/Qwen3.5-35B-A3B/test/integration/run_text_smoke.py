@@ -39,8 +39,9 @@ def build_config(model_path: str, tp: int, seq_len: int):
 
     # 35B-A3B is a MoE variant (qwen3_5_moe_text). Use MoENeuronConfig so
     # initialize_moe_module() finds the router / blockwise-matmul / moe_tp_degree
-    # settings. Force use_torch_block_wise=True because the stock SDK 2.29
-    # DLAMI does not ship the shard-hidden LNC=2 blockwise-matmul NKI kernel.
+    # settings. Force use_torch_block_wise=True because the shipped
+    # neuronx-cc 2.26.6360 DLAMI does not ship the shard-hidden LNC=2
+    # blockwise-matmul NKI kernel.
     neuron_config = MoENeuronConfig(
         tp_degree=tp,
         batch_size=1,
@@ -62,8 +63,9 @@ def build_config(model_path: str, tp: int, seq_len: int):
         #   use_torch_block_wise                     → 554 ms TTFT (fallback)
         # shard-on-intermediate wins at short prompts (chat), the patched
         # shard-hidden path is closer for long prompts (>256). Neither is a
-        # true NKI shard-hidden kernel — that path in the shipped SDK 2.29
-        # DLAMI is a NotImplementedError stub. modeling_qwen35.py monkey-patches
+        # true NKI shard-hidden kernel — that path in the shipped DLAMI
+        # (neuronx-cc 2.26.6360) is a NotImplementedError stub.
+        # modeling_qwen35.py monkey-patches
         # `_call_shard_hidden_kernel` to wire in nkilib's forward kernel so
         # the default path is at least runnable; we still explicitly pick
         # shard-on-intermediate here for best measured TTFT.

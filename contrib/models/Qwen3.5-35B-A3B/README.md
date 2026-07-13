@@ -12,7 +12,7 @@ DeltaNet + attention path from PR #173 (originally targeted at Qwen3.6-27B
 dense) and plugs NxDI's `initialize_moe_module` (from `moe_v2`) into a new
 `Qwen35MoEBlock`. Runs on the stock
 `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/` DLAMI venv
-(Neuron SDK 2.29 / NKI 0.3.0). Only the config / decoder-layer / weight
+(`neuronx-cc` 2.26.6360 / `nki` 0.5.0). Only the config / decoder-layer / weight
 converter in `modeling_qwen35.py` gained a MoE branch; the rest of the file
 is byte-identical to the dense contribs.
 
@@ -98,10 +98,13 @@ Deltas vs the dense contrib source (a couple of hundred lines total):
 | Component | Version |
 |---|---|
 | Instance | `trn2.48xlarge` (validated at TP=8) |
-| Neuron SDK | 2.29 (NKI 0.3.0) |
-| Python | 3.12 |
-| `torch` | 2.9.1 (torch-neuronx 2.9.0.2) |
+| `neuronx-cc` | 2.26.6360.0 |
+| `nki` | 0.5.0 |
+| `neuronx-distributed` | 0.19.28492 |
 | `neuronx-distributed-inference` | 0.10.18399 |
+| `torch-neuronx` | 2.9.0.2 (torch 2.9.1) |
+| `libneuronxla` | 2.2.17544 |
+| Python | 3.12 |
 | `transformers` | 4.57.6 (Neuron runtime). HF CPU reference needs ≥ 5.13. |
 
 ## Checkpoint
@@ -145,7 +148,8 @@ photosynthesis definition).
 
 `run_benchmark.py --prompt-lens 16 64 256 --max-new-tokens 64 --repeats 5`
 
-Three MoE blockwise-matmul backends were evaluated on the shipped SDK 2.29:
+Three MoE blockwise-matmul backends were evaluated on the shipped
+`neuronx-cc 2.26.6360` DLAMI:
 
 | MoE backend | 16 tok TTFT | 64 tok TTFT | 256 tok TTFT | TPOT | notes |
 |---|---:|---:|---:|---:|---|
@@ -157,8 +161,9 @@ Three MoE blockwise-matmul backends were evaluated on the shipped SDK 2.29:
 `run_benchmark.py` — it wins at short prompts (chat use case). The third
 row is a **monkey-patched path**: NxDI's default LNC=2 forward MoE kernel
 (`_call_shard_hidden_kernel`) is a `NotImplementedError` stub because the
-`neuronxcc.nki._private.blockwise_mm` module is absent from the SDK 2.29
-DLAMI. However, the same kernel forward implementation is available at
+`neuronxcc.nki._private.blockwise_mm` module is absent from the shipped
+`neuronx-cc 2.26.6360` DLAMI. However, the same kernel forward
+implementation is available at
 `nkilib.experimental.moe.forward.bwmm_shard_on_H.blockwise_mm_baseline_shard_hidden`,
 so `modeling_qwen35.py::_patch_nxd_shard_hidden_kernel()` wires it in at
 import time. That gives the default LNC=2 forward path a runnable
@@ -240,7 +245,7 @@ python contrib/models/Qwen3.5-35B-A3B/test/integration/run_vl_benchmark.py \
 - **`blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": True}`**
   (default). Two alternate MoE prefill kernels are evaluated in the
   benchmark table above; the shard-on-intermediate path is the fastest one
-  that runs on the shipped SDK 2.29 DLAMI. The truly-preferred
+  that runs on the shipped `neuronx-cc 2.26.6360` DLAMI. The truly-preferred
   `_call_shard_hidden_kernel` LNC=2 path is not available in the shipped
   DLAMI and would require a future SDK drop.
 - **`moe_ep_degree=1`** — expert parallelism (`moe_ep_degree > 1`) is
@@ -265,8 +270,9 @@ python contrib/models/Qwen3.5-35B-A3B/test/integration/run_vl_benchmark.py \
   is available. All 5 prompts in the accuracy suite produce coherent,
   factually correct Neuron output.
 - **Shipped SDK MoE kernel gap.** The truly-preferred LNC=2 shard-hidden
-  NKI kernel (`_call_shard_hidden_kernel`) is not present in the SDK 2.29
-  DLAMI. Current default (`use_shard_on_intermediate_dynamic_while`) gets
+  NKI kernel (`_call_shard_hidden_kernel`) is not present in the shipped
+  `neuronx-cc 2.26.6360` DLAMI. Current default
+  (`use_shard_on_intermediate_dynamic_while`) gets
   ~480 ms at prompt=16 (13 % better than the torch fallback) but scales
   linearly with prompt length. A future SDK drop should close this.
 - **Expert parallelism (EP=1).** `moe_ep_degree > 1` is supported for

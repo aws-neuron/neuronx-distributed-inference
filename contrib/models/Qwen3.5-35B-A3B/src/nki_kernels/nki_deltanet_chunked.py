@@ -13,7 +13,7 @@ No sequence-indexed DMA inside the kernel -- all inputs/outputs are full tiles.
 This avoids the DMA OOB issue seen with nl.sequential_range + slice indexing
 in the NxDI model compilation context.
 
-NKI v3 (SDK 2.29, NKI 0.3.0). Uses nki.* namespace.
+NKI v3 (neuronx-cc 2.26.6360 / nki 0.5.0). Uses nki.* namespace.
 """
 
 import nki
