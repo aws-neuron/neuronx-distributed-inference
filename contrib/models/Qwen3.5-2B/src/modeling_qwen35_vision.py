@@ -72,6 +72,26 @@ except ImportError:
             Qwen3_5MoeVisionRotaryEmbedding = None
 
 
+class _TPVisionAdapter:
+    """Wrap a parallel_model_load()'d TP vision model to match the call
+    convention used by NeuronQwen35VisionModelWrapper.forward
+    ((hidden_states, attention_mask, cos, sin) with 4 positional args).
+
+    parallel_model_trace was invoked with (hs, mask, (cos, sin)), so the
+    traced graph expects the RoPE tuple as a single input; this adapter
+    re-packs the (cos, sin) pair.
+    """
+
+    def __init__(self, parallel_model):
+        self._m = parallel_model
+
+    def __call__(self, hidden_states, attention_mask, cos, sin):
+        out = self._m(hidden_states, attention_mask, (cos, sin))
+        if isinstance(out, (list, tuple)):
+            return out[0]
+        return out
+
+
 def apply_rotary_pos_emb_vision(q, k, cos, sin):
     """Apply rotary position embeddings to vision Q and K tensors.
 
@@ -409,11 +429,15 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
     def load_compiled(self, compiled_model_path):
         """Load pre-compiled standalone vision encoder(s).
 
-        Supports two modes:
+        Supports three modes:
         1. Single .pt file: Legacy mode, loads one compiled model for one bucket size.
-        2. Directory with multiple .pt files: Multi-bucket mode. Files must be named
-           'vision_encoder_{bucket_size}.pt' (e.g., 'vision_encoder_256.pt').
-           Falls back to single 'vision_encoder.pt' in the directory.
+        2. Directory of `vision_encoder_{bucket}.pt` files: Legacy multi-bucket
+           mode (single-core `torch_neuronx.trace` output).
+        3. Directory of `bucket_{bucket}/tp_*.pt` subdirs: TP-sharded mode
+           (produced by `compile_vision_encoder_tp.py` via
+           `parallel_model_trace`). Auto-detected before mode 2. TP and legacy
+           buckets can coexist in the same directory — TP buckets take priority
+           when both exist for the same size.
 
         Args:
             compiled_model_path: Path to a .pt file or directory containing bucket .pt files.
@@ -428,13 +452,43 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
             self._compiled_buckets = None
             logger.info("Vision encoder loaded successfully (single bucket)")
         elif os.path.isdir(compiled_model_path):
-            # Directory mode: look for bucket-specific files
+            # TP-sharded buckets: subdirs `bucket_<N>/tp_*.pt`
+            tp_buckets = {}
+            for entry in sorted(os.listdir(compiled_model_path)):
+                if not entry.startswith("bucket_"):
+                    continue
+                sub = os.path.join(compiled_model_path, entry)
+                if not os.path.isdir(sub):
+                    continue
+                try:
+                    bucket_size = int(entry.replace("bucket_", ""))
+                except ValueError:
+                    continue
+                # Detect TP shards (tp_0.pt, tp_1.pt, ...)
+                shard_files = sorted(glob_module.glob(os.path.join(sub, "tp_*.pt")))
+                if not shard_files:
+                    continue
+                try:
+                    from neuronx_distributed.trace import parallel_model_load
+                except ImportError:
+                    logger.warning(
+                        "TP vision buckets found but neuronx_distributed not "
+                        "importable; skipping TP buckets"
+                    )
+                    break
+                logger.info(
+                    f"  Loading TP vision bucket {bucket_size} "
+                    f"({len(shard_files)}-way) from {sub}"
+                )
+                tp_buckets[bucket_size] = _TPVisionAdapter(parallel_model_load(sub))
+
+            # Legacy per-bucket .pt files at the top level
             bucket_files = sorted(
                 glob_module.glob(
                     os.path.join(compiled_model_path, "vision_encoder_*.pt")
                 )
             )
-            if bucket_files:
+            if tp_buckets or bucket_files:
                 self._compiled_buckets = {}
                 for bf in bucket_files:
                     # Extract bucket size from filename: vision_encoder_256.pt -> 256
@@ -447,6 +501,8 @@ class NeuronQwen35VisionModelWrapper(ModelWrapper):
                         logger.info(f"  Loaded vision bucket {bucket_size} from {bf}")
                     except ValueError:
                         logger.warning(f"  Skipping unrecognized file: {bf}")
+                # TP buckets take priority when both exist for the same size
+                self._compiled_buckets.update(tp_buckets)
                 self._compiled_model = None
                 # Update vision_seq_len_buckets to match compiled buckets
                 self.vision_seq_len_buckets = sorted(self._compiled_buckets.keys())

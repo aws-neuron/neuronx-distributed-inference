@@ -219,6 +219,35 @@ python contrib/models/Qwen3.5-2B/test/integration/run_vl_benchmark.py \
     --max-new-tokens 48 --repeats 3
 ```
 
+**Optional: TP-sharded vision encoder** (`compile_vision_encoder_tp.py`).
+The single-core trace above sees `ColumnParallelLinear` fall back to plain
+linear at `tp=1`. Recompiling the same ViT with `parallel_model_trace(tp_degree=N)`
+shards QKV / MLP linears across N cores, gathering / all-reducing at
+each block boundary. Compile output lives under `bucket_<N>/tp_*.pt` and
+is auto-detected by `NeuronQwen35VisionModelWrapper.load_compiled` in the
+same directory as the legacy `vision_encoder_<N>.pt` files.
+
+```bash
+# TP=4 shard for bucket 4096 (covers 1024×1024 and each tile of 2048×2048)
+python contrib/models/Qwen3.5-2B/test/integration/compile_vision_encoder_tp.py \
+    --model-path /mnt/nvme/models/Qwen3.5-2B \
+    --out-dir    /tmp/qwen35_2b_vl_bench/vision \
+    --tp 4 --buckets 4096
+```
+
+Measured (trn2.48xlarge, TP=8 text, bf16, VL bucket 4096, 1024×1024 image):
+
+| Vision path        | Standalone latency | E2E TTFT | vs TP=1 vision |
+|--------------------|-------------------:|---------:|---------------:|
+| TP=1 (single core) |             308 ms |   526 ms |          1.00× |
+| TP=2               |             198 ms |   ~-100 ms E2E    |          ~1.6× |
+| **TP=4**           |         **101 ms** | **318 ms** |     **1.65× E2E TTFT** |
+
+TP=8 for the vision encoder is technically feasible but wasn't measured
+here; extrapolated ~75–90 ms standalone (≈ 3.5–4× TP=1). Bucket 16384
+(non-tiled 2048×2048) exceeds the compiler's 10M-instruction verification
+limit even at TP=4, so the tiled path stays required at 2048×2048.
+
 **Accuracy note (vs HuggingFace CPU bf16 greedy on the same 3 sizes):** HF
 identifies "Pallas's cat" at all 3 sizes. Neuron identifies "Pallas's cat"
 correctly at 1024×1024 (best case). At 512×512 it mis-identifies as
