@@ -41,14 +41,18 @@ DEFAULT_PROMPT = "What is in this image? Describe it briefly."
 
 
 def build_vl_config(model_path: str, tp: int, max_seq_len: int, buckets):
+    # MoE variant needs MoENeuronConfig (see run_text_smoke.py comment block).
+    # The `_call_shard_hidden_kernel` stub in NxD is monkey-patched at import
+    # time by modeling_qwen35.py, so shard-on-intermediate remains the best
+    # explicit choice for prefill.
     from neuronx_distributed_inference.models.config import (
-        NeuronConfig,
+        MoENeuronConfig,
         OnDeviceSamplingConfig,
     )
     from src.modeling_qwen35 import Qwen35InferenceConfig
     from src.modeling_qwen35_vl import Qwen35VLInferenceConfig
 
-    neuron_config = NeuronConfig(
+    neuron_config = MoENeuronConfig(
         tp_degree=tp,
         batch_size=1,
         ctx_batch_size=1,
@@ -62,7 +66,14 @@ def build_vl_config(model_path: str, tp: int, max_seq_len: int, buckets):
         flash_decoding_enabled=False,
         logical_nc_config=2,
         save_sharded_checkpoint=True,
+        moe_tp_degree=tp,
+        moe_ep_degree=1,
+        normalize_top_k_affinities=True,
+        blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": True},
     )
+    if hasattr(neuron_config, "router_config"):
+        neuron_config.router_config.dtype = torch.float32
+        neuron_config.router_config.act_fn = "softmax"
 
     with open(os.path.join(model_path, "config.json")) as f:
         full = json.load(f)

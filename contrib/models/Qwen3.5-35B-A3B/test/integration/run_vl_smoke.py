@@ -52,12 +52,12 @@ if _CONTRIB_ROOT not in sys.path:
 def build_vl_text_config(model_path: str, tp: int, seq_len: int):
     """Build a Qwen35InferenceConfig with vision-aware CTE inputs enabled."""
     from neuronx_distributed_inference.models.config import (
-        NeuronConfig,
+        MoENeuronConfig,
         OnDeviceSamplingConfig,
     )
     from src.modeling_qwen35 import Qwen35InferenceConfig
 
-    neuron_config = NeuronConfig(
+    neuron_config = MoENeuronConfig(
         tp_degree=tp,
         batch_size=1,
         ctx_batch_size=1,
@@ -69,7 +69,14 @@ def build_vl_text_config(model_path: str, tp: int, seq_len: int):
         flash_decoding_enabled=False,
         logical_nc_config=2,
         save_sharded_checkpoint=True,
+        moe_tp_degree=tp,
+        moe_ep_degree=1,
+        normalize_top_k_affinities=True,
+        blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": True},
     )
+    if hasattr(neuron_config, "router_config"):
+        neuron_config.router_config.dtype = torch.float32
+        neuron_config.router_config.act_fn = "softmax"
 
     with open(os.path.join(model_path, "config.json")) as f:
         full = json.load(f)

@@ -16,11 +16,11 @@ dense) and plugs NxDI's `initialize_moe_module` (from `moe_v2`) into a new
 converter in `modeling_qwen35.py` gained a MoE branch; the rest of the file
 is byte-identical to the dense contribs.
 
-**Status:** text-only inference is validated end-to-end on `trn2.48xlarge`
-(TP=8, bf16, seq_len=512). Vision-language is not attempted in this contrib
-yet — see "Known limitations". VL requires the vision encoder to be
-compiled separately (same as the 2B/4B/9B/27B recipe) and a text model
-recompile with `use_text_only_cte_inputs=False`.
+**Status:** both text-only **and vision-language** inference are validated
+end-to-end on `trn2.48xlarge` (TP=8, bf16). VL uses the Neuron-compiled
+vision encoder (buckets 1024 / 4096) plus a text-model recompile with
+`use_text_only_cte_inputs=False` and CTE bucketing enabled, sharing the
+same DeltaNet + MoE decoder as the text-only path.
 
 ## Architecture diff vs dense Qwen3.5-27B
 
@@ -52,7 +52,7 @@ Qwen3.5-35B-A3B/
 ├── README.md
 ├── src/
 │   ├── modeling_qwen35.py     — DeltaNet + GQA text stack + NEW `Qwen35MoEBlock`
-│   ├── modeling_qwen35_vl.py  — (unused for text-only)
+│   ├── modeling_qwen35_vl.py  — VL orchestrator (vision + text)
 │   ├── modeling_qwen35_vision.py
 │   ├── hybrid_apc.py
 │   ├── nki_kernels/           — DeltaNet NKI kernels (unchanged)
@@ -189,6 +189,47 @@ TPOT of ~7.7 ms sits between 9B (6.9 ms) and 4B (5.7 ms), matching the
 inflated TTFT/TPOT ratio is a consequence of the shipped kernel gap, not the
 architecture.
 
+## Measured VL performance (TP=8, bf16, CTE buckets 512/1024/2048/4096/8192)
+
+Vision encoder compiled to Neuron for two buckets (1024, 4096) via
+`compile_vision_encoder.py`; text model compiled with
+`use_text_only_cte_inputs=False` and CTE bucketing enabled so the same
+artifact handles all three image sizes. Prompt: *"What is in this image?
+Describe it briefly."* — three repeats after warmup.
+
+| Image | Vision path | TTFT (ms) | TPOT (ms) | tok/s |
+|---|---|---:|---:|---:|
+| 512×512  | Neuron ViT (bucket 1024) | **1036.8** | 8.2 | 121.9 |
+| 1024×1024 | Neuron ViT (bucket 4096) | **2004.0** | 8.1 | 123.6 |
+| 2048×2048 | 2×2 tile → 4× Neuron ViT (bucket 4096) | **5490.4** | 8.1 | 123.2 |
+
+TPOT is flat (~8 ms) across sizes because decode is unchanged; TTFT scales
+with image → text-token count (image tokens: ~278 / 1046 / 4712, CTE bucket
+picked: 512 / 1024 / 8192). Sample output on `test_image_1024.jpg` — the
+model correctly identifies the animal as a **Pallas's cat (manul)**;
+`test_image_2048.jpg` (a leopard-like feline) resolves to *"close-up of an
+animal...rosettes/spots"* using the 2×2 tile fallback. Both descriptions
+show the vision+MoE stack is functioning end-to-end.
+
+To reproduce:
+
+```bash
+# 1. Compile vision encoder buckets (once, ~10 min for 1024, ~12 min for 4096)
+python contrib/models/Qwen3.5-35B-A3B/test/integration/compile_vision_encoder.py \
+    --model-path /mnt/nvme/models/Qwen3.5-35B-A3B \
+    --out-dir /tmp/qwen35_35b_a3b_vl_bench/vision \
+    --buckets 1024 4096
+
+# 2. Compile text model + benchmark (once, ~15 min compile then benchmark)
+python contrib/models/Qwen3.5-35B-A3B/test/integration/run_vl_benchmark.py \
+    --model-path /mnt/nvme/models/Qwen3.5-35B-A3B \
+    --compiled-path /tmp/qwen35_35b_a3b_vl_bench \
+    --tp 8 --images 512 1024 2048 --buckets 512 1024 2048 4096 8192 \
+    --max-new-tokens 48 --repeats 3 \
+    --vision-compiled-dir /tmp/qwen35_35b_a3b_vl_bench/vision \
+    --out-json /tmp/qwen35_35b_a3b_vl_bench.json
+```
+
 ## Notable configuration choices
 
 - **`MoENeuronConfig`** (not `NeuronConfig`) — required by
@@ -219,10 +260,6 @@ architecture.
 
 ## Known limitations / follow-ups
 
-- **VL not attempted.** Vision encoder compile + text recompile with
-  `use_text_only_cte_inputs=False` + the tiled path all work in the dense
-  siblings, so extension should be mechanical, but combined MoE + vision
-  scatter has not been exercised.
 - **HF greedy match not run**. 35B-A3B on CPU bf16 is ~67 GB and greedy
   generation takes many minutes per prompt; deferred until GPU or larger CPU
   is available. All 5 prompts in the accuracy suite produce coherent,
