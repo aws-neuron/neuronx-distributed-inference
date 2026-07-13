@@ -14,8 +14,8 @@ This contrib model reuses the DeltaNet + GQA modeling code contributed to
 [PR #173](https://github.com/aws-neuron/neuronx-distributed-inference/pull/173)
 for the 27B sibling and adapts it to the 2B variant. **No modifications to the
 installed NxDI library are required** — everything runs on the stock
-`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/` DLAMI venv (Neuron SDK 2.29
-/ NKI 0.3.0).
+`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/` DLAMI venv
+(`neuronx-cc` 2.26.6360 / `nki` 0.5.0).
 
 **Status:** text-only and vision-language inference are both validated
 end-to-end on `trn2.48xlarge`. VL requires the legacy-direct DeltaNet CTE
@@ -51,10 +51,13 @@ Qwen3.5-2B/
 | Component      | Version                                      |
 |----------------|----------------------------------------------|
 | Instance       | `trn2.48xlarge` (validated at TP=8)          |
-| Neuron SDK     | 2.29 (NKI 0.3.0)                             |
-| Python         | 3.12 (system DLAMI venv)                     |
-| `torch`        | 2.9.1 (torch-neuronx 2.9.0.2)                |
+| `neuronx-cc`   | 2.26.6360.0                                  |
+| `nki`          | 0.5.0                                        |
+| `neuronx-distributed` | 0.19.28492                            |
 | `neuronx-distributed-inference` | 0.10.18399                  |
+| `torch-neuronx` | 2.9.0.2 (torch 2.9.1)                       |
+| `libneuronxla` | 2.2.17544                                    |
+| Python         | 3.12 (system DLAMI venv)                     |
 | `transformers` | 4.57.6 (for Neuron runtime). **HF reference on CPU requires transformers ≥ 5.13.** |
 
 ## Checkpoint
@@ -239,7 +242,7 @@ Not yet done:
 
 ## HF reference on CPU
 
-Because `transformers==4.57.6` (bundled with the NxDI SDK 2.29 DLAMI) predates
+Because `transformers==4.57.6` (bundled with the current NxDI DLAMI) predates
 the `qwen3_5` architecture, running HF as an accuracy oracle needs an isolated
 newer venv:
 
@@ -298,6 +301,6 @@ pytest contrib/models/Qwen3.5-2B/test/integration/test_model.py -s
 ## Maintainer
 
 Contributed as part of the NxDI contrib community pool. Testing on
-`trn2.48xlarge` with SDK 2.29. Modeling code originates from PR #173 (27B
+`trn2.48xlarge` (neuronx-cc 2.26.6360 / nki 0.5.0). Modeling code originates from PR #173 (27B
 sibling) reused verbatim; only weight loading (`update_state_dict_for_tied_weights`)
 and the config validation were adapted for the 2B variant.

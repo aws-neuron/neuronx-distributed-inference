@@ -13,7 +13,7 @@ Key optimizations over nki_deltanet_chunked.py:
   6. nc_transpose (Vector Engine) for all 128x128 transposes instead of
      nc_matmul(moving=eye) (Tensor Engine) — frees TE for actual math
 
-NKI 0.3.0 (SDK 2.29). k_dim = v_dim = 128 = P_MAX exactly.
+neuronx-cc 2.26.6360 / nki 0.5.0. k_dim = v_dim = 128 = P_MAX exactly.
 Chunk size = 128 = P_MAX (one tile per chunk).
 
 Mathematical framework:

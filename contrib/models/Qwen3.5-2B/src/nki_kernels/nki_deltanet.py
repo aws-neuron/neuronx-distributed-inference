@@ -1,6 +1,6 @@
 """NKI kernels for DeltaNet gated delta rule recurrent forward.
 
-NKI v3 (SDK 2.29, NKI 0.3.0). Processes a SINGLE (batch, head) pair per kernel call.
+NKI v3 (neuronx-cc 2.26.6360 / nki 0.5.0). Processes a SINGLE (batch, head) pair per kernel call.
 The caller loops over (B, H) in PyTorch and calls this kernel for each pair.
 
 Input layout: All inputs are 2D contiguous tensors (S, 128).
@@ -412,7 +412,7 @@ def deltanet_recurrent_fwd(
         delta_row_psum = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=delta_row_psum, data=delta)
 
-        # Copy PSUM (1, 128) -> SBUF (1, 128) first (NKI 0.3.0 requires matching P dims)
+        # Copy PSUM (1, 128) -> SBUF (1, 128) first (nki requires matching P dims)
         delta_row_sb = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=delta_row_sb, src=delta_row_psum)
 
@@ -561,7 +561,7 @@ def deltanet_recurrent_fwd_state(
         delta_row_psum = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=delta_row_psum, data=delta)
 
-        # Copy PSUM (1, 128) -> SBUF (1, 128) first (NKI 0.3.0 requires matching P dims)
+        # Copy PSUM (1, 128) -> SBUF (1, 128) first (nki requires matching P dims)
         delta_row_sb = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=delta_row_sb, src=delta_row_psum)
 

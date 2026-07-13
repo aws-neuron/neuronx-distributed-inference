@@ -80,9 +80,9 @@ from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
 from neuronx_distributed.utils import cpu_mode
 
 try:
-    from nki import jit as nki_jit  # NKI 0.3.0+ (SDK 2.29)
+    from nki import jit as nki_jit  # standalone nki package (>=0.3.0)
 except ImportError:
-    from torch_neuronx.xla_impl.ops import nki_jit  # NKI 0.2.x (SDK 2.28)
+    from torch_neuronx.xla_impl.ops import nki_jit  # legacy embedded path
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 from src.nki_kernels.nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
