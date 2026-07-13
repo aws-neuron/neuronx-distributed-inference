@@ -366,6 +366,61 @@ try:
     HAS_MOE_V2 = True
 except ImportError:
     HAS_MOE_V2 = False
+
+
+def _patch_nxd_shard_hidden_kernel():
+    """Monkey-patch NxD's `_call_shard_hidden_kernel` to use the nkilib
+    blockwise-matmul-shard-on-H NKI kernel present in SDK 2.29's `nkilib`
+    package. Upstream NxD gates the fastest MoE blockwise path on a
+    `neuronxcc.nki._private.blockwise_mm` module which is absent from the
+    DLAMI; falling through, it raises NotImplementedError. But the same
+    kernel exists at `nkilib.experimental.moe.forward.bwmm_shard_on_H.
+    blockwise_mm_baseline_shard_hidden` — we wire that up here so the
+    default LNC=2 forward path becomes available.
+    """
+    try:
+        from nkilib.experimental.moe.forward.bwmm_shard_on_H import (
+            blockwise_mm_baseline_shard_hidden as _nki_shard_H,
+        )
+    except ImportError:
+        return  # nothing to do; NxD's fallback handling stays in effect
+
+    from neuronx_distributed.modules.moe import blockwise as _nxd_blockwise
+
+    if getattr(_nxd_blockwise, "_qwen35_shard_hidden_patched", False):
+        return
+
+    def _call_shard_hidden_kernel_patched(args):
+        """Drop-in replacement matching the NxD `_call_shard_hidden_kernel`
+        signature but using the nkilib forward-only kernel.
+
+        The nkilib kernel returns (output, gate_up_activations_T, down_activations)
+        — no `output=` kwarg — so we match that layout.
+        """
+        result = _nki_shard_H[2](
+            hidden_states=args.hidden_states,
+            expert_affinities_masked=args.expert_affinities_masked,
+            gate_up_proj_weight=args.gate_up_proj_weight,
+            down_proj_weight=args.down_proj_weight,
+            block_size=args.block_size,
+            token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
+            block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+            gate_up_activations_T=args.gate_up_activations_T,
+            down_activations=args.down_activations,
+            skip_dma=args.skip_dma,
+            is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+            expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
+        )
+        if isinstance(result, tuple) and len(result) == 3:
+            return result
+        # Some kernel builds return only the output tensor; adapt.
+        return result, args.gate_up_activations_T, args.down_activations
+
+    _nxd_blockwise._call_shard_hidden_kernel = _call_shard_hidden_kernel_patched
+    _nxd_blockwise._qwen35_shard_hidden_patched = True
+
+
+_patch_nxd_shard_hidden_kernel()
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaMLP
 from neuronx_distributed_inference.models.model_wrapper import (
     CONTEXT_ENCODING_MODEL_TAG,

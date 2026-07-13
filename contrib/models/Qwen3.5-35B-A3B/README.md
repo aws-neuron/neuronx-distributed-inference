@@ -145,20 +145,29 @@ photosynthesis definition).
 
 `run_benchmark.py --prompt-lens 16 64 256 --max-new-tokens 64 --repeats 5`
 
-Two MoE blockwise-matmul backends were evaluated on the shipped SDK 2.29:
+Three MoE blockwise-matmul backends were evaluated on the shipped SDK 2.29:
 
 | MoE backend | 16 tok TTFT | 64 tok TTFT | 256 tok TTFT | TPOT | notes |
 |---|---:|---:|---:|---:|---|
-| `use_torch_block_wise=True` | 553.8 ms | 554.0 ms | 553.6 ms | ~7.7 ms | pure PyTorch fallback; flat TTFT because CPU |
-| **`use_shard_on_intermediate_dynamic_while=True`** (default) | **480.0 ms** | **575.5 ms** | **667.1 ms** | **~7.7 ms** | shard-hidden LNC=2 NKI kernel — 13 % faster at prompt=16, grows with prompt length |
+| `use_torch_block_wise=True` | 553.8 ms | 554.0 ms | 553.6 ms | ~7.7 ms | unrolled per-block loop in NxDI graph; runs on Neuron but no NKI kernel fusion |
+| **`use_shard_on_intermediate_dynamic_while=True`** (default) | **480.0 ms** | **575.5 ms** | **667.1 ms** | **~7.7 ms** | LNC=2 NKI kernel sharding on intermediate dim; 13 % faster at prompt=16, grows with prompt length |
+| patched `_call_shard_hidden_kernel` (nkilib fwd) | 567.0 ms | 566.5 ms | 566.7 ms | ~7.8 ms | see below |
 
 `shard_on_intermediate` is the current default in `run_text_smoke.py` /
-`run_benchmark.py`. It's a faster prefill kernel than the torch fallback but
-also NOT the fastest possible path — the `_call_shard_hidden_kernel`
-LNC=2 kernel that NxDI would prefer isn't shipped with the SDK 2.29 DLAMI
-(`_call_shard_hidden_kernel is not available - kernel not imported from
-nkilib` raises when we don't opt into an alternative). A future SDK drop
-should give a further TTFT reduction.
+`run_benchmark.py` — it wins at short prompts (chat use case). The third
+row is a **monkey-patched path**: NxDI's default LNC=2 forward MoE kernel
+(`_call_shard_hidden_kernel`) is a `NotImplementedError` stub because the
+`neuronxcc.nki._private.blockwise_mm` module is absent from the SDK 2.29
+DLAMI. However, the same kernel forward implementation is available at
+`nkilib.experimental.moe.forward.bwmm_shard_on_H.blockwise_mm_baseline_shard_hidden`,
+so `modeling_qwen35.py::_patch_nxd_shard_hidden_kernel()` wires it in at
+import time. That gives the default LNC=2 forward path a runnable
+implementation (flat 567 ms TTFT regardless of prompt length) — slower
+than shard-on-intermediate for short prompts but more stable at long
+prompts. Kept as a safety net; not chosen as the default.
+
+None of these three paths matches what a genuine LNC=2 shard-hidden NKI
+kernel could deliver in a future SDK drop.
 
 **Why is TTFT / TPOT ratio so different from the dense siblings?**
 Dense models spend ~40-60 % of prefill in the FFN block; MoE only dispatches

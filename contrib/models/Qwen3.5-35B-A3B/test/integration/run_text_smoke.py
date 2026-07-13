@@ -56,9 +56,17 @@ def build_config(model_path: str, tp: int, seq_len: int):
         moe_tp_degree=tp,
         moe_ep_degree=1,
         normalize_top_k_affinities=True,
-        # Try the shard-on-intermediate LNC=2 NKI kernel — if it exists in the
-        # shipped SDK it beats the pure-torch fallback. If it errors out with
-        # a "not available" ImportError, revert to use_torch_block_wise=True.
+        # Backend selection (empirical, TP=8, prompt=16, batch=1):
+        #   use_shard_on_intermediate_dynamic_while  → 480 ms TTFT (best short)
+        #   patched _call_shard_hidden_kernel        → 567 ms TTFT (flat vs prompt)
+        #   use_torch_block_wise                     → 554 ms TTFT (fallback)
+        # shard-on-intermediate wins at short prompts (chat), the patched
+        # shard-hidden path is closer for long prompts (>256). Neither is a
+        # true NKI shard-hidden kernel — that path in the shipped SDK 2.29
+        # DLAMI is a NotImplementedError stub. modeling_qwen35.py monkey-patches
+        # `_call_shard_hidden_kernel` to wire in nkilib's forward kernel so
+        # the default path is at least runnable; we still explicitly pick
+        # shard-on-intermediate here for best measured TTFT.
         blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": True},
     )
     # Qwen3.5-MoE uses softmax over router logits.
