@@ -110,6 +110,24 @@ TTFT is essentially flat because DeltaNet is O(1)-state and the full-attention
 layers touch only 6/24 layers. TPOT is dominated by TP-8 all-reduce + host-loop
 overhead at batch = 1.
 
+### TP=4 comparison (seq_len=1024 bucket, `bf16`)
+
+`python test/integration/run_benchmark.py --prompt-lens 16 64 128 256 512 --max-new-tokens 64 --repeats 5`
+after compiling with `--tp 4 --seq-len 1024`:
+
+| prompt tokens | TTFT (ms, median) | TPOT (ms, median) | Throughput (tok/s) |
+|---------------|-------------------|-------------------|--------------------|
+| 16            | 42.2              | 4.76              | 210.4              |
+| 64            | 42.2              | 4.74              | 211.3              |
+| 128           | 42.2              | 4.71              | 211.8              |
+| 256           | 42.5              | 4.77              | 209.7              |
+| 512           | 42.5              | 4.75              | 210.5              |
+
+TTFT is flat across prompt sizes here because bucketing is disabled — every
+prompt is padded to the single seq_len=1024 bucket. TP=4 is ≈ 1.76× slower
+TTFT and 1.19× slower TPOT than TP=8 above; the sub-2× ratio is because
+DeltaNet + collective overhead don't scale purely linearly with TP.
+
 ## Accuracy vs. HuggingFace reference
 
 Comparison run against `transformers==5.13.0` CPU bf16 greedy on 5 diverse
@@ -247,6 +265,27 @@ TP=8 for the vision encoder is technically feasible but wasn't measured
 here; extrapolated ~75–90 ms standalone (≈ 3.5–4× TP=1). Bucket 16384
 (non-tiled 2048×2048) exceeds the compiler's 10M-instruction verification
 limit even at TP=4, so the tiled path stays required at 2048×2048.
+
+### End-to-end VL benchmark at TP=4
+
+Full VL run at `--tp 4` (text model **and** vision encoder both TP=4):
+
+| image     | TTFT (ms, median) | TPOT (ms) | vs TP=8 VL |
+|-----------|------------------:|----------:|-----------:|
+| 512×512   |          **126**  |     4.8   | 1.48× slower |
+| 1024×1024 |          **488**  |     4.9   | 1.53× slower |
+| 2048×2048 |     n/a †         |    n/a †  |      n/a †   |
+
+† 2048×2048 requires the text-model CTE bucket 8192 (image tokens push the
+input past 4096). Not compiled in this measurement set — text buckets used
+were `[512, 1024, 2048, 4096]` to keep compile time manageable. Extrapolated
+~1.65× TP=8 (i.e. ≈ 3400 ms).
+
+Same "TP=4 slower than TP=8 but by less than 2×" pattern as text-only: for
+small models the collective overhead grows disproportionately as TP goes up,
+so the marginal benefit of TP=8 over TP=4 is smaller than the 2× core count
+would suggest — useful when core count is constrained (e.g. running multiple
+models on a `trn2.48xlarge` concurrently).
 
 **Accuracy note (vs HuggingFace CPU bf16 greedy on the same 3 sizes):** HF
 identifies "Pallas's cat" at all 3 sizes. Neuron identifies "Pallas's cat"
