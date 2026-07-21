@@ -1,35 +1,25 @@
 #!/bin/bash
 # Single-node 8xH100 vLLM server for MiMo-V2.5 (official HF OCP-FP8 checkpoint).
 #
-# ============================ KNOWN BROKEN ============================
-# vLLM CANNOT currently serve MiMo-V2.5 FP8. Both vllm 0.25.1 and nightly
-# crash while loading the fused qkv_proj on the sliding-window layers:
+# ---- Requires vLLM PR #42270 (not yet merged into any released image) ----
+# Stock vLLM (0.25.1 AND nightly) crashes loading V2.5 FP8 in
+# _shard_fp8_qkv_proj: "RuntimeError: The size of tensor a (1856) must match
+# tensor b (1792)". A sliding-window layer's fused-qkv group is 1856 rows =
+# 14.5 blocks of the 128-row FP8 scale, so per-KV-head scale slicing misaligns.
+# vLLM PR #42270 ("MiMo V2: Pro fused-QKV FP8 loader + fix SWA wrong-data on
+# V2.5 base") replaces the loader with one that dequant/requantizes shards that
+# cut through 128-row scale blocks. As of 2026-07 the PR is still OPEN, so we
+# bind-mount its two model files (pr42270/) and cp them into the nightly image
+# at container start. Once the PR merges, drop the cp step + pr42270/ and use a
+# release image.
 #
-#     RuntimeError: The size of tensor a (1856) must match the size of
-#     tensor b (1792) at non-singleton dimension 0
-#     (vllm/model_executor/models/mimo_v2.py::_shard_fp8_qkv_proj)
+# With the PR applied, the model-card reference command works as-is:
+# TP=8 + expert parallel (the paired-qkv loader handles the 4-KV-head split
+# that plain vLLM rejects). Speculative decoding (MTP/EAGLE) left OFF for parity
+# with the Trn2 baseline; prefix/chunked prefill off to match Trn2.
 #
-# Root cause (upstream bug): a SWA layer's fused-qkv group is 1856 rows =
-# 14.5 blocks of the 128-row FP8 scale, so it is NOT 128-aligned. The loader
-# slices the scale per KV-head group (scale_rows_per_group = 116 // 8 = 14 ->
-# 1792 rows) and multiplies it against the 1856-row weight group -> shape
-# mismatch. This fires at EVERY 8-GPU shape:
-#   - TP=8: can't even start, "TP size must evenly split the 4 KV heads".
-#   - TP=4 / TP=2 (incl. DP=2 x TP=4): each rank gets 2 SWA KV heads -> the
-#     g>1 de-interleave path -> the 1856-vs-1792 crash.
-# There is no vLLM TP config that both (a) splits the 4 full-attn KV heads and
-# (b) gives 1 SWA KV head per rank, so the buggy path is unavoidable.
-#
-# apply_mimo_fp8_patch.py makes the server START (whole-tensor dequant), but the
-# output is gibberish -- the re-quantization path is not numerically correct --
-# so it is NOT a usable fix, only a diagnostic. Use SGLang (run_sglang_h100.sh)
-# for the H100 baseline. This script is kept to document the reference command
-# and reproduce the bug.
-# =====================================================================
-#
-# The command below is the reference vLLM command from the model card
-# (TP=8 + expert parallel, mimo parsers), which is what you WOULD run once the
-# upstream loader is fixed.
+# Usage:
+#   bash run_vllm_h100.sh
 set -e
 
 MODEL_DIR="${MODEL_DIR:-/opt/dlami/nvme/models/MiMo-V2.5}"
@@ -37,8 +27,9 @@ PORT="${PORT:-8000}"
 TP="${TP:-8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"              # MiMo-V2.5 bs=32
-IMAGE="${IMAGE:-vllm-efa:latest}"
+IMAGE="${IMAGE:-vllm/vllm-openai:nightly}"      # PR #42270 not in a release yet
 CACHE_DIR="${CACHE_DIR:-/opt/dlami/nvme/vllm_cache}"
+PATCH_DIR="${PATCH_DIR:-$(cd "$(dirname "$0")/pr42270" && pwd)}"
 CTR_MODEL="/models/MiMo-V2.5"
 mkdir -p "$CACHE_DIR"
 
@@ -46,29 +37,40 @@ if [ ! -f "$MODEL_DIR/config.json" ]; then
     echo "ERROR: model not found at $MODEL_DIR" >&2
     exit 1
 fi
+if [ ! -f "$PATCH_DIR/mimo_v2.py" ]; then
+    echo "ERROR: PR #42270 files not found at $PATCH_DIR" >&2
+    exit 1
+fi
 
 echo "=========================================="
-echo "MiMo-V2.5 vLLM (single-node TP=$TP + EP, Docker) -- EXPECTED TO FAIL"
+echo "MiMo-V2.5 vLLM (single-node TP=$TP + EP, PR #42270, Docker)"
 echo "  Port: $PORT   max-model-len: $MAX_MODEL_LEN   max-num-seqs: $MAX_NUM_SEQS"
 echo "=========================================="
 
+M=/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models
 exec docker run --rm --gpus all \
     --network host --privileged --ipc=host --shm-size=32g \
     -v "${MODEL_DIR}:${CTR_MODEL}:ro" \
     -v "${CACHE_DIR}:/root/.cache" \
+    -v "${PATCH_DIR}:/pr:ro" \
     -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-    "$IMAGE" "$CTR_MODEL" \
-    --served-model-name MiMo-V2.5 \
-    --trust-remote-code \
-    --generation-config vllm \
-    --enable-expert-parallel \
-    --tensor-parallel-size "$TP" \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --max-num-seqs "$MAX_NUM_SEQS" \
-    --no-enable-prefix-caching \
-    --no-enable-chunked-prefill \
-    --host 0.0.0.0 \
-    --port "$PORT" \
-    --tool-call-parser mimo \
-    --enable-auto-tool-choice \
-    --reasoning-parser mimo
+    --entrypoint bash \
+    "$IMAGE" -c "
+      cp /pr/mimo_v2.py $M/mimo_v2.py &&
+      cp /pr/mimo_v2_mtp.py $M/mimo_v2_mtp.py &&
+      echo '[run_vllm_h100] applied PR #42270 model files' &&
+      exec vllm serve '$CTR_MODEL' \
+        --served-model-name MiMo-V2.5 \
+        --trust-remote-code \
+        --generation-config vllm \
+        --enable-expert-parallel \
+        --tensor-parallel-size $TP \
+        --max-model-len $MAX_MODEL_LEN \
+        --max-num-seqs $MAX_NUM_SEQS \
+        --no-enable-prefix-caching \
+        --no-enable-chunked-prefill \
+        --host 0.0.0.0 \
+        --port $PORT \
+        --tool-call-parser mimo \
+        --enable-auto-tool-choice \
+        --reasoning-parser mimo"

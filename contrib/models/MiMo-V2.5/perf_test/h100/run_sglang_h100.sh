@@ -1,6 +1,6 @@
 #!/bin/bash
 # Single-node 8xH100 SGLang server for MiMo-V2.5 (official HF OCP-FP8 checkpoint).
-# This is the WORKING H100 baseline (vLLM cannot serve V2.5 FP8 -- see
+# Works out of the box (vLLM also works but needs PR #42270 -- see
 # run_vllm_h100.sh). V2.5 FP8 (~295 GB) fits on one 8xH100 node (640 GB).
 #
 # Reuses sglang-efa:latest (superset of stock lmsysorg/sglang).
