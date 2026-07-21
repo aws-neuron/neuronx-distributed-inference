@@ -446,29 +446,37 @@ inspect the resulting `*.ntff` with `neuron-profile view` / Neuron Explorer.
 
 ### H100 GPU baseline (cross-platform comparison, 2026-07-21)
 
-For reference, the **official HF OCP-FP8 checkpoint** served on H100 via the
-stock `vllm/vllm-openai:latest` Docker image, using the **same**
-`run_bench_single.sh` and the same input/output (360/120), prefix caching and
-chunked prefill **disabled** on both sides for a fair comparison. See
-`perf_test/h100/` for the launch script and setup notes.
+The **official HF OCP-FP8 checkpoint** served on H100 across two nodes, using
+the **same** `run_bench_single.sh` and the same input/output (360/120), prefix
+caching + chunked prefill **disabled** for a fair comparison. See
+`perf_test/h100/` for launch scripts, Dockerfiles, and setup notes.
 
 - **Trn2**: trn2.48xlarge, TP=64 / moe_tp=1 / moe_ep=64, BS=48, `seq_len=512`, vllm-neuron 0.5.3.
-- **H100**: 2× p5 (16× H100-80GB), TP=8 × PP=2, vLLM 0.25.1, CUDA graphs on, `--max-model-len 4096`. Two nodes are required — the ~963 GB FP8 weights don't fit on one 8×80 GB node, and MiMo's 8 KV heads cap TP at 8 (TP=16 fails the KV-head divisibility check), so we use TP=8 within a node × PP=2 across nodes.
+- **H100**: 2× p5 (16× H100-80GB). The ~963 GB FP8 weights don't fit on one 8×80 GB node, so both frameworks shard across two nodes.
+  - **vLLM 0.25.1**: TP=8 × PP=2 (MiMo's 8 KV heads cap TP at 8; TP=16 fails the KV-head divisibility check). CUDA graphs on.
+  - **SGLang 0.5.15**: TP=16 × DP=2 with `--enable-dp-attention` + EP=16 (DP-attention shards KV heads so TP=16 works).
+
+**Cross-node fabric matters enormously.** The stock `vllm/vllm-openai` and
+`lmsysorg/sglang` images lack `aws-ofi-nccl`, so NCCL silently falls back to TCP
+sockets (`Using network Socket`) instead of EFA RDMA. Rebuilding both images
+with GDRCopy + the AWS EFA installer (`Dockerfile.{vllm,sglang}-efa`, with
+`NCCL_NET_PLUGIN=ofi`) switches NCCL to `efa-direct` over 32 NICs.
 
 | Concurrency | Platform | Output tok/s | Total tok/s | Median TTFT (ms) | Median TPOT (ms) |
 |---|---|---|---|---|---|
-| 1  | H100 | 113.2 | 452  | 73     | 8.3   |
-| 1  | Trn2 | 5.2   | 20.5 | —      | 189   |
-| 16 | H100 | 373.1 | 1491 | 252    | 22.2  |
-| 16 | Trn2 | *(not measured)* | — | — | — |
-| 48 | H100 | 141.1 | 563  | 13,175 | 231.7 |
-| 48 | Trn2 | 71.9  | 287  | 6,912  | 572.1 |
+| 48 | **SGLang + EFA** (TP16/DP2/EP16) | **802.6** | **3204** | **1,080** | **50.6** |
+| 48 | vLLM + EFA (TP8/PP2)   | 157.8 | 630  | 13,765 | 216.9 |
+| 48 | vLLM, stock/socket (TP8/PP2) | 141.1 | 563  | 13,175 | 231.7 |
+| 48 | Trn2 (TP64)            | 71.9  | 287  | 6,912  | 572.1 |
+| 1  | vLLM + EFA (TP8/PP2)   | 113.2 | 452  | 73     | 8.3   |
+| 1  | Trn2 (TP64)            | 5.2   | 20.5 | —      | 189   |
+| 16 | vLLM + EFA (TP8/PP2)   | 373.1 | 1491 | 252    | 22.2  |
 
 Notes:
-- At c=48, H100 ≈ **2×** Trn2 output throughput (141 vs 72 tok/s) and ~2.5× faster decode (TPOT 232 vs 572 ms).
-- H100 c=1 and c=16 are far higher than c=48 output/stream because PP has no batch contention at low load; at c=48 the pipeline saturates and per-stream latency rises. Trn2's fixed BS=48 graph makes c=1 severely under-fed (5 tok/s), so the platforms are only directly comparable at c=48.
-- **Not equal-hardware**: H100 uses 16 GPUs across 2 nodes vs Trn2's single 64-core instance, and H100 runs CUDA graphs while Trn2 runs eager. Normalize per-device / per-dollar before drawing efficiency conclusions.
-- **H100 output is coherent across all requests** — it does not exhibit the Trn2 vLLM "garbled-after-first-request" bug (issue #31), consistent with GPU stacks dequantizing FP8→BF16 before matmul.
+- **SGLang + EFA is ~5× vLLM and ~11× Trn2** at c=48 (803 vs 158 vs 72 out-tok/s), with **~13× lower TTFT** than vLLM (1.08 s vs 13.8 s). Its DP-attention + EP architecture parallelizes prefill far better than vLLM's PP=2 (which serializes the two pipeline stages).
+- **EFA vs socket is not the whole story for vLLM**: switching vLLM from socket to EFA only moved it 141→158 tok/s. vLLM's multi-node bottleneck here is the PP=2 pipeline bubble, not the fabric — the KV-heads=8 constraint forces PP instead of the wide TP that SGLang's DP-attention enables. (For SGLang the EFA fix is essential — on sockets its all-to-all EP would be crippled.)
+- **Not equal-hardware**: H100 uses 16 GPUs / 2 nodes vs Trn2's single 64-core instance, and H100 runs CUDA graphs while Trn2 runs eager. Normalize per-device / per-dollar before drawing efficiency conclusions.
+- **Both GPU stacks produce coherent output across all requests** — no "garbled-after-first-request" bug (Trn2 issue #31), consistent with GPU stacks dequantizing FP8→BF16 before matmul.
 
 > **Compile time:** the first Pro compile on SDK 2.29 is ~60 minutes for the TKG NEFF and ~15 minutes for the CTE NEFF; subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass. First full server launch (compile + shard + warmup) is ~2 hours wall-clock.
 

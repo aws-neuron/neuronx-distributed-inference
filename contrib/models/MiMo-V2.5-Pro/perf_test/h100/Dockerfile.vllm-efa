@@ -1,0 +1,51 @@
+# Minimal EFA-enabled vLLM image for MiMo-V2.5-Pro multi-node inference.
+#
+# Same EFA fix as Dockerfile.sglang-efa-minimal, but on the vLLM base. The stock
+# vllm/vllm-openai image lacks aws-ofi-nccl, so cross-node NCCL falls back to TCP
+# sockets (~14 GB/s vs ~400 GB/s EFA) -> slow multi-node prefill/all-reduce. This
+# was the likely cause of the low 2-node TP=8xPP=2 numbers on the stock image.
+#
+#   - GDRCopy   (GPU memreg for EFA VRAM transfer)
+#   - AWS EFA installer (libfabric + EFA provider + aws-ofi-nccl plugin)
+#
+# Build (x86_64, no GPU needed at build time):
+#   docker build -t vllm-efa:latest -f Dockerfile.vllm-efa-minimal .
+
+ARG VLLM_BASE=vllm/vllm-openai:latest
+FROM ${VLLM_BASE}
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+        git cmake build-essential wget curl \
+        libgflags-dev autoconf automake libtool \
+    && true
+
+# ---- GDRCopy (GPU memreg for EFA VRAM transfer) ----
+ARG GDRCOPY_VERSION=2.5.2
+RUN cd /tmp && \
+    wget -q https://github.com/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz && \
+    tar xf v${GDRCOPY_VERSION}.tar.gz && cd gdrcopy-${GDRCOPY_VERSION} && \
+    make -j$(nproc) lib lib_install CUDA=/usr/local/cuda PREFIX=/usr/local && \
+    rm -rf /tmp/gdrcopy* /tmp/v${GDRCOPY_VERSION}.tar.gz
+
+# ---- AWS EFA installer (libfabric + EFA provider + aws-ofi-nccl) ----
+RUN cd /tmp && \
+    curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz && \
+    tar xzf aws-efa-installer-latest.tar.gz && \
+    cd aws-efa-installer && \
+    ./efa_installer.sh -y --skip-kmod -g --no-verify && \
+    rm -rf /tmp/aws-efa-installer* /var/lib/apt/lists/*
+
+# ---- EFA runtime env ----
+ENV FI_PROVIDER=efa
+ENV FI_EFA_USE_DEVICE_RDMA=1
+ENV PATH="/opt/amazon/efa/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/amazon/efa/lib:/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
+# ---- NCCL aws-ofi-nccl plugin (short name "ofi"; see sglang Dockerfile note) ----
+ENV NCCL_NET_PLUGIN=ofi
+
+# Restore the vLLM OpenAI entrypoint (the RUNs above run as root shell; the base
+# image's ENTRYPOINT is inherited, but set WORKDIR sanely).
+WORKDIR /workspace

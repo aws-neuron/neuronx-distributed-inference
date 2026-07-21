@@ -75,6 +75,8 @@ fi
 
 vllm bench serve \
     --backend vllm \
+    --host localhost \
+    --port "$PORT" \
     --model "$SERVED_MODEL_NAME" \
     --tokenizer "$TOKENIZER_PATH" \
     --endpoint /v1/completions \

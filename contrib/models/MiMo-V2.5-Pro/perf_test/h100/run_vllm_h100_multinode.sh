@@ -24,8 +24,13 @@ MASTER_ADDR="${MASTER_ADDR:-172.31.45.21}"     # P5-1 private IP
 MASTER_PORT="${MASTER_PORT:-29500}"
 IFACE="${IFACE:-enp71s0}"                       # NCCL/GLOO socket iface
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
-IMAGE="${IMAGE:-vllm/vllm-openai:latest}"
+# EFA-enabled image (GDRCopy + aws-ofi-nccl). The stock vllm/vllm-openai lacks
+# aws-ofi-nccl, so cross-node NCCL falls back to TCP sockets (~5x slower). Built
+# from Dockerfile.vllm-efa.
+IMAGE="${IMAGE:-vllm-efa:latest}"
+CACHE_DIR="${CACHE_DIR:-/opt/dlami/nvme/vllm_cache}"
 CTR_MODEL="/models/MiMo-V2.5-Pro"
+mkdir -p "$CACHE_DIR"
 
 if [ ! -f "$MODEL_DIR/config.json" ]; then
     echo "ERROR: model not found at $MODEL_DIR (config.json missing)." >&2
@@ -33,7 +38,7 @@ if [ ! -f "$MODEL_DIR/config.json" ]; then
 fi
 
 echo "=========================================="
-echo "MiMo-V2.5-Pro vLLM (2-node TP=16, Docker)"
+echo "MiMo-V2.5-Pro vLLM (2-node TP=8 x PP=2, EFA, Docker)"
 echo "  Model:        $MODEL_DIR"
 echo "  Node rank:    $NODE_RANK / $NNODES"
 echo "  Master:       $MASTER_ADDR:$MASTER_PORT   iface: $IFACE"
@@ -79,9 +84,14 @@ exec docker run --rm --gpus all \
     --network host --privileged --ipc=host --shm-size=32g \
     --device /dev/infiniband \
     -v "${MODEL_DIR}:${CTR_MODEL}:ro" \
+    -v "${CACHE_DIR}:/root/.cache" \
     -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
     -e GLOO_SOCKET_IFNAME="$IFACE" \
     -e NCCL_SOCKET_IFNAME="$IFACE" \
+    -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
+    -e NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}" \
+    -e FI_PROVIDER=efa \
+    -e NCCL_NET_PLUGIN="${NCCL_NET_PLUGIN:-ofi}" \
     -e VLLM_HOST_IP="$(hostname -I | awk '{print $1}')" \
     "$IMAGE" "$CTR_MODEL" \
     "${COMMON_ARGS[@]}" "${ROLE_ARGS[@]}"
