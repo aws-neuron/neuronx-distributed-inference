@@ -698,13 +698,22 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 else:
                     prior_scores = prior_scores + attention_mask
 
-            # Apply sliding window mask for SWA layers
+            # Apply sliding window mask for SWA layers.
+            # NOTE: build the window per batch slot using each request's own
+            # decode position. The old code used position_ids[0, 0] (slot 0)
+            # broadcast to the whole batch, which is only correct when every
+            # slot is at the same decode step (static/synchronous batch, e.g.
+            # the smoke path). Under vLLM continuous batching, requests are at
+            # different positions, so a single broadcast window mis-clips the
+            # other slots' KV and produces garbled output on 2nd+ requests
+            # (the "first request ok, rest garbled" bug). Use per-slot positions.
             if self.is_sliding_window and self.sliding_window_size is not None and position_ids is not None:
                 kv_seq_len = prior_scores.size(-1)
-                current_pos = position_ids[0, 0]
-                pos_indices = torch.arange(kv_seq_len, device=prior_scores.device)
-                sliding_mask = pos_indices >= (current_pos - self.sliding_window_size + 1)
-                sliding_mask = sliding_mask[None, None, None, :]
+                # position_ids: [bsz, q_len] -> per-slot current position [bsz, 1]
+                current_pos = position_ids[:, 0].reshape(-1, 1)  # [bsz, 1]
+                pos_indices = torch.arange(kv_seq_len, device=prior_scores.device)[None, :]  # [1, kv_seq_len]
+                sliding_mask = pos_indices >= (current_pos - self.sliding_window_size + 1)  # [bsz, kv_seq_len]
+                sliding_mask = sliding_mask[:, None, None, :]  # [bsz, 1, 1, kv_seq_len]
                 prior_scores = prior_scores.masked_fill(~sliding_mask, float('-inf'))
 
             prior_scores = prior_scores.to(torch.float32)
