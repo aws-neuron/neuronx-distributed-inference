@@ -9,7 +9,7 @@
 #   bash bench_all.sh 8000  vllm           # vLLM (if/when it works)
 set -e
 PORT="${1:-30000}"
-CONFIG_NAME="${2:-sglang_cp2}"
+CONFIG_NAME="${2:-sglang_dp2}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 for C in 1 16 32; do

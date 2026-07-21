@@ -5,43 +5,40 @@
 #
 # Reuses sglang-efa:latest (superset of stock lmsysorg/sglang).
 #
-# ---- Why --attention-context-parallel-size 2 (not plain TP=8 or DP=2) ----
-# MiMoV2ForCausalLM's fused qkv_proj is TP=4-interleaved, so SGLang requires the
-# *effective* attention TP size to be exactly 4 (plain --tp 8 is rejected with
-# "requires effective attention TP size 4"). Two 8-GPU shapes give effective
-# attn TP = 4:
-#   - DP=2 + --enable-dp-attention (the model-card reference): but single-node it
-#     deadlocks the shared-MoE / lm-head collective when a request occupies only
-#     one DP group -- the idle group never launches its matching forward, so the
-#     collective hangs (300s scheduler watchdog -> crash). The reference relies on
-#     --moe-a2a-backend deepep to change that collective, but DeepEP needs a
-#     working nvshmem RDMA transport which this box's NICs (rdmapXXs0, not mlx5)
-#     don't provide -- IBGDA init fails and the forward pass hangs (tested
-#     low_latency + normal + REMOTE_TRANSPORT=none + IBGDA=0). DeepEP does work on
-#     p5en.48xlarge (mlx5 EFA + a custom Mooncake/nvshmem image); see
-#     xiaomi_datalab/mimo_v25.
-#   - ATTN_CP=2 (attention context parallel): effective attn TP = tp/cp = 4, MoE
-#     shards over TP=8, no DP idle-group problem, no DeepEP. Works out of the box
-#     on plain P5. THIS IS THE DEFAULT.
+# ---- Default = the model-card / SGLang cookbook command (DP-attention) ----
+# https://docs.sglang.io/cookbook/autoregressive/Xiaomi/MiMo-V2.5
+#   --tp 8 --dp 2 --enable-dp-attention --enable-dp-lm-head --mm-enable-dp-encoder
+#   --mem-fraction-static 0.65 --chunked-prefill-size 16384
+# DP=2 gives effective attention TP = tp/dp = 4, which MiMoV2ForCausalLM requires
+# (its fused qkv_proj is TP=4-interleaved; plain --tp 8 is rejected). This runs
+# out of the box single-node -- NO DeepEP needed. The three DP flags
+# (--enable-dp-attention + --enable-dp-lm-head + --mm-enable-dp-encoder) together
+# with mem-fraction 0.65 are what make the shared-MoE / lm-head collective work;
+# an earlier attempt with only --enable-dp-attention and mem-fraction 0.9 hung.
 #
 # ---- Speculative decoding (MTP/EAGLE) ----
-# The checkpoint ships model_mtp.safetensors, and the reference command enables
-# EAGLE. We LEAVE IT OFF (the Trn2 port has no spec decoding, so this is the
-# apples-to-apples baseline). SPEC=1 turns on the reference EAGLE flags.
+# The checkpoint ships model_mtp.safetensors and the cookbook enables EAGLE. We
+# LEAVE IT OFF by default (the Trn2 port has no spec decoding, so this is the
+# apples-to-apples baseline). SPEC=1 turns on the cookbook EAGLE flags.
+#
+# ---- Alternative: attention context parallel (ATTN_CP) ----
+# Set DP=1 ATTN_CP=2 for --attention-context-parallel-size 2 instead of DP. Also
+# gives effective attn TP=4, splits attention along the sequence so a single
+# request uses all 8 GPUs (measured slightly faster at low concurrency), and
+# needs no DP flags. Kept as a documented alternative.
 #
 # Usage:
-#   bash run_sglang_h100.sh                 # working default (attn-cp=2, no spec)
+#   bash run_sglang_h100.sh                 # cookbook DP=2 baseline (no spec)
 #   SPEC=1 bash run_sglang_h100.sh          # + EAGLE speculative decoding
-#   DP=2 DEEPEP=1 bash run_sglang_h100.sh   # model-card DP-attention + DeepEP
-#                                           #   (only works where nvshmem/DeepEP does)
+#   DP=1 ATTN_CP=2 bash run_sglang_h100.sh  # attention-context-parallel variant
 set -e
 
 MODEL_DIR="${MODEL_DIR:-/opt/dlami/nvme/models/MiMo-V2.5}"
 PORT="${PORT:-30000}"
 TP="${TP:-8}"
-DP="${DP:-1}"                                    # 1 => use ATTN_CP; >1 => DP-attention
-ATTN_CP="${ATTN_CP:-2}"                          # effective attn TP = TP/ATTN_CP = 4
-MEM_FRAC="${MEM_FRAC:-0.9}"                       # weights ~295GB; rest for KV cache
+DP="${DP:-2}"                                    # cookbook default; DP=1 => use ATTN_CP
+ATTN_CP="${ATTN_CP:-2}"                           # only used when DP=1
+MEM_FRAC="${MEM_FRAC:-0.65}"                       # cookbook value
 IMAGE="${IMAGE:-sglang-efa:latest}"
 CACHE_DIR="${CACHE_DIR:-/opt/dlami/nvme/sglang_cache}"
 CTR_MODEL="/models/MiMo-V2.5"
@@ -52,17 +49,19 @@ if [ ! -f "$MODEL_DIR/config.json" ]; then
     exit 1
 fi
 
-# Parallelism shape: DP-attention (reference) if DP>1, else attention-CP.
-DP_ARGS=()
+# Parallelism shape: cookbook DP-attention if DP>1, else attention-CP.
+PAR_ARGS=()
 if [ "$DP" -gt 1 ]; then
-    DP_ARGS=( --dp "$DP" --enable-dp-attention --enable-dp-lm-head )
-    echo "  DP-attention: ON (dp=$DP, effective attn TP = $((TP/DP)))"
+    PAR_ARGS=( --dp "$DP" --enable-dp-attention --enable-dp-lm-head --mm-enable-dp-encoder )
+    echo "  DP-attention: dp=$DP (effective attn TP = $((TP/DP)))"
 else
-    DP_ARGS=( --attention-context-parallel-size "$ATTN_CP" )
+    PAR_ARGS=( --attention-context-parallel-size "$ATTN_CP" )
     echo "  Attention context parallel: $ATTN_CP (effective attn TP = $((TP/ATTN_CP)))"
 fi
 
-# DeepEP MoE all-to-all (needs a working nvshmem RDMA transport; see header).
+# DeepEP MoE all-to-all: NOT needed single-node (and its nvshmem RDMA transport
+# fails on this box's non-mlx5 NICs). Off by default; DEEPEP=1 to force it where
+# it works (e.g. p5en.48xlarge with mlx5 EFA).
 A2A_ARGS=()
 DEEPEP_ENV=()
 if [ "${DEEPEP:-0}" = "1" ]; then
@@ -101,7 +100,7 @@ exec docker run --rm --gpus all \
     --served-model-name MiMo-V2.5 \
     --trust-remote-code \
     --tp "$TP" \
-    "${DP_ARGS[@]}" \
+    "${PAR_ARGS[@]}" \
     --moe-dense-tp-size 1 \
     --mem-fraction-static "$MEM_FRAC" \
     --max-running-requests 128 \
