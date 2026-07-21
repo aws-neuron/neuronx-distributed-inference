@@ -25,12 +25,23 @@ fi
 
 cd $HOME/vllm-neuron
 
-# Apply patch (idempotent via `git apply --check` first).
+# Apply patch. Distinguish three cases so a corrupt/conflicting patch is a
+# hard error rather than being silently skipped (a malformed hunk header once
+# caused this to no-op, leaving the contrib model unregistered and vLLM unable
+# to load MiMo-V2.5-Pro):
+#   - applies cleanly            -> apply it
+#   - already applied (reverse)  -> skip, fine
+#   - neither                    -> abort with a clear message
 if git apply --check "$PATCH_FILE" 2>/dev/null; then
     git apply "$PATCH_FILE"
     echo "  Applied $PATCH_FILE"
+elif git apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
+    echo "  Patch already applied; skipping."
 else
-    echo "  Patch already applied or conflicts; continuing."
+    echo "  ERROR: $PATCH_FILE does not apply cleanly and is not already applied." >&2
+    echo "  Refusing to continue with an unpatched vllm-neuron (MiMo would fail to load)." >&2
+    git apply --check "$PATCH_FILE"   # surface the real error, then abort via set -e
+    exit 1
 fi
 
 pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .

@@ -1,8 +1,56 @@
+diff --git a/vllm_neuron/platform.py b/vllm_neuron/platform.py
+index 7d64b83..9966ce8 100644
+--- a/vllm_neuron/platform.py
++++ b/vllm_neuron/platform.py
+@@ -286,6 +286,43 @@ class NeuronPlatform(Platform):
+     ) -> None:
+         # Apply config overrides here - this is called before VllmConfig is created
+         cls._apply_config_overrides()
++        # Register NxDI contrib model architectures into vLLM's ModelRegistry.
++        # This hook runs before ModelConfig's architecture validation and after
++        # vLLM is fully importable, so (unlike the platform-plugin register())
++        # it avoids the vllm.config circular import. Lazy string registration
++        # ("<module>:<class>") imports nothing here.
++        cls._register_contrib_archs()
++
++    @classmethod
++    def _register_contrib_archs(cls) -> None:
++        """Alias contrib architectures (in checkpoint config.json but not in
++        vLLM's built-in registry) so ModelConfig validation accepts them.
++
++        Best-effort and idempotent. The aliased stub is only used to satisfy
++        validation; the Neuron path resolves the real class via NxDI
++        MODEL_TYPES inside the engine worker (see neuronx_distributed_model_loader
++        ._register_contrib_models / _get_neuron_model_cls).
++        """
++        import warnings as _w
++        try:
++            from vllm.model_executor.models.registry import ModelRegistry
++            supported = set(ModelRegistry.get_supported_archs())
++            _aliases = {
++                # MiMo-V2.5-Pro config.json declares MiMoV2ForCausalLM, which
++                # vLLM does not know; alias to its built-in MiMoV2Flash stub.
++                "MiMoV2ForCausalLM":
++                    "vllm.model_executor.models.mimo_v2_flash:MiMoV2FlashForCausalLM",
++                "MiMoV2ProForCausalLM":
++                    "vllm.model_executor.models.mimo_v2_flash:MiMoV2FlashForCausalLM",
++            }
++            for _arch, _target in _aliases.items():
++                if _arch not in supported:
++                    ModelRegistry.register_model(_arch, _target)
++        except Exception as _e:  # pragma: no cover - best-effort
++            _w.warn(
++                f"Contrib architecture registration failed: {_e}",
++                category=UserWarning,
++            )
+ 
+     @classmethod
+     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 diff --git a/vllm_neuron/worker/neuronx_distributed_model_loader.py b/vllm_neuron/worker/neuronx_distributed_model_loader.py
-index d2099eb..0c162e4 100644
+index d2099eb..a8dfc7f 100644
 --- a/vllm_neuron/worker/neuronx_distributed_model_loader.py
 +++ b/vllm_neuron/worker/neuronx_distributed_model_loader.py
-@@ -922,6 +922,94 @@ def _camel_to_kebab(name: str) -> str:
+@@ -922,6 +922,98 @@ def _camel_to_kebab(name: str) -> str:
      return re.sub("([a-z0-9])([A-Z])", r"\1-\2", s1).lower()
  
  
@@ -56,7 +104,7 @@ index d2099eb..0c162e4 100644
 +    _patch_autoconfig_trust_remote_code()
 +
 +    mimo_src = _os.environ.get("NXDI_CONTRIB_MIMO_V2_FLASH_SRC")
-+    if mimo_src and _os.path.isdir(mimo_src) and "mimov2flash" not in MODEL_TYPES:
++    if mimo_src and _os.path.isdir(mimo_src) and "mimov2" not in MODEL_TYPES:
 +        if mimo_src not in _sys.path:
 +            _sys.path.insert(0, mimo_src)
 +        try:
@@ -64,7 +112,7 @@ index d2099eb..0c162e4 100644
 +            # Register under both Flash and Pro model_type keys so the same
 +            # NxDI wrapper serves MiMo-V2-Flash, MiMo-V2.5-Pro, and any sibling
 +            # that inherits the same config.
-+            for _mt in ("mimov2flash", "mimov2pro"):
++            for _mt in ("mimov2", "mimov2flash", "mimov2pro"):
 +                MODEL_TYPES.setdefault(_mt, {"causal-lm": NeuronMiMoV2ForCausalLM})
 +            try:
 +                from vllm.model_executor.models.registry import ModelRegistry
@@ -72,7 +120,7 @@ index d2099eb..0c162e4 100644
 +                # wrapper so ModelConfig validation accepts the architecture
 +                # regardless of whether the checkpoint calls itself Flash or
 +                # Pro.
-+                for _arch in ("MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM"):
++                for _arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM"):
 +                    ModelRegistry.register_model(_arch, NeuronMiMoV2ForCausalLM)
 +            except ImportError:
 +                pass
@@ -101,7 +149,7 @@ index d2099eb..0c162e4 100644
  def _get_neuron_model_cls(architecture: str):
      """
      Get Neuron model class from architecture string.
-@@ -941,6 +1029,7 @@ def _get_neuron_model_cls(architecture: str):
+@@ -941,6 +1033,7 @@ def _get_neuron_model_cls(architecture: str):
          _get_neuron_model_cls("NeuronLlamaForCausalLM")
          <class 'NeuronLlamaForCausalLM'>
      """
