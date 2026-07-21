@@ -395,6 +395,55 @@ Per-stream ITL median holds at ~220 ms across all concurrency levels; TPOT/TTFT 
 
 > Expected BF16-attn delta: only q/k/v go from FP8 to BF16 (MoE is unchanged), so steady-state throughput should be within a few percent. TTFT should drop proportionally with `seq_len` (256 vs 1024 prefill tokens).
 
+### Measured 2026-07-21 (BF16-attn + FP8 MoE, `seq_len=512`, BS=48, TP=64, moe_tp=1/moe_ep=64)
+
+Same instance/recipe as the shipping config, via `bench_smoke_throughput.py`
+(NxDI direct path, coherent output). Prefill and decode measured separately
+(a `max_new_tokens=1` call isolates prefill/TTFT; the full call minus that
+isolates steady-state decode). 3-iter averages, very stable.
+
+| in/out | Prefill (CTE) | Decode (TKG) | End-to-end |
+|--------|---------------|--------------|------------|
+| 360/120 | 37.9 s → 456 in-tok/s | 22.4 s / 119 steps → 255 out-tok/s (5.3/stream) | 60.3 s → 95.6 out-tok/s |
+| 500/2   | 37.9 s → 634 in-tok/s | 0.2 s / 1 step → 235 out-tok/s (4.9/stream) | — |
+
+**Prefill dominates and is nearly constant in input length** (37.9 s for both
+360 and 500 input tokens). The context-encoding NEFF has a single bucket
+`context_encoding_buckets=[512]`, so every prefill pads to 512 and pays the
+same cost regardless of real input length — that fixed ~38 s (≈190 decode
+steps' worth of time) is the #1 optimization target, and it is almost
+certainly the 384-expert FP8 MoE blockwise matmul over 512 positions, not
+attention. Decode itself is cheap (~0.2 s/token for the whole BS=48 batch).
+
+vLLM serving on the same NEFF/recipe (input/output 360/120):
+
+| Concurrency | Output tok/s | Total tok/s | TPOT median | Notes |
+|-------------|--------------|-------------|-------------|-------|
+| 48 | 71.9 | 287 | 572 ms | output garbled after first request (issue #31) |
+| 1  | 5.2  | 20.5 | 189 ms | under-fed (BS=48 graph, 1 request); not representative |
+
+vLLM at c=48 reaches 72 out-tok/s vs the smoke path's 96 — the ~25% gap is
+vLLM's continuous-batching scheduler / async / request-state overhead (the same
+runtime layer behind the issue #31 garbling). Smoke is the batched-compute
+ceiling for this NEFF; vLLM is the realistic serving figure with scheduling.
+
+Reproduce (smoke path):
+
+```bash
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
+export MIMO_V25_PRO_COMPILED_PATH=/opt/dlami/nvme/models/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512/
+# decode-focused:
+INPUT_LEN=360 MAX_NEW_TOKENS=120 N_ITERS=3 \
+    python3 contrib/models/MiMo-V2.5-Pro/perf_test/bench_smoke_throughput.py
+# prefill-focused (near-full context, ~1 output token):
+INPUT_LEN=500 MAX_NEW_TOKENS=2 N_ITERS=3 \
+    python3 contrib/models/MiMo-V2.5-Pro/perf_test/bench_smoke_throughput.py
+```
+
+To capture a device profile for bottleneck analysis (attention vs MoE vs
+collectives) set `NEURON_RT_INSPECT_DEVICE_PROFILE=<dir>` before the run and
+inspect the resulting `*.ntff` with `neuron-profile view` / Neuron Explorer.
+
 > **Compile time:** the first Pro compile on SDK 2.29 is ~60 minutes for the TKG NEFF and ~15 minutes for the CTE NEFF; subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass. First full server launch (compile + shard + warmup) is ~2 hours wall-clock.
 
 ## Compatibility Matrix
