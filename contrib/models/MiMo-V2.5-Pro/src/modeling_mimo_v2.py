@@ -698,6 +698,36 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 else:
                     prior_scores = prior_scores + attention_mask
 
+            # Per-row causal UPPER bound on the prior (cached) KV.
+            #
+            # K_prior spans the whole n_positions cache buffer. Only positions
+            # strictly BEFORE this row's current decode position hold valid
+            # prior KV for THIS request; positions >= current_pos are either
+            # future slots or stale KV physically left by a *different* request
+            # that previously occupied this batch row / cache slot. MiMo hand-
+            # rolls the decode attention (it does not use the base flash-decode
+            # kernel, which would bound reads by per-row computed_context_lens),
+            # so without an explicit per-row bound the full-attention layers
+            # rely entirely on the externally-supplied attention_mask. Under
+            # vLLM batched decode that mask can be width-collapsed to
+            # torch.max(position_ids) (model_base._infer_attention_mask), so a
+            # row whose position < the batch-global max attends to stale KV and
+            # its output deterministically garbles from decode token 2 onward
+            # (byte-identical across identical prompts), keyed on having >1
+            # active row. Bounding per-row here makes correctness independent of
+            # the external mask for BOTH full-attn and SWA layers. The active
+            # (current) token is scored separately via active_scores below, so
+            # the bound is strict-less-than current_pos.
+            if position_ids is not None:
+                kv_seq_len = prior_scores.size(-1)
+                current_pos = position_ids[:, 0].reshape(-1, 1)  # [bsz, 1]
+                pos_indices = torch.arange(
+                    kv_seq_len, device=prior_scores.device
+                )[None, :]  # [1, kv_seq_len]
+                causal_mask = (pos_indices < current_pos)  # [bsz, kv_seq_len]
+                causal_mask = causal_mask[:, None, None, :]  # [bsz, 1, 1, kv_seq_len]
+                prior_scores = prior_scores.masked_fill(~causal_mask, float("-inf"))
+
             # Apply sliding window mask for SWA layers.
             # NOTE: build the window per batch slot using each request's own
             # decode position. The old code used position_ids[0, 0] (slot 0)
