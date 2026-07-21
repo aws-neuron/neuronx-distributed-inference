@@ -468,7 +468,7 @@ Output token throughput (tok/s), higher is better:
 |----------------------------|------|-------|-------|
 | **SGLang + EFA** (TP16/DP2/EP16) | 32.6 | 345.4 | **802.6** |
 | SGLang, socket (TP16/DP2/EP16)   | 11.2 | 70.4  | 139.2 |
-| vLLM + EFA, **DP2×TP8 + EP** (best vLLM) | *(n/m)* | *(n/m)* | 270.5 |
+| vLLM + EFA, **DP2×TP8 + EP** (best vLLM) | 27.8 | 299.0 | 270.5 |
 | vLLM + EFA, TP8/PP2             | 115.0 | 261.8 | 157.8 |
 | vLLM, socket, TP8/PP2          | 113.2 | 373.1 | 141.1 |
 | Trn2 (TP64)                     | 5.2  | *(n/m)* | 71.9  |
@@ -491,7 +491,7 @@ Notes:
 - **At c=48, SGLang + EFA wins decisively**: 803 out-tok/s and 1.08 s TTFT — ~5× vLLM's 158 and ~11× Trn2's 72, with ~13× lower TTFT than vLLM.
 - **EFA is make-or-break for SGLang, nearly irrelevant for vLLM's PP path.** SGLang c=48 collapses from 803 → 139 tok/s (TTFT 1.08 s → 16.8 s) on TCP sockets — its EP=16 all-to-all + DP-attention move a lot of data cross-node. vLLM TP8/PP2 barely moves (141 → 158) because PP=2 only ships pipeline-boundary activations; its bottleneck is the pipeline bubble, not the fabric. **The stock images fall back to sockets — always verify NCCL logs `NET/OFI ... efa-direct`, not `Using network Socket`.**
 - **vLLM: use DP+EP, not PP.** Replacing TP8/PP2 with **DP2×TP8 + `--enable-expert-parallel`** (vLLM's analogue to SGLang's DP-attention: each DP rank runs TP=8 attention, dividing the 8 KV heads, while MoE shards across TP×DP=16) lifts vLLM c=48 from 158 → **270 tok/s** and halves TTFT (13.8 → 7.6 s), with no pipeline bubble. Still ~3× behind SGLang (270 vs 803) — the remaining gap is SGLang's more mature MoE kernels (DeepGEMM, EP all-to-all) and prefill parallelism — but DP+EP is clearly the right multi-node shape for this model on vLLM.
-- **Low vs high concurrency flips the winner.** At c=1, vLLM (115 tok/s, TTFT 69 ms) beats SGLang (33 tok/s) — SGLang's DP/EP synchronization is pure overhead with one request; vLLM's PP pipelines a single stream cleanly. SGLang only pulls ahead once concurrency fills its wide TP16/DP2/EP16 (c=48).
+- **Low vs high concurrency flips the winner, and picks the parallelism.** At c=1, vLLM **TP8/PP2** (115 tok/s, TTFT 69 ms) beats everything — a single stream pipelines cleanly with no DP/EP sync. Both DP/EP layouts are slow at c=1 (vLLM DP+EP 27.8, SGLang 32.6): the DP/EP all-reduce/all-to-all is pure overhead with one request. Once concurrency fills the wide parallelism (c=16/48), DP/EP wins big (SGLang 803, vLLM DP+EP 270/299) and PP falls behind (158). Takeaway: PP for latency-bound single-stream, DP+EP for throughput-bound serving.
 - **Not equal-hardware**: H100 uses 16 GPUs / 2 nodes vs Trn2's single 64-core instance, CUDA graphs vs eager. Normalize per-device / per-dollar before drawing efficiency conclusions.
 - **Both GPU stacks produce coherent output across all requests** — no "garbled-after-first-request" bug (Trn2 issue #31), consistent with GPU stacks dequantizing FP8→BF16 before matmul.
 
