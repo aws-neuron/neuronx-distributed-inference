@@ -39,6 +39,8 @@ Key features:
 
 **This port compiles cleanly and is verified to produce coherent output end-to-end via the NxDI direct smoke path (`smoke_generate_mimo_v2.py`). The shipping recipe is BF16 attention + FP8 MoE at `seq_len=512` (largest seq_len that fits HBM).**
 
+> **Re-verified 2026-07-21** on trn2.48xlarge (i-0f2e7a5194376e8fe) from the pre-compiled `seq512` NEFF + `models/MiMo-V2.5-Pro-Neuron-FP8` (04-28) weights. `smoke_generate_mimo_v2.py` (MINIMAL_CHAT=1, 40 tokens) loaded the presharded 64-rank checkpoint in ~200s (warmup 9.4s) and produced coherent output that correctly self-identifies as MiMo: `"<think>Okay, the user is asking for a simple self-introduction ... to establish my identity as MiMo. ..."`. The direct-smoke path is confirmed still working; vLLM serving was **not** re-tested this run and is presumed still blocked on issue #31.
+
 **Known issue — vLLM serving is broken.** The first `/v1/chat/completions` request against `vllm-neuron` returns coherent output; every subsequent request returns garbled text. Same compiled NEFF serves 5 successive greedy generations byte-identically via the smoke path, so the bug is specifically in vllm-neuron's runtime / request-state handling. Tracking upstream at https://github.com/vllm-project/vllm-neuron/issues/31. Last updated 2026-04-30.
 
 ### Why BF16 attn + FP8 MoE
@@ -72,7 +74,7 @@ GPU stacks (sglang on H100/H200) run the same OCP FP8 checkpoint correctly becau
 ## Prerequisites
 
 - **Instance**: trn2.48xlarge (128 physical NeuronCores, logical_nc_config=2 → 64 logical cores)
-- **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9)
+- **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9). Verified toolchain (2026-07-21 instance): `neuronx-cc 2.26.6360.0`, `neuronx-distributed 0.19.28492`, `neuronx-distributed-inference 0.10.18399`, `torch 2.9.1`, `torch-neuronx 2.9.0.2.15`. The `neuronx-cc` package version (2.26.x) differs from the SDK release-train number (2.29); if you re-compile on a differently-imaged DLAMI, confirm these versions match or expect a cache miss.
 - **Venv**: `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (used by preprocess, smoke, and vLLM serving alike; ships with the DLAMI and is where `0_setup.sh` installs the patched `vllm-neuron`).
 - **Disk**: ~3 TB free under `/opt/dlami/nvme` (the HF FP8 checkpoint is ~962 GB, the Neuron-FP8 preprocessed output is ~1 TB, and `save_sharded_checkpoint=true` writes another ~300-1000 GB per compiled config (varies with recipe)).
 
@@ -106,8 +108,8 @@ git clone <your-fork>/neuronx-distributed-inference.git
 cd neuronx-distributed-inference
 git checkout contrib/MiMo-V2.5-Pro          # the branch this README lives on
 
-# 2. Download the HuggingFace FP8 checkpoint (~290 GB). Any HF-compatible
-#    downloader works; huggingface-cli example:
+# 2. Download the HuggingFace FP8 checkpoint (~1 TB; 50 safetensors shards).
+#    Any HF-compatible downloader works; huggingface-cli example:
 huggingface-cli download XiaomiMiMo/MiMo-V2.5-Pro \
     --local-dir /opt/dlami/nvme/models/MiMo-V2.5-Pro
 
@@ -176,7 +178,7 @@ override or if you plan to launch vLLM outside of `bench_mimo_v2.sh`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `NEURON_COMPILED_ARTIFACTS` | `/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8_vllm` | Where vLLM writes the NEFF + per-rank sharded weights. Default points at a persistent path under `/opt/dlami/nvme/compiled/` so multiple configs don't collide and runs after the nightly reboot can reuse the sharded weights. vLLM's fallback is `<checkpoint>/neuron-compiled-artifacts/<hash>/` which buries output inside the checkpoint dir. |
+| `NEURON_COMPILED_ARTIFACTS` | `/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_bf16attn_seq256_vllm` (per `start_vllm_server.sh`) | Where vLLM writes the NEFF + per-rank sharded weights. Default points at a persistent path under `/opt/dlami/nvme/compiled/` so multiple configs don't collide and runs after the nightly reboot can reuse the sharded weights. vLLM's fallback is `<checkpoint>/neuron-compiled-artifacts/<hash>/` which buries output inside the checkpoint dir. **Note:** the script default is still a `seq256` path while the shipping recipe is `seq512` — override this to a `seq512` dir (e.g. `.../mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512`) to reuse the pre-compiled artifacts documented above, or expect a fresh ~60 min compile. |
 | `BASE_COMPILE_WORK_DIR` | `/opt/dlami/nvme/tmp/nxd_model/<basename of NEURON_COMPILED_ARTIFACTS>` | NxDI's HLO / NEFF staging workdir. Default is `/tmp/nxd_model/`, which is wiped by the nightly Trn2 reboot and can silently corrupt parallel compiles that share a basename; the pinned value lives on persistent storage and is unique per config. |
 | `VLLM_ENGINE_READY_TIMEOUT_S` | `7200` | First-time compile of Pro's 384-expert MoE is ~60 min TKG + ~15 min CTE + ~30 min shard, well past vLLM's default. |
 
@@ -217,9 +219,15 @@ Pro's attention weights have `abs_mean ≈ 0.00124`, roughly 4× smaller than V2
 
 The preprocess handles this in a single pass: `split_qkv_fused()` unfuses Pro's `qkv_proj` into per-proj BF16 tensors directly, and the Flash-style per-proj fallback path dequants via `_dequant_attn_to_bf16()`. The checkpoint emitted by preprocess has no `q_proj.scale` / `k_proj.scale` / `v_proj.scale` entries. Compile-time `modules_to_not_convert` must therefore include `q_proj`, `k_proj`, `v_proj` so NxDI routes them through a plain `ColumnParallelLinear` rather than the FP8 `QuantizedColumnParallel` path — `smoke_compile_mimo_v2.py` already does this.
 
-### Fallback: FP8 → BF16
+### Parallel preprocess (faster)
 
-`src/conversion_script/preprocess_mimo_v2_fp8.py` dequantizes the entire checkpoint to BF16. Output is ~290 GB; BF16 is numerically equivalent to the published HF FP8 weights and is useful as a known-good reference. Throughput is ~2× worse than the FP8 path because every attention/MLP matmul operates on full BF16 weights.
+`src/conversion_script/preprocess_mimo_v2_parallel.py` (driven by `run_preprocess_parallel.sh`) is a multiprocess wrapper around the same per-layer conversion. Each worker dequants one layer independently, cutting wall time from ~20-30 min (serial) to ~5-6 min with 12 workers (peak ~300 GB CPU RAM on a 2 TB box). Output is identical to the serial path (BF16 attn + FP8 MoE).
+
+```bash
+N_WORKERS=12 bash contrib/models/MiMo-V2.5-Pro/src/conversion_script/run_preprocess_parallel.sh
+```
+
+> Note: there is no FP8 → full-BF16 conversion mode. Both preprocess scripts always emit the shipping recipe (BF16 q/k/v attention + FP8 MoE experts); q/k/v are dequantized to BF16 in-pass, but MoE weights stay FP8. A separate all-BF16 reference checkpoint, if needed, must be produced by other means.
 
 ## Usage
 
@@ -324,7 +332,7 @@ Intermediate ratios (`moe_tp=32/ep=2`, `moe_tp=16/ep=4`) have been empirically t
 
 ### batch_size >= 48
 
-NxDI's TKG (token generation) path refuses Expert Parallelism when `batch_size < num_experts / top_k`. For Pro that is 384 / 8 = 48, so the smallest working BS on the FP8 path is 48. BS=1 latency demos are not possible on FP8; use the BF16 checkpoint with `moe_tp=64, moe_ep=1, batch_size=1` for single-stream latency measurements.
+NxDI's TKG (token generation) path refuses Expert Parallelism when `batch_size < num_experts / top_k`. For Pro that is 384 / 8 = 48, so the smallest working BS on the FP8 path is 48. BS=1 latency demos are not possible on the FP8 (moe_ep=64) path; a single-stream configuration would require `moe_tp=64, moe_ep=1, batch_size=1`, which in turn needs an all-BF16 checkpoint (the preprocess scripts here only emit BF16-attn + FP8-MoE, so that BF16 checkpoint must be produced separately).
 
 ### outer ep_degree = 1
 
