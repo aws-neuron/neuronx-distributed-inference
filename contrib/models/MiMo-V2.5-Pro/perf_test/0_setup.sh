@@ -17,10 +17,16 @@ source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 PATCH_FILE="$(cd "$(dirname "$0")" && pwd)/vllm-neuron-patch.patch"
 
 echo ""
-echo "[1/2] Installing vllm-neuron (release-0.5.0) with the contrib registration patch..."
+echo "[1/2] Installing vllm-neuron (release-0.5.3) with the contrib registration patch..."
 
+# release-0.5.3 is the version the DLAMI ships by default and is the same
+# model-loading architecture as 0.5.0 (NxDI MODEL_TYPES + traced model.pt), so
+# the contrib patch applies cleanly. 0.5.3 adds only base-model LoRA / DP
+# round-robin robustness fixes over 0.5.0; no architecture change. The newer
+# release-0.21.x line drops NxDI entirely (hand-written model classes) and does
+# not support contrib models, so it is NOT usable for this port.
 if [ ! -d $HOME/vllm-neuron ]; then
-    git clone --branch release-0.5.0 https://github.com/vllm-project/vllm-neuron.git $HOME/vllm-neuron
+    git clone --branch release-0.5.3 https://github.com/vllm-project/vllm-neuron.git $HOME/vllm-neuron
 fi
 
 cd $HOME/vllm-neuron

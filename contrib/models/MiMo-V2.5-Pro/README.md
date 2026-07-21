@@ -345,7 +345,7 @@ MiMo-V2.5-Pro can be served via [vllm-neuron](https://github.com/aws-neuron/vllm
 ### Setup
 
 ```bash
-# The setup script clones vllm-project/vllm-neuron at release-0.5.0, applies
+# The setup script clones vllm-project/vllm-neuron at release-0.5.3, applies
 # the contrib registration patch, installs it editable, and downloads
 # Pro Neuron-FP8 weights from S3 (set MIMO_V2_FLASH_PATH to override).
 bash contrib/models/MiMo-V2.5-Pro/perf_test/0_setup.sh
@@ -371,7 +371,7 @@ See "Environment variables" above for all the knobs (`NEURON_COMPILED_ARTIFACTS`
 
 ### vllm-neuron patch summary
 
-The patch is applied to vllm-neuron 0.5.0 and:
+The patch is applied to vllm-neuron 0.5.3 (also applies cleanly to 0.5.0; same model-loading architecture) and:
 
 - Patches `AutoConfig.from_pretrained` to default `trust_remote_code=True` so NxDI's `hf_adapter.load_config` can load the `MiMoV2Config` custom code that ships with the checkpoint.
 - Registers `NeuronMiMoV2ForCausalLM` into NxDI's `MODEL_TYPES` under `mimov2flash` and `mimov2pro` so the NxDI loader resolves either model_type to the contrib Neuron wrapper.
