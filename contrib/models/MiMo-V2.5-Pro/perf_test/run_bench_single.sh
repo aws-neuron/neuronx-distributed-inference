@@ -26,9 +26,20 @@
 
 set -e
 
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
+# On Trn2 the vllm CLI lives in the Neuron DLAMI venv; source it if present.
+# On other hosts (e.g. an H100 GPU box for cross-platform comparison) `vllm`
+# is expected to already be on PATH, so skip the venv activation there.
+NEURON_VENV="/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate"
+[ -f "$NEURON_VENV" ] && source "$NEURON_VENV"
 
 MODEL_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8}"
+# --model is the name the server registered (request routing); --tokenizer is a
+# local path the bench client loads. On Trn2 both equal MODEL_PATH. On a host
+# where the server was started with --served-model-name (e.g. the H100 Docker
+# run), set SERVED_MODEL_NAME to that name and TOKENIZER_PATH to the local
+# checkpoint dir, else the client sends an unknown model id and gets 404.
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$MODEL_PATH}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"
 PORT="${PORT:-8000}"
 CONCURRENCY="${CONCURRENCY:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-16}"
@@ -64,8 +75,8 @@ fi
 
 vllm bench serve \
     --backend vllm \
-    --model "$MODEL_PATH" \
-    --tokenizer "$MODEL_PATH" \
+    --model "$SERVED_MODEL_NAME" \
+    --tokenizer "$TOKENIZER_PATH" \
     --endpoint /v1/completions \
     --dataset-name random \
     --num-prompts "$NUM_PROMPTS" \

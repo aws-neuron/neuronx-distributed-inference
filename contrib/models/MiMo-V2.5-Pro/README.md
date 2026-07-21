@@ -444,6 +444,32 @@ To capture a device profile for bottleneck analysis (attention vs MoE vs
 collectives) set `NEURON_RT_INSPECT_DEVICE_PROFILE=<dir>` before the run and
 inspect the resulting `*.ntff` with `neuron-profile view` / Neuron Explorer.
 
+### H100 GPU baseline (cross-platform comparison, 2026-07-21)
+
+For reference, the **official HF OCP-FP8 checkpoint** served on H100 via the
+stock `vllm/vllm-openai:latest` Docker image, using the **same**
+`run_bench_single.sh` and the same input/output (360/120), prefix caching and
+chunked prefill **disabled** on both sides for a fair comparison. See
+`perf_test/h100/` for the launch script and setup notes.
+
+- **Trn2**: trn2.48xlarge, TP=64 / moe_tp=1 / moe_ep=64, BS=48, `seq_len=512`, vllm-neuron 0.5.3.
+- **H100**: 2× p5 (16× H100-80GB), TP=8 × PP=2, vLLM 0.25.1, CUDA graphs on, `--max-model-len 4096`. Two nodes are required — the ~963 GB FP8 weights don't fit on one 8×80 GB node, and MiMo's 8 KV heads cap TP at 8 (TP=16 fails the KV-head divisibility check), so we use TP=8 within a node × PP=2 across nodes.
+
+| Concurrency | Platform | Output tok/s | Total tok/s | Median TTFT (ms) | Median TPOT (ms) |
+|---|---|---|---|---|---|
+| 1  | H100 | 113.2 | 452  | 73     | 8.3   |
+| 1  | Trn2 | 5.2   | 20.5 | —      | 189   |
+| 16 | H100 | 373.1 | 1491 | 252    | 22.2  |
+| 16 | Trn2 | *(not measured)* | — | — | — |
+| 48 | H100 | 141.1 | 563  | 13,175 | 231.7 |
+| 48 | Trn2 | 71.9  | 287  | 6,912  | 572.1 |
+
+Notes:
+- At c=48, H100 ≈ **2×** Trn2 output throughput (141 vs 72 tok/s) and ~2.5× faster decode (TPOT 232 vs 572 ms).
+- H100 c=1 and c=16 are far higher than c=48 output/stream because PP has no batch contention at low load; at c=48 the pipeline saturates and per-stream latency rises. Trn2's fixed BS=48 graph makes c=1 severely under-fed (5 tok/s), so the platforms are only directly comparable at c=48.
+- **Not equal-hardware**: H100 uses 16 GPUs across 2 nodes vs Trn2's single 64-core instance, and H100 runs CUDA graphs while Trn2 runs eager. Normalize per-device / per-dollar before drawing efficiency conclusions.
+- **H100 output is coherent across all requests** — it does not exhibit the Trn2 vLLM "garbled-after-first-request" bug (issue #31), consistent with GPU stacks dequantizing FP8→BF16 before matmul.
+
 > **Compile time:** the first Pro compile on SDK 2.29 is ~60 minutes for the TKG NEFF and ~15 minutes for the CTE NEFF; subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass. First full server launch (compile + shard + warmup) is ~2 hours wall-clock.
 
 ## Compatibility Matrix
