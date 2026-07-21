@@ -453,7 +453,7 @@ caching + chunked prefill **disabled** for a fair comparison. See
 
 - **Trn2**: trn2.48xlarge, TP=64 / moe_tp=1 / moe_ep=64, BS=48, `seq_len=512`, vllm-neuron 0.5.3.
 - **H100**: 2× p5 (16× H100-80GB). The ~963 GB FP8 weights don't fit on one 8×80 GB node, so both frameworks shard across two nodes.
-  - **vLLM 0.25.1**: TP=8 × PP=2 (MiMo's 8 KV heads cap TP at 8; TP=16 fails the KV-head divisibility check). CUDA graphs on.
+  - **vLLM 0.25.1**: DP=2 × TP=8 + `--enable-expert-parallel` + chunked prefill. (MiMo's 8 KV heads cap per-rank TP at 8; DP replicates the TP=8 attention across nodes and shards MoE over TP×DP=16. CUDA graphs on.)
   - **SGLang 0.5.15**: TP=16 × DP=2 with `--enable-dp-attention` + EP=16 (DP-attention shards KV heads so TP=16 works).
 
 **Cross-node fabric matters enormously.** The stock `vllm/vllm-openai` and
@@ -462,37 +462,35 @@ sockets (`Using network Socket`) instead of EFA RDMA. Rebuilding both images
 with GDRCopy + the AWS EFA installer (`Dockerfile.{vllm,sglang}-efa`, with
 `NCCL_NET_PLUGIN=ofi`) switches NCCL to `efa-direct` over 32 NICs.
 
-Output token throughput (tok/s), higher is better:
+All runs below have **prefix/radix cache OFF and chunked prefill ON on both
+frameworks** (verified fair — see notes). Output token throughput (tok/s),
+higher is better:
 
 | Platform (fabric)          | c=1  | c=16  | c=48  |
 |----------------------------|------|-------|-------|
-| **SGLang + EFA** (TP16/DP2/EP16) | 32.6 | 345.4 | **802.6** |
+| **SGLang + EFA** (TP16/DP2/EP16) | 32.6 | 344.0 | **875.8** |
+| vLLM + EFA, **DP2×TP8 + EP + chunked** (best vLLM) | 27.8 | 221.1 | **748.3** |
 | SGLang, socket (TP16/DP2/EP16)   | 11.2 | 70.4  | 139.2 |
-| vLLM + EFA, **DP2×TP8 + EP** (best vLLM) | 27.8 | 299.0 | 270.5 |
-| vLLM + EFA, TP8/PP2             | 115.0 | 261.8 | 157.8 |
-| vLLM, socket, TP8/PP2          | 113.2 | 373.1 | 141.1 |
 | Trn2 (TP64)                     | 5.2  | *(n/m)* | 71.9  |
 
-SGLang EFA vs socket (out-tok/s): c=1 2.9×, c=16 4.9×, c=48 5.8× — the EFA
+SGLang EFA vs socket (out-tok/s): c=1 2.9×, c=16 4.9×, c=48 6.3× — the EFA
 advantage grows with concurrency as more cross-node all-to-all traffic piles up.
 
 Median TTFT / TPOT (ms) at c=48:
 
 | Platform (fabric)          | Median TTFT | Median TPOT |
 |----------------------------|-------------|-------------|
-| **SGLang + EFA**           | **1,080**   | **50.6**    |
-| vLLM + EFA, DP2×TP8 + EP    | 7,614       | 117.6       |
-| vLLM + EFA, TP8/PP2        | 13,765      | 216.9       |
-| SGLang, socket             | 16,831      | 231.0       |
-| vLLM, socket, TP8/PP2      | 13,175      | 231.7       |
+| **SGLang + EFA**           | **726**     | **47.6**    |
+| vLLM + EFA, DP2×TP8 + EP + chunked | 624 | 57.2  |
 | Trn2                       | 6,912       | 572.1       |
 
 Notes:
-- **At c=48, SGLang + EFA wins decisively**: 803 out-tok/s and 1.08 s TTFT — ~5× vLLM's 158 and ~11× Trn2's 72, with ~13× lower TTFT than vLLM.
-- **EFA is make-or-break for SGLang, nearly irrelevant for vLLM's PP path.** SGLang c=48 collapses from 803 → 139 tok/s (TTFT 1.08 s → 16.8 s) on TCP sockets — its EP=16 all-to-all + DP-attention move a lot of data cross-node. vLLM TP8/PP2 barely moves (141 → 158) because PP=2 only ships pipeline-boundary activations; its bottleneck is the pipeline bubble, not the fabric. **The stock images fall back to sockets — always verify NCCL logs `NET/OFI ... efa-direct`, not `Using network Socket`.**
-- **vLLM: use DP+EP, not PP.** Replacing TP8/PP2 with **DP2×TP8 + `--enable-expert-parallel`** (vLLM's analogue to SGLang's DP-attention: each DP rank runs TP=8 attention, dividing the 8 KV heads, while MoE shards across TP×DP=16) lifts vLLM c=48 from 158 → **270 tok/s** and halves TTFT (13.8 → 7.6 s), with no pipeline bubble. Still ~3× behind SGLang (270 vs 803) — the remaining gap is SGLang's more mature MoE kernels (DeepGEMM, EP all-to-all) and prefill parallelism — but DP+EP is clearly the right multi-node shape for this model on vLLM.
-- **Low vs high concurrency flips the winner, and picks the parallelism.** At c=1, vLLM **TP8/PP2** (115 tok/s, TTFT 69 ms) beats everything — a single stream pipelines cleanly with no DP/EP sync. Both DP/EP layouts are slow at c=1 (vLLM DP+EP 27.8, SGLang 32.6): the DP/EP all-reduce/all-to-all is pure overhead with one request. Once concurrency fills the wide parallelism (c=16/48), DP/EP wins big (SGLang 803, vLLM DP+EP 270/299) and PP falls behind (158). Takeaway: PP for latency-bound single-stream, DP+EP for throughput-bound serving.
-- **Not equal-hardware**: H100 uses 16 GPUs / 2 nodes vs Trn2's single 64-core instance, CUDA graphs vs eager. Normalize per-device / per-dollar before drawing efficiency conclusions.
+- **At c=48 SGLang and a properly-tuned vLLM are close**: SGLang 876 vs vLLM 748 out-tok/s (~15%), TTFT 726 vs 624 ms. Both are ~10-12× Trn2's 72.
+- **The vLLM config matters enormously — use DP+EP + chunked prefill.** MiMo's 8 KV heads cap per-rank TP at 8, so a single node can't hold the model with pure TP. Do **not** reach for pipeline parallel (PP=2) as the multi-node fallback — it leaves a pipeline bubble and was ~5× slower in our testing. Instead use **DP2×TP8 + `--enable-expert-parallel`** (vLLM's analogue to SGLang's `--enable-dp-attention`: each DP rank runs TP=8 attention dividing the 8 KV heads; MoE shards across TP×DP=16) **with chunked prefill enabled**. Chunked prefill is the single biggest lever (it overlaps prefill with decode; not a caching shortcut, so fair to leave on) and gets vLLM to 748 tok/s @ c=48.
+- **EFA is make-or-break for the DP/EP path.** SGLang c=48 collapses 876 → 139 tok/s (TTFT 726 ms → 16.8 s) on TCP sockets — the EP=16 all-to-all moves a lot of data cross-node, and the same applies to vLLM's DP+EP path. **Stock images fall back to sockets — always verify NCCL logs `NET/OFI ... efa-direct`, not `Using network Socket`.**
+- **radix/prefix cache didn't matter for this benchmark** — disabling SGLang's radix cache left c=48 unchanged (802 → 876, if anything faster), because `--random-range-ratio 0.03` prompts share little prefix. Both frameworks are benchmarked with caches off for strict fairness.
+- **DP/EP is a throughput play, not a latency one.** At c=1 the DP/EP all-reduce/all-to-all sync is pure overhead (SGLang 32.6, vLLM DP+EP 27.8 tok/s); it only pays off once concurrency fills the wide parallelism (c=16/48). If single-stream latency is the goal on a model this size, a narrower non-DP layout would win — but that trades away the aggregate throughput these numbers are about.
+- **Not equal-hardware**: H100 = 16 GPUs / 2 nodes with CUDA graphs; Trn2 = one 64-core instance, eager. Normalize per-device / per-dollar before drawing efficiency conclusions.
 - **Both GPU stacks produce coherent output across all requests** — no "garbled-after-first-request" bug (Trn2 issue #31), consistent with GPU stacks dequantizing FP8→BF16 before matmul.
 
 > **Compile time:** the first Pro compile on SDK 2.29 is ~60 minutes for the TKG NEFF and ~15 minutes for the CTE NEFF; subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass. First full server launch (compile + shard + warmup) is ~2 hours wall-clock.

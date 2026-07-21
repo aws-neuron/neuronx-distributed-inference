@@ -11,7 +11,10 @@ The FP8 weights are ~963 GB, which does not fit on a single 8×H100-80GB node
 must divide 8 (TP≤8) — `--tensor-parallel-size 16` fails with *"TP size must
 evenly split the number of KV heads"*. So:
 
-- **vLLM**: TP=8 (within a node) × PP=2 (across the two nodes) = world size 16.
+- **vLLM**: DP=2 × TP=8 + `--enable-expert-parallel` + chunked prefill = world
+  size 16. Each DP rank runs TP=8 attention (dividing the 8 KV heads); MoE shards
+  across TP×DP=16. (Do NOT use PP=2 as the multi-node fallback — it leaves a
+  pipeline bubble and measured ~5× slower.)
 - **SGLang**: TP=16 × DP=2 with `--enable-dp-attention` (DP-attention shards the
   KV heads differently, so TP=16 is fine) + EP=16.
 
@@ -53,8 +56,8 @@ Run the **same** launch script on both nodes, changing only `NODE_RANK`
 
 ```bash
 # vLLM (node 0 = API server on :8000, node 1 = --headless follower)
-NODE_RANK=0 MASTER_ADDR=<node0-ip> bash run_vllm_h100_multinode.sh
-NODE_RANK=1 MASTER_ADDR=<node0-ip> bash run_vllm_h100_multinode.sh
+DP_RANK=0 DP_ADDR=<node0-ip> bash run_vllm_h100_dp.sh
+DP_RANK=1 DP_ADDR=<node0-ip> bash run_vllm_h100_dp.sh
 
 # SGLang (both nodes run the same command; node 0 serves on :30000)
 NODE_RANK=0 DIST_INIT_ADDR=<node0-ip>:20000 bash run_sglang_h100_multinode.sh
