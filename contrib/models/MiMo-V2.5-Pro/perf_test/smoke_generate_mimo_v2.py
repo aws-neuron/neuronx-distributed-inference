@@ -27,7 +27,7 @@ MODEL_PATH = os.environ.get(
 )
 COMPILED_PATH = os.environ.get(
     "MIMO_V25_PRO_COMPILED_PATH",
-    "/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512/",
+    "/opt/dlami/nvme/models/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512/",
 )
 
 # Must match smoke_compile_mimo_v2.py exactly, else load() sees a

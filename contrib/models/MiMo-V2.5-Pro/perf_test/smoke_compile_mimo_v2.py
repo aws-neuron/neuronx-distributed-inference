@@ -39,7 +39,7 @@ MODEL_PATH = os.environ.get(
 )
 COMPILED_PATH = os.environ.get(
     "MIMO_V25_PRO_COMPILED_PATH",
-    "/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512/",
+    "/opt/dlami/nvme/models/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512/",
 )
 
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "64"))
