@@ -62,6 +62,9 @@ class BaseMultiLora(nn.Module):
         else:
             return self.weight_active
 
+    def set_layer_id(self, layer_id):
+        self.layer_id = layer_id
+
     def forward(self, x: torch.Tensor, adapter_ids: torch.Tensor, is_context_encoding: bool) -> torch.Tensor:
         raise NotImplementedError
 
@@ -79,7 +82,7 @@ class MultiLoraLinear(BaseMultiLora):
         input_size: int,
         output_size: int,
         dtype: torch.dtype = torch.float32,
-        memory_transpose: bool = True,
+        memory_transpose: bool = True
     ) -> None:
         self.max_loras = max_loras
         self.max_loras_active = max_loras_active
@@ -105,7 +108,7 @@ class MultiLoraConv2d(BaseMultiLora, nn.Conv2d):
         kernel_size,
         stride,
         padding,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.float32
     ) -> None:
         self.max_loras = max_loras
         self.max_loras_active = max_loras_active
@@ -152,7 +155,7 @@ class MultiLoraEmbedding(BaseMultiLora):
         scale_grad_by_freq: bool,
         sparse: bool,
         dtype: torch.dtype = torch.float32,
-        memory_transpose: bool = True,
+        memory_transpose: bool = True
     ) -> None:
         self.max_loras = max_loras
         self.max_loras_active = max_loras_active
