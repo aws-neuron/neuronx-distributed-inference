@@ -31,7 +31,11 @@ export NXDI_CONTRIB_MIMO_V2_FLASH_SRC
 # Persistent compile-artifact location (NEFF + per-rank sharded weights).
 # Setting this overrides vLLM's fallback of
 # <checkpoint>/neuron-compiled-artifacts/<hash>/.
-: "${NEURON_COMPILED_ARTIFACTS:=/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_bf16attn_seq256_vllm}"
+# Point at the SAME dir as the smoke seq512 NEFF (no _vllm suffix): vLLM reuses
+# its 64 pre-sharded tp*_sharded_checkpoint.safetensors (skips the ~30 min shard
+# step) and only compiles the CB/async NEFF variant into this dir. A separate
+# _vllm dir would be empty and force a full from-scratch compile + reshard.
+: "${NEURON_COMPILED_ARTIFACTS:=/opt/dlami/nvme/models/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512}"
 export NEURON_COMPILED_ARTIFACTS
 # NxDI HLO/NEFF staging directory, pinned to persistent storage so it
 # survives the nightly Trn2 reboot and a unique per-config subdir.
@@ -57,7 +61,7 @@ exec python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" \
     --tokenizer "$MODEL_PATH" \
     --tensor-parallel-size 64 \
-    --max-model-len 256 \
+    --max-model-len 512 \
     --max-num-seqs 48 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
@@ -86,12 +90,12 @@ exec python3 -m vllm.entrypoints.openai.api_server \
             "batch_size": 48,
             "ctx_batch_size": 1,
             "tkg_batch_size": 48,
-            "max_context_length": 256,
-            "seq_len": 256,
+            "max_context_length": 512,
+            "seq_len": 512,
             "is_continuous_batching": true,
             "enable_bucketing": true,
-            "context_encoding_buckets": [256],
-            "token_generation_buckets": [256],
+            "context_encoding_buckets": [512],
+            "token_generation_buckets": [512],
             "async_mode": true,
             "on_device_sampling_config": {
                 "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
