@@ -536,6 +536,7 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
         return_dict: Optional[bool] = None,
         llava_args: Optional[List] = [],
         input_capture_hook: Optional[Callable] = None,
+        tensor_capture_hook: Optional[Callable] = None,
         slot_mapping: Optional[torch.LongTensor] = None,
         block_table: Optional[torch.LongTensor] = None,
         full_context_lens: Optional[torch.LongTensor] = None,
@@ -659,6 +660,9 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
                 (self.text_config.neuron_config.enable_fused_speculation or self.text_config.neuron_config.is_medusa):
             logits_or_next_tokens = outputs[:2]
             constructed_outputs = self._construct_output_with_tokens_and_logits(next_tokens=logits_or_next_tokens[0], logits=logits_or_next_tokens[1])
+            captured_tensors_offset = self._get_captured_tensors_offset()
+            if captured_tensors_offset > 0:
+                constructed_outputs.captured_tensors = outputs[2: 2 + captured_tensors_offset]
         else:
             if is_run_on_neuron:
                 # When run on neuron, KV cache remains on device
@@ -667,6 +671,11 @@ class NeuronBaseForImageToText(NeuronBaseForCausalLM):
                 # When run on cpu, KV cache is returned which has to be ignored
                 logits_or_next_tokens, *_ = outputs
             constructed_outputs = self._construct_output(logits_or_next_tokens)
+
+            # Add captured tensors if available
+            captured_tensors_offset = self._get_captured_tensors_offset()
+            if captured_tensors_offset > 0 and is_run_on_neuron and isinstance(outputs, list) and len(outputs) > captured_tensors_offset:
+                constructed_outputs.captured_tensors = outputs[:captured_tensors_offset]
 
         if logging.root.isEnabledFor(logging.DEBUG):
             logging.debug("---output---")
