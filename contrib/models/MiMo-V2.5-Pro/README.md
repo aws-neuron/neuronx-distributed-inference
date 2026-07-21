@@ -462,20 +462,31 @@ sockets (`Using network Socket`) instead of EFA RDMA. Rebuilding both images
 with GDRCopy + the AWS EFA installer (`Dockerfile.{vllm,sglang}-efa`, with
 `NCCL_NET_PLUGIN=ofi`) switches NCCL to `efa-direct` over 32 NICs.
 
-| Concurrency | Platform | Output tok/s | Total tok/s | Median TTFT (ms) | Median TPOT (ms) |
-|---|---|---|---|---|---|
-| 48 | **SGLang + EFA** (TP16/DP2/EP16) | **802.6** | **3204** | **1,080** | **50.6** |
-| 48 | vLLM + EFA (TP8/PP2)   | 157.8 | 630  | 13,765 | 216.9 |
-| 48 | vLLM, stock/socket (TP8/PP2) | 141.1 | 563  | 13,175 | 231.7 |
-| 48 | Trn2 (TP64)            | 71.9  | 287  | 6,912  | 572.1 |
-| 1  | vLLM + EFA (TP8/PP2)   | 113.2 | 452  | 73     | 8.3   |
-| 1  | Trn2 (TP64)            | 5.2   | 20.5 | —      | 189   |
-| 16 | vLLM + EFA (TP8/PP2)   | 373.1 | 1491 | 252    | 22.2  |
+Output token throughput (tok/s), higher is better:
+
+| Platform (fabric)          | c=1  | c=16  | c=48  |
+|----------------------------|------|-------|-------|
+| **SGLang + EFA** (TP16/DP2/EP16) | 32.6 | 345.4 | **802.6** |
+| SGLang, socket (TP16/DP2/EP16)   | —    | —     | 139.2 |
+| vLLM + EFA (TP8/PP2)             | 115.0 | 261.8 | 157.8 |
+| vLLM, socket (TP8/PP2)          | 113.2 | 373.1 | 141.1 |
+| Trn2 (TP64)                     | 5.2  | *(n/m)* | 71.9  |
+
+Median TTFT / TPOT (ms) at c=48:
+
+| Platform (fabric)          | Median TTFT | Median TPOT |
+|----------------------------|-------------|-------------|
+| **SGLang + EFA**           | **1,080**   | **50.6**    |
+| SGLang, socket             | 16,831      | 231.0       |
+| vLLM + EFA                 | 13,765      | 216.9       |
+| vLLM, socket               | 13,175      | 231.7       |
+| Trn2                       | 6,912       | 572.1       |
 
 Notes:
-- **SGLang + EFA is ~5× vLLM and ~11× Trn2** at c=48 (803 vs 158 vs 72 out-tok/s), with **~13× lower TTFT** than vLLM (1.08 s vs 13.8 s). Its DP-attention + EP architecture parallelizes prefill far better than vLLM's PP=2 (which serializes the two pipeline stages).
-- **EFA vs socket is not the whole story for vLLM**: switching vLLM from socket to EFA only moved it 141→158 tok/s. vLLM's multi-node bottleneck here is the PP=2 pipeline bubble, not the fabric — the KV-heads=8 constraint forces PP instead of the wide TP that SGLang's DP-attention enables. (For SGLang the EFA fix is essential — on sockets its all-to-all EP would be crippled.)
-- **Not equal-hardware**: H100 uses 16 GPUs / 2 nodes vs Trn2's single 64-core instance, and H100 runs CUDA graphs while Trn2 runs eager. Normalize per-device / per-dollar before drawing efficiency conclusions.
+- **At c=48, SGLang + EFA wins decisively**: 803 out-tok/s and 1.08 s TTFT — ~5× vLLM's 158 and ~11× Trn2's 72, with ~13× lower TTFT than vLLM.
+- **EFA is make-or-break for SGLang, nearly irrelevant for vLLM.** SGLang c=48 collapses from 803 → 139 tok/s (TTFT 1.08 s → 16.8 s) on TCP sockets — its EP=16 all-to-all + DP-attention move a lot of data cross-node. vLLM barely moves (141 → 158) because PP=2 only ships pipeline-boundary activations; its bottleneck is the pipeline bubble, not the fabric. So on sockets SGLang ≈ vLLM (~140), but with EFA SGLang pulls ~5× ahead. **The stock images fall back to sockets — always verify NCCL logs `NET/OFI ... efa-direct`, not `Using network Socket`.**
+- **Low vs high concurrency flips the winner.** At c=1, vLLM (115 tok/s, TTFT 69 ms) beats SGLang (33 tok/s) — SGLang's DP/EP synchronization is pure overhead with one request; vLLM's PP pipelines a single stream cleanly. SGLang only pulls ahead once concurrency fills its wide TP16/DP2/EP16 (c=48).
+- **Not equal-hardware**: H100 uses 16 GPUs / 2 nodes vs Trn2's single 64-core instance, CUDA graphs vs eager. Normalize per-device / per-dollar before drawing efficiency conclusions.
 - **Both GPU stacks produce coherent output across all requests** — no "garbled-after-first-request" bug (Trn2 issue #31), consistent with GPU stacks dequantizing FP8→BF16 before matmul.
 
 > **Compile time:** the first Pro compile on SDK 2.29 is ~60 minutes for the TKG NEFF and ~15 minutes for the CTE NEFF; subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass. First full server launch (compile + shard + warmup) is ~2 hours wall-clock.
