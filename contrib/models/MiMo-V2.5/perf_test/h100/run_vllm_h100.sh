@@ -15,11 +15,18 @@
 #
 # With the PR applied, the model-card reference command works as-is:
 # TP=8 + expert parallel (the paired-qkv loader handles the 4-KV-head split
-# that plain vLLM rejects). Speculative decoding (MTP/EAGLE) left OFF for parity
-# with the Trn2 baseline; prefix/chunked prefill off to match Trn2.
+# that plain vLLM rejects).
+#
+# Optimizations: chunked prefill ON by default (matches the Pro serving recipe;
+# it roughly 4x's mid-concurrency throughput vs off by interleaving the 900-token
+# prefills with decode instead of preempting). Prefix caching OFF (would inflate
+# throughput via cache hits on the random dataset) and speculative decode
+# (MTP/EAGLE) OFF, both for parity with the Trn2 baseline. Set CHUNKED=0 to get
+# the no-chunked config that exactly matches Trn2 (Neuron has no chunked prefill).
 #
 # Usage:
-#   bash run_vllm_h100.sh
+#   bash run_vllm_h100.sh              # chunked prefill ON (recommended)
+#   CHUNKED=0 bash run_vllm_h100.sh    # no chunked prefill (exact Trn2 parity)
 set -e
 
 MODEL_DIR="${MODEL_DIR:-/opt/dlami/nvme/models/MiMo-V2.5}"
@@ -27,6 +34,7 @@ PORT="${PORT:-8000}"
 TP="${TP:-8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"              # MiMo-V2.5 bs=32
+CHUNKED="${CHUNKED:-1}"                          # 1 = chunked prefill on (default)
 IMAGE="${IMAGE:-vllm/vllm-openai:nightly}"      # PR #42270 not in a release yet
 CACHE_DIR="${CACHE_DIR:-/opt/dlami/nvme/vllm_cache}"
 PATCH_DIR="${PATCH_DIR:-$(cd "$(dirname "$0")/pr42270" && pwd)}"
@@ -42,9 +50,16 @@ if [ ! -f "$PATCH_DIR/mimo_v2.py" ]; then
     exit 1
 fi
 
+if [ "$CHUNKED" = "1" ]; then
+    CHUNKED_FLAG="--enable-chunked-prefill"
+else
+    CHUNKED_FLAG="--no-enable-chunked-prefill"
+fi
+
 echo "=========================================="
 echo "MiMo-V2.5 vLLM (single-node TP=$TP + EP, PR #42270, Docker)"
 echo "  Port: $PORT   max-model-len: $MAX_MODEL_LEN   max-num-seqs: $MAX_NUM_SEQS"
+echo "  chunked-prefill: $CHUNKED_FLAG"
 echo "=========================================="
 
 M=/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models
@@ -68,7 +83,7 @@ exec docker run --rm --gpus all \
         --max-model-len $MAX_MODEL_LEN \
         --max-num-seqs $MAX_NUM_SEQS \
         --no-enable-prefix-caching \
-        --no-enable-chunked-prefill \
+        $CHUNKED_FLAG \
         --host 0.0.0.0 \
         --port $PORT \
         --tool-call-parser mimo \

@@ -1,0 +1,43 @@
+INFO 07-21 23:06:02 [importing.py:53] Triton is installed but 0 active driver(s) found (expected 1). Disabling Triton to prevent runtime errors.
+INFO 07-21 23:06:02 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+W0721 23:06:03.214000 9 torch/utils/cpp_extension.py:140] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+INFO 07-21 23:06:04 [main.py:69] Unspecified platform detected, switching to CPU Platform instead.
+WARNING 07-21 23:06:04 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+[transformers] You are using a model of type `mimo_v2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[transformers] PreTrainedConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7fdfe6d9ac00>, trust_remote_code=False, seed=0, num_prompts=16, dataset_name='random', no_stream=False, dataset_path=None, no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=900, random_output_len=90, random_range_ratio='0.03', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='vllm', base_url=None, host='localhost', port=8000, endpoint='/v1/completions', header=None, max_concurrency=1, model='MiMo-V2.5', input_len=None, output_len=None, tokenizer='/wk/MiMo-V2.5', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=False, self_timed=None, percentile_metrics=None, metric_percentiles='99', goodput=None, request_id_prefix='bench-d08c46c8-', top_p=None, top_k=None, min_p=None, temperature=None, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+INFO 07-21 23:06:05 [utils.py:90] Sampling input_len from [873, 927] and output_len from [87, 93]
+WARNING: vllm bench serve no longer sets temperature==0 (greedy) in requests by default. The default will be determined on the server side and can be model/API specific. For the old behavior, include --temperature=0.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 1
+  0%|          | 0/16 [00:00<?, ?it/s]  6%|▋         | 1/16 [00:04<01:10,  4.69s/it] 12%|█▎        | 2/16 [00:05<00:31,  2.26s/it] 19%|█▉        | 3/16 [00:05<00:19,  1.49s/it] 25%|██▌       | 4/16 [00:06<00:13,  1.14s/it] 31%|███▏      | 5/16 [00:06<00:10,  1.07it/s] 38%|███▊      | 6/16 [00:07<00:08,  1.24it/s] 44%|████▍     | 7/16 [00:08<00:06,  1.37it/s] 50%|█████     | 8/16 [00:08<00:05,  1.49it/s] 56%|█████▋    | 9/16 [00:09<00:04,  1.56it/s] 62%|██████▎   | 10/16 [00:09<00:03,  1.61it/s] 69%|██████▉   | 11/16 [00:10<00:03,  1.66it/s] 75%|███████▌  | 12/16 [00:10<00:02,  1.70it/s] 81%|████████▏ | 13/16 [00:11<00:01,  1.72it/s] 88%|████████▊ | 14/16 [00:12<00:01,  1.73it/s] 94%|█████████▍| 15/16 [00:12<00:00,  1.73it/s]100%|██████████| 16/16 [00:13<00:00,  1.75it/s]100%|██████████| 16/16 [00:13<00:00,  1.21it/s]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     16        
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  13.21     
+Total input tokens:                      14404     
+Total generated tokens:                  1445      
+Request throughput (req/s):              1.21      
+Output token throughput (tok/s):         109.39    
+Peak output token throughput (tok/s):    169.00    
+Peak concurrent requests:                3.00      
+Total token throughput (tok/s):          1199.76   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          341.16    
+Median TTFT (ms):                        82.66     
+P99 TTFT (ms):                           3584.43   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          5.42      
+Median TPOT (ms):                        5.41      
+P99 TPOT (ms):                           5.49      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           5.42      
+Median ITL (ms):                         5.39      
+P99 ITL (ms):                            6.54      
+==================================================

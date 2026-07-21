@@ -134,34 +134,37 @@ Slightly faster (a single request uses all 8 GPUs instead of 4 per DP group):
 | 16 | 792.68  | 8699.94  | 17.66 | 186  | 726 |
 | 32 | 1570.83 | 17240.36 | 17.78 | 237  | 293 |
 
-**vLLM + PR #42270, TP=8 + EP** — `results/vllm_pr42270_c{1,16,32}.txt`:
+**vLLM + PR #42270, TP=8 + EP, chunked prefill ON (default)** —
+`results/vllm_chunked_c{1,16,32}.txt`:
 
 | Concurrency | Output throughput (tok/s) | Total throughput (tok/s) | TPOT median (ms) | TTFT median (ms) | TTFT P99 (ms) |
 |---|---|---|---|---|---|
-| 1  | 48.26   | 529.33   | 5.42  | 84  | 12469 |
-| 16 | 214.49  | 2354.09  | 16.74 | 224 | 16225 |
-| 32 | 1459.66 | 16020.21 | 18.31 | 273 | 715 |
+| 1  | 109.39  | 1199.76  | 5.41  | 83  | 3584 |
+| 16 | 923.54  | 10136.18 | 15.35 | 216 | 412  |
+| 32 | 1484.95 | 16297.79 | 18.20 | 255 | 697  |
 
-vLLM's median TPOT is actually the lowest of the three (5.4 ms at c=1), but with
-`--no-enable-chunked-prefill` (matching Trn2) its c=1/c=16 output throughput and
-tail TTFT suffer badly — each new request's 900-token prefill preempts decode
-(P99 TTFT 12–16 s at c≤16). By c=32 the pipeline stays saturated and vLLM catches
-SGLang (1460 vs 1421 out tok/s). SGLang's DP-attention absorbs the prefill
-interleaving far better at low/mid concurrency.
+vLLM has the **lowest TPOT** of all configs (5.4 ms at c=1) and, with chunked
+prefill, the **highest c=16 throughput** (924 tok/s). Chunked prefill is what
+makes the difference: with it OFF (`CHUNKED=0`, the exact Trn2-parity config,
+`results/vllm_pr42270_*`) each new request's 900-token prefill preempts decode
+and c=16 collapses to 214 tok/s with 16 s P99 TTFT. Turning it on interleaves
+prefill with decode and recovers ~4.3x at c=16.
 
 ### H100 vs Trn2 (vLLM-Neuron) — same 900/90 shape, out tok/s
 
-| Concurrency | SGLang DP=2 | SGLang CP=2 | vLLM+PR#42270 | Trn2 | best / Trn2 |
+| Concurrency | SGLang DP=2 | SGLang CP=2 | vLLM (chunked) | Trn2 | best / Trn2 |
 |---|---:|---:|---:|---:|---:|
-| 1  | 91.10   | 125.69  | 48.26   | 15.88  | **7.9×** |
-| 16 | 702.18  | 792.68  | 214.49  | 113.92 | **7.0×** |
-| 32 | 1420.97 | 1570.83 | 1459.66 | 147.39 | **10.7×** |
+| 1  | 91.10   | 125.69  | 109.39  | 15.88  | **7.9×** |
+| 16 | 702.18  | 792.68  | 923.54  | 113.92 | **8.1×** |
+| 32 | 1420.97 | 1570.83 | 1484.95 | 147.39 | **10.7×** |
 
 (Trn2 numbers from the main README's Performance section: BS=32, TP=64 /
-moe_ep=64, CB + bucketing.) The H100 gap is largest at c=32 because the GPU
-median ITL stays ~13–20 ms across concurrency while the Trn2 BS=32 TKG NEFF runs
-at a fixed ~58 ms/token regardless of occupancy.
+moe_ep=64, CB + bucketing.) All three GPU configs land within ~2x of each other;
+vLLM-chunked wins c=16, SGLang-CP2 wins c=1 and c=32. The H100/Trn2 gap is
+largest at c=32 because the GPU median ITL stays ~13–20 ms across concurrency
+while the Trn2 BS=32 TKG NEFF runs at a fixed ~58 ms/token regardless of occupancy.
 
-> **Note:** these are the *language-only, no-spec-decode* baselines for
-> apples-to-apples comparison with Trn2. Turning on EAGLE (`SPEC=1` on SGLang)
-> would raise decode throughput further; the model card's full recipe enables it.
+> **Note:** these are the *language-only, no-spec-decode* baselines. All GPU runs
+> keep prefix caching + speculative decode OFF; vLLM keeps chunked prefill ON
+> (the one optimization Neuron can't match — Trn2 uses fixed-shape CTE/TKG NEFFs).
+> Turning on EAGLE (`SPEC=1` on SGLang) would raise decode throughput further.
