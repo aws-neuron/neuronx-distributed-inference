@@ -196,6 +196,27 @@ class MiMoV2InferenceConfig(InferenceConfig):
         # Parse hybrid layer pattern
         self._parse_hybrid_pattern()
 
+    def _validate_chunked_attention_support(self):
+        """Skip the base class's chunked-attention validator for MiMo.
+
+        MiMo implements sliding-window attention ENTIRELY in its own modeling
+        code (the hand-rolled per-row sliding_mask, driven by
+        sliding_window_size), and never uses the base class's framework-level
+        "chunked attention" path. The HF config carries attention_chunk_size
+        (== sliding_window = 128), which InferenceConfig absorbs as an
+        attribute and which trips the base _validate_chunked_attention_support:
+        that validator hard-requires attention_dp_degree == 1 (among others),
+        which would forbid the data-parallel attention we use to eliminate the
+        CONVERT_TO_MHA KV replication. Since the chunked-attention code path is
+        inapplicable to MiMo, this validator is a no-op here.
+
+        Note: the base calls validate_config() (hence this) at the END of
+        InferenceConfig.__init__, i.e. during MiMoV2InferenceConfig's
+        super().__init__() — so overriding the method (rather than deleting the
+        attribute afterward) is what actually takes effect in time.
+        """
+        return
+
     def _parse_hybrid_pattern(self):
         """Parse hybrid layer pattern to determine attention types."""
         if hasattr(self, 'hybrid_layer_pattern') and self.hybrid_layer_pattern:
@@ -359,7 +380,10 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 config.num_key_value_heads,
                 getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
             )
-            self.local_cache_kv_heads = max(1, self.cache_num_kv_heads // tp_degree)
+            # Divide by the attention TP degree (== full tp_degree when DP=1),
+            # matching DataParallelKVCacheManager._get_num_kv_heads_per_rank
+            # which sizes the per-rank cache as num_kv_heads // (tp // dp).
+            self.local_cache_kv_heads = max(1, self.cache_num_kv_heads // self.attn_tp_degree)
 
     def init_gqa_properties(self):
         """Override base class to prevent creating incompatible QKV projections.
@@ -383,8 +407,23 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         dtype = config.neuron_config.torch_dtype
         tp_degree = config.neuron_config.tp_degree
 
-        # Check if we need GQA CONVERT_TO_MHA (when tp_degree > num_kv_heads)
-        self.use_gqa_convert_to_mha = tp_degree > self.attn_num_kv_heads
+        # Data-parallel attention: when attention_dp_degree > 1, attention runs
+        # on a reduced TP group of size tp_degree // attention_dp_degree, while
+        # MoE keeps the full TP/EP. This lets attn TP == num_kv_heads so no
+        # CONVERT_TO_MHA replication is needed (killing the 8-16x KV cache
+        # bloat). We run BOTH prefill (CTE) and decode (TKG) on this same
+        # reduced group (unlike the base class which uses full-TP CTE + a
+        # DP-TP decode + rank reordering); this avoids the base's
+        # validate_tp_prefill_to_dp_decode assertion, which the SWA layers
+        # (8 kv heads) would otherwise fail. See the attn_dp design memo.
+        self.attention_dp_degree = getattr(
+            config.neuron_config, "attention_dp_degree", 1
+        ) or 1
+        self.attn_tp_degree = tp_degree // self.attention_dp_degree
+
+        # Check if we need GQA CONVERT_TO_MHA. With DP attention the relevant
+        # comparison is the *attention* TP degree, not the full TP degree.
+        self.use_gqa_convert_to_mha = self.attn_tp_degree > self.attn_num_kv_heads
 
         # Store source heads for preshard_hook
         self._src_num_kv_heads = self.attn_num_kv_heads
@@ -405,7 +444,17 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         o_hidden_size = self.attn_num_heads * self.attn_v_head_dim
 
         if parallel_state.model_parallel_is_initialized():
-            tp_group = parallel_state.get_tensor_model_parallel_group()
+            if self.attention_dp_degree > 1:
+                # Bind attention projections to the reduced DP-attention TP
+                # group (size = attn_tp_degree). init is idempotent/global.
+                from neuronx_distributed_inference.modules.attention.attention_process_groups import (
+                    init_data_parallel_attention_process_groups,
+                    get_data_parallel_attention_tp_group,
+                )
+                init_data_parallel_attention_process_groups(config)
+                tp_group = get_data_parallel_attention_tp_group()
+            else:
+                tp_group = parallel_state.get_tensor_model_parallel_group()
 
             # Q projection
             self.q_proj = ColumnParallelLinear(
@@ -449,13 +498,14 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 sequence_dimension=1 if self.sequence_parallel_enabled else None,
             )
 
-            # Calculate local dimensions after TP split
-            self.local_num_heads = self.attn_num_heads // tp_degree
+            # Calculate local dimensions after the *attention* TP split
+            # (attn_tp_degree = tp_degree // attention_dp_degree).
+            self.local_num_heads = self.attn_num_heads // self.attn_tp_degree
             if self.use_gqa_convert_to_mha:
                 # With CONVERT_TO_MHA, local KV heads = local Q heads
                 self.local_num_kv_heads = self.local_num_heads
             else:
-                self.local_num_kv_heads = max(1, self.attn_num_kv_heads // tp_degree)
+                self.local_num_kv_heads = max(1, self.attn_num_kv_heads // self.attn_tp_degree)
         else:
             self.q_proj = nn.Linear(config.hidden_size, q_hidden_size, bias=config.attention_bias)
             self.k_proj = nn.Linear(config.hidden_size, k_hidden_size, bias=config.attention_bias)
@@ -552,10 +602,46 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 hidden_states, dim=1, rank=cp_rank, num_partitions=self.cp_degree
             )
 
-        bsz, q_len, _ = hidden_states.size()
-
         # Determine if this is token generation (past_key_value is not None)
         is_token_gen = past_key_value is not None
+
+        # Data-parallel attention (decode only): split the batch across the
+        # attention DP groups so each group processes batch // dp rows against
+        # its own slice of the KV cache (DataParallelKVCacheManager sizes the
+        # cache to kv_cache_batch_size = tkg_batch // dp). Prefill (CTE) runs on
+        # every DP group redundantly at ctx_batch_size=1 (only the owning
+        # group's KV write persists); we accept the redundant prefill compute
+        # to keep the CTE/TKG head layout identical (see attn_dp design memo).
+        is_data_parallel_attn = (
+            is_token_gen
+            and self.attention_dp_degree > 1
+            and parallel_state.model_parallel_is_initialized()
+        )
+        if is_data_parallel_attn:
+            from neuronx_distributed_inference.modules.attention.attention_process_groups import (
+                get_data_parallel_attention_dp_group,
+            )
+            from neuronx_distributed_inference.utils.distributed import get_dp_rank
+
+            dp_rank = get_dp_rank(
+                self.rank_util.get_rank(),
+                self.attn_tp_degree,
+                self.attention_dp_degree,
+                self.neuron_config.switch_cc,
+            )
+            hidden_states = split_along_dim(
+                hidden_states, dim=0, rank=dp_rank, num_partitions=self.attention_dp_degree
+            )
+            if attention_mask is not None:
+                attention_mask = split_along_dim(
+                    attention_mask, dim=0, rank=dp_rank, num_partitions=self.attention_dp_degree
+                )
+            if position_ids is not None:
+                position_ids = split_along_dim(
+                    position_ids, dim=0, rank=dp_rank, num_partitions=self.attention_dp_degree
+                )
+
+        bsz, q_len, _ = hidden_states.size()
 
         # Project Q, K, V
         query_states = self.q_proj(hidden_states)
@@ -617,9 +703,19 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 q_len = q_len // self.cp_degree
                 # K/V stay at full S for attention computation
             else:
-                # Q/K/V have S/CP. Save local KV for cache, then all-gather K/V.
-                key_states_for_cache = key_states
-                value_states_for_cache = value_states
+                # Q/K/V have S/CP. All-gather K/V to full S, then save the
+                # FULL-S K/V for the cache.
+                #
+                # BUGFIX: the cache must hold ALL sequence positions, not just
+                # this CP rank's local S/CP chunk. Previously key/value_states_for_cache
+                # were assigned the local chunk BEFORE the gather, so the
+                # DataParallelKVCacheManager wrote only ~1/cp_degree of the
+                # sequence's KV. Decode then attended to a wildly incomplete
+                # context (only the owning CP-group chunk), producing
+                # grammatical-but-wrong / repetitive / drifting output that
+                # degraded with generation length. The base class gathers first
+                # then caches the full-S tensor (attention_base.py:548-563); we
+                # now match that.
                 key_states = gather_from_tensor_model_parallel_region_with_dim(
                     key_states, gather_dim=2,
                     process_group=get_context_parallel_attention_cp_group(),
@@ -628,6 +724,8 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                     value_states, gather_dim=2,
                     process_group=get_context_parallel_attention_cp_group(),
                 )
+                key_states_for_cache = key_states
+                value_states_for_cache = value_states
                 # Q stays at S/CP
         else:
             # Store key/value states BEFORE GQA repeat for KV cache
@@ -752,8 +850,14 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             # This must be applied to token generation as well!
             use_sink = self._use_sink_bias and self.attention_sink_bias is not None
             if use_sink:
-                tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.model_parallel_is_initialized() else 0
-                local_sink = self.attention_sink_bias[tp_rank * self.local_num_heads:(tp_rank + 1) * self.local_num_heads]
+                global_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.model_parallel_is_initialized() else 0
+                # Under DP attention the Q heads are sharded across the reduced
+                # TP group (attn_tp_degree), and every DP group shards the 64
+                # heads identically. The sink bias (stored per global head) must
+                # be indexed by the rank WITHIN the attention TP group, not the
+                # global rank, else ranks >= attn_tp_degree index out of bounds.
+                attn_tp_rank = global_rank % self.attn_tp_degree
+                local_sink = self.attention_sink_bias[attn_tp_rank * self.local_num_heads:(attn_tp_rank + 1) * self.local_num_heads]
                 sink_bias = local_sink.reshape(1, -1, 1, 1).expand(bsz, -1, q_len, 1)
                 all_scores = torch.cat([all_scores, sink_bias], dim=-1)
 
@@ -813,9 +917,12 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             # This adds an extra "sink" column to attention weights
             use_sink = self._use_sink_bias and self.attention_sink_bias is not None
             if use_sink:
-                # Get local portion of sink bias for this TP rank
-                tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.model_parallel_is_initialized() else 0
-                local_sink = self.attention_sink_bias[tp_rank * self.local_num_heads:(tp_rank + 1) * self.local_num_heads]
+                # Get local portion of sink bias for this rank. Index by the
+                # rank WITHIN the attention TP group (see decode path above);
+                # equals the global rank when attention_dp_degree == 1.
+                global_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.model_parallel_is_initialized() else 0
+                attn_tp_rank = global_rank % self.attn_tp_degree
+                local_sink = self.attention_sink_bias[attn_tp_rank * self.local_num_heads:(attn_tp_rank + 1) * self.local_num_heads]
                 # Reshape and expand: [local_num_heads] -> [bsz, local_num_heads, q_len, 1]
                 sink_bias = local_sink.reshape(1, -1, 1, 1).expand(bsz, -1, q_len, 1)
                 attn_weights = torch.cat([attn_weights, sink_bias], dim=-1)
@@ -851,8 +958,19 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
 
         attn_output = self.o_proj(attn_output)
 
-        # Prepare KV cache output - return as tuple for KV cache manager
-        # Return LOCAL key/value states for cache (each CP rank stores its portion)
+        # Data-parallel attention: gather the per-DP-group batch shards back to
+        # the full batch (dim 0) before the residual add and the MoE, which run
+        # at full TP/EP and expect the full batch. Mirrors the base class's
+        # post-attention DP all-gather.
+        if is_data_parallel_attn:
+            attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                attn_output, gather_dim=0,
+                process_group=get_data_parallel_attention_dp_group(),
+            )
+
+        # Prepare KV cache output - return as tuple for KV cache manager.
+        # Under DP attention these are the DP-local (batch // dp) shards, which
+        # DataParallelKVCacheManager writes into this group's cache slice.
         new_key_value = (key_states_for_cache, value_states_for_cache)
 
         return attn_output, new_key_value, cos_cache, sin_cache
@@ -1000,13 +1118,23 @@ class NeuronMiMoV2Model(NeuronBaseModel):
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
 
-        # Check if we need GQA CONVERT_TO_MHA mode
-        # When tp_degree > num_kv_heads, we replicate K/V to match num_attention_heads
+        # Attention TP degree under data-parallel attention (== tp_degree when
+        # attention_dp_degree == 1). Must match NeuronMiMoV2Attention so the KV
+        # cache shape agrees with the per-layer projections.
+        attention_dp_degree = getattr(
+            config.neuron_config, "attention_dp_degree", 1
+        ) or 1
+        attn_tp_degree = self.tp_degree // attention_dp_degree
+
+        # Check if we need GQA CONVERT_TO_MHA mode. Under DP attention the
+        # decisive comparison is attn_tp_degree, not the full tp_degree: if
+        # attn_tp_degree <= num_kv_heads the KV heads shard cleanly with no
+        # replication, so MHA conversion (and its 8-16x cache bloat) is off.
         min_kv_heads = min(
             config.num_key_value_heads,
             getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
         )
-        self.use_gqa_convert_to_mha = self.tp_degree > min_kv_heads
+        self.use_gqa_convert_to_mha = attn_tp_degree > min_kv_heads
 
         if self.use_gqa_convert_to_mha:
             # With CONVERT_TO_MHA, KV cache stores num_attention_heads (same as Q)
@@ -1124,9 +1252,19 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
     full_num_kv_heads = config.num_key_value_heads  # 4
     swa_num_kv_heads = config.swa_num_key_value_heads  # 8
 
+    # Under data-parallel attention the K/V weights must be replicated only if
+    # the *attention* TP degree (tp_degree // attention_dp_degree) exceeds the
+    # kv-head count. With attention_dp_degree chosen so attn_tp <= kv_heads,
+    # both gates are False and the checkpoint loads at its native head width
+    # (no replication) — this is what removes the KV cache bloat.
+    attention_dp_degree = getattr(
+        config.neuron_config, "attention_dp_degree", 1
+    ) or 1
+    attn_tp_degree = tp_degree // attention_dp_degree
+
     # Check if we need to replicate K/V weights
-    full_use_convert_to_mha = tp_degree > full_num_kv_heads
-    swa_use_convert_to_mha = tp_degree > swa_num_kv_heads
+    full_use_convert_to_mha = attn_tp_degree > full_num_kv_heads
+    swa_use_convert_to_mha = attn_tp_degree > swa_num_kv_heads
 
     for layer_idx in range(config.num_hidden_layers):
         # Add rank utility for attention
