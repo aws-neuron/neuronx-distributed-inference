@@ -44,3 +44,32 @@ All runs: 0 failures (2 / 32 / 64 prompts at c=1 / 16 / 32).
 
 > These are the H100 reference numbers for a direct comparison against the Trn2
 > 16K-compiled port at 15K/1K. Language-only, no prefix caching, no spec decode.
+
+## Cross-platform: H100 vs Trn2 (15K in / 1K out)
+
+Trn2 numbers from the main README's "Long Context" section (trn2.48xlarge,
+seq_len=16384, `tp=64, attention_dp=16, cp=16, moe_ep=64`, BS=32).
+
+**Output throughput (tok/s):**
+
+| Concurrency | Trn2 | H100 SGLang | H100 vLLM | SGLang / Trn2 |
+|---|---:|---:|---:|---:|
+| 1  | 4.49  | 94.6   | 82.7   | **21×** |
+| 16 | 48.49 | 867.8  | 712.5  | **18×** |
+| 32 | 74.01 | 1255.2 | 1181.7 | **17×** |
+
+**TTFT median (ms, lower = faster first token):**
+
+| Concurrency | Trn2 | H100 SGLang | H100 vLLM | Trn2 / SGLang |
+|---|---:|---:|---:|---:|
+| 1  | 6051  | 699  | 6587 | 8.7× slower |
+| 16 | 17985 | 1336 | 1132 | 13× slower |
+| 32 | 23941 | 1473 | 2054 | 16× slower |
+
+At 16K context the H100/Trn2 gap widens to **~17–21× throughput** (vs ~7–11× at
+the short 900/90 shape) — long context is where Trn2 is hit hardest. Both
+platforms are prefill-bound here, but Trn2 more severely: it must serve 16K via
+`cp=dp=16` with `chunked_prefill=false`, so 16K prefills run one-at-a-time and
+queue (main-README Trn2 P99 TTFT reaches ~187 s at c=32). A single 16K prefill is
+~6.06 s on Trn2 vs ~0.7 s on H100 SGLang. Trn2 also cannot currently fit 32K
+(HBM overflow), while single-node H100 can (see `../../` 32K exploration).
