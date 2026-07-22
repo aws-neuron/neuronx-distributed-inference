@@ -168,3 +168,46 @@ while the Trn2 BS=32 TKG NEFF runs at a fixed ~58 ms/token regardless of occupan
 > keep prefix caching + speculative decode OFF; vLLM keeps chunked prefill ON
 > (the one optimization Neuron can't match — Trn2 uses fixed-shape CTE/TKG NEFFs).
 > Turning on EAGLE (`SPEC=1` on SGLang) would raise decode throughput further.
+
+## Long-context: 32K input, how far does concurrency go? (SGLang)
+
+How many concurrent 32K-input requests can one 8xH100 node sustain? Server:
+`run_sglang_h100_32k.sh` (cookbook DP=2, `--context-length 34816
+--mem-fraction-static 0.9`). Sweep: `bench_32k.sh 1 8 16 32 64 128` (32K input /
+128 output, `2*c` prompts per level). Raw logs in `results/longctx_32k/`.
+
+| Client concurrency (`--max-concurrency`) | Succeeded | Total throughput (tok/s) | TTFT median (s) | TTFT P99 (s) | TPOT median (ms) |
+|---|---|---|---|---|---|
+| 1   | 2/2 ✅     | 11597 | 1.6  | 2.1  | 9.9  |
+| 8   | 16/16 ✅   | 39038 | 3.6  | 5.3  | 24   |
+| 16  | 32/32 ✅   | 43433 | 5.9  | 10.3 | 48   |
+| 32  | 64/64 ✅   | 46423 | 11.0 | 20.6 | 92   |
+| 64  | 128/128 ✅ | 46227 | 20.4 | 42.9 | 173  |
+| 128 | 256/256 ✅ | 46253 | 64.9 | 87.7 | 196  |
+
+**Answer: up to c=128 completes with zero failures** — but that's the client's
+in-flight count, absorbed by SGLang's queue. Two different "concurrency" numbers:
+
+- **Client concurrency** (`Maximum request concurrency` in the bench output) = the
+  value passed to `--max-concurrency`; the client keeps that many requests
+  in-flight. Everything from 1 to 128 runs clean.
+- **Server-side resident** (`#running-req` in the server log) peaks at **~20–27**,
+  regardless of how high the client pushes; the rest sit in the queue
+  (`#queue-req` peaked at ~55 at c=128). This ceiling is the KV pool:
+  `max_total_num_tokens = 678149` / 32768 ≈ **20.7 fully-resident 32K requests**.
+
+**Why 32K fits at all**: hybrid attention. Only 9 of 48 layers are full attention;
+the 39 sliding-window layers (window 128) have window-capped KV. At 32K the server
+logs **full-token usage ≈ 0.39, SWA-token usage ≈ 0.08** — the long prompt's KV is
+dominated by just the 9 full layers, so KV per request (~780 MB) is far below a
+same-size dense model.
+
+**Practical guidance**:
+- **Max throughput** saturates by **c=16–32** (~46K tok/s total, prefill-bound);
+  higher concurrency only grows the queue, not throughput.
+- **Low TTFT** (no queueing): keep client concurrency **≤ ~20** (≈ resident cap).
+- **c=64/128 works** but is pure queueing — throughput flat, TTFT climbs to the
+  minute range. Bump `--mem-fraction-static` toward 0.92+ to raise the resident cap.
+
+> **Trn2 comparison (pending)**: the c=32 row is the intended cross-platform point.
+> Trn2 32K-input / c=32 numbers to be filled in once measured.
