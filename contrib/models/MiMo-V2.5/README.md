@@ -409,6 +409,70 @@ Observations:
 
 > **Compile time:** the first MiMo-V2.5 compile on SDK 2.29 is ~30 minutes (TKG + CE HLO compilation, weight layout optimization, then `shard_checkpoint` for 64 ranks which dominates at ~27 minutes). Subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and the NEFF loads in ~1 minute. `save_sharded_checkpoint=true` persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the `shard_checkpoint` pass entirely.
 
+## Long Context (up to 16K, data-parallel + context-parallel attention)
+
+The default recipe (`attention_dp_degree=1`) forces `CONVERT_TO_MHA` because
+`tp_degree=64 > num_kv_heads (4 full / 8 SWA)`, replicating K/V up to 64 heads.
+That 8-16x KV-cache bloat caps `seq_len` at ~512 on 64 cores. To serve long
+context, combine three settings in `override_neuron_config`:
+
+| Setting | Purpose |
+|---|---|
+| `attention_dp_degree=16` | Attention runs at TP = 64/16 = 4 = num_kv_heads (zero KV replication, no CONVERT_TO_MHA). Decode splits the batch across 16 DP groups; MoE stays EP=64. |
+| `cp_degree=16` | Context parallelism splits the prefill sequence 16 ways so the context-encoding compute graph stays under the compiler's ~10M-instruction limit (a single unsplit 16K CTE graph is ~10.1M and fails). |
+| `sequence_parallel_enabled=false` | MiMo's hand-rolled CP path (asymmetric head_dim 192/128 precludes the base fused-QKV CP kernel) uses the SP=false branch. |
+
+**Constraint: `cp_degree == attention_dp_degree`.** With `cp != dp` the base KV
+manager engages a CP→DP head-remap (`get_kv_head_indices_context_parallel_dp_decode`)
+that asserts `tp_degree/dp_degree >= num_kv_heads`; MiMo's 8 SWA KV heads
+violate it (64/16 = 4 < 8). Keeping `cp == dp` skips that path.
+
+Validated at **seq_len=16384** (`tp_degree=64, attention_dp_degree=16,
+cp_degree=16, moe_ep_degree=64`, BS=32). Outputs are factually correct
+(e.g. "The author of Hamlet is William Shakespeare"). DP=1 cannot serve 16K —
+its KV cache alone would need ~1.2 TB, exceeding total HBM.
+
+### Long-context throughput (trn2.48xlarge, seq_len=16384, FP8, cp=dp=16, BS=32)
+
+Input/output 15000 / 1000 tokens (random dataset):
+
+| Concurrency | Output throughput (tok/s) | TTFT median (ms) | TTFT P99 (ms) | TPOT median (ms) |
+|---|---|---|---|---|
+| 1 | 4.49 | 6051 | 6059 | 217 |
+| 16 | 48.49 | 17985 | 93566 | 275 |
+| 32 | 74.01 | 23941 | 186927 | 352 |
+
+Observations:
+- **Throughput scales with concurrency** (4.5 -> 48.5 -> 74.0 tok/s) as decode
+  batching fills up.
+- **TTFT dominates at high concurrency**: a 15K-token prefill is expensive even
+  split 16 ways via CP, and with `chunked_prefill=false` those prefills queue —
+  P99 TTFT reaches ~187 s at c=32. Long context on a single node trades TTFT for
+  throughput; keep concurrency low for latency-sensitive use.
+
+### Prefill-only cost (input 16000 / output 10, isolates TTFT = prefill time)
+
+| Concurrency | TTFT median (ms) | TTFT mean (ms) | TTFT P99 (ms) |
+|---|---|---|---|
+| 1 | 6055 | 6055 | 6071 |
+| 16 | 47955 | 46900 | 93495 |
+| 32 | 89942 | 90806 | 186959 |
+
+- A single 16K prefill costs **~6.06 s** (cp=16, 48 layers of 256-expert MoE).
+  This matches the c=1 TTFT of the 15K/1K run, confirming TTFT there is
+  essentially the prefill.
+- TTFT grows ~linearly with concurrency because `chunked_prefill=false` runs one
+  context-encoding pass at a time — 16 requests queue to ~48 s, 32 to ~90 s
+  median. The prefill queue, not decode, is the long-context bottleneck; enabling
+  chunked prefill would help but is not currently wired with DP attention.
+
+> **32K note:** seq_len=32768 does not currently fit. `cp=dp=16` compiles but a
+> single core's HBM overflows (KV tensors ~12.7 GB + 32K activation scratchpad
+> ~9.8 GB > 24 GB); `cp=32,dp=16` hits the `cp != dp` head-remap assertion; and
+> `cp=dp=32` triggers a compiler-backend (walrus) failure. 32K needs further
+> work (lower batch while satisfying the MoE EP floor, or adopting the base
+> class's CP machinery).
+
 ## Compatibility Matrix
 
 | Instance | Neuron SDK 2.29+ (PyTorch 2.9) | 2.21 and earlier |
@@ -426,7 +490,7 @@ pytest contrib/models/MiMo-V2.5/test/integration/test_model.py -v
 ## Key Implementation Notes
 
 1. **Hybrid Attention**: `hybrid_layer_pattern` list determines full vs sliding window per layer; the modeling code constructs one `NeuronMiMoV2Attention` per layer with the correct `is_sliding_window` flag and rope_theta.
-2. **CONVERT_TO_MHA**: When `tp_degree > num_kv_heads` (64 > 4 full / 64 > 8 SWA), K/V are replicated to `num_attention_heads` (64) during state-dict conversion; this applies to both `.weight` and the per-row `.scale` on the FP8 path.
+2. **CONVERT_TO_MHA**: When the *attention* TP degree `tp_degree // attention_dp_degree > num_kv_heads` (default: 64 > 4 full / 64 > 8 SWA), K/V are replicated to `num_attention_heads` (64) during state-dict conversion; this applies to both `.weight` and the per-row `.scale` on the FP8 path. Setting `attention_dp_degree=16` makes attn TP = 4 = num_kv_heads, disabling replication (see "Long Context" above) — the gate keys off `attn_tp_degree`, so `attention_dp_degree=1` preserves the original full-replication behavior.
 3. **Attention Sink Bias**: Learnable per-head bias added as an extra "sink" column to attention scores in sliding window layers (not added in full-attention layers). Per-rank slicing of the bias happens inside `forward()` based on `parallel_state.get_tensor_model_parallel_rank()`.
 4. **Fused qkv split in preprocess**: V2.5's HF checkpoint stores `self_attn.qkv_proj.weight` as 4 interleaved Q/K/V groups (see "Checkpoint Preparation" above). The preprocess script must slice these groups — naïve `[Q|K|V]` concat slicing produces garbage outputs.
 5. **weight_map rebuild**: V2.5's `model.safetensors.index.json` references legacy `model_N-00001-of-00002.safetensors` filenames that do not match the actual `model_pp0_epN_shardM.safetensors` objects on disk. `LazyWeightMap` scans the on-disk shards at startup and rebuilds `weight_map` directly from each file's manifest; the inconsistent index is ignored.
