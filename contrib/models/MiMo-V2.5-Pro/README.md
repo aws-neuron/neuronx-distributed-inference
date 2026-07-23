@@ -495,6 +495,34 @@ Notes:
 
 > **Compile time:** the first Pro compile on SDK 2.29 is ~60 minutes for the TKG NEFF and ~15 minutes for the CTE NEFF; subsequent runs with the same `override_neuron_config` hit the neuronx-cc cache and start in ~1-2 minutes. `save_sharded_checkpoint=true` additionally persists per-rank FP8 shards under `<compiled-path>/weights/`, letting future `load()` calls skip the ~10-minute shard_checkpoint pass. First full server launch (compile + shard + warmup) is ~2 hours wall-clock.
 
+## Long Context (infrastructure present, not yet serving > 512)
+
+The modeling code carries the same data-parallel + context-parallel attention
+infrastructure as MiMo-V2.5 (`attention_dp_degree`, `cp_degree`, the CP full-S
+KV-cache fix, and the chunked-attention validator override). It is backward
+compatible: at `attention_dp_degree=1` (the default 512 recipe) it reduces to
+the original behavior.
+
+**However, long context does not yet run on Pro.** `seq_len=4096` with
+`attention_dp_degree=8` compiles, but a single NeuronCore's HBM overflows at
+load:
+
+| HBM component (per core, dp=8) | Size |
+|---|---|
+| Tensors (weights ~19.4 GB + KV ~1.3 GB) | 20.7 GB |
+| Scratchpad (4K activations) | 2.0 GB |
+| Model code | 1.05 GB |
+| **Total** | **~23.8 / 24 GB → overflow** |
+
+Pro's weights (384 experts x 70 layers) already sit near the per-core limit, and
+DP attention adds per-DP-group weight replication that tips it over. KV is only
+~1.3 GB, so lowering the batch or raising `attention_dp_degree` (which shrinks
+KV) does not help — the weights are the bottleneck. Serving Pro beyond 512 needs
+weight-side relief (`moe_tp>1` sharding, currently blocked by the FP8 blockwise
+scale collapse — see "FP8 Configuration Notes"; or more aggressive quantization),
+not parallelism tuning. The sibling **MiMo-V2.5** (smaller weights) validates the
+same DP+CP approach at **seq_len=16384**.
+
 ## Compatibility Matrix
 
 | Instance | Neuron SDK 2.29+ (PyTorch 2.9) | 2.21 and earlier |
