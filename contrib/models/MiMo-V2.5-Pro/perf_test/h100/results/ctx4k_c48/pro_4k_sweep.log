@@ -1,0 +1,43 @@
+===== c=1 ISL=4096 OSL=128 np=2 =====
+WARNING 07-23 01:40:10 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Maximum request concurrency: 1
+Successful requests:                     2         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  8.64      
+Total input tokens:                      8313      
+Output token throughput (tok/s):         29.40     
+Total token throughput (tok/s):          991.51    
+Median TTFT (ms):                        629.30    
+P99 TTFT (ms):                           703.31    
+Median TPOT (ms):                        29.29     
+--- c=1 done ---
+===== c=16 ISL=4096 OSL=128 np=32 =====
+WARNING 07-23 01:40:40 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Maximum request concurrency: 16
+Successful requests:                     32        
+Failed requests:                         0         
+Maximum request concurrency:             16        
+Benchmark duration (s):                  17.40     
+Total input tokens:                      131287    
+Output token throughput (tok/s):         235.24    
+Total token throughput (tok/s):          7778.90   
+Median TTFT (ms):                        1723.10   
+P99 TTFT (ms):                           4262.25   
+Median TPOT (ms):                        51.30     
+--- c=16 done ---
+===== c=48 ISL=4096 OSL=128 np=96 =====
+WARNING 07-23 01:41:20 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Maximum request concurrency: 48
+Successful requests:                     96        
+Failed requests:                         0         
+Maximum request concurrency:             48        
+Benchmark duration (s):                  33.46     
+Total input tokens:                      393608    
+Output token throughput (tok/s):         368.49    
+Total token throughput (tok/s):          12132.52  
+Median TTFT (ms):                        3054.62   
+P99 TTFT (ms):                           10918.00  
+Median TPOT (ms):                        100.09    
+--- c=48 done ---
+ALL_DONE
