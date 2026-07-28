@@ -1,0 +1,47 @@
+mkdir: cannot create directory '/opt/dlami/nvme/models/bench_results/mimo_v2_5_h100/ctx15k_sglang': Permission denied
+===== sglang c=1 ISL=15000 OSL=1000 np=2 =====
+tee: /opt/dlami/nvme/models/bench_results/mimo_v2_5_h100/ctx15k_sglang/c1.txt: No such file or directory
+WARNING 07-22 23:09:55 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Maximum request concurrency: 1
+Successful requests:                     2         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  21.00     
+Total input tokens:                      30439     
+Output token throughput (tok/s):         94.61     
+Total token throughput (tok/s):          1544.02   
+Median TTFT (ms):                        698.86    
+P99 TTFT (ms):                           898.13    
+Median TPOT (ms):                        9.88      
+--- c=1 done ---
+===== sglang c=16 ISL=15000 OSL=1000 np=32 =====
+tee: /opt/dlami/nvme/models/bench_results/mimo_v2_5_h100/ctx15k_sglang/c16.txt: No such file or directory
+WARNING 07-22 23:10:38 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Maximum request concurrency: 16
+Successful requests:                     32        
+Failed requests:                         0         
+Maximum request concurrency:             16        
+Benchmark duration (s):                  36.86     
+Total input tokens:                      480778    
+Output token throughput (tok/s):         867.75    
+Total token throughput (tok/s):          13911.65  
+Median TTFT (ms):                        1336.45   
+P99 TTFT (ms):                           4500.89   
+Median TPOT (ms):                        16.66     
+--- c=16 done ---
+===== sglang c=32 ISL=15000 OSL=1000 np=64 =====
+tee: /opt/dlami/nvme/models/bench_results/mimo_v2_5_h100/ctx15k_sglang/c32.txt: No such file or directory
+WARNING 07-22 23:11:39 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Maximum request concurrency: 32
+Successful requests:                     64        
+Failed requests:                         0         
+Maximum request concurrency:             32        
+Benchmark duration (s):                  51.03     
+Total input tokens:                      960566    
+Output token throughput (tok/s):         1255.16   
+Total token throughput (tok/s):          20080.10  
+Median TTFT (ms):                        1473.42   
+P99 TTFT (ms):                           8828.01   
+Median TPOT (ms):                        22.10     
+--- c=32 done ---
+ALL_DONE
