@@ -329,6 +329,47 @@ def test_block_kv_get_kv_by_layer_id_with_dequantization():
     assert v_cache.dtype == torch.float32
 
 
+def test_block_kv_prefix_quantization_dequantizes_selected_blocks_only():
+    kv_quant_config = KVQuantizationConfig(
+        quant_dtype=torch.bfloat16,
+        direct_cast=True,
+    )
+
+    kv_cache_mgr = _pa_prepare_cache_mgr(
+        tp_degree=1,
+        batch_size=1,
+        pa_num_blocks=16,
+        pa_block_size=128,
+        num_attention_heads=8,
+        num_kv_head=4,
+        hidden_size=32,
+        num_hidden_layers=2,
+        is_prefix_caching=True,
+        kv_quant_config=kv_quant_config,
+    )
+    seen_shapes = []
+    original_dequantize = kv_cache_mgr._dequantize_cache
+
+    def record_dequantize(cache_tensor, layer_idx, is_key=True):
+        seen_shapes.append((is_key, tuple(cache_tensor.shape)))
+        return original_dequantize(cache_tensor, layer_idx, is_key=is_key)
+
+    kv_cache_mgr._dequantize_cache = record_dequantize
+
+    block_table = torch.tensor([[0, 2]], dtype=torch.int64)
+    k_cache, v_cache = kv_cache_mgr.get_kv_by_layer_id(
+        idx=0,
+        active_block_table=block_table,
+    )
+
+    assert k_cache.dtype == torch.float32
+    assert v_cache.dtype == torch.float32
+    assert seen_shapes == [
+        (True, (1, 4, 256, 4)),
+        (False, (1, 4, 256, 4)),
+    ]
+
+
 def test_block_kv_direct_cast_update_integration():
     """Test update_kv_by_layer_id with direct_cast quantization."""
     kv_quant_config = KVQuantizationConfig(
@@ -491,6 +532,89 @@ def test_prefix_caching_reading_kv_cache():
             hidden_size // num_attention_heads,
         )
         assert torch.equal(actual, expected)
+
+
+def test_prefix_caching_reading_maps_invalid_block_ids_to_padding_block():
+    kv_cache_mgr = _pa_prepare_cache_mgr(
+        tp_degree=1,
+        batch_size=1,
+        pa_num_blocks=4,
+        pa_block_size=128,
+        seq_len=128 * 128,
+        num_attention_heads=4,
+        num_kv_head=2,
+        hidden_size=8,
+        num_hidden_layers=1,
+        is_prefix_caching=True,
+    )
+    assert not kv_cache_mgr.block_tiling
+    _pa_mock_kv_cache_in_mgr(kv_cache_mgr)
+
+    pad_block_id = kv_cache_mgr.pa_num_blocks
+    kv_cache_mgr.past_key_values[0].data[pad_block_id].fill_(99)
+    safe_table = BlockKVCacheManager._safe_active_block_table(
+        torch.tensor([[0, -1, 2, 999]], dtype=torch.int64),
+        kv_cache_mgr.pa_num_blocks + BlockKVCacheManager._NUM_EXTRA_RESERVED_BLOCK,
+    )
+    assert torch.equal(
+        safe_table,
+        torch.tensor([[0, pad_block_id, 2, pad_block_id]], dtype=torch.int64),
+    )
+
+    k_cache, _ = kv_cache_mgr.get_kv_by_layer_id(
+        idx=0,
+        active_block_table=torch.tensor([[0, -1, 2, 999]], dtype=torch.int64),
+    )
+    assert torch.equal(k_cache[:, :, :128, :], torch.zeros_like(k_cache[:, :, :128, :]))
+    assert torch.equal(
+        k_cache[:, :, 128:256, :],
+        torch.full_like(k_cache[:, :, 128:256, :], 99),
+    )
+    assert torch.equal(
+        k_cache[:, :, 256:384, :],
+        torch.full_like(k_cache[:, :, 256:384, :], 2),
+    )
+    assert torch.equal(
+        k_cache[:, :, 384:512, :],
+        torch.full_like(k_cache[:, :, 384:512, :], 99),
+    )
+
+
+def test_prefix_caching_tiled_reading_maps_invalid_block_ids_to_padding_block():
+    kv_cache_mgr = _pa_prepare_cache_mgr(
+        tp_degree=1,
+        batch_size=2,
+        pa_num_blocks=16,
+        pa_block_size=128,
+        seq_len=1024,
+        num_attention_heads=8,
+        num_kv_head=4,
+        hidden_size=16,
+        num_hidden_layers=1,
+        is_prefix_caching=True,
+    )
+    assert kv_cache_mgr.block_tiling
+    _pa_mock_kv_cache_in_mgr(kv_cache_mgr)
+
+    pad_block_id = kv_cache_mgr.pa_num_blocks
+    kv_cache_mgr.past_key_values[0].data[pad_block_id].fill_(77)
+    k_cache, _ = kv_cache_mgr.get_kv_by_layer_id(
+        idx=0,
+        active_block_table=torch.tensor([[0, -1, 2, 999]], dtype=torch.int64),
+    )
+    assert torch.equal(k_cache[:, :, :128, :], torch.zeros_like(k_cache[:, :, :128, :]))
+    assert torch.equal(
+        k_cache[:, :, 128:256, :],
+        torch.full_like(k_cache[:, :, 128:256, :], 77),
+    )
+    assert torch.equal(
+        k_cache[:, :, 256:384, :],
+        torch.full_like(k_cache[:, :, 256:384, :], 2),
+    )
+    assert torch.equal(
+        k_cache[:, :, 384:512, :],
+        torch.full_like(k_cache[:, :, 384:512, :], 77),
+    )
 
 
 def _pa_mock_kv_cache_in_mgr(kv_cache_mgr: BlockKVCacheManager):
@@ -860,6 +984,77 @@ def test_chunked_prefill_writing_kv_cache():
         assert torch.equal(actual[block_id, :, block_offset, :], expected[0, :, seq_pos, :])
 
 
+def test_chunked_prefill_tkg_read_maps_invalid_block_ids_to_padding_block():
+    kv_cache_mgr = _pa_prepare_cache_mgr(
+        tp_degree=1,
+        batch_size=1,
+        pa_num_blocks=4,
+        pa_block_size=2,
+        seq_len=128,
+        num_attention_heads=2,
+        num_kv_head=1,
+        hidden_size=2,
+        num_hidden_layers=1,
+        chunked_prefill_config=ChunkedPrefillConfig(tkg_model_enabled=True),
+    )
+    with torch.no_grad():
+        for block_id in range(4):
+            kv_cache_mgr.past_key_values[0][block_id].fill_(block_id)
+
+    k_cache, _ = kv_cache_mgr.get_kv_by_layer_id(
+        idx=0,
+        active_block_table=torch.tensor([[0, -1, 2, 999]], dtype=torch.int64),
+        is_for_context_encoding=False,
+    )
+
+    assert torch.equal(k_cache[:, :, 0:2, :], torch.zeros_like(k_cache[:, :, 0:2, :]))
+    assert torch.equal(
+        k_cache[:, :, 2:4, :],
+        torch.full_like(k_cache[:, :, 2:4, :], 3),
+    )
+    assert torch.equal(
+        k_cache[:, :, 4:6, :],
+        torch.full_like(k_cache[:, :, 4:6, :], 2),
+    )
+    assert torch.equal(
+        k_cache[:, :, 6:8, :],
+        torch.full_like(k_cache[:, :, 6:8, :], 3),
+    )
+
+
+def test_chunked_prefill_update_maps_any_invalid_slot_to_padding_slot():
+    kv_cache_mgr = _pa_prepare_cache_mgr(
+        tp_degree=1,
+        batch_size=1,
+        pa_num_blocks=4,
+        pa_block_size=2,
+        seq_len=128,
+        num_attention_heads=2,
+        num_kv_head=1,
+        hidden_size=2,
+        num_hidden_layers=1,
+        chunked_prefill_config=ChunkedPrefillConfig(tkg_model_enabled=True),
+    )
+    latest = _pa_prepare_latest_kv_cache(
+        batch_size=1,
+        n_active_tokens=4,
+        head_dim=1,
+        num_kv_heads_per_rank=1,
+        num_hidden_layers=1,
+    )
+
+    updated_cache = kv_cache_mgr.update_cache(
+        is_for_context_encoding=False,
+        seq_ids=None,
+        position_ids=None,
+        new_key_values=latest,
+        seq_len=None,
+        scatter_index=torch.tensor([[0, -1, -2, 999]], dtype=torch.int64),
+    )
+
+    assert torch.equal(updated_cache[0][0, :, 0, :], latest[0][0][0, :, 0, :])
+
+
 def _pa_prepare_latest_kv_cache(
     batch_size=1,
     n_active_tokens=32,
@@ -983,6 +1178,50 @@ def test_generate_tokengen_slot_mapping_bs1():
     assert torch.allclose(cpu_result, device_result)
 
 
+def test_generate_tokengen_slot_mapping_masks_inactive_oob_block_index():
+    block_size = torch.tensor(256, dtype=torch.int32)
+    position_ids = torch.tensor([[1024], [1023]], dtype=torch.int32)
+    target_slot_mapping = torch.tensor([[-1], [1023]], dtype=torch.int32)
+    block_table = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [0, 1, 2, 3],
+        ],
+        dtype=torch.int32,
+    )
+
+    result = generate_tokengen_slot_mapping(
+        position_ids,
+        target_slot_mapping,
+        block_table,
+        block_size,
+    )
+
+    assert torch.equal(result, torch.tensor([[-1], [1023]], dtype=torch.int32))
+
+
+def test_generate_tokengen_slot_mapping_masks_active_invalid_table_entry():
+    block_size = torch.tensor(256, dtype=torch.int32)
+    position_ids = torch.tensor([[1024], [1023]], dtype=torch.int32)
+    target_slot_mapping = torch.tensor([[1024], [1023]], dtype=torch.int32)
+    block_table = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [0, 1, 2, 3],
+        ],
+        dtype=torch.int32,
+    )
+
+    result = generate_tokengen_slot_mapping(
+        position_ids,
+        target_slot_mapping,
+        block_table,
+        block_size,
+    )
+
+    assert torch.equal(result, torch.tensor([[-1], [1023]], dtype=torch.int32))
+
+
 def test_generate_fusedspec_slot_mapping():
     batch_size = 4
     speculation_length = 5
@@ -1023,3 +1262,40 @@ def test_generate_fusedspec_slot_mapping():
     assert cpu_result.shape == device_result.shape
     assert cpu_result.dtype == device_result.dtype
     assert torch.allclose(cpu_result, device_result)
+
+
+def test_generate_fusedspec_slot_mapping_masks_inactive_oob_block_indices():
+    block_size = torch.tensor(256, dtype=torch.int32)
+    position_ids = torch.tensor([[1024], [1022]], dtype=torch.int32)
+    target_slot_mapping = torch.tensor(
+        [
+            [-1, -1, -1],
+            [1022, 1023, 1024],
+        ],
+        dtype=torch.int32,
+    )
+    block_table = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [0, 1, 2, 3],
+        ],
+        dtype=torch.int32,
+    )
+
+    result = generate_fusedspec_slot_mapping(
+        position_ids,
+        target_slot_mapping,
+        block_table,
+        block_size,
+    )
+
+    assert torch.equal(
+        result,
+        torch.tensor(
+            [
+                [-1, -1, -1],
+                [1022, 1023, -1],
+            ],
+            dtype=torch.int32,
+        ),
+    )

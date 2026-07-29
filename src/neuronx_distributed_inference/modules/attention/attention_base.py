@@ -82,7 +82,38 @@ def import_nki_cte_attention_kernel():
     return nki.jit(attention_cte), _has_native_gqa_tp_support
 
 
+def import_nki_segmented_cte_attention_kernel():
+    """Import the Neuron 2.30 block-KV segmented CTE kernel when available."""
+    try:
+        mod = import_module("nkilib.core.attention.attention_segmented_cte")
+    except ImportError:
+        return None
+
+    attention_segmented_cte = getattr(mod, "attention_segmented_cte", None)
+    if attention_segmented_cte is None:
+        return None
+    return nki.jit(attention_segmented_cte)
+
+
+def import_nki_qwen_segmented_cte_256_kernel():
+    """Import the Qwen head_dim=256 segmented CTE kernel when available."""
+    try:
+        mod = import_module(
+            "neuronx_distributed_inference.modules.attention.nki_kernels."
+            "qwen_segcte256.attention_segmented_cte_256"
+        )
+    except ImportError:
+        return None
+
+    attention_segmented_cte = getattr(mod, "attention_segmented_cte", None)
+    if attention_segmented_cte is None:
+        return None
+    return nki.jit(attention_segmented_cte)
+
+
 _flash_fwd_call_nki, _has_native_gqa_tp_support = import_nki_cte_attention_kernel()
+_segmented_cte_call_nki = import_nki_segmented_cte_attention_kernel()
+_qwen_segmented_cte_256_call_nki = import_nki_qwen_segmented_cte_256_kernel()
 
 logger = logging.getLogger("Neuron")
 
@@ -297,6 +328,7 @@ class NeuronAttentionBase(nn.Module):
             fused_rmsnorm_skip_gamma=self.neuron_config.fused_rmsnorm_skip_gamma,
             logical_nc_config=self.neuron_config.logical_nc_config,
             qkv_kernel_nbsd_layout=self.neuron_config.qkv_kernel_nbsd_layout,
+            quantized=self.neuron_config.quantized,
             on_cpu=self.neuron_config.on_cpu,
             rank_ordering=rank_ordering,
         )
@@ -319,6 +351,7 @@ class NeuronAttentionBase(nn.Module):
             out_proj_kernel_enabled=self.attn_block_tkg_nki_kernel_enabled or self.neuron_config.out_proj_kernel_enabled,
             logical_nc_config=self.neuron_config.logical_nc_config,
             rank_ordering=rank_ordering,
+            quantized=self.neuron_config.quantized,
         )
         if self.learned_sinks_size is not None:
             self.tkg_learned_sinks = LearnedSink(self.learned_sinks_size, self.num_attention_heads, self.torch_dtype, process_group.size(), rank_ordering)
@@ -352,6 +385,7 @@ class NeuronAttentionBase(nn.Module):
             fused_rmsnorm_skip_gamma=self.neuron_config.fused_rmsnorm_skip_gamma,
             logical_nc_config=self.neuron_config.logical_nc_config,
             qkv_kernel_nbsd_layout=self.neuron_config.qkv_kernel_nbsd_layout,
+            quantized=self.neuron_config.quantized,
             on_cpu=self.neuron_config.on_cpu,
             tiling_factor=self.neuron_config.cc_pipeline_tiling_factor if self.neuron_config.tile_cc else 1,
             seq_len_threshold_for_cc_tiling=self.neuron_config.seq_len_threshold_for_cc_tiling,
@@ -377,6 +411,7 @@ class NeuronAttentionBase(nn.Module):
             logical_nc_config=self.neuron_config.logical_nc_config,
             tiling_factor=self.neuron_config.cc_pipeline_tiling_factor if self.neuron_config.tile_cc else 1,
             rank_ordering=cte_rank_ordering,
+            quantized=self.neuron_config.quantized,
         )
         self.learned_sinks = None
         if self.learned_sinks_size is not None:
@@ -769,11 +804,201 @@ class NeuronAttentionBase(nn.Module):
             attn_output = torch.matmul(active_scores, V_active)
         return attn_output, flash_attn_strategy
 
-    def perform_prefix_prefill(self, Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask) -> Tensor:
+    def _prefix_cte_attention_backend(self) -> str:
+        return getattr(
+            self.neuron_config,
+            "prefix_cte_attention_backend",
+            "attention_cte",
+        )
+
+    def _prefix_cte_attention_segment_size(self, q_len: int) -> int:
+        segment_size = getattr(
+            self.neuron_config,
+            "prefix_cte_attention_segment_size",
+            None,
+        )
+        if segment_size is None:
+            return int(q_len)
+        return int(segment_size)
+
+    def _prepare_segmented_cte_cache(self, segmented_past_key_value):
+        K_cache, V_cache = segmented_past_key_value
+        block_size = int(self.neuron_config.pa_block_size)
+
+        if K_cache.dim() != 4 or V_cache.dim() != 4:
+            raise ValueError(
+                "segmented_cte prefix prefill requires 4D block KV cache "
+                f"tensors, got K={tuple(K_cache.shape)} V={tuple(V_cache.shape)}"
+            )
+        if K_cache.shape[1] == block_size and V_cache.shape[1] == block_size:
+            K_cache = K_cache.permute(0, 2, 1, 3)
+            V_cache = V_cache.permute(0, 2, 1, 3)
+        elif K_cache.shape[2] != block_size or V_cache.shape[2] != block_size:
+            raise ValueError(
+                "segmented_cte prefix prefill expected block KV cache in "
+                "(blocks, block, heads, dim) or (blocks, heads, block, dim) "
+                f"layout, got K={tuple(K_cache.shape)} V={tuple(V_cache.shape)}"
+            )
+        return K_cache, V_cache
+
+    def perform_prefix_prefill_segmented_cte(
+        self,
+        Q,
+        q_len,
+        bsz,
+        segmented_past_key_value,
+        active_block_table,
+        computed_context_lens,
+    ) -> Tensor:
+        use_qwen_segcte256 = self.head_dim == 256
+        segmented_cte_call_nki = _qwen_segmented_cte_256_call_nki if use_qwen_segcte256 else _segmented_cte_call_nki
+        if segmented_cte_call_nki is None:
+            if use_qwen_segcte256:
+                raise ImportError(
+                    "prefix_cte_attention_backend=segmented_cte with head_dim=256 "
+                    "requires the Qwen qwen_segcte256 kernel package."
+                )
+            raise ImportError(
+                "prefix_cte_attention_backend=segmented_cte requires "
+                "nkilib.core.attention.attention_segmented_cte from Neuron "
+                "2.30+."
+            )
+        if segmented_past_key_value is None:
+            raise ValueError(
+                "segmented_cte prefix prefill requires an already-updated "
+                "block KV cache."
+            )
+        if active_block_table is None or computed_context_lens is None:
+            raise ValueError(
+                "segmented_cte prefix prefill requires active_block_table and "
+                "computed_context_lens."
+            )
+        if self.k_cache_transposed:
+            raise ValueError("segmented_cte prefix prefill does not support transposed K cache.")
+        if use_qwen_segcte256 and self.sliding_window is not None:
+            raise ValueError("qwen_segcte256 segmented CTE does not support sliding-window attention.")
+
+        block_size = int(self.neuron_config.pa_block_size)
+        prior_seg_size = self._prefix_cte_attention_segment_size(q_len)
+        if prior_seg_size % block_size != 0:
+            raise ValueError(
+                "prefix_cte_attention_segment_size must be divisible by "
+                f"pa_block_size ({block_size}), got {prior_seg_size}."
+            )
+
+        K_cache, V_cache = self._prepare_segmented_cte_cache(segmented_past_key_value)
+        Q = Q.reshape(bsz * self.num_heads, q_len, self.head_dim).to(self.torch_dtype)
+        Q = Q / self.softmax_scale
+        K_cache = K_cache.to(self.torch_dtype)
+        V_cache = V_cache.to(self.torch_dtype)
+        active_block_table = active_block_table.to(torch.int32)
+        prior_tokens = computed_context_lens.reshape(bsz, 1).to(torch.int32)
+
+        learned_sinks = self.get_learned_sinks()
+        sink = None
+        if learned_sinks is not None:
+            sink = (
+                learned_sinks.reshape(1, self.num_heads)
+                .expand(bsz, self.num_heads)
+                .reshape(bsz * self.num_heads, 1)
+                .to(self.torch_dtype)
+            )
+
+        flash_attn_strategy = self.get_flash_attention_strategy(
+            q_len, has_attention_mask=False
+        )
+        tp_out = not use_qwen_segcte256
+        if flash_attn_strategy == FlashAttentionStrategy.SHARDED_KERNEL:
+            attn_output = segmented_cte_call_nki[self.logical_nc_config](
+                Q,
+                K_cache,
+                V_cache,
+                active_block_table,
+                prior_tokens,
+                block_size,
+                prior_seg_size,
+                1.0,
+                tp_q=True,
+                tp_out=tp_out,
+                sliding_window=self.sliding_window,
+                sink=sink,
+                num_q_heads=self.num_heads,
+                k_pre_transposed=False,
+            )
+        elif flash_attn_strategy == FlashAttentionStrategy.UNSHARDED_KERNEL:
+            attn_output = segmented_cte_call_nki(
+                Q,
+                K_cache,
+                V_cache,
+                active_block_table,
+                prior_tokens,
+                block_size,
+                prior_seg_size,
+                1.0,
+                tp_q=True,
+                tp_out=tp_out,
+                sliding_window=self.sliding_window,
+                sink=sink,
+                num_q_heads=self.num_heads,
+                k_pre_transposed=False,
+            )
+        else:
+            raise ValueError(
+                "segmented_cte prefix prefill requires the NKI flash attention "
+                f"strategy, got {flash_attn_strategy}."
+            )
+
+        if use_qwen_segcte256:
+            attn_output = attn_output.reshape((bsz, self.num_heads, q_len, self.head_dim)).permute(0, 1, 3, 2)
+        else:
+            attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
+        logger.debug("Segmented CTE attn output after reshape %s", attn_output.shape)
+        return attn_output, flash_attn_strategy
+
+    def perform_prefix_prefill(
+        self,
+        Q,
+        K,
+        V,
+        q_len,
+        bsz,
+        attention_mask,
+        past_key_value,
+        active_mask,
+        active_block_table=None,
+        computed_context_lens=None,
+        segmented_past_key_value=None,
+    ) -> Tensor:
         """attention computation at prefilling (context encoding) phase"""
+        if self._prefix_cte_attention_backend() == "segmented_cte":
+            return self.perform_prefix_prefill_segmented_cte(
+                Q,
+                q_len,
+                bsz,
+                segmented_past_key_value,
+                active_block_table,
+                computed_context_lens,
+            )
+
         K_prior = past_key_value[0]
         V_prior = past_key_value[1]
-        prior_len = K_prior.shape[-2]
+        prior_len = K_prior.shape[-1] if self.k_cache_transposed else K_prior.shape[-2]
+
+        prefix_chunk_size = getattr(
+            self.neuron_config, "prefix_cte_attention_chunk_size", None
+        )
+        if prefix_chunk_size is not None and prior_len > int(prefix_chunk_size):
+            return self.perform_prefix_prefill_chunked_prior(
+                Q,
+                K,
+                V,
+                q_len,
+                bsz,
+                attention_mask,
+                past_key_value,
+                active_mask,
+                int(prefix_chunk_size),
+            )
 
         flash_attn_strategy = self.get_flash_attention_strategy(q_len, has_attention_mask=False)
         logger.debug(f"Flash attention strategy: {flash_attn_strategy}")
@@ -913,6 +1138,112 @@ class NeuronAttentionBase(nn.Module):
 
         return attn_output, flash_attn_strategy
 
+    def perform_prefix_prefill_chunked_prior(
+        self,
+        Q,
+        K,
+        V,
+        q_len,
+        bsz,
+        attention_mask,
+        past_key_value,
+        active_mask,
+        prefix_chunk_size,
+    ) -> Tensor:
+        """
+        Prefix-prefill attention with an online softmax over cached-prefix chunks.
+
+        This path avoids materializing the full [Q, prefix] score tensor for very
+        long prefix-cache buckets. It is intended for long Hybrid APC buckets
+        such as [active=3072, prefix=262144], where the monolithic CTE NEFF can
+        exceed per-HBM scratchpad during runtime load.
+        """
+        logger.debug(
+            "ATTN: chunked prefix prior for Q.shape=%s prefix_chunk_size=%s",
+            Q.shape,
+            prefix_chunk_size,
+        )
+
+        K_prior = past_key_value[0]
+        V_prior = past_key_value[1]
+        K_active = repeat_kv(K, self.num_key_value_groups)
+        V_active = repeat_kv(V, self.num_key_value_groups)
+        K_prior = repeat_kv(K_prior, self.num_key_value_groups)
+        V_prior = repeat_kv(V_prior, self.num_key_value_groups)
+
+        prior_len = K_prior.shape[-1] if self.k_cache_transposed else K_prior.shape[-2]
+        compute_dtype = torch.float32
+        q_compute = Q.to(compute_dtype)
+
+        running_max = torch.full(
+            (bsz, self.num_heads, q_len, 1),
+            torch.finfo(compute_dtype).min,
+            dtype=compute_dtype,
+            device=Q.device,
+        )
+        running_sum = torch.zeros(
+            (bsz, self.num_heads, q_len, 1),
+            dtype=compute_dtype,
+            device=Q.device,
+        )
+        running_output = torch.zeros(
+            (bsz, self.num_heads, q_len, self.head_dim),
+            dtype=compute_dtype,
+            device=Q.device,
+        )
+
+        def update_online_softmax(scores, values, max_so_far, sum_so_far, out_so_far):
+            scores = scores.to(compute_dtype)
+            chunk_max = torch.max(scores, dim=-1, keepdim=True).values
+            new_max = torch.maximum(max_so_far, chunk_max)
+            old_scale = torch.exp(max_so_far - new_max)
+            chunk_scale = torch.exp(scores - new_max)
+            new_sum = sum_so_far * old_scale + torch.sum(
+                chunk_scale, dim=-1, keepdim=True
+            )
+            new_out = out_so_far * old_scale + torch.matmul(
+                chunk_scale.to(values.dtype),
+                values,
+            ).to(compute_dtype)
+            return new_max, new_sum, new_out
+
+        for prefix_start in range(0, int(prior_len), int(prefix_chunk_size)):
+            prefix_end = min(prefix_start + int(prefix_chunk_size), int(prior_len))
+            if self.k_cache_transposed:
+                K_prior_chunk = K_prior[:, :, :, prefix_start:prefix_end]
+            else:
+                K_prior_chunk = K_prior[:, :, prefix_start:prefix_end, :].transpose(2, 3)
+            V_prior_chunk = V_prior[:, :, prefix_start:prefix_end, :]
+            prior_scores = torch.matmul(q_compute, K_prior_chunk.to(compute_dtype))
+            prior_scores = prior_scores / self.softmax_scale
+            running_max, running_sum, running_output = update_online_softmax(
+                prior_scores,
+                V_prior_chunk,
+                running_max,
+                running_sum,
+                running_output,
+            )
+
+        active_scores = torch.matmul(
+            q_compute,
+            K_active.transpose(2, 3).to(compute_dtype),
+        )
+        active_scores = active_scores / self.softmax_scale
+        active_scores = torch.where(
+            active_mask,
+            active_scores,
+            torch.finfo(active_scores.dtype).min,
+        )
+        running_max, running_sum, running_output = update_online_softmax(
+            active_scores,
+            V_active,
+            running_max,
+            running_sum,
+            running_output,
+        )
+        attn_output = (running_output / running_sum).to(Q.dtype)
+        return attn_output, FlashAttentionStrategy.NONE
+
     def perform_prefill_chunked_attn(self, Q, K, V, q_len, bsz, attention_mask, chunk_size) -> Tensor:
         """attention computation at prefilling (context encoding) phase using native PyTorch ops"""
         K_active = repeat_kv(K, self.num_key_value_groups)
@@ -947,9 +1278,35 @@ class NeuronAttentionBase(nn.Module):
         attn_output = torch.cat(outputs, dim=2)
         return attn_output, FlashAttentionStrategy.NONE
 
-    def perform_prefix_prefill_windowed_attn(self, Q, K, V, q_len, bsz, attention_mask, window_size, past_key_value, active_mask) -> Tensor:
+    def perform_prefix_prefill_windowed_attn(
+        self,
+        Q,
+        K,
+        V,
+        q_len,
+        bsz,
+        attention_mask,
+        window_size,
+        past_key_value,
+        active_mask,
+        active_block_table=None,
+        computed_context_lens=None,
+        segmented_past_key_value=None,
+    ) -> Tensor:
         """attention computation at prefilling (context encoding) phase with sliding window"""
-        return self.perform_prefix_prefill(Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask)
+        return self.perform_prefix_prefill(
+            Q,
+            K,
+            V,
+            q_len,
+            bsz,
+            attention_mask,
+            past_key_value,
+            active_mask,
+            active_block_table=active_block_table,
+            computed_context_lens=computed_context_lens,
+            segmented_past_key_value=segmented_past_key_value,
+        )
 
     def get_flash_attention_strategy_cp(self, q_len):
         """
@@ -1460,11 +1817,36 @@ class NeuronAttentionBase(nn.Module):
 
         return attn_output
 
-    def attention_context_encode(self, Q, K, V, q_len, bsz, attention_mask, past_key_value=None, active_mask=None):
-        if past_key_value is None:
+    def attention_context_encode(
+        self,
+        Q,
+        K,
+        V,
+        q_len,
+        bsz,
+        attention_mask,
+        past_key_value=None,
+        active_mask=None,
+        active_block_table=None,
+        computed_context_lens=None,
+        segmented_past_key_value=None,
+    ):
+        if past_key_value is None and segmented_past_key_value is None:
             attn_output, flash_attn_strategy = self.perform_prefill(Q, K, V, q_len, bsz, attention_mask)
         else:
-            attn_output, flash_attn_strategy = self.perform_prefix_prefill(Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask)
+            attn_output, flash_attn_strategy = self.perform_prefix_prefill(
+                Q,
+                K,
+                V,
+                q_len,
+                bsz,
+                attention_mask,
+                past_key_value,
+                active_mask,
+                active_block_table=active_block_table,
+                computed_context_lens=computed_context_lens,
+                segmented_past_key_value=segmented_past_key_value,
+            )
         if self.flash_decoding_enabled:
             K, V = self._filter_kv_for_flash_decoding(K, V, q_len, Q)
 
@@ -1510,7 +1892,21 @@ class NeuronAttentionBase(nn.Module):
             attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output, K, V
 
-    def attention_context_encode_windowed_attention(self, Q, K, V, q_len, bsz, attention_mask, window_size=None, past_key_value=None, active_mask=None):
+    def attention_context_encode_windowed_attention(
+        self,
+        Q,
+        K,
+        V,
+        q_len,
+        bsz,
+        attention_mask,
+        window_size=None,
+        past_key_value=None,
+        active_mask=None,
+        active_block_table=None,
+        computed_context_lens=None,
+        segmented_past_key_value=None,
+    ):
         if past_key_value is None:
             attn_output, flash_attn_strategy = self.perform_prefill_windowed_attn(Q, K, V, q_len, bsz, attention_mask, window_size)
             if flash_attn_strategy not in [FlashAttentionStrategy.NONE]:
@@ -1518,7 +1914,20 @@ class NeuronAttentionBase(nn.Module):
             else:
                 attn_output = attn_output.transpose(1, 2).contiguous()  # transpose BHSD -> BSHD
         else:
-            attn_output, _ = self.perform_prefix_prefill_windowed_attn(Q, K, V, q_len, bsz, attention_mask, window_size, past_key_value, active_mask)
+            attn_output, _ = self.perform_prefix_prefill_windowed_attn(
+                Q,
+                K,
+                V,
+                q_len,
+                bsz,
+                attention_mask,
+                window_size,
+                past_key_value,
+                active_mask,
+                active_block_table=active_block_table,
+                computed_context_lens=computed_context_lens,
+                segmented_past_key_value=segmented_past_key_value,
+            )
             attn_output = attn_output.transpose(1, 2).contiguous()  # transpose BHSD -> BSHD
         return attn_output, K, V
 
@@ -1733,9 +2142,32 @@ class NeuronAttentionBase(nn.Module):
         if rotary_position_ids is None:
             rotary_position_ids = position_ids
 
+        segmented_raw_past_key_value = None
+        use_raw_segmented_prefix_cte = (
+            get_kv_per_layer
+            and getattr(self.neuron_config, "is_prefix_caching", False)
+            and self._prefix_cte_attention_backend() == "segmented_cte"
+            and kwargs.get("active_block_table") is not None
+            and getattr(kwargs.get("active_block_table"), "ndim", 0) > 1
+            and q_len >= 128
+        )
         if get_kv_per_layer:
             assert kv_mgr is not None
-            past_key_value = kv_mgr.get_kv_by_layer_id(**kwargs)
+            if use_raw_segmented_prefix_cte:
+                get_raw_kv_by_layer_id = getattr(
+                    kv_mgr, "get_raw_kv_by_layer_id", None
+                )
+                if get_raw_kv_by_layer_id is None:
+                    raise ValueError(
+                        "segmented_cte prefix prefill requires a block KV "
+                        "manager with get_raw_kv_by_layer_id()."
+                    )
+                segmented_raw_past_key_value = get_raw_kv_by_layer_id(
+                    idx=kwargs["idx"],
+                    kvcache_buffer=kwargs.get("kvcache_buffer"),
+                )
+            else:
+                past_key_value = kv_mgr.get_kv_by_layer_id(**kwargs)
 
         is_token_gen = past_key_value is not None
 
@@ -1825,6 +2257,26 @@ class NeuronAttentionBase(nn.Module):
             use_polar_compatible_rope=use_polar_compatible_rope,
         )
 
+        segmented_past_key_value = None
+        segmented_updated_kv = None
+        use_segmented_prefix_cte = (
+            not is_token_gen
+            and (past_key_value is not None or segmented_raw_past_key_value is not None)
+            and self._prefix_cte_attention_backend() == "segmented_cte"
+        )
+        if use_segmented_prefix_cte:
+            if kv_mgr is None or not update_kv_per_layer:
+                raise ValueError(
+                    "segmented_cte prefix prefill requires kv_mgr and "
+                    "update_kv_per_layer so active KV is present in the block cache."
+                )
+            segmented_updated_kv = kv_mgr.update_kv_by_layer_id(
+                kv_per_layer=(K, V),
+                position_ids=position_ids,
+                **kwargs,
+            )
+            segmented_past_key_value = segmented_updated_kv
+
         if is_token_gen:
             attn_output = self.attention_tokengen(
                 Q, K, V, attention_mask, position_ids, past_key_value, active_mask, **kwargs
@@ -1833,7 +2285,19 @@ class NeuronAttentionBase(nn.Module):
             # transpose BHSD -> BSHD
             attn_output = attn_output.transpose(1, 2).contiguous()
         else:
-            attn_output, K, V = self.attention_context_encode(Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask)
+            attn_output, K, V = self.attention_context_encode(
+                Q,
+                K,
+                V,
+                q_len,
+                bsz,
+                attention_mask,
+                past_key_value,
+                active_mask,
+                active_block_table=kwargs.get("active_block_table"),
+                computed_context_lens=kwargs.get("computed_context_lens"),
+                segmented_past_key_value=segmented_past_key_value,
+            )
 
         # merge multi head hidden
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
@@ -1845,9 +2309,11 @@ class NeuronAttentionBase(nn.Module):
             # Output K in BNSd if not transposed, otherwise BNdS
             K = K.permute(0, 1, 3, 2)
 
-        kv: Tuple[Tensor, Tensor] = (K, V)
+        kv: Tuple[Tensor, Tensor] = (
+            segmented_updated_kv if segmented_updated_kv is not None else (K, V)
+        )
 
-        if update_kv_per_layer:
+        if update_kv_per_layer and segmented_updated_kv is None:
             assert kv_mgr is not None
             kv = kv_mgr.update_kv_by_layer_id(
                 kv_per_layer=kv,

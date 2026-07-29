@@ -83,6 +83,10 @@ def pad_to_128_multiple(x, dim, tensor_grp_size=None):
 quantized_weight_cache = {}
 
 
+def _is_row_parallel_quantized_projection(prefix: str) -> bool:
+    return "down_proj" in prefix or "o_proj" in prefix
+
+
 def _get_weight_from_state_dict_quantized(prefix: str, state_dict: Dict[str, Any], tensor_grp_size: Optional[int] = None) -> torch.Tensor:
     """
     Get weight from state dict with quantization support.
@@ -106,7 +110,7 @@ def _get_weight_from_state_dict_quantized(prefix: str, state_dict: Dict[str, Any
         assert (
             quantized_tensor.dtype == torch.float8_e4m3fn
         ), "Expected weight type to be float8_e4m3fn"
-        dim = 0 if "down_proj" in prefix else 1
+        dim = 0 if _is_row_parallel_quantized_projection(prefix) else 1
         quantized_tensor = pad_to_128_multiple(quantized_tensor.view(torch.int8).t(), dim, tensor_grp_size)
         quantized_tensor = quantized_tensor.view(torch.float8_e4m3fn)
         quantized_tensor = quantized_tensor.contiguous()
@@ -151,7 +155,7 @@ def _get_scale_from_state_dict_quantized(prefix: str, state_dict: Dict[str, Any]
         # transpose --> [1, H]
         # broadcast --> [128, H]
         scale = state_dict[prefix + "scale"]
-        if "down_proj" not in prefix:
+        if not _is_row_parallel_quantized_projection(prefix):
             scale = pad_to_128_multiple(scale, 0, tensor_grp_size)
         scale = scale.t()
         scale = torch.broadcast_to(scale, (128, scale.shape[1]))
