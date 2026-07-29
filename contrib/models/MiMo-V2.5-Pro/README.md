@@ -43,6 +43,38 @@ Key features:
 
 **Known issue — vLLM serving is broken.** The first `/v1/chat/completions` request against `vllm-neuron` returns coherent output; every subsequent request returns garbled text. Same compiled NEFF serves 5 successive greedy generations byte-identically via the smoke path, so the bug is specifically in vllm-neuron's runtime / request-state handling. Tracking upstream at https://github.com/vllm-project/vllm-neuron/issues/31. Last updated 2026-04-30.
 
+### ⚠️ Required: pin `neuronx-cc` to 2.25.3371 — 2.26.6360 miscompiles this model
+
+**`neuronx-cc 2.26.6360.0+6f180f47` (Neuron SDK 2.31.0) silently produces a numerically wrong NEFF for this model. Generated text is garbage. Compilation succeeds with exit 0 and no warning.** Use `2.25.3371.0+f524f7f8` (SDK 2.30.0) or `2.24.8799.0+6f62ff7c`.
+
+**No model-code change is needed** — the code in this directory is correct on both compilers. The *only* variable is the compiler package. Compiling the byte-identical token-generation HLO (same NxDI, same weights, same flags, same runtime, same process) gives:
+
+| neuronx-cc | 213-token prompt, greedy, `max_new_tokens=20` |
+|---|---|
+| 2.24.8799.0+6f62ff7c | `' Paris.  Question: what is the capital city of France? Answer: Paris.  Question:'` ✅ |
+| 2.25.3371.0+f524f7f8 | `' Paris.  Question: what is the capital city of France? Answer: Paris.  Question:'` ✅ |
+| **2.26.6360.0+6f180f47** | **`'., the the,,,,1.1.1.1.  the the the'`** ❌ |
+
+2.23 / 2.24 / 2.25 are all equivalent; the behaviour change lands exactly at 2.26.
+
+To downgrade without disturbing the rest of the DLAMI venv, install the older compiler into its own venv and shadow only that package:
+
+```bash
+python3 -m venv --system-site-packages /opt/dlami/nvme/venv_cc225
+/opt/dlami/nvme/venv_cc225/bin/pip install --no-deps 'neuronx-cc==2.25.3371.0+f524f7f8'
+
+# in the working venv: shadow ONLY neuronxcc. Do NOT prepend the new venv's bin to PATH --
+# neuronx-cc is invoked in-process by libneuronxla, and that venv has no torch.
+export PYTHONPATH=/opt/dlami/nvme/venv_cc225/lib/python3.12/site-packages:$PYTHONPATH
+python3 -c "import neuronxcc; print(neuronxcc.__version__)"   # expect 2.25.3371.0+f524f7f8
+```
+
+Delete any NEFF compiled by 2.26 before rebuilding, or the compiler cache will hand the bad artifact straight back.
+
+**Detection.** A short prompt is *not* discriminating — the broken build answers `"The capital of France is"` plausibly (`' a country that is known for its rich history…'`). Prompts of **≥200 tokens** are required to expose the corruption. Any accuracy gate for this model must use long prompts.
+
+Root-cause status: narrowed to the compiler and reported to AWS. The new default-on NIR codegen backend ("narwhal") and the `--allreduce-buffer-size` default change were both **ruled out** by full rebuilds (`--internal-backend-options='--enable-narwhal=0'` produced byte-identical garble). The one remaining 2.26-only difference we can see is that 2.26 force-enables `--internal-disable-fma-on-ios` (a sunda `InferIntrinsicOnCC` option whose own default is `False`, injected inside the compiled driver and not disableable from any CLI spelling); at TP=64 every layer crosses a collective. That is a **lead, not a confirmed diagnosis**.
+
 ### Why BF16 attn + FP8 MoE
 
 Pro's attention weights have `abs_mean ≈ 0.00124`, roughly 4× smaller than V2.5 (256 experts). Under an all-FP8 recipe, the NKI blockwise FP8 accumulator on attention q/k/v at this magnitude drifts the logits across 70 layers and produces prompt-dependent gibberish (`"The capital of France is\n# 1000000000000000"`, `"Once upon a time in a small village there lived\n# 0000000000..."`, etc.). Dequantizing q/k/v to BF16 before the matmul restores coherent output. MoE experts (scales `≈ 2.3e-5`, similarly small) can stay FP8.
@@ -74,7 +106,7 @@ GPU stacks (sglang on H100/H200) run the same OCP FP8 checkpoint correctly becau
 ## Prerequisites
 
 - **Instance**: trn2.48xlarge (128 physical NeuronCores, logical_nc_config=2 → 64 logical cores)
-- **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9). Verified toolchain (2026-07-21 instance): `neuronx-cc 2.26.6360.0`, `neuronx-distributed 0.19.28492`, `neuronx-distributed-inference 0.10.18399`, `torch 2.9.1`, `torch-neuronx 2.9.0.2.15`. The `neuronx-cc` package version (2.26.x) differs from the SDK release-train number (2.29); if you re-compile on a differently-imaged DLAMI, confirm these versions match or expect a cache miss.
+- **Neuron SDK**: 2.29 (Python 3.12, PyTorch 2.9). Verified toolchain: **`neuronx-cc 2.25.3371.0+f524f7f8`** (see the pin warning above — do **not** use 2.26.6360, it miscompiles this model), `neuronx-distributed 0.19.28492`, `neuronx-distributed-inference 0.10.18399`, `torch 2.9.1`, `torch-neuronx 2.9.0.2.15`. The `neuronx-cc` package version differs from the SDK release-train number; if you re-compile on a differently-imaged DLAMI, confirm these versions match or expect a cache miss.
 - **Venv**: `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (used by preprocess, smoke, and vLLM serving alike; ships with the DLAMI and is where `0_setup.sh` installs the patched `vllm-neuron`).
 - **Disk**: ~3 TB free under `/opt/dlami/nvme` (the HF FP8 checkpoint is ~962 GB, the Neuron-FP8 preprocessed output is ~1 TB, and `save_sharded_checkpoint=true` writes another ~300-1000 GB per compiled config (varies with recipe)).
 
