@@ -72,37 +72,56 @@ measured end-to-end on `trn2.3xlarge`.
 
 ### trn2.3xlarge, TP=4, LNC=2, bfloat16, SDK 2.30
 
-Configuration: `move_trace_to_device` on the encoder, on-device sampling
-(greedy), `n_positions=768`, `seq_len=512`.
+Two serving paths are supported.  The **standalone** path
+(`NeuronApplicationVoxtral.transcribe()`) is ~7% faster because it can
+use a smaller CTE bucket (`seq_len=512`) than the KV cache
+(`n_positions=768`).  The **vLLM** path requires
+`seq_len == n_positions` (see Known Limitations) so it recompiles with
+`seq_len=768`.
+
+Configuration common to both paths: `move_trace_to_device=True` on the
+encoder, on-device sampling (greedy), TP=4 on trn2.3xlarge at LNC=2.
+
+**Standalone `NeuronApplicationVoxtral` path** (`seq_len=512`,
+`n_positions=768`):
 
 | Metric | Value |
 |--------|-------:|
-| Mean latency per file | **0.468 s** |
-| Median decode throughput | **155 tok/s** |
+| Mean latency per file (5-clip mix, 5-25 s) | **0.477 s** |
+| Median decode throughput (18-clip TED benchmark, 3 clips per 5 s bin) | **155 tok/s** |
 | Encoder wall (median) | 78 ms |
 | CPU projector | 7 ms |
 | Decoder wall (median) | 389 ms |
 
-Per-duration bin (mean per-file latency, ms):
+**vLLM path** (`seq_len=768`, `n_positions=768`):
 
-| Duration | 0-5 s | 5-10 s | 10-15 s | 15-20 s | 20-25 s | 25-30 s |
-|----------|:-----:|:------:|:-------:|:-------:|:-------:|:-------:|
-| Mean ms  | 191   | 347    | 381     | 503     | 642     | 742     |
+| Metric | Value |
+|--------|-------:|
+| Mean latency per file (5-clip mix, 5-25 s) | **0.502 s** |
+| Median per-file latency (same mix) | 0.456 s |
+| P90 | 0.729 s |
+
+Per-duration bin (5-clip harness, means in ms) -- both paths:
+
+| Duration | 5-10 s | 10-15 s | 15-20 s | 20-25 s | 25-30 s |
+|----------|:------:|:-------:|:-------:|:-------:|:-------:|
+| Standalone ms | 184 | 419 | 590 | 700 | -- |
+| vLLM ms       | 291 | 408 | 454 | 626 | 733 |
 
 ### trn2.3xlarge, TP=1, LNC=2, bfloat16, SDK 2.30
 
-Same optimizations as TP=4. Mean latency per file: **0.967 s**, decode
+Standalone path only. Mean latency per file: **0.967 s**, decode
 throughput median **66 tok/s**. Functional at TP=1; 16/18 transcripts
 byte-identical to TP=4 (2 differ in punctuation or paraphrasing).
 
 ## Optimizations shipped in this contrib
 
 Four changes over the initial port (stock SDK 2.31 was 0.656 s/file at
-TP=4) that together bring the customer-harness mean to 0.468 s/file:
+TP=4) that together bring the customer-harness mean to ~0.47-0.50 s/file:
 
 1. **`torch_neuronx.move_trace_to_device(encoder, 0)`** at load time
    (default; the constructor argument `move_trace_to_device=True` gates
-   this — set to `False` to fall back to `async_load`).
+   this -- set to `False` to fall back to `async_load`).
    Removes ~95 ms of per-call host overhead on the audio encoder.
 2. **On-device sampling** (`on_device_sampling=True`): greedy argmax
    runs inside the compiled NEFF (`OnDeviceSamplingConfig(top_k=1,
@@ -113,15 +132,13 @@ TP=4) that together bring the customer-harness mean to 0.468 s/file:
    maximum audio-token count (375) plus a short prompt. Per-token DMA
    cost drops ~5×.
 4. **`seq_len=512`** (CTE bucket, down from 2048): matches the
-   ~375-token audio prefill. **SDK 2.30 only** — on SDK 2.31 this
-   regresses (compiler codegen differs). Keep `seq_len=2048` on other
-   SDKs.
-
-`compile()` / `load()` default to `n_positions=4096` and `seq_len=2048`
-for compatibility with longer text prompts; the notebook and harness
-show how to pass the tuned values.
+   ~375-token audio prefill. Small additional decoder-side win.
+   **Standalone path only.**  For vLLM serving, set `seq_len=768`
+   (see Known Limitations).
 
 ## Usage
+
+Standalone (fastest):
 
 ```python
 from modeling_voxtral import NeuronApplicationVoxtral
@@ -133,7 +150,7 @@ COMPILED_PATH = "/mnt/models/compiled/voxtral_mini_3b"
 app = NeuronApplicationVoxtral(
     model_path=MODEL_PATH,
     tp_degree=4,               # TP=4 recommended on trn2.3xlarge
-    seq_len=512,               # SDK 2.30; use 2048 on other SDKs
+    seq_len=512,               # SDK 2.30 optimum; use 2048 on other SDKs
     n_positions=768,           # sized for a single 30 s audio clip
     dtype=torch.bfloat16,
     on_device_sampling=True,   # greedy argmax on-device
@@ -156,6 +173,10 @@ print(text)
 answer = app.generate("What is the capital of France?", max_new_tokens=50)
 print(answer)
 ```
+
+For vLLM serving, compile with `seq_len=768` (matching `n_positions`)
+and use the vllm-neuron plugin from the jimburtoft fork -- see the
+walkthrough notebook.
 
 ## Example Checkpoints
 
@@ -235,9 +256,16 @@ python summarize_results.py results/
 - **30 s audio maximum.** Voxtral supports up to 30 min transcribe / 40
   min understand modes upstream; those code paths have not been
   validated on Neuron. All benchmarks are on 0-30 s clips.
-- **`seq_len=512` is SDK 2.30-specific.** On SDK 2.31 the same setting
-  regresses by ~16% (compiler codegen difference). Use `seq_len=2048`
-  on SDK 2.31.
+- **vLLM path requires `seq_len == n_positions`.** vLLM 0.16.0's V1
+  scheduler feeds the TKG NEFF positions that can span the range
+  `[0, n_positions)` during decode. If the traced NEFF has
+  `seq_len < n_positions` (e.g. the standalone-optimized `seq_len=512
+  / n_positions=768` combo), positions in the gap trigger NRT status
+  1006. Standalone `NeuronApplicationVoxtral.transcribe()` does not
+  hit this because its generation loop pads inputs to `seq_len` before
+  decoding.  Use `seq_len=n_positions` for vLLM serving; the
+  standalone path can use a shorter `seq_len` for ~5-7% additional
+  speedup.
 - **`--auto-cast=matmult`** is *not* passed to the text decoder (NxDI
   handles the LLM path). It *is* included in the audio encoder trace
   compiler args, which is required for the FP32 → BF16 path in Whisper's

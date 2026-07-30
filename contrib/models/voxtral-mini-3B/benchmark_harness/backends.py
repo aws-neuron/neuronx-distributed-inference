@@ -48,7 +48,9 @@ def load_backend(name: str, **kwargs) -> Backend:
         # Trigger lazy import.  Adding a new backend? register it here.
         if name == "nxdi_neuron":
             from backend_nxdi import register as _reg  # type: ignore
-
+            _reg(_REGISTRY)
+        elif name == "vllm_neuron":
+            from backend_vllm import register as _reg  # type: ignore
             _reg(_REGISTRY)
         else:
             raise ValueError(f"Unknown backend {name!r}; known: {list(_REGISTRY)}")

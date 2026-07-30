@@ -80,6 +80,18 @@ def build_backend(args: argparse.Namespace):
             move_trace_to_device=not args.no_move_trace,
             max_new_tokens=args.max_new_tokens,
         )
+    if args.backend == "vllm_neuron":
+        return load_backend(
+            "vllm_neuron",
+            model_dir=args.model_dir,
+            compiled_dir=args.compiled_dir,
+            tp_degree=args.tp_degree,
+            seq_len=args.seq_len,
+            n_positions=args.n_positions,
+            max_num_seqs=1,
+            max_model_len=args.n_positions,
+            max_new_tokens=args.max_new_tokens,
+        )
     raise ValueError(f"Unknown --backend {args.backend!r}")
 
 
