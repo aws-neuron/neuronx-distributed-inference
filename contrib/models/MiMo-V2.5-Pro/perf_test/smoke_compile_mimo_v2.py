@@ -43,9 +43,16 @@ COMPILED_PATH = os.environ.get(
 )
 
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "64"))
-# seq_len=512 is the largest value verified to fit HBM under the BF16-attn
-# recipe. seq_len=1024 OOMs on load (previous attempt failed allocating
-# ~40 MB for rdh/alltoall rings after per-rank tensors reached 20.9/24 GB).
+# 512 is the default because it is the length the model is *verified correct* at,
+# not because longer does not fit. HBM-wise, 1024 loads fine on the stock recipe
+# and 4096 loads with MIMO_SWA_KV_TRUNCATION=1 (~20.6/24 GB per rank). The
+# blocker is output quality, not memory: on the seq1024 NEFF, prompts beyond
+# ~480 tokens first start answering plausibly-but-wrongly (~520) and then
+# collapse into single-token repetition (>=568), even on neuronx-cc 2.25.3371
+# with truncation OFF -- i.e. on a graph proven structurally identical to the
+# 512 recipe's. See README "长上下文与输出退化" for the measured threshold.
+# (An earlier note here claimed 1024 OOMs by ~40 MB; that predates the
+# BF16-attn + cc 2.25 recipe and no longer reproduces.)
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "512"))
 # BS=48 is the minimum that avoids forward_selective_loading on decode:
 # `BS * top_k / num_experts >= 1.0` → BS >= 384/8 = 48. At BS=1 the TKG

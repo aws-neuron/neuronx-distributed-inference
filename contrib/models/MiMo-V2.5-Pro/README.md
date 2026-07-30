@@ -85,8 +85,8 @@ GPU stacks (sglang on H100/H200) run the same OCP FP8 checkpoint correctly becau
 
 ### Cost and constraints
 
-- **HBM headroom.** BF16 q/k/v adds ~2 GB per rank. `seq_len=1024` OOMs on load (the previous attempt failed allocating ~40 MB for rdh/alltoall rings after per-rank tensors already reached 20.9/24 GB). `seq_len=512` is the largest value empirically verified to fit HBM at BS=48.
-- **Short context.** Even at `seq_len=512`, Pro's full chat template with the default system prompt is ~260 tokens; that leaves ~250 tokens for user input + generation. Longer context needs a different HBM plan (cross-instance TP/PP, or a larger instance).
+- **HBM headroom.** BF16 q/k/v adds ~2 GB per rank, leaving little margin against the 24 GB per-core budget. `seq_len=512` is the recommended value, but **HBM is no longer the binding constraint**: `seq_len=1024` compiles and loads fine on the stock recipe, and `4096` loads with `MIMO_SWA_KV_TRUNCATION=1` (~20.6/24 GB per rank). What limits usable context is **output quality** — see "Long context and output degeneration" below. (An earlier revision of this README claimed `seq_len=1024` OOMs by ~40 MB; that measurement predates the BF16-attn + `neuronx-cc 2.25` recipe and no longer reproduces.)
+- **Short context.** Pro's full chat template with the default system prompt is ~260 tokens, so at `seq_len=512` only ~250 tokens remain for user input + generation.
 - `BS * top_k / num_experts >= 1.0` required when `moe_ep_degree > 1` at decode (else `NotImplementedError`). With `num_experts=384, top_k=8` this forces `BS >= 48`.
 - `n_routed_experts=384 = 2^7 × 3` → `384 / ep_degree` is never a power of 2 (6, 12, 24, 48, 96, 192, 384). Kimi PR #131 says NKI `_bwmm_shard_on_block_nki_call` on SDK 2.29 has "depressed logits with EP=2" and recommends SDK 2.28.
 
@@ -95,9 +95,58 @@ GPU stacks (sglang on H100/H200) run the same OCP FP8 checkpoint correctly becau
 - **All-FP8 attention (`modules_to_not_convert` without q/k/v).** Drifts as described above. Known broken; `preprocess_mimo_v2_fp8.py` no longer emits it.
 - **`use_torch_block_wise=True`** (PyTorch-fallback blockwise matmul for higher accumulator precision): compile+shard succeeded after ~2 h, but `model.load()` crashed with `status=4 Allocation Failure` — the fallback path raises HBM demand even when scoped to MoE.
 
+### Long context and output degeneration
+
+Raising `seq_len` past 512 is **not** an HBM problem any more, and raising it does
+not buy usable context. Two independent things were measured:
+
+**1. HBM: solved, opt-in.** `MIMO_SWA_KV_TRUNCATION=1` sizes the 60
+sliding-window layers' KV cache to `sliding_window=128` instead of `seq_len`,
+leaving the 10 full-attention layers at full length. At `seq_len=4096` that cuts
+KV from 21.1 GB to 3.6 GB per rank, and the model compiles and loads at ~20.6/24
+GB. Off by default; see `MiMoV2SlidingWindowKVCacheManager` in
+`src/modeling_mimo_v2.py` for the ring-buffer indexing this requires.
+
+Note this is the *opposite* trade from `attention_dp_degree > 1`, which shrinks
+the KV cache but replicates attention **weights** per DP group (+4.1 GB/rank at
+dp=8) — Pro's weights already sit near the limit, so DP attention overflows where
+cache truncation fits.
+
+**2. Output quality: unsolved, and the real limit.** Independently of `seq_len`
+and of the truncation flag, generation degrades as the *prompt* gets longer.
+Measured on the `seq_len=1024` NEFF with truncation **OFF** (i.e. a graph proven
+structurally identical to the working 512 recipe — see the regression note
+below), greedy decoding, needle-in-a-haystack over non-repetitive prose:
+
+| prompt tokens | behaviour |
+|--------------:|-----------|
+| ≤ 480 | coherent, on topic |
+| ~522 | coherent but **wrong**: invents an answer instead of retrieving the planted one |
+| ≥ 568 | collapses into single-token repetition (`the the the…`) mixed with replacement characters |
+
+The middle band matters more than the collapse: output stays fluent and
+well-formed while the content is fabricated, which is far harder to catch in
+production than obvious repetition. **Treat ~480 prompt tokens as the practical
+ceiling**, well under the nominal window.
+
+Repetitive filler was ruled out as the cause — the same collapse occurs with 15
+unrelated paragraphs of varied prose. This is the same symptom class as the
+`neuronx-cc 2.26.6360` garbling documented above, but it reproduces on the
+pinned-correct 2.25.3371, so it is **not** the same root cause and is not fixed
+by the pin. Filed with AWS; no modeling-level workaround known.
+
+**Regression safety.** With `MIMO_SWA_KV_TRUNCATION` unset (the default), the
+truncation code emits a structurally identical graph to the version before it was
+added, verified by comparing multisets of `(opcode, output shape, operand
+shapes)` across all HLO modules (CTE 54658 instructions, TKG 47418). Do not
+compare HLO protobuf byte hashes for this — serialization is nondeterministic
+run-to-run, so byte hashes differ between two runs of the *same* code. Always
+establish a same-code control before trusting a "differs" verdict.
+
 ### Next experiments queued
 
-- **Even longer `seq_len`** (> 512): needs a tighter HBM plan — smaller batch, different EP ratio, or cross-instance sharding.
+- **Root-cause the long-prompt degeneration** (above) — the blocker for any
+  context beyond ~480 tokens. Pending with AWS.
 - **Upstream vllm-neuron fix** for the "first-request-only" serving bug (issue #31); patch branch at `whn09/vllm-neuron#fix/hybrid-attn-swa-spec` is a placeholder that did not resolve the symptom.
 - **Cross-instance BF16** via pipeline/tensor parallelism on 2× Trn2 (single-instance HBM cannot hold full BF16 Pro).
 - **Selective BF16 only on MoE `gate_up_proj`** (smallest expert scales) while keeping `down_proj` FP8 — another axis to probe if attn drift returns at longer contexts.
@@ -213,6 +262,7 @@ override or if you plan to launch vLLM outside of `bench_mimo_v2.sh`.
 | `NEURON_COMPILED_ARTIFACTS` | `/opt/dlami/nvme/models/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512` (per `start_vllm_server.sh`) | Where vLLM writes its NEFF + per-rank sharded weights. Points at the **same** dir as the smoke-path seq512 NEFF (no `_vllm` suffix) so vLLM reuses its 64 pre-sharded `tp*_sharded_checkpoint.safetensors` and skips the ~30 min shard step. vLLM still compiles its own continuous-batching / async / on-device-sampling NEFF variant into this dir on first launch (~60 min), but the reshard is avoided. A separate empty dir (e.g. a `_vllm` suffix) would force a full from-scratch compile *and* reshard. vLLM's own fallback is `<checkpoint>/neuron-compiled-artifacts/<hash>/`. |
 | `BASE_COMPILE_WORK_DIR` | `/opt/dlami/nvme/tmp/nxd_model/<basename of NEURON_COMPILED_ARTIFACTS>` | NxDI's HLO / NEFF staging workdir. Default is `/tmp/nxd_model/`, which is wiped by the nightly Trn2 reboot and can silently corrupt parallel compiles that share a basename; the pinned value lives on persistent storage and is unique per config. |
 | `VLLM_ENGINE_READY_TIMEOUT_S` | `7200` | First-time compile of Pro's 384-expert MoE is ~60 min TKG + ~15 min CTE + ~30 min shard, well past vLLM's default. |
+| `MIMO_SWA_KV_TRUNCATION` | `0` (off) | Size the 60 sliding-window layers' KV cache to `sliding_window=128` instead of `seq_len`, which is what lets `seq_len=4096` fit HBM. **Must be set identically at compile and at load** — it changes the KV cache shapes, so a NEFF compiled with it will not load without it. Off by default: at `seq_len=512` it saves little, and the verified 512 recipe is graph-identical with it unset. See "Long context and output degeneration" — it fixes the memory ceiling, not the quality ceiling. |
 
 For a quick `curl` sanity check while the server is up:
 

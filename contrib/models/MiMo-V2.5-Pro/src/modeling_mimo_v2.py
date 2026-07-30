@@ -9,6 +9,7 @@
 
 import gc
 import math
+import os
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -51,8 +52,13 @@ from neuronx_distributed_inference.models.model_wrapper import (
 from neuronx_distributed_inference.modules.attention.attention_base import (
     NeuronAttentionBase,
 )
-from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.modules.attention.utils import (
+    RotaryEmbedding,
+    get_last_kv_window,
+)
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.generation.sampling import create_sampler
+from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
 try:
@@ -63,6 +69,57 @@ except ImportError:
 from torch_neuronx.xla_impl.ops import nki_jit
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
+
+#: Opt-in: truncate the KV cache of sliding-window layers to `sliding_window`
+#: instead of the full seq_len. Off by default -- the verified seq_len=512 recipe
+#: is unaffected, and at 512 the saving is small anyway. See
+#: MiMoV2SlidingWindowKVCacheManager for what this changes and why.
+MIMO_SWA_KV_TRUNCATION = os.environ.get("MIMO_SWA_KV_TRUNCATION", "0") == "1"
+
+
+def swa_kv_truncation_enabled(config) -> bool:
+    """Whether SWA layers get a window-sized ring cache for this config.
+
+    Single source of truth, because two places must agree exactly or the model
+    silently computes the wrong thing: the cache manager (which sizes and
+    indexes the cache) and each attention module (which builds its decode mask
+    in ring coordinates only if the cache actually is a ring). Both must also
+    decide *before* the layers are constructed, so every condition here has to
+    be knowable from the config alone -- notably including the paths that fall
+    back to a manager which cannot do per-layer sizing.
+    """
+    if not MIMO_SWA_KV_TRUNCATION:
+        return False
+
+    window = getattr(config, "sliding_window", None)
+    if not window or not any(
+        t == "sliding_window" for t in config.layer_attention_types
+    ):
+        return False
+
+    # Nothing to truncate, and a ring no larger than the sequence buys nothing
+    # while still adding ring-indexing risk.
+    if window >= config.neuron_config.seq_len:
+        warnings.warn(
+            f"MIMO_SWA_KV_TRUNCATION ignored: sliding_window={window} >= "
+            f"seq_len={config.neuron_config.seq_len}, nothing to truncate."
+        )
+        return False
+
+    # These two select DataParallelKVCacheManager / BlockKVCacheManager upstream
+    # (model_base.py init_inference_optimization), neither of which accepts
+    # layer_to_cache_size_mapping. Rather than half-apply the optimization --
+    # ring masks reading a full-length cache would silently corrupt attention --
+    # leave those configurations exactly as they were.
+    if config.neuron_config.attention_dp_degree > 1 or config.neuron_config.is_block_kv_layout:
+        warnings.warn(
+            "MIMO_SWA_KV_TRUNCATION ignored: attention_dp_degree > 1 and "
+            "is_block_kv_layout use KV cache managers that do not support "
+            "per-layer cache sizes. Falling back to full-length caches."
+        )
+        return False
+
+    return True
 
 
 def get_rmsnorm_cls():
@@ -321,6 +378,11 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             self.attn_num_kv_heads = config.swa_num_key_value_heads
             rope_theta = getattr(config, 'swa_rope_theta', 10000.0)
             self.sliding_window_size = config.sliding_window
+            # With the cache truncated to the window (MIMO_SWA_KV_TRUNCATION=1)
+            # it becomes a ring buffer, so a slot index is no longer an absolute
+            # position and the decode masks below must be built in ring
+            # coordinates instead.
+            self.swa_kv_cache_is_ring = swa_kv_truncation_enabled(config)
         else:
             self.attn_head_dim = config.head_dim
             self.attn_v_head_dim = config.v_head_dim
@@ -328,6 +390,7 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             self.attn_num_kv_heads = config.num_key_value_heads
             rope_theta = config.rope_theta
             self.sliding_window_size = None
+            self.swa_kv_cache_is_ring = False
 
         # Calculate partial rotary dimensions
         self.partial_rotary_factor = config.partial_rotary_factor
@@ -777,8 +840,15 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             # K_prior shape: [bsz, num_heads, kv_seq_len, head_dim]
             prior_scores = torch.matmul(query_states, K_prior.transpose(-2, -1)) * self.scaling
 
-            # Apply attention mask to prior scores
-            if attention_mask is not None:
+            # Apply attention mask to prior scores.
+            #
+            # Skipped for a ring-buffer SWA cache: the externally-supplied mask
+            # is indexed by absolute position over n_positions columns, whereas
+            # prior_scores here has only `cache_len` columns whose index is a
+            # ring slot. The mask is neither the right width nor the right
+            # coordinate system; the ring mask built below replaces it entirely
+            # (it is self-sufficient -- it depends only on position_ids).
+            if attention_mask is not None and not self.swa_kv_cache_is_ring:
                 # Convert boolean mask to additive mask if needed
                 if attention_mask.dtype == torch.bool:
                     prior_scores = prior_scores.masked_fill(~attention_mask, float('-inf'))
@@ -805,7 +875,12 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             # the external mask for BOTH full-attn and SWA layers. The active
             # (current) token is scored separately via active_scores below, so
             # the bound is strict-less-than current_pos.
-            if position_ids is not None:
+            #
+            # Ring-buffer SWA caches are excluded: every slot of a filled ring
+            # holds a position < current_pos, so the absolute comparison below
+            # would be both meaningless (slot != position) and unnecessary. The
+            # ring mask that follows does the equivalent job in ring coordinates.
+            if position_ids is not None and not self.swa_kv_cache_is_ring:
                 kv_seq_len = prior_scores.size(-1)
                 current_pos = position_ids[:, 0].reshape(-1, 1)  # [bsz, 1]
                 pos_indices = torch.arange(
@@ -828,8 +903,35 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 kv_seq_len = prior_scores.size(-1)
                 # position_ids: [bsz, q_len] -> per-slot current position [bsz, 1]
                 current_pos = position_ids[:, 0].reshape(-1, 1)  # [bsz, 1]
-                pos_indices = torch.arange(kv_seq_len, device=prior_scores.device)[None, :]  # [1, kv_seq_len]
-                sliding_mask = pos_indices >= (current_pos - self.sliding_window_size + 1)  # [bsz, kv_seq_len]
+                col_idx = torch.arange(kv_seq_len, device=prior_scores.device)[None, :]  # [1, kv_seq_len]
+                if self.swa_kv_cache_is_ring:
+                    # Ring cache: column j holds whichever position last landed
+                    # in slot j, not position j. Reconstruct it, then apply the
+                    # same two-sided window rule as the non-ring branch:
+                    #   0 < current_pos - p <= window - 1
+                    # The lower bound also drops slots not yet written (their
+                    # reconstructed position lands >= current_pos), which makes
+                    # this mask self-sufficient: it subsumes both the external
+                    # mask and the per-row causal bound skipped above. `ring` is
+                    # one fewer than the cache length, matching the manager's
+                    # mimo_ring_size(); the spare slot is never written, so
+                    # `col_idx < ring` masks it out.
+                    ring = kv_seq_len - 1
+                    # Position slot j currently holds, for this row:
+                    #   base = largest multiple of `ring` at or below current_pos
+                    #   p    = base + j, minus `ring` if that overshoots
+                    base = (current_pos // ring) * ring  # [bsz, 1]
+                    slot_pos = base + col_idx  # [bsz, kv_seq_len]
+                    slot_pos = torch.where(slot_pos >= current_pos, slot_pos - ring, slot_pos)
+                    delta = current_pos - slot_pos
+                    sliding_mask = (
+                        (delta > 0)
+                        & (delta <= self.sliding_window_size - 1)
+                        & (slot_pos >= 0)
+                        & (col_idx < ring)
+                    )
+                else:
+                    sliding_mask = col_idx >= (current_pos - self.sliding_window_size + 1)  # [bsz, kv_seq_len]
                 sliding_mask = sliding_mask[:, None, None, :]  # [bsz, 1, 1, kv_seq_len]
                 prior_scores = prior_scores.masked_fill(~sliding_mask, float('-inf'))
 
@@ -1108,6 +1210,122 @@ class NeuronMiMoV2DecoderLayer(nn.Module):
         return outputs
 
 
+class MiMoV2SlidingWindowKVCacheManager(KVCacheManager):
+    """KV cache manager that sizes SWA layers to the window, not to seq_len.
+
+    MiMo is hybrid: 10 full-attention layers plus 60 sliding-window layers with
+    `sliding_window=128`. A window layer can only ever attend to the last 128
+    tokens, but the stock manager gives all 70 layers a full seq_len cache. At
+    seq_len=4096 that is 21.1 GB of KV per rank against a 24 GB budget; sizing
+    the 60 window layers to 128 brings it to 3.6 GB, which is what makes 4K fit.
+    (The alternative, attention_dp_degree>1, replicates attention *weights* per
+    DP group at +4.1 GB/rank, and Pro's weights already sit near the limit.)
+
+    Three things change together, which is why this is a subclass rather than
+    just passing `layer_to_cache_size_mapping` to the stock manager:
+
+    1. Allocation -- already handled by the base `_init_kv_shape`.
+    2. Decode indexing -- `padding_side="right"` scatters at the ABSOLUTE
+       position, out of bounds for a 128-slot cache, so window layers index
+       modulo the ring size. The stock manager only applies a modulo when
+       `attention_chunk_size`/`sliding_window` is set globally, and both are
+       all-or-nothing: `sliding_window` would also shrink the full-attention
+       caches to 128 and silently destroy long-range attention.
+    3. Prefill writing -- narrowed to the last window by
+       `update_kv_by_layer_id` below.
+
+    The read side stays the model's hand-rolled sliding mask, which switches to
+    ring coordinates via `swa_kv_cache_is_ring`. The base mask helpers are
+    deliberately unused: `_create_chunked_attn_mask_tkg` implements *chunked*
+    attention, which resets every 128 tokens -- different semantics, wrong here.
+
+    Verified by exhaustive simulation of write-then-mask over prefill lengths
+    1..4096 x 300 decode steps: the positions the mask exposes are exactly
+    {p : 0 < cur-p <= w-1}.
+    """
+
+    def __init__(self, config: InferenceConfig, is_swa_layer: List[bool], **kwargs):
+        self.mimo_is_swa_layer = list(is_swa_layer)
+        # Both of these change the meaning of v_shapes[.][2], which
+        # mimo_ring_size reads as the ring modulus: tiling turns dim 2 into the
+        # tile axis, and apply_seq_ids_mask pads every layer's cache. Neither is
+        # set in the Pro recipes, so assert rather than guess.
+        assert not config.neuron_config.kv_cache_tiling, (
+            "MIMO_SWA_KV_TRUNCATION does not support kv_cache_tiling: the tiled "
+            "layout changes which shape dim holds the cache length."
+        )
+        assert not config.neuron_config.apply_seq_ids_mask, (
+            "MIMO_SWA_KV_TRUNCATION does not support apply_seq_ids_mask: it pads "
+            "each layer's cache, so the ring modulus would no longer match the "
+            "positions written."
+        )
+        super().__init__(config, **kwargs)
+
+    def mimo_ring_size(self, layer_idx: int) -> int:
+        """Number of ring slots actually used by a sliding-window layer.
+
+        The cache has `window_size` slots but only `window_size - 1` join the
+        ring: decode scores the active token separately from the cache
+        (`active_scores` in the attention forward), so one slot must never be
+        read as "prior". Mirrors the stock manager's
+        `position_ids % (self.sliding_window - 1)` and gpt_oss's
+        `sliding_window = sliding_window - 1`. A window of w attends to w-1
+        prior tokens plus the active one, so nothing is lost.
+        """
+        return self.v_shapes[layer_idx][2] - 1
+
+    def update_kv_by_layer_id(self, idx, is_for_context_encoding: bool, seq_ids,
+                              position_ids, kv_per_layer, seq_len: int, **kwargs):
+        """Write only the last window of KV during prefill on SWA layers.
+
+        The base prefill path writes all `q_len` slots, which for a 4096-token
+        prefill does not fit a 128-slot cache. Only the tail is ever readable by
+        a window layer, so gather that tail -- in ring order, so the decode-time
+        modulo addressing lines up -- and hand the base class an exactly
+        cache-sized block. `get_last_kv_window` is the same helper
+        attention_base uses for its windowed path and does exactly this rotation.
+
+        Decode is untouched here; it goes through the scatter path below.
+        """
+        if is_for_context_encoding and self.mimo_is_swa_layer[idx]:
+            latest_k, latest_v = kv_per_layer[0], kv_per_layer[1]
+            # +1 because get_last_kv_window internally uses window_size - 1
+            # slots, and we want to fill the full ring (= cache_len - 1).
+            latest_k, latest_v = get_last_kv_window(
+                self.mimo_ring_size(idx) + 1, position_ids, latest_k, latest_v
+            )
+            kv_per_layer = (latest_k, latest_v)
+
+        return super().update_kv_by_layer_id(
+            idx=idx,
+            is_for_context_encoding=is_for_context_encoding,
+            seq_ids=seq_ids,
+            position_ids=position_ids,
+            kv_per_layer=kv_per_layer,
+            seq_len=seq_len,
+            **kwargs,
+        )
+
+    def _get_index_to_update_new_position(
+        self, seq_ids, scatter_index, position_ids, full_k, transposed: bool, layer_idx: int
+    ):
+        """Ring-buffer the decode write position for sliding-window layers only.
+
+        Full-attention layers keep absolute positions and defer to the base
+        implementation, so their behaviour is bit-for-bit unchanged.
+        """
+        if not self.mimo_is_swa_layer[layer_idx]:
+            return super()._get_index_to_update_new_position(
+                seq_ids, scatter_index, position_ids, full_k, transposed, layer_idx
+            )
+
+        position_ids = position_ids % self.mimo_ring_size(layer_idx)
+
+        index = scatter_index if self.is_medusa else position_ids
+        view_shape = (-1, 1, index.shape[-1], 1) if not transposed else (-1, 1, 1, index.shape[-1])
+        return index.view(*view_shape).expand_as(full_k)
+
+
 class NeuronMiMoV2Model(NeuronBaseModel):
     """MiMo-V2.5-Pro Model for NXD inference."""
 
@@ -1150,6 +1368,66 @@ class NeuronMiMoV2Model(NeuronBaseModel):
         # MiMo handles sliding window per-layer in the attention module itself.
         # Setting has_mixed_attn = True enables proper mask creation without affecting cache size.
         self.has_mixed_attn = True
+
+        # Opt-in per-layer KV cache sizing (MIMO_SWA_KV_TRUNCATION=1). Sliding-window
+        # layers only need `sliding_window` slots; giving all 70 layers a full
+        # seq_len cache is what puts 4K out of HBM reach. Left as None by default so
+        # the base class takes its original single-shape path.
+        self.mimo_is_swa_layer = [
+            t == "sliding_window" for t in config.layer_attention_types
+        ]
+        self.mimo_layer_to_cache_size_mapping = None
+        if swa_kv_truncation_enabled(config):
+            # max_length (not seq_len) is what the base class allocates for the
+            # single-shape path, so full-attention layers must keep using it or
+            # they would silently shrink.
+            max_length = config.neuron_config.max_length
+            self.mimo_layer_to_cache_size_mapping = [
+                config.sliding_window if is_swa else max_length
+                for is_swa in self.mimo_is_swa_layer
+            ]
+
+    def init_inference_optimization(self, config: MiMoV2InferenceConfig):
+        """Install the per-layer SWA cache manager when truncation is enabled.
+
+        Only reached when swa_kv_truncation_enabled() produced a mapping; the
+        default path falls through to the stock manager selection untouched. The
+        fallback conditions all live in that predicate rather than here, because
+        the attention modules -- already built by this point -- had to make the
+        same ring-or-not decision from the same inputs.
+        """
+        if self.mimo_layer_to_cache_size_mapping is None:
+            return super().init_inference_optimization(config)
+
+        if self.on_device_sampling:
+            lm_head_tp_degree = None
+            if hasattr(self, "lm_head") and hasattr(self.lm_head, "tensor_parallel_group"):
+                lm_head_tp_degree = self.lm_head.tensor_parallel_group.size()
+            self.sampler = create_sampler(config.neuron_config, lm_head_tp_degree)
+
+        # The base class forwards these three to the manager, and all three must
+        # stay unset for the per-layer ring to be correct. They are unset for
+        # MiMo today (see the has_mixed_attn note above), so fail loudly rather
+        # than silently drop them if that ever changes:
+        #  - sliding_window / attention_chunk_size would apply their own modulo to
+        #    EVERY layer, including full-attention ones, and resize all caches.
+        #  - windowed_context_encoding_size moves the prefill write offset, which
+        #    update_kv_by_layer_id assumes is the plain last-window block.
+        assert self.sliding_window is None and self.attention_chunk_size is None, (
+            "MIMO_SWA_KV_TRUNCATION replaces the global sliding_window / "
+            "attention_chunk_size mechanism; they must not be set as well."
+        )
+        assert self.windowed_context_encoding_size is None, (
+            "MIMO_SWA_KV_TRUNCATION does not support windowed context encoding."
+        )
+
+        self.kv_mgr = MiMoV2SlidingWindowKVCacheManager(
+            config,
+            is_swa_layer=self.mimo_is_swa_layer,
+            num_kv_head=self.num_key_value_heads,
+            global_rank=self.rank_util,
+            layer_to_cache_size_mapping=self.mimo_layer_to_cache_size_mapping,
+        )
 
     def init_model(self, config: MiMoV2InferenceConfig):
         self.padding_idx = getattr(config, 'pad_token_id', None)
