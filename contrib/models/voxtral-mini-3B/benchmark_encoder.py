@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Voxtral Audio Encoder Optimization Benchmark (Task 013)
+Voxtral Audio Encoder Optimization Benchmark
 
-Measures detailed component latencies before/after compiler flag optimization.
-Run this TWICE: once with baseline compiler args, once with optimized args.
+Measures detailed component latencies for the Voxtral audio encoder to
+help evaluate compiler-flag or SDK-version tradeoffs.  Run this TWICE:
+once with a baseline compile, once with an alternate compile.
 
 Usage:
     # Baseline (compile with minimal flags first)
     python benchmark_encoder.py --label baseline
 
-    # Optimized (recompile with optimized flags)
-    python benchmark_encoder.py --label optimized
+    # Alternate (recompile with different flags)
+    python benchmark_encoder.py --label alternate
 
 Environment variables:
     VOXTRAL_MODEL_PATH      Path to HF model weights (default: /mnt/models/voxtral-mini-3B)

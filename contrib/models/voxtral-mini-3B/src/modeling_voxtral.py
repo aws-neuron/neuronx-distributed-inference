@@ -41,7 +41,7 @@ AUDIO_TOKEN_ID = 24  # from Voxtral config.json
 # ---------------------------------------------------------------------------
 # NxDI model classes
 # ---------------------------------------------------------------------------
-from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.models.llama.modeling_llama import (
     NeuronLlamaForCausalLM,
     NeuronLlamaModel,
@@ -290,6 +290,7 @@ class VoxtralInferenceConfig:
         seq_len: int = 2048,
         n_positions: int = 4096,
         dtype: torch.dtype = torch.bfloat16,
+        on_device_sampling: bool = False,
     ):
         self.text_model_path = text_model_path
         self.full_config = full_config
@@ -298,6 +299,7 @@ class VoxtralInferenceConfig:
         self.seq_len = seq_len
         self.n_positions = n_positions
         self.dtype = dtype
+        self.on_device_sampling = on_device_sampling
 
     def build(self) -> PixtralInferenceConfig:
         """Build and return the PixtralInferenceConfig."""
@@ -305,13 +307,24 @@ class VoxtralInferenceConfig:
         text_hidden_size = text_cfg["hidden_size"]
         audio_token_id = self.full_config.get("audio_token_id", AUDIO_TOKEN_ID)
 
+        # On-device sampling: greedy argmax runs inside the compiled NEFF
+        # (removes a host round-trip per token).  Compile-time and runtime
+        # settings must match, so the same flag controls both.
+        ods_cfg = (
+            OnDeviceSamplingConfig(
+                top_k=1, do_sample=False, dynamic=False, deterministic=False
+            )
+            if self.on_device_sampling
+            else None
+        )
+
         text_neuron_config = NeuronConfig(
             tp_degree=self.tp_degree,
             batch_size=self.batch_size,
             seq_len=self.seq_len,
             n_positions=self.n_positions,
             torch_dtype=self.dtype,
-            on_device_sampling_config=None,
+            on_device_sampling_config=ods_cfg,
             enable_bucketing=False,
             flash_decoding_enabled=False,
             fused_qkv=True,
@@ -415,13 +428,52 @@ class NeuronApplicationVoxtral:
         seq_len: int = 2048,
         n_positions: int = 4096,
         dtype: torch.dtype = torch.bfloat16,
+        on_device_sampling: bool = False,
+        move_trace_to_device: bool = True,
     ):
+        """
+        Parameters
+        ----------
+        model_path : str
+            HuggingFace model directory (e.g. `mistralai/Voxtral-Mini-3B-2507`
+            downloaded via `snapshot_download`).
+        tp_degree : int
+            Tensor parallel degree for the LLM decoder. `1` fits on a single
+            NeuronCore; `4` uses all four logical cores of trn2.3xlarge at
+            LNC=2.
+        batch_size : int
+            Compile-time batch size.  Only `1` has been benchmarked in this
+            contrib.  See "Known limitations" in the README.
+        seq_len : int
+            Compile-time CTE (prompt) bucket length.  Voxtral audio always
+            produces 375 audio tokens plus a short prompt, so `seq_len=768`
+            is sufficient for a single 30 s clip; the default `2048` leaves
+            headroom for longer text prompts.
+        n_positions : int
+            Compile-time KV cache size.  Shrink to `768` to speed up short
+            audio-transcription workloads; keep `4096` for longer contexts.
+        dtype : torch.dtype
+            Model dtype (default `bfloat16`).
+        on_device_sampling : bool
+            If `True`, greedy argmax runs inside the NEFF (removes one
+            host round-trip per generated token).  Only compatible with
+            greedy decoding (`top_k=1`).  Compile-time and runtime settings
+            must match, so this flag flows into both `NeuronConfig` and
+            the runtime generate call.
+        move_trace_to_device : bool
+            If `True` (default), call `torch_neuronx.move_trace_to_device`
+            on the audio encoder after `torch.jit.load`.  Removes per-call
+            host overhead on the encoder.  Set to `False` to fall back to
+            `torch_neuronx.async_load` (previous behaviour).
+        """
         self.model_path = model_path
         self.tp_degree = tp_degree
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.n_positions = n_positions
         self.dtype = dtype
+        self.on_device_sampling = on_device_sampling
+        self.move_trace_to_device = move_trace_to_device
 
         # Read full model config
         config_path = os.path.join(model_path, "config.json")
@@ -588,7 +640,15 @@ class NeuronApplicationVoxtral:
         # Audio encoder
         logger.info(f"Loading audio encoder from {audio_encoder_path}")
         self.audio_encoder = torch.jit.load(audio_encoder_path)
-        torch_neuronx.async_load(self.audio_encoder)
+        # move_trace_to_device eliminates ~95 ms of per-call host overhead
+        # by pre-staging the traced module onto NeuronCore 0.  Falls back to
+        # async_load if the caller explicitly opts out (or if the helper is
+        # unavailable on older torch_neuronx builds).
+        if self.move_trace_to_device and hasattr(torch_neuronx, "move_trace_to_device"):
+            logger.info("Calling torch_neuronx.move_trace_to_device(encoder, 0)")
+            torch_neuronx.move_trace_to_device(self.audio_encoder, 0)
+        else:
+            torch_neuronx.async_load(self.audio_encoder)
 
         # Projector (CPU)
         logger.info("Loading projector (CPU)...")
@@ -863,6 +923,7 @@ class NeuronApplicationVoxtral:
             seq_len=self.seq_len,
             n_positions=self.n_positions,
             dtype=self.dtype,
+            on_device_sampling=self.on_device_sampling,
         )
         pixtral_config = config_builder.build()
         return VoxtralForCausalLM(text_model_path, pixtral_config)
