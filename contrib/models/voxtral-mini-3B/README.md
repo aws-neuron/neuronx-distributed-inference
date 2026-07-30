@@ -32,7 +32,7 @@ voxtral-mini-3B/
 ├── README.md
 ├── voxtral_trn2_walkthrough.ipynb   — end-to-end walkthrough on trn2.3xlarge
 ├── benchmark_encoder.py             — component-level encoder benchmark
-├── benchmark_harness/               — customer-facing latency harness
+├── benchmark_harness/               — serial latency harness (user-supplied audio)
 │   ├── run_voxtral_benchmark.py
 │   ├── backends.py
 │   ├── backend_nxdi.py
@@ -117,7 +117,7 @@ byte-identical to TP=4 (2 differ in punctuation or paraphrasing).
 ## Optimizations shipped in this contrib
 
 Four changes over the initial port (stock SDK 2.31 was 0.656 s/file at
-TP=4) that together bring the customer-harness mean to ~0.47-0.50 s/file:
+TP=4) that together bring the harness mean to ~0.47-0.50 s/file:
 
 1. **`torch_neuronx.move_trace_to_device(encoder, 0)`** at load time
    (default; the constructor argument `move_trace_to_device=True` gates
@@ -224,7 +224,7 @@ The tests:
 
 An end-to-end Jupyter walkthrough covering: launching the trn2.3xlarge
 instance, installing dependencies, downloading the model, compiling
-(one-time), running a single-file transcription, and running the customer
+(one-time), running a single-file transcription, and running the benchmark
 harness in `benchmark_harness/`. See the notebook itself for details.
 
 ## Benchmark harness
