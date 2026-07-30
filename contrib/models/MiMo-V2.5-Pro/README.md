@@ -159,6 +159,36 @@ establish a same-code control before trusting a "differs" verdict.
 - **Venv**: `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` (used by preprocess, smoke, and vLLM serving alike; ships with the DLAMI and is where `0_setup.sh` installs the patched `vllm-neuron`).
 - **Disk**: ~3 TB free under `/opt/dlami/nvme` (the HF FP8 checkpoint is ~962 GB, the Neuron-FP8 preprocessed output is ~1 TB, and `save_sharded_checkpoint=true` writes another ~300-1000 GB per compiled config (varies with recipe)).
 
+  **The sharded weights do not depend on `seq_len`** — sharding is a function of
+  TP/EP degree and quantization only. So a second `seq_len` variant needs only
+  its own `model.pt` + `neuron_config.json`; symlink `weights/` at an existing
+  artifact dir and the ~70 min / ~1 TB reshard is skipped entirely. Keeping one
+  copy of the shards per *recipe* rather than per compiled config is the
+  difference between ~1 TB and filling the array.
+
+### Compiled artifacts on S3
+
+`s3://datalab/xiaomi/compiled/` — restore with `aws s3 cp`/`s5cmd` instead of
+recompiling (compiles are ~60-90 min each):
+
+| Prefix | Contents |
+|---|---|
+| `mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512/` | The canonical BF16-attn + FP8-MoE recipe: NEFF **and** the 64 sharded weight files. Restore this one first — the weights serve every variant below. |
+| `pro_seq1024_stock_cc225/` | `seq_len=1024`, stock recipe (truncation OFF), built on `neuronx-cc 2.25.3371`. NEFF only. |
+| `pro_seq4096_swatrunc_cc225/` | `seq_len=4096`, **requires `MIMO_SWA_KV_TRUNCATION=1` at load** (it changes KV cache shapes, so it will not load without the flag). NEFF only. |
+
+The two NEFF-only prefixes carry no `weights/`; point them at the seq512 shards:
+
+```bash
+ln -s /opt/dlami/nvme/models/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq512/weights \
+      /opt/dlami/nvme/models/compiled/pro_seq1024_stock_cc225/weights
+```
+
+Both were verified byte-identical to the seq512 shards before being deduplicated
+(md5 of `tp0`/`tp31`/`tp63`). Note the 1024 and 4096 NEFFs are useful for HBM and
+compile-path work only — see the degeneration limits above before treating either
+as a usable long-context deployment.
+
 ### NVMe mount
 
 The Trn2 DLAMI ships with four local NVMe SSDs that are assembled into a
