@@ -1,0 +1,1216 @@
+#!/usr/bin/env python3
+"""
+End-to-end speech synthesis for Qwen2.5-Omni-7B on NeuronX (TP=4).
+
+Full pipeline: Thinker (text) -> Talker (codec tokens) -> Token2Wav (audio).
+
+All three Neuron-compiled components (Thinker, Talker, Token2Wav DiT) are
+loaded *once* into the same Python process and reused across runs. The
+default 8-core layout puts Thinker/Talker on cores 0-3 (TP=4) and DiT on
+core 4 / BigVGAN on core 5 so DiT/vocoder run concurrently with talker
+decode. With `NEURON_RT_VISIBLE_CORES=0-3` (e.g. on trn2.3xlarge) the
+script auto-collapses DiT/BigVGAN onto the 0-3 group — slower for
+streaming but functional for full-utterance synthesis. The first
+inference still pays the full model-load cost, but subsequent runs are
+pure inference.
+
+Two-step workflow:
+  Step 1: Compile all Neuron components (one-time, ~30 min)
+  Step 2: Run inference
+
+Prerequisites:
+  - Trn2 instance (trn2.48xlarge or trn2.3xlarge, 4+ NeuronCores)
+  - Neuron SDK 2.23+ with PyTorch 2.9
+  - Model weights downloaded from Qwen/Qwen2.5-Omni-7B (auto-fetched on first run)
+  - pip install soundfile
+
+Usage:
+  source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+  cd neuronx-distributed-inference
+
+  # Step 1: Compile (one-time)
+  python examples/generate_qwen25_omni_speech.py --compile
+
+  # Step 2: Run inference
+  python examples/generate_qwen25_omni_speech.py
+  python examples/generate_qwen25_omni_speech.py --prompt "Tell me about the weather"
+  python examples/generate_qwen25_omni_speech.py --speaker Chelsie --output hello.wav
+
+  # Benchmark: load each model once, run N inferences, report avg latency
+  python examples/generate_qwen25_omni_speech.py --num-runs 5
+"""
+
+import os as _os
+
+# Make 8 cores visible by default. Thinker/Talker stay on cores 0-3 (TP=4);
+# DiT replicas go on cores 4-7 so its forwards run truly concurrently with
+# talker decode (Neuron driver serializes shared-core dispatches). Override
+# with QWEN25_OMNI_VISIBLE_CORES="0-3" to fall back to the old single-group
+# layout for A/B comparison.
+_os.environ.setdefault(
+    "NEURON_RT_VISIBLE_CORES",
+    _os.environ.get("QWEN25_OMNI_VISIBLE_CORES", "0-7"),
+)
+
+# --- Qwen2.5-Omni contrib bootstrap ---
+import sys as _sys
+from pathlib import Path as _Path
+_SRC = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in _sys.path:
+    _sys.path.insert(0, str(_SRC))
+import _upstream_compat  # noqa: F401  (applies hf_adapter shim)
+# --- end bootstrap ---
+
+import argparse
+import gc
+import json
+import os
+import sys
+import time
+
+import torch
+
+try:
+    import soundfile as sf
+except ImportError:
+    sys.exit(
+        "soundfile is required for WAV output. Install with: pip install soundfile"
+    )
+
+from _model_path import resolve_model_path
+
+MODEL_PATH = resolve_model_path()
+COMPILED_PATH = os.environ.get(
+    "QWEN25_OMNI_COMPILED_PATH", "/tmp/qwen25_omni_compiled"
+)
+TP_DEGREE = int(os.environ.get("QWEN25_OMNI_TP_DEGREE", "4"))
+
+# Thinker prefill / decode buckets. Without bucketing the NEFF prefills the
+# full seq_len (2048) regardless of input length — TTFT is flat ~70ms even
+# for a 30-token chat prompt. Buckets pin prefill cost to actual input
+# length; the multimodal path (generate_qwen25_omni.py:217-218) already uses
+# the same scheme. seq_len/max_context_length stay at 2048 (= max bucket).
+DEFAULT_THINKER_BUCKETS = [256, 512, 1024, 2048]
+_env_thinker_buckets = os.environ.get("QWEN25_OMNI_THINKER_BUCKETS")
+if _env_thinker_buckets:
+    THINKER_BUCKETS = sorted(
+        {int(x) for x in _env_thinker_buckets.split(",") if x.strip()}
+    )
+else:
+    THINKER_BUCKETS = list(DEFAULT_THINKER_BUCKETS)
+THINKER_MAX_SEQ = max(THINKER_BUCKETS)
+
+# Talker prefill / decode buckets. Same motivation as the thinker: without
+# bucketing, every decode step computes attention against the full 2048
+# bucket regardless of how many codec tokens have actually been generated.
+# Talker context (~50-100 tokens) + max_gen (600) keeps the active sequence
+# under 1024 for typical chat-style replies.
+DEFAULT_TALKER_BUCKETS = [256, 512, 1024, 2048]
+_env_talker_buckets = os.environ.get("QWEN25_OMNI_TALKER_BUCKETS")
+if _env_talker_buckets:
+    TALKER_BUCKETS = sorted(
+        {int(x) for x in _env_talker_buckets.split(",") if x.strip()}
+    )
+else:
+    TALKER_BUCKETS = list(DEFAULT_TALKER_BUCKETS)
+TALKER_MAX_SEQ = max(TALKER_BUCKETS)
+
+# DiT mel_len buckets. Streaming chunks (chunk_size=25 codec * dit.repeats(2) =
+# 50 mel frames) benefit hugely from a small bucket; full-utterance generation
+# still needs 2048. The 1024 bucket avoids 4x O(n^2) waste when actual mel_len
+# falls in (512, 1024]. Override with QWEN25_OMNI_DIT_BUCKETS="60,120,256,2048".
+DEFAULT_DIT_BUCKETS = [60, 120, 256, 512, 1024, 2048]
+_env_buckets = os.environ.get("QWEN25_OMNI_DIT_BUCKETS")
+if _env_buckets:
+    DIT_BUCKETS = sorted({int(x) for x in _env_buckets.split(",") if x.strip()})
+else:
+    DIT_BUCKETS = list(DEFAULT_DIT_BUCKETS)
+DIT_MAX_MEL_LEN = max(DIT_BUCKETS)
+
+# Count visible NeuronCores so we can collapse the 8-core layout down to
+# whatever the runtime actually exposes (e.g. 4 cores on trn2.3xlarge or
+# when the user sets NEURON_RT_VISIBLE_CORES=0-3 for an A/B comparison).
+def _count_visible_cores():
+    spec = os.environ.get("NEURON_RT_VISIBLE_CORES", "").strip()
+    if not spec:
+        return None  # unknown — let the runtime decide
+    n = 0
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            n += int(hi) - int(lo) + 1
+        else:
+            n += 1
+    return n
+
+
+_VISIBLE_CORES = _count_visible_cores()
+
+
+def _resolve_core_start(env_var, default_start, count):
+    """Honor the env var when set; otherwise pick default if it fits, else -1."""
+    raw = os.environ.get(env_var)
+    if raw is not None:
+        return int(raw)
+    if _VISIBLE_CORES is not None and default_start + count > _VISIBLE_CORES:
+        return -1  # not enough cores for split layout — collapse onto 0..N-1
+    return default_start
+
+
+# DiT placement: by default replicate the single-core DiT NEFF onto core 4
+# so DiT forwards run truly concurrently with the TP=4 talker on cores 0-3.
+# Set START to -1 to disable the post-load placement (DiT then falls in
+# with whatever cores the runtime picks, typically inside 0-3). When fewer
+# than 5 cores are visible the script auto-collapses to -1.
+DIT_CORE_COUNT = int(os.environ.get("QWEN25_OMNI_DIT_CORE_COUNT", "1"))
+DIT_CORE_START = _resolve_core_start(
+    "QWEN25_OMNI_DIT_CORE_START", 4, DIT_CORE_COUNT
+)
+
+# BigVGAN: enable Neuron-traced vocoder via QWEN25_OMNI_BIGVGAN_NEURON=1.
+# Compiler bucket caps at T=256 on neuronxcc <= 2.25 — T>=512 crashes
+# [NCC_ITIN902] TensorInitialization regardless of compiler args, and
+# T=256 only compiles under --auto-cast=all (compile_bigvgan picks that
+# automatically). For full utterances (T_mel >> 256) the runtime BigVGAN
+# shim does chunked overlap-add at T=256, so a single large bucket is
+# enough to keep the vocoder fully on Neuron. We still keep two small
+# buckets in the grid for streaming chunks (chunk_size=25 → 50 mel
+# frames) where overlap-add overhead would dominate.
+DEFAULT_BIGVGAN_BUCKETS = [60, 128, 256]
+BIGVGAN_NEURON = os.environ.get("QWEN25_OMNI_BIGVGAN_NEURON", "1") == "1"
+_env_bv_buckets = os.environ.get("QWEN25_OMNI_BIGVGAN_BUCKETS")
+if _env_bv_buckets:
+    BIGVGAN_BUCKETS = sorted(
+        {int(x) for x in _env_bv_buckets.split(",") if x.strip()}
+    )
+else:
+    BIGVGAN_BUCKETS = list(DEFAULT_BIGVGAN_BUCKETS)
+BIGVGAN_CORE_COUNT = int(os.environ.get("QWEN25_OMNI_BIGVGAN_CORE_COUNT", "1"))
+BIGVGAN_CORE_START = _resolve_core_start(
+    "QWEN25_OMNI_BIGVGAN_CORE_START", 5, BIGVGAN_CORE_COUNT
+)
+
+DEFAULT_PROMPT = "Say hello and briefly introduce yourself in two sentences."
+DEFAULT_SYSTEM = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating "
+    "text and speech."
+)
+DEFAULT_SPEAKER = "Ethan"
+
+_ORIG_EMBEDDING_FORWARD = torch.nn.Embedding.forward
+
+
+def _restore_embedding():
+    """Restore original Embedding.forward if Neuron loading changed it."""
+    if torch.nn.Embedding.forward is not _ORIG_EMBEDDING_FORWARD:
+        torch.nn.Embedding.forward = _ORIG_EMBEDDING_FORWARD
+
+
+class Timer:
+    def __init__(self, label):
+        self.label = label
+        self.elapsed = 0
+
+    def __enter__(self):
+        self.start = time.time()
+        return self
+
+    def __exit__(self, *args):
+        self.elapsed = time.time() - self.start
+        print(f"  [{self.label}] {self.elapsed:.2f}s")
+
+
+# ==========================================================================
+# Compilation (--compile)
+# ==========================================================================
+
+def _compile_thinker(model_path, out_path, greedy=False):
+    from neuronx_distributed_inference.models.config import (
+        NeuronConfig, OnDeviceSamplingConfig, TensorCaptureConfig,
+    )
+    from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+    from modeling_qwen25_omni import (
+        NeuronQwen25OmniForCausalLM, Qwen25OmniInferenceConfig,
+    )
+
+    sampling = (
+        OnDeviceSamplingConfig(do_sample=False)
+        if greedy
+        else OnDeviceSamplingConfig(
+            do_sample=True, temperature=0.7, top_k=20, top_p=0.8,
+        )
+    )
+    # Side-band the final RMSNorm output as a NEFF output so we no longer need
+    # the 1.66s HF CPU forward to recover hidden_states[-1] for the talker.
+    # NxDI auto-flips output_logits=True when this is set.
+    capture = TensorCaptureConfig(modules_to_capture=["norm"], capture_inputs=False)
+    # NxD's TensorRegistry.clear() wipes modules_to_capture at the end of every
+    # forward (model_base.py:1148 -> registry.clear() -> model_info reset to
+    # CapturedModelInfo([], 10, False)). enable_tensor_capture is only called
+    # once before bucket 0 traces; for bucket 1+ the hook still fires but
+    # register_tensor sees an empty modules_to_capture list and routes the
+    # tensor to manual_tensors instead, so the NEFFs for the larger buckets
+    # never expose the norm output. Patch clear() to preserve the capture
+    # config across forwards — drop tensor data only.
+    from neuronx_distributed.utils.tensor_capture.registry import (
+        CapturedModelInfo, TensorRegistry,
+    )
+    def _clear_preserve_config(self):
+        cfg = self.model_info
+        new = CapturedModelInfo(
+            list(cfg.modules_to_capture), cfg.max_tensors, cfg.capture_inputs,
+        )
+        new.hooks = cfg.hooks
+        self.model_info = new
+    TensorRegistry.clear = _clear_preserve_config
+    nc = NeuronConfig(
+        tp_degree=TP_DEGREE, batch_size=1,
+        seq_len=THINKER_MAX_SEQ, max_context_length=THINKER_MAX_SEQ,
+        torch_dtype=torch.bfloat16,
+        enable_bucketing=True,
+        context_encoding_buckets=THINKER_BUCKETS,
+        token_generation_buckets=THINKER_BUCKETS,
+        on_device_sampling_config=sampling,
+        tensor_capture_config=capture,
+    )
+    cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(model_path))
+    model = NeuronQwen25OmniForCausalLM(model_path, cfg)
+    model.compile(out_path)
+
+
+def _compile_talker(model_path, out_path):
+    from transformers import AutoConfig
+    from modeling_qwen25_omni_talker import (
+        NeuronQwen25OmniTalkerForCausalLM, TalkerInferenceConfig, TalkerNeuronConfig,
+    )
+    from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+
+    hf = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    tc = hf.talker_config
+
+    # No OnDeviceSamplingConfig: the NEFF returns gathered bf16 logits and
+    # CPU-side HF adapter samples them. On-device sampling silently drops
+    # repetition_penalty (HF applies it via logits_processor only when
+    # outputs.logits is not None), and without it talker mode-collapses
+    # into "oooo" past ~75 codec tokens. CPU sampling adds <2ms/step.
+    tnc = TalkerNeuronConfig(
+        tp_degree=TP_DEGREE, batch_size=1,
+        seq_len=TALKER_MAX_SEQ, max_context_length=TALKER_MAX_SEQ,
+        torch_dtype=torch.bfloat16,
+        enable_bucketing=True,
+        context_encoding_buckets=TALKER_BUCKETS,
+        token_generation_buckets=TALKER_BUCKETS,
+    )
+    tic = TalkerInferenceConfig(
+        neuron_config=tnc, load_config=load_pretrained_config(hf_config=tc),
+    )
+    talker = NeuronQwen25OmniTalkerForCausalLM(model_path, config=tic)
+    talker.compile(out_path)
+
+
+def _compile_dit(model_path, out_path):
+    from transformers import AutoConfig
+    from safetensors.torch import load_file
+    from modeling_qwen25_omni_token2wav import (
+        NeuronQwen25OmniToken2WavWithNeuronDiT,
+    )
+
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    t2w = NeuronQwen25OmniToken2WavWithNeuronDiT(hf_config.token2wav_config)
+
+    state_dict = {}
+    for fn in sorted(os.listdir(model_path)):
+        if fn.endswith(".safetensors"):
+            sd = load_file(os.path.join(model_path, fn))
+            for k, v in sd.items():
+                if k.startswith("token2wav."):
+                    state_dict[k[len("token2wav."):]] = v
+    t2w.load_state_dict(state_dict, strict=False)
+    t2w.compile_dit(
+        out_path,
+        max_mel_len=DIT_MAX_MEL_LEN,
+        batch_size=2,
+        mel_lens=DIT_BUCKETS,
+    )
+
+
+def _compile_bigvgan(model_path, out_path):
+    from transformers import AutoConfig
+    from safetensors.torch import load_file
+    from modeling_qwen25_omni_token2wav import (
+        NeuronQwen25OmniToken2WavWithNeuronDiT,
+    )
+
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    t2w = NeuronQwen25OmniToken2WavWithNeuronDiT(hf_config.token2wav_config)
+
+    state_dict = {}
+    for fn in sorted(os.listdir(model_path)):
+        if fn.endswith(".safetensors"):
+            sd = load_file(os.path.join(model_path, fn))
+            for k, v in sd.items():
+                if k.startswith("token2wav."):
+                    state_dict[k[len("token2wav."):]] = v
+    t2w.load_state_dict(state_dict, strict=False)
+    t2w.compile_bigvgan(out_path, mel_lens=BIGVGAN_BUCKETS)
+
+
+def compile_all(model_path, compiled_path, greedy=False):
+    """Compile all three Neuron components: Thinker, Talker, DiT.
+
+    Each component is compiled sequentially in the current process. Compilation
+    holds the Neuron compiler (not the runtime) so there's no core-conflict
+    issue even when all three share TP=4 / core 0-3.
+
+    ``greedy=True`` adds a thinker NEFF compiled with do_sample=False (saved
+    to ``thinker_tp4_greedy`` so the sampling NEFF is preserved for the demo
+    flow). The talker / DiT / BigVGAN NEFFs are sampling-agnostic and reused.
+    """
+    print("=" * 60)
+    print("Compiling Qwen2.5-Omni Speech Components")
+    print("=" * 60)
+    print(f"  Model:    {model_path}")
+    print(f"  Output:   {compiled_path}")
+    print(f"  TP:       {TP_DEGREE}")
+    print(f"  Greedy thinker: {greedy}")
+    t_total = time.time()
+
+    thinker_subdir = "thinker_tp4_greedy" if greedy else "thinker_tp4"
+    thinker_fn = (lambda mp, op: _compile_thinker(mp, op, greedy=greedy))
+
+    stages = [
+        ("Thinker",  thinker_subdir, "neuron_config.json",   thinker_fn),
+        ("Talker",   "talker_tp4",   "neuron_config.json",   _compile_talker),
+        ("DiT",      "dit_core",     "dit_core_meta.json",   _compile_dit),
+    ]
+    if BIGVGAN_NEURON:
+        stages.append(
+            ("BigVGAN", "bigvgan", "bigvgan_meta.json", _compile_bigvgan)
+        )
+    for idx, (label, subdir, marker, fn) in enumerate(stages, 1):
+        print(f"\n--- [{idx}/{len(stages)}] Compiling {label} ---")
+        out_path = os.path.join(compiled_path, subdir)
+        if os.path.exists(os.path.join(out_path, marker)):
+            print("  Already compiled, skipping.")
+            continue
+        t0 = time.time()
+        fn(model_path, out_path)
+        print(f"  {label} compiled in {time.time() - t0:.1f}s")
+
+    print(f"\nAll components compiled in {time.time() - t_total:.0f}s")
+    print(f"Artifacts saved to: {compiled_path}/")
+    return True
+
+
+# ==========================================================================
+# Inference: model loading (once per process)
+# ==========================================================================
+
+def _check_compiled(compiled_path, greedy=False):
+    thinker_dir = "thinker_tp4_greedy" if greedy else "thinker_tp4"
+    checks = [
+        (os.path.join(compiled_path, thinker_dir, "neuron_config.json"), "Thinker"),
+        (os.path.join(compiled_path, "talker_tp4", "neuron_config.json"), "Talker"),
+        (os.path.join(compiled_path, "dit_core", "dit_core_meta.json"), "DiT"),
+    ]
+    if BIGVGAN_NEURON:
+        checks.append(
+            (os.path.join(compiled_path, "bigvgan", "bigvgan_meta.json"), "BigVGAN")
+        )
+    missing = [name for path, name in checks if not os.path.exists(path)]
+    if missing:
+        print(f"ERROR: Missing compiled artifacts for: {', '.join(missing)}")
+        print(f"Run with --compile first:")
+        print(f"  python {sys.argv[0]} --compile")
+        return False
+    return True
+
+
+def load_thinker(model_path, compiled_path, greedy=False):
+    """Load the Thinker (Qwen2.5-Omni text model) onto Neuron, return (adapter, tokenizer).
+
+    ``greedy=True`` loads the NEFF compiled with do_sample=False, used for
+    apples-to-apples Trn2 vs H100 benches where the text reply must be
+    deterministic across hardware.
+    """
+    from neuronx_distributed_inference.models.config import (
+        NeuronConfig, OnDeviceSamplingConfig, TensorCaptureConfig,
+    )
+    from neuronx_distributed_inference.utils.hf_adapter import (
+        load_pretrained_config, HuggingFaceGenerationAdapter,
+    )
+    from modeling_qwen25_omni import (
+        NeuronQwen25OmniForCausalLM, Qwen25OmniInferenceConfig,
+    )
+    from transformers import AutoTokenizer
+
+    sampling = (
+        OnDeviceSamplingConfig(do_sample=False)
+        if greedy
+        else OnDeviceSamplingConfig(
+            do_sample=True, temperature=0.7, top_k=20, top_p=0.8,
+        )
+    )
+    capture = TensorCaptureConfig(modules_to_capture=["norm"], capture_inputs=False)
+    nc = NeuronConfig(
+        tp_degree=TP_DEGREE, batch_size=1,
+        seq_len=THINKER_MAX_SEQ, max_context_length=THINKER_MAX_SEQ,
+        torch_dtype=torch.bfloat16,
+        enable_bucketing=True,
+        context_encoding_buckets=THINKER_BUCKETS,
+        token_generation_buckets=THINKER_BUCKETS,
+        on_device_sampling_config=sampling,
+        tensor_capture_config=capture,
+    )
+    cfg = Qwen25OmniInferenceConfig(nc, load_config=load_pretrained_config(model_path))
+    model = NeuronQwen25OmniForCausalLM(model_path, cfg)
+
+    thinker_dir = "thinker_tp4_greedy" if greedy else "thinker_tp4"
+    t0 = time.time()
+    model.load(os.path.join(compiled_path, thinker_dir))
+    load_time = time.time() - t0
+    print(f"  [Thinker] loaded in {load_time:.1f}s")
+
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    adapter = HuggingFaceGenerationAdapter(model)
+
+    # Warmup the NEFF so the first real inference isn't artificially slow.
+    enc = tok(
+        tok.apply_chat_template(
+            [{"role": "user", "content": "Hi"}],
+            tokenize=False, add_generation_prompt=True,
+        ),
+        return_tensors="pt",
+    )
+    _ = adapter.generate(
+        input_ids=enc["input_ids"], attention_mask=enc["attention_mask"],
+        max_new_tokens=5, eos_token_id=[tok.eos_token_id, 151645],
+    )
+    print("  [Thinker] warmup done")
+    return adapter, tok, load_time
+
+
+def load_talker(model_path, compiled_path):
+    """Load the Talker model onto Neuron and return (talker, adapter, talker_config)."""
+    from transformers import AutoConfig
+    from modeling_qwen25_omni_talker import (
+        NeuronQwen25OmniTalkerForCausalLM, TalkerInferenceConfig, TalkerNeuronConfig,
+    )
+    from neuronx_distributed_inference.utils.hf_adapter import (
+        load_pretrained_config, HuggingFaceGenerationAdapter,
+    )
+
+    hf = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    tc = hf.talker_config
+
+    tnc = TalkerNeuronConfig(
+        tp_degree=TP_DEGREE, batch_size=1,
+        seq_len=TALKER_MAX_SEQ, max_context_length=TALKER_MAX_SEQ,
+        torch_dtype=torch.bfloat16,
+        enable_bucketing=True,
+        context_encoding_buckets=TALKER_BUCKETS,
+        token_generation_buckets=TALKER_BUCKETS,
+    )
+    tic = TalkerInferenceConfig(
+        neuron_config=tnc, load_config=load_pretrained_config(hf_config=tc),
+    )
+    talker = NeuronQwen25OmniTalkerForCausalLM(model_path, config=tic)
+
+    t0 = time.time()
+    talker.load(os.path.join(compiled_path, "talker_tp4"))
+    load_time = time.time() - t0
+    print(f"  [Talker]  loaded in {load_time:.1f}s")
+
+    adapter = HuggingFaceGenerationAdapter(talker)
+    return talker, adapter, tc, load_time
+
+
+def load_token2wav(model_path, compiled_path):
+    """Load the Token2Wav model (DiT on Neuron + BigVGAN on CPU)."""
+    from transformers import AutoConfig
+    from safetensors.torch import load_file
+    from modeling_qwen25_omni_token2wav import (
+        NeuronQwen25OmniToken2WavWithNeuronDiT,
+    )
+
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    t2w_cfg = hf_config.token2wav_config
+
+    t2w = NeuronQwen25OmniToken2WavWithNeuronDiT(t2w_cfg)
+
+    state_dict = {}
+    for fn in sorted(os.listdir(model_path)):
+        if fn.endswith(".safetensors"):
+            sd = load_file(os.path.join(model_path, fn))
+            for k, v in sd.items():
+                if k.startswith("token2wav."):
+                    state_dict[k[len("token2wav."):]] = v
+    t2w.load_state_dict(state_dict, strict=False)
+
+    t0 = time.time()
+    t2w.load_dit(os.path.join(compiled_path, "dit_core"))
+    if DIT_CORE_START >= 0:
+        import torch_neuronx
+        cores = getattr(t2w, "_neuron_dit_cores", None) or {}
+        for bucket, neff in cores.items():
+            t_place = time.time()
+            torch_neuronx.set_neuron_cores(
+                neff, start_nc=DIT_CORE_START, nc_count=DIT_CORE_COUNT,
+            )
+            print(
+                f"  [DiT]     bucket={bucket} placed start_nc={DIT_CORE_START} "
+                f"nc_count={DIT_CORE_COUNT} in {time.time()-t_place:.1f}s",
+                flush=True,
+            )
+    load_time = time.time() - t0
+    _restore_embedding()
+    print(f"  [DiT]     loaded in {load_time:.1f}s")
+
+    bigvgan_dir = os.path.join(compiled_path, "bigvgan")
+    if BIGVGAN_NEURON and os.path.exists(
+        os.path.join(bigvgan_dir, "bigvgan_meta.json")
+    ):
+        t1 = time.time()
+        t2w.load_bigvgan(bigvgan_dir)
+        if BIGVGAN_CORE_START >= 0:
+            import torch_neuronx
+            for bucket, neff in t2w._neuron_bigvgan_cores.items():
+                tp = time.time()
+                torch_neuronx.set_neuron_cores(
+                    neff,
+                    start_nc=BIGVGAN_CORE_START,
+                    nc_count=BIGVGAN_CORE_COUNT,
+                )
+                print(
+                    f"  [BigVGAN] bucket={bucket} placed start_nc={BIGVGAN_CORE_START} "
+                    f"nc_count={BIGVGAN_CORE_COUNT} in {time.time()-tp:.1f}s",
+                    flush=True,
+                )
+        _restore_embedding()
+        print(f"  [BigVGAN] loaded in {time.time()-t1:.1f}s")
+    return t2w, t2w_cfg, load_time
+
+
+def load_hf_cpu(model_path):
+    """Load the HF Qwen2.5-Omni model on CPU in bfloat16 (for hidden-state extraction)."""
+    from transformers import Qwen2_5OmniForConditionalGeneration
+
+    t0 = time.time()
+    hf_model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    )
+    hf_model.eval()
+    _restore_embedding()
+    load_time = time.time() - t0
+    print(f"  [HF CPU]  loaded in {load_time:.1f}s")
+    return hf_model, load_time
+
+
+# ==========================================================================
+# Talker prep cache (one-time setup, off the hot path)
+# ==========================================================================
+
+class TalkerPrepCache:
+    """All static inputs the talker prep step needs, built once at startup.
+
+    The original ``prepare_talker_input`` re-loaded the speaker dict from
+    disk, scanned every safetensors shard to find ``talker.model.embed_tokens.weight``,
+    re-instantiated ``ThinkerToTalkerProjection`` from the HF state dict,
+    and re-read ``hf_config.talker_config`` on **every** utterance. None
+    of that data changes between runs; together they accounted for ~150ms
+    of the 170ms per-utterance prep budget.
+
+    This class hoists all of it to startup so the per-utterance path is
+    pure tensor math. Once a cache exists, ``hf_model`` can be freed
+    (the cache holds its own copies of the embed tables and proj weights),
+    cutting CPU resident memory by ~9GB.
+    """
+
+    def __init__(self, thinker_embed, talker_embed, proj,
+                 talker_cfg, speakers):
+        self.thinker_embed = thinker_embed
+        self.talker_embed = talker_embed
+        self.proj = proj
+        self.talker_cfg = talker_cfg
+        self.speakers = speakers
+
+    @classmethod
+    def build(cls, model_path, hf_model):
+        from transformers import AutoConfig
+        from modeling_qwen25_omni_talker import ThinkerToTalkerProjection
+
+        t0 = time.time()
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        talker_cfg = hf_config.talker_config
+
+        # Detach a standalone copy of the thinker input embedding so we can
+        # free hf_model later. The HF copy is wired into the full 7B forward
+        # graph; nn.Embedding(weight) gives us a clean, dtype-stable lookup.
+        thinker_emb_src = hf_model.thinker.get_input_embeddings()
+        thinker_embed = torch.nn.Embedding(
+            thinker_emb_src.num_embeddings, thinker_emb_src.embedding_dim
+        )
+        thinker_embed.weight.data = thinker_emb_src.weight.data.detach().clone()
+        thinker_embed.eval()
+
+        # Same idea for the talker input embedding. It lives under
+        # ``talker.model.embed_tokens.weight`` in the HF state dict.
+        talker_w = None
+        for k, v in hf_model.state_dict().items():
+            if k.endswith("talker.model.embed_tokens.weight"):
+                talker_w = v
+                break
+        if talker_w is None:
+            raise RuntimeError(
+                "talker.model.embed_tokens.weight not found in hf_model state dict"
+            )
+        talker_embed = torch.nn.Embedding(talker_w.shape[0], talker_w.shape[1])
+        talker_embed.weight.data = talker_w.detach().clone().float()
+        talker_embed.eval()
+
+        # ThinkerToTalkerProjection (3584 -> 896). Live in bf16 to match
+        # the talker's vision_embeddings dtype downstream.
+        proj_weight = proj_bias = None
+        for k, v in hf_model.state_dict().items():
+            if "thinker_to_talker_proj.weight" in k:
+                proj_weight = v
+            elif "thinker_to_talker_proj.bias" in k:
+                proj_bias = v
+        if proj_weight is None:
+            raise RuntimeError("thinker_to_talker_proj.weight not found in hf_model")
+        proj = ThinkerToTalkerProjection(proj_weight.shape[1], proj_weight.shape[0])
+        proj.proj.weight.data = proj_weight.detach().clone()
+        if proj_bias is not None:
+            proj.proj.bias.data = proj_bias.detach().clone()
+        proj.to(proj_weight.dtype)
+        proj.eval()
+
+        # Speaker conditioning lives in spk_dict.pt next to the model
+        # weights. Load all entries up-front so switching speakers between
+        # runs is free.
+        spk_dict_path = os.path.join(model_path, "spk_dict.pt")
+        raw = torch.load(spk_dict_path, weights_only=True)
+        speakers = {}
+        for name, sp in raw.items():
+            cond = sp["cond"].float()
+            if cond.dim() == 1:
+                cond = cond.unsqueeze(0)
+            ref_mel = sp["ref_mel"].float()
+            if ref_mel.dim() == 2:
+                ref_mel = ref_mel.unsqueeze(0)
+            bos = sp["bos_token"]
+            if isinstance(bos, torch.Tensor):
+                bos = bos.item()
+            speakers[name] = {
+                "conditioning": cond,
+                "reference_mel": ref_mel,
+                "bos_token": int(bos),
+            }
+
+        elapsed = time.time() - t0
+        print(f"  [Prep cache] built in {elapsed:.2f}s "
+              f"(speakers={list(speakers)}, talker_vocab={talker_w.shape[0]})")
+        return cls(thinker_embed, talker_embed, proj, talker_cfg, speakers)
+
+
+# ==========================================================================
+# Inference: per-run phases
+# ==========================================================================
+
+def run_thinker(thinker_adapter, tokenizer, prompt, system_prompt):
+    """Phase 1: Thinker generates text."""
+    chat = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": prompt},
+    ]
+    enc = tokenizer(
+        tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True),
+        return_tensors="pt",
+    )
+
+    t0 = time.time()
+    out = thinker_adapter.generate(
+        input_ids=enc["input_ids"], attention_mask=enc["attention_mask"],
+        max_new_tokens=200, eos_token_id=[tokenizer.eos_token_id, 151645],
+    )
+    elapsed = time.time() - t0
+
+    prompt_len = enc["input_ids"].shape[1]
+    all_ids = out[0].tolist()
+    gen_ids = all_ids[prompt_len:]
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    return {
+        "all_ids": all_ids,
+        "prompt_len": prompt_len,
+        "gen_text": text,
+        "n_tokens": len(gen_ids),
+        "gen_time": elapsed,
+    }
+
+
+def extract_hidden_states(thinker_model, cache, thinker_result):
+    """Phase 2: Recover per-token hidden states the talker needs.
+
+    The compiled Neuron Thinker emits sampled tokens only, but with
+    ``TensorCaptureConfig(modules_to_capture=["norm"])`` the NEFF also returns
+    the last-layer post-norm hidden states (= HF's ``outputs.hidden_states[-1]``).
+    We do one CTE forward over prompt+reply (~80ms at the 2048 bucket) and
+    read the captured tensor — replacing the 1.66s HF CPU forward.
+
+    The talker also wants ``hidden_states[0]`` (embedding output) but that is
+    just ``embed_tokens(input_ids)`` and is cheap on CPU — we compute it
+    locally rather than re-running the 7B transformer stack.
+
+    Uses ``cache.thinker_embed`` for the embedding lookup so callers can
+    free the HF CPU model once the cache is built.
+
+    Returns a duck-typed object exposing ``.hidden_states`` so the rest of the
+    pipeline (``prepare_talker_input``) is unchanged.
+    """
+    full_ids = torch.tensor([thinker_result["all_ids"]], dtype=torch.long)
+    prompt_len = thinker_result["prompt_len"]
+    total_len = full_ids.shape[1]
+
+    t0 = time.time()
+    with torch.no_grad():
+        thinker_model.reset()  # force CTE path (kv_cache_populated=False)
+        attention_mask = torch.ones_like(full_ids)
+        position_ids = torch.arange(total_len, dtype=torch.long).unsqueeze(0)
+        out = thinker_model(
+            input_ids=full_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+        )
+        captured = out.captured_tensors
+        if not captured or captured[0].dim() != 3:
+            raise RuntimeError(
+                "thinker NEFF did not expose the 'norm' output — recompile "
+                "after the TensorRegistry.clear() patch in _compile_thinker "
+                "(without it, only bucket 0 captures)."
+            )
+        last_hidden = captured[0][:, :total_len, :].to(torch.bfloat16)
+
+        embedding_output = cache.thinker_embed(full_ids).to(torch.bfloat16)
+
+        # Reset the KV state before the next generate() so cte runs again.
+        thinker_model.reset()
+    elapsed = time.time() - t0
+
+    class _HiddenStatesProxy:
+        __slots__ = ("hidden_states",)
+        def __init__(self, embed, last):
+            self.hidden_states = (embed, last)
+
+    outputs = _HiddenStatesProxy(embedding_output, last_hidden)
+    return outputs, full_ids, prompt_len, elapsed
+
+
+def prepare_talker_input(cache, outputs, full_ids, prompt_len, speaker):
+    """Phase 3: Build projected thinker states for the Talker.
+
+    Pure tensor math — all weight loading / config reading happens once at
+    startup in ``TalkerPrepCache.build``. Per-utterance cost is dominated
+    by two ``proj(...)`` calls and a few small embedding lookups.
+    """
+    talker_cfg = cache.talker_cfg
+    sp = cache.speakers[speaker]
+    conditioning = sp["conditioning"]
+    reference_mel = sp["reference_mel"]
+    bos_token = sp["bos_token"]
+
+    embedding_output = outputs.hidden_states[0]
+    last_hidden = outputs.hidden_states[-1]
+    total_len = full_ids.shape[1]
+
+    context_embed = embedding_output[:, :prompt_len, :]
+    context_hidden = last_hidden[:, :prompt_len, :]
+    reply_embeds = embedding_output[:, prompt_len:total_len, :]
+    reply_hiddens = last_hidden[:, prompt_len:total_len, :]
+
+    thinker_reply_part = reply_hiddens + reply_embeds
+    talker_inputs_embeds = context_hidden + context_embed
+
+    bos_embed = cache.thinker_embed(torch.tensor([[bos_token]], dtype=torch.long))
+    talker_inputs_embeds = torch.cat([
+        talker_inputs_embeds, bos_embed, thinker_reply_part[:, :1, :],
+    ], dim=1)
+
+    codec_bos_embed = cache.talker_embed(
+        torch.tensor([talker_cfg.tts_codec_start_token_id])
+    )
+    codec_pad_embed = cache.talker_embed(
+        torch.tensor([talker_cfg.tts_codec_pad_token_id])
+    )
+    talker_inputs_embeds[:, -1, :] += codec_bos_embed
+    talker_inputs_embeds[:, -2, :] += codec_pad_embed
+
+    eos_embed = cache.thinker_embed(
+        torch.tensor([[talker_cfg.tts_text_end_token_id]], dtype=torch.long)
+    )
+    pad_embed = cache.thinker_embed(
+        torch.tensor([[talker_cfg.tts_text_pad_token_id]], dtype=torch.long)
+    )
+    thinker_reply_part = torch.cat(
+        [thinker_reply_part[:, 1:, :], eos_embed, pad_embed], dim=1
+    )
+
+    context_len = talker_inputs_embeds.shape[1]
+    n_reply = thinker_reply_part.shape[1]
+
+    projected_context = cache.proj(talker_inputs_embeds)
+    projected_reply = cache.proj(thinker_reply_part)
+
+    return {
+        "projected_context": projected_context,
+        "projected_reply": projected_reply,
+        "context_len": context_len,
+        "n_reply": n_reply,
+        "conditioning": conditioning,
+        "reference_mel": reference_mel,
+    }
+
+
+def run_talker(talker_model, talker_adapter, talker_cfg, talker_input, *,
+               greedy=False, seed=None):
+    """Phase 4: Talker generates codec tokens.
+
+    ``seed`` (when set) seeds the CPU torch RNG immediately before
+    talker.generate() so the codec sequence is reproducible across runs
+    on Trn2. Note: this only stabilizes Trn2 ↔ Trn2; Trn2 ↔ GPU codec
+    sequences still differ (CUDA RNG ≠ CPU RNG and bf16 matmul numerics
+    diverge), but with the same sampling kwargs and a greedy thinker
+    pinning the text, codec lengths are statistically close.
+    """
+    projected_context = talker_input["projected_context"]
+    projected_reply = talker_input["projected_reply"]
+    context_len = talker_input["context_len"]
+
+    codec_bos = talker_cfg.tts_codec_start_token_id
+    codec_eos = talker_cfg.tts_codec_end_token_id
+    codec_pad = talker_cfg.tts_codec_pad_token_id
+    codec_mask = talker_cfg.tts_codec_mask_token_id
+
+    talker_input_ids = torch.cat([
+        torch.full((1, context_len - 2), codec_mask, dtype=torch.long),
+        torch.tensor([[codec_pad]], dtype=torch.long),
+        torch.tensor([[codec_bos]], dtype=torch.long),
+    ], dim=1)
+    talker_attention_mask = torch.ones_like(talker_input_ids, dtype=torch.long)
+
+    max_gen = min(600, TALKER_MAX_SEQ - context_len - 10)
+
+    # Re-set vision embeddings before each run (context encoding consumes them).
+    ve = projected_context.to(torch.bfloat16)
+    vm = torch.ones(1, context_len, 1, dtype=torch.int32)
+    reply = projected_reply.to(torch.bfloat16)
+    talker_model.set_vision_embeddings(ve, vm, thinker_reply_embeds=reply)
+
+    # Talker always uses normal sampling regardless of ``greedy`` (which
+    # only pins the thinker). Forcing argmax here on Trn2 reproducibly
+    # falls into a single-token loop ("ooooo"); cross-hardware codec
+    # equality is unattainable in bf16 either way.
+    sample_kwargs = {
+        "do_sample": True, "temperature": 0.9,
+        "top_k": 40, "top_p": 0.8, "repetition_penalty": 1.05,
+    }
+
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    t0 = time.time()
+    out = talker_adapter.generate(
+        input_ids=talker_input_ids,
+        attention_mask=talker_attention_mask,
+        max_new_tokens=max_gen,
+        eos_token_id=[codec_eos, codec_pad],
+        suppress_tokens=[codec_bos],
+        **sample_kwargs,
+    )
+    elapsed = time.time() - t0
+
+    gen_tokens = out[0, context_len:].tolist()
+    while gen_tokens and gen_tokens[-1] == codec_eos:
+        gen_tokens.pop()
+    return gen_tokens, elapsed
+
+
+def run_token2wav(t2w, t2w_cfg, codec_codes, conditioning, reference_mel, *, seed=None):
+    """Phase 5: Token2Wav DiT + BigVGAN synthesize a waveform.
+
+    ``seed`` (when set) calls ``torch.manual_seed(seed)`` immediately before
+    the DiT init noise is drawn so the starting latent is reproducible.
+    Used by the apples-to-apples Trn2 vs H100 bench.
+    """
+    code_tensor = torch.tensor([codec_codes], dtype=torch.long)
+    num_embeds = getattr(t2w_cfg.dit_config, "num_embeds", 8193)
+    if code_tensor.max() >= num_embeds:
+        code_tensor = code_tensor.clamp(0, num_embeds)
+
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    t0 = time.time()
+    wav = t2w(
+        code=code_tensor,
+        conditioning=conditioning,
+        reference_mel=reference_mel,
+        num_steps=10,
+        guidance_scale=0.5,
+    )
+    elapsed = time.time() - t0
+    return wav, elapsed
+
+
+# ==========================================================================
+# Main
+# ==========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Qwen2.5-Omni-7B speech synthesis on Neuron"
+    )
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Compile all Neuron components (one-time, ~30 min)",
+    )
+    parser.add_argument(
+        "--num-runs", type=int, default=1,
+        help="Number of inference runs per component for benchmarking (default: 1)",
+    )
+    parser.add_argument(
+        "--prompt", default=DEFAULT_PROMPT,
+        help="Text prompt for speech generation",
+    )
+    parser.add_argument(
+        "--system-prompt", default=DEFAULT_SYSTEM,
+        help="System prompt",
+    )
+    parser.add_argument(
+        "--speaker", default=DEFAULT_SPEAKER, choices=["Ethan", "Chelsie"],
+        help="Speaker voice (default: Ethan)",
+    )
+    parser.add_argument(
+        "--model-path", default=MODEL_PATH,
+        help=f"Model path (default: {MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--compiled-path", default=COMPILED_PATH,
+        help=f"Compiled artifacts path (default: {COMPILED_PATH})",
+    )
+    parser.add_argument(
+        "--output", default="speech_output.wav",
+        help="Output WAV file path (default: speech_output.wav)",
+    )
+    parser.add_argument(
+        "--greedy", action="store_true",
+        help=(
+            "Use greedy thinker NEFF (do_sample=False). Talker always uses "
+            "sampling. Loads / compiles ``thinker_tp4_greedy``."
+        ),
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help=(
+            "Seed used right before each Token2Wav call so DiT init noise "
+            "is reproducible across hardware. Default 42."
+        ),
+    )
+    parser.add_argument(
+        "--dump-codec", default=None,
+        help=(
+            "Path to write a JSON dump of the first run's "
+            "{thinker_text, thinker_token_ids, codec_token_ids} for "
+            "cross-hardware codec divergence diagnosis."
+        ),
+    )
+    args = parser.parse_args()
+
+    model_path = args.model_path
+    compiled_path = args.compiled_path
+    num_runs = args.num_runs
+
+    if args.compile:
+        ok = compile_all(model_path, compiled_path, greedy=args.greedy)
+        sys.exit(0 if ok else 1)
+
+    if not _check_compiled(compiled_path, greedy=args.greedy):
+        sys.exit(1)
+
+    print("=" * 60)
+    print("Qwen2.5-Omni Speech Pipeline (Neuron, TP=4, single process)")
+    print("=" * 60)
+    print(f"  Model:    {model_path}")
+    print(f"  Compiled: {compiled_path}")
+    print(f"  Speaker:  {args.speaker}")
+    print(f"  Prompt:   {args.prompt}")
+    print(f"  Output:   {args.output}")
+    print(f"  Runs:     {num_runs}")
+    visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "?")
+    dit_loc = (
+        f"core {DIT_CORE_START}" if DIT_CORE_START >= 0 else "shared 0-3"
+    )
+    bv_loc = (
+        f"core {BIGVGAN_CORE_START}" if BIGVGAN_CORE_START >= 0 else "shared 0-3"
+    )
+    print(
+        f"  Layout:   visible={visible}  thinker/talker=0-3 (TP=4)  "
+        f"dit={dit_loc}  bigvgan={bv_loc}"
+    )
+    t_total = time.time()
+
+    # ----- Load everything once -----
+    print("\n--- Loading models (one-time cost) ---")
+    t_load_total = time.time()
+    thinker_adapter, tokenizer, thinker_load = load_thinker(
+        model_path, compiled_path, greedy=args.greedy,
+    )
+    hf_model, hf_load = load_hf_cpu(model_path)
+    talker_model, talker_adapter, talker_cfg, talker_load = load_talker(model_path, compiled_path)
+    t2w, t2w_cfg, dit_load = load_token2wav(model_path, compiled_path)
+
+    # Build the talker prep cache, then drop the 17GB HF CPU model. The
+    # cache holds detached copies of the only weights the per-utterance
+    # prep step actually needs (thinker embed, talker embed, projection).
+    prep_cache = TalkerPrepCache.build(model_path, hf_model)
+    del hf_model
+    gc.collect()
+
+    total_load = time.time() - t_load_total
+    print(f"  Total model load time: {total_load:.1f}s")
+
+    # ----- Run the pipeline num_runs times -----
+    thinker_times, talker_times, t2w_times = [], [], []
+    hidden_times, prep_times = [], []
+    first_text = first_codes = first_wav = None
+    first_audio_duration = 0.0
+
+    for i in range(num_runs):
+        print(f"\n--- Run {i+1}/{num_runs} ---")
+
+        thinker_result = run_thinker(
+            thinker_adapter, tokenizer, args.prompt, args.system_prompt,
+        )
+        thinker_times.append(thinker_result["gen_time"])
+        print(
+            f"  [Thinker]   {thinker_result['n_tokens']} tokens in "
+            f"{thinker_result['gen_time']:.3f}s - {thinker_result['gen_text'][:80]}"
+        )
+
+        outputs, full_ids, prompt_len, hidden_time = extract_hidden_states(
+            thinker_adapter.neuron_model, prep_cache, thinker_result,
+        )
+        hidden_times.append(hidden_time)
+        print(f"  [Hidden]    forward pass in {hidden_time:.2f}s")
+
+        t0 = time.time()
+        talker_input = prepare_talker_input(
+            prep_cache, outputs, full_ids, prompt_len, args.speaker,
+        )
+        prep_time = time.time() - t0
+        prep_times.append(prep_time)
+        print(
+            f"  [Prep]      context={talker_input['context_len']} tokens, "
+            f"reply={talker_input['n_reply']} tokens ({prep_time:.2f}s)"
+        )
+
+        codec_codes, talker_time = run_talker(
+            talker_model, talker_adapter, talker_cfg, talker_input,
+            greedy=args.greedy, seed=args.seed,
+        )
+        talker_times.append(talker_time)
+        print(f"  [Talker]    {len(codec_codes)} codec tokens in {talker_time:.3f}s")
+        if not codec_codes:
+            print("  Talker produced no tokens, aborting run.")
+            continue
+
+        wav, t2w_time = run_token2wav(
+            t2w, t2w_cfg, codec_codes,
+            talker_input["conditioning"], talker_input["reference_mel"],
+            seed=args.seed,
+        )
+        t2w_times.append(t2w_time)
+        print(f"  [Token2Wav] synthesized in {t2w_time:.2f}s")
+
+        if first_text is None:
+            first_text = thinker_result["gen_text"]
+            first_codes = codec_codes
+            first_wav = wav
+            if args.dump_codec:
+                dump = {
+                    "platform": "neuron",
+                    "greedy": bool(args.greedy),
+                    "seed": int(args.seed),
+                    "thinker_text": thinker_result["gen_text"],
+                    "thinker_token_ids": thinker_result["all_ids"][
+                        thinker_result["prompt_len"]:
+                    ],
+                    "codec_token_ids": list(map(int, codec_codes)),
+                }
+                with open(args.dump_codec, "w") as _f:
+                    json.dump(dump, _f, indent=2)
+                print(f"  [dump]      wrote {args.dump_codec} "
+                      f"({len(dump['codec_token_ids'])} codec tokens)")
+
+        # Free the per-run temporaries so the heap doesn't grow across runs.
+        del outputs, full_ids, talker_input
+        gc.collect()
+
+    # ----- Write first run's audio -----
+    if first_wav is not None and isinstance(first_wav, torch.Tensor) and first_wav.numel() > 0:
+        wav_np = first_wav.detach().cpu().float().numpy().flatten()
+        sf.write(args.output, wav_np, 24000)
+        first_audio_duration = len(wav_np) / 24000
+        print(f"\n  Audio: {first_audio_duration:.1f}s saved to {args.output}")
+
+    total_time = time.time() - t_total
+
+    def _avg(xs):
+        return sum(xs) / len(xs) if xs else 0.0
+
+    print("\n" + "=" * 60)
+    print("RESULTS")
+    print("=" * 60)
+    if first_text:
+        print(f"  Text:      {first_text[:200]}")
+    print("\n  Model load time (one-time cost, excluded from pipeline avg):")
+    print(f"    Thinker:   {thinker_load:.1f}s")
+    print(f"    HF CPU:    {hf_load:.1f}s")
+    print(f"    Talker:    {talker_load:.1f}s")
+    print(f"    DiT:       {dit_load:.1f}s")
+    print(f"    Total:     {total_load:.1f}s")
+    print(f"\n  Per-run latency (avg of {num_runs} runs):")
+    print(f"    Thinker:     {_avg(thinker_times):.3f}s")
+    print(f"    Hidden:      {_avg(hidden_times):.3f}s (Neuron capture)")
+    print(f"    Prep:        {_avg(prep_times):.3f}s")
+    print(f"    Talker:      {_avg(talker_times):.3f}s")
+    print(f"    Token2Wav:   {_avg(t2w_times):.2f}s")
+    pipeline_avg = (
+        _avg(thinker_times) + _avg(hidden_times) + _avg(prep_times)
+        + _avg(talker_times) + _avg(t2w_times)
+    )
+    print(f"    Pipeline:    {pipeline_avg:.2f}s total")
+    if first_audio_duration > 0:
+        print(f"\n  Audio:     {first_audio_duration:.1f}s")
+        print(f"  RTF:       {pipeline_avg/first_audio_duration:.2f}x")
+    if num_runs > 1:
+        print(f"\n  Per-run breakdown ({num_runs} runs):")
+        print(f"    Thinker:     {['%.3f' % t for t in thinker_times]}")
+        print(f"    Hidden:      {['%.3f' % t for t in hidden_times]}")
+        print(f"    Talker:      {['%.3f' % t for t in talker_times]}")
+        print(f"    Token2Wav:   {['%.2f' % t for t in t2w_times]}")
+    print(f"\n  Wall time:   {total_time:.1f}s (load + {num_runs} run(s))")
+    print(f"  Output:      {args.output}")
+
+
+if __name__ == "__main__":
+    main()
