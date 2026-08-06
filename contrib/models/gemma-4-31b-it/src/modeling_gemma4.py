@@ -79,6 +79,60 @@ except ImportError:
 
 
 # ====================================================================================
+# Rotary Position Embedding -- Proportional RoPE
+# ====================================================================================
+
+
+class ProportionalRotaryEmbedding(RotaryEmbedding):
+    """Proportional RoPE matching HuggingFace `_compute_proportional_rope_parameters`.
+
+    Gemma4 global (full_attention) layers use `rope_type: "proportional"` with
+    `partial_rotary_factor=0.25` over `global_head_dim=512`. HuggingFace reference:
+
+        rope_angles  = int(partial_rotary_factor * head_dim // 2)     # 64
+        nope_angles  = head_dim // 2 - rope_angles                    # 192
+        inv_freq[j]  = 1 / base ** (2j / head_dim)  for j in [0, rope_angles)
+        inv_freq[j]  = 0                             for j in [rope_angles, head_dim/2)
+
+    Note the denominator is the FULL `head_dim` (512), NOT `2 * rope_angles` (128).
+    The zero-padded frequencies produce `cos=1, sin=0`, so those dims are pass-through
+    when composed with the standard `rotate_half` formula. Rotation therefore covers
+    the full `head_dim` head (matching HF), with the last 384 dims being identity.
+
+    For SWA layers (`partial_rotary_factor=1.0`), `rope_angles = head_dim//2` and
+    `nope_angles = 0`, so this class degenerates to the base `RotaryEmbedding`.
+
+    See PR #106 comment 1 (prashant182 / OpenRelay) for the on-device verification
+    that this matches the HF reference to bf16 precision at all tested positions.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        rope_angles: int,
+        max_position_embeddings: int = 2048,
+        base: float = 10000,
+    ):
+        super().__init__(
+            dim=dim, max_position_embeddings=max_position_embeddings, base=base
+        )
+        self.rope_angles = rope_angles
+
+    def get_inv_freqs(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        # Top `rope_angles` real frequencies over the full head_dim ladder.
+        idx = torch.arange(
+            0, 2 * self.rope_angles, 2, dtype=torch.float, device=device
+        )
+        rot = 1.0 / (self.base ** (idx / self.dim))
+        nope = self.dim // 2 - self.rope_angles
+        if nope > 0:
+            return torch.cat(
+                [rot, torch.zeros(nope, dtype=torch.float, device=device)]
+            )
+        return rot
+
+
+# ====================================================================================
 # Normalization
 # ====================================================================================
 
@@ -397,15 +451,22 @@ class NeuronGemma4Attention(NeuronAttentionBase):
         rope_theta = config._layer_rope_theta
         partial_rotary_factor = config._layer_partial_rotary_factor
 
-        # RoPE dimension: for global layers with partial_rotary_factor=0.25,
-        # only 25% of dims get RoPE. But RotaryEmbedding always rotates dim/2 pairs,
-        # so we pass the rotary dim = head_dim * partial_rotary_factor (rounded to even).
-        rotary_dim = int(head_dim * partial_rotary_factor)
-        # Ensure even
-        rotary_dim = rotary_dim - (rotary_dim % 2)
-
-        rotary_emb = RotaryEmbedding(
-            dim=rotary_dim,
+        # Proportional RoPE (Gemma4 spec, matches HuggingFace `_compute_proportional_rope_parameters`):
+        # - inv_freq denominator is the FULL head_dim (not 2*rope_angles)
+        # - top `rope_angles` real frequencies + zero-pad remaining `nope_angles`
+        # - `rotate_half` acts over the full head_dim; zero-padded dims pass through
+        #
+        # For SWA layers (partial_rotary_factor=1.0):
+        #   rope_angles = head_dim//2, nope_angles=0 -> degenerates to full rotation.
+        # For global layers (partial_rotary_factor=0.25, head_dim=512):
+        #   rope_angles = 64, nope_angles = 192 -> top 64 pairs rotated, last 192 pass.
+        #
+        # PR #106 comment 1 (prashant182 / OpenRelay) verified this matches the HF
+        # reference on-device to bf16 precision at all tested positions past 32K.
+        rope_angles = int(partial_rotary_factor * head_dim // 2)
+        rotary_emb = ProportionalRotaryEmbedding(
+            dim=head_dim,
+            rope_angles=rope_angles,
             max_position_embeddings=config.max_position_embeddings,
             base=rope_theta,
         )
@@ -441,18 +502,24 @@ class NeuronGemma4Attention(NeuronAttentionBase):
         self._is_sliding = is_sliding
         self._k_eq_v = config._layer_k_eq_v
         self._head_dim = head_dim
-        self._rotary_dim = rotary_dim
+        self._rope_angles = rope_angles
         self._partial_rotary_factor = partial_rotary_factor
 
     def apply_rotary_embedding(
         self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
     ):
         """
-        Override to handle partial rotary embedding for global layers.
+        Full-head rotary embedding for both SWA and global layers.
 
-        For SWA layers: partial_rotary_factor=1.0, rotary_dim==head_dim -> full rotation (same as base).
-        For global layers: partial_rotary_factor=0.25, rotary_dim=128, head_dim=512 ->
-            only rotate the first 128 dims, leave the remaining 384 unchanged.
+        The `ProportionalRotaryEmbedding` produces cos/sin over the full `head_dim`
+        with zero-padded frequencies for the "nope" tail. Applying `rotate_half` and
+        `apply_rotary_pos_emb` over the full head is equivalent to rotating the top
+        `rope_angles` frequency pairs and passing through the rest, matching HF.
+
+        For SWA layers (partial_rotary_factor=1.0): all `head_dim/2` freqs are real.
+        For global layers (partial_rotary_factor=0.25): top 64 real freqs, 192 zeros.
+
+        (Previous split-rotate-concat implementation was Bug 1 from PR #106.)
         """
         if self.rotary_emb is None:
             return Q, K, cos_cache, sin_cache
@@ -460,22 +527,7 @@ class NeuronGemma4Attention(NeuronAttentionBase):
         if cos_cache is None or sin_cache is None:
             cos_cache, sin_cache = self.rotary_emb(V, position_ids)
 
-        if self._rotary_dim == self._head_dim:
-            # Full rotation (SWA layers) - use standard path
-            Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
-        else:
-            # Partial rotation (global layers) - split, rotate, concatenate
-            # Q, K are in BHSD layout: [batch, num_heads, seq, head_dim]
-            q_rot = Q[..., : self._rotary_dim]
-            q_pass = Q[..., self._rotary_dim :]
-            k_rot = K[..., : self._rotary_dim]
-            k_pass = K[..., self._rotary_dim :]
-
-            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos_cache, sin_cache)
-
-            Q = torch.cat([q_rot, q_pass], dim=-1)
-            K = torch.cat([k_rot, k_pass], dim=-1)
-
+        Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
         return Q, K, cos_cache, sin_cache
 
     # forward() is inherited from NeuronAttentionBase -- no override needed.
