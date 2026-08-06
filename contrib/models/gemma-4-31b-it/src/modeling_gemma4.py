@@ -983,53 +983,46 @@ class NeuronGemma4TextModel(NeuronBaseModel):
         ] * config.num_hidden_layers
 
     def _create_windowed_attn_mask_tkg(self, attention_mask, window_size, position_ids):
-        """Override: SWA TKG mask must match the uniform KV cache size.
+        """Override: SWA TKG mask must attend to the causal sliding window over the LINEAR KV cache.
 
-        The base class creates a mask of shape (B, 1, 1, window_size), but our
-        KV caches use _uniform_cache_len = max(sliding_window, max_length).
-        When max_length > sliding_window, the SWA cache has extra slots beyond
-        the window that must be masked out.
+        This contrib passes ``sliding_window=None`` to ``NeuronAttentionBase`` (Discovery
+        #27, see ``NeuronGemma4Attention.__init__``), which means the KV cache is written
+        LINEARLY at absolute positions ``0..seq-1``, not with a rolling index. Therefore
+        a decode query at absolute position ``pos`` must attend to cache slots in the
+        causal sliding window ``[pos - window_size + 1, pos - 1]`` (the current position
+        ``pos`` is handled by ``compute_for_token_gen``'s active-scores path, so it is
+        NOT in the prior mask -- matches the base class convention of ``idx < pos``).
 
-        The mask has True for valid prior positions and False for masked positions.
-        For SWA at a given position, only the last (window_size - 1) positions
-        are valid.  The extra slots (beyond window_size) are always False.
+        The previous implementation masked cache slots ``[0..window_size-2]`` valid for
+        every decode query regardless of ``pos``, which only accidentally overlapped the
+        correct window while ``pos < 2*window``. For ``pos > 2*window - 1`` there was
+        zero overlap and SWA layers attended to the earliest tokens instead of the
+        recent window, causing garbage generation. This is Bug 2 from PR #106 review
+        (prashant182 / OpenRelay). Cliff was observed at ~2.5-2.8k tokens with
+        ``window_size=1024``.
+
+        The mask shape is ``[B, 1, 1, _uniform_cache_len]`` where the uniform cache
+        length equals ``max(sliding_window, max_length)`` (see ``__init__``). For short
+        contexts (``pos < window_size``), the lower bound ``pos - window_size + 1`` is
+        negative, so ``j >= (pos - window_size + 1)`` is always true and the mask
+        degrades to the pure causal ``j < pos`` -- correct behavior.
+
+        The mask also naturally handles the case where ``max_length > sliding_window``
+        (Task 018 shape mismatch): slots beyond the causal window are masked False
+        automatically, no explicit padding step needed.
+
+        See PR #106 comment 2 for the position/overlap analysis.
         """
-        batch_size, _ = attention_mask.shape
         cache_len = self._uniform_cache_len
-
-        if cache_len == window_size:
-            # No padding needed: fall back to base class behavior
-            return super()._create_windowed_attn_mask_tkg(
-                attention_mask, window_size, position_ids
-            )
-
-        # Build a cache_len-sized mask. The SWA KV cache is written with a
-        # rolling index (pos % cache_len). During TKG the base class reads the
-        # full cache of size cache_len, but only the last (window_size - 1)
-        # positions are valid for this query.
-        #
-        # For simplicity we replicate the base-class windowed logic over the
-        # first window_size slots and mask out the rest (slots window_size ..
-        # cache_len - 1 are always False).
-        pos = position_ids[:, 0]
-        idx = torch.arange(window_size, device=attention_mask.device).unsqueeze(0)
-        base_mask = (idx < pos.unsqueeze(1)) & (idx < window_size - 1)
-
-        full_mask = torch.ones(
-            (batch_size, window_size), dtype=torch.bool, device=attention_mask.device
-        )
-        full_mask[:, -1] = False
-
-        seq_less_than_window = pos < window_size - 1
-        window_mask = torch.where(
-            seq_less_than_window.unsqueeze(1), base_mask, full_mask
-        )
-
-        # Pad to cache_len with False (masked out)
-        pad_len = cache_len - window_size
-        padded_mask = F.pad(window_mask, (0, pad_len), value=False)
-
-        return padded_mask[:, None, None, :]
+        # position_ids is (B, 1) at decode; pos is the absolute query position.
+        pos = position_ids[:, 0].unsqueeze(1)  # [B, 1]
+        j = torch.arange(cache_len, device=attention_mask.device).unsqueeze(0)  # [1, cache_len]
+        # Causal sliding window over the linear cache.
+        # `j < pos` excludes the active/current position (handled by active-scores path).
+        # `j >= pos - window_size + 1` is the sliding-window lower bound; for pos < window_size
+        # this is negative and the condition is always True, degrading to pure causal.
+        window_mask = (j < pos) & (j >= (pos - window_size + 1))  # [B, cache_len]
+        return window_mask[:, None, None, :]
 
     def _create_simple_attn_mask(self, attention_mask):
         """Override: global (non-SWA) mask must match uniform KV cache size.
