@@ -997,53 +997,34 @@ class NeuronGemma4TextModel(NeuronBaseModel):
         ] * config.num_hidden_layers
 
     def _create_windowed_attn_mask_tkg(self, attention_mask, window_size, position_ids):
-        """Override: SWA TKG mask must match the uniform KV cache size.
+        """SWA token-gen mask: causal sliding window over the LINEAR KV cache.
 
-        The base class creates a mask of shape (B, 1, 1, window_size), but our
-        KV caches use _uniform_cache_len = max(sliding_window, max_length).
-        When max_length > sliding_window, the SWA cache has extra slots beyond
-        the window that must be masked out.
+        The KV cache is now written LINEARLY (we pass sliding_window=None to the
+        Gemma4KVCacheManager, see init_inference_optimization), so cache slot j holds
+        the K/V for absolute position j. A decode query at absolute position `pos`
+        must attend to the causal sliding window [pos - window_size + 1, pos - 1]
+        (the current position `pos` is handled by compute_for_token_gen's active-scores
+        path, so it is excluded from the prior mask -- `j < pos`, matching the base
+        class convention).
 
-        The mask has True for valid prior positions and False for masked positions.
-        For SWA at a given position, only the last (window_size - 1) positions
-        are valid.  The extra slots (beyond window_size) are always False.
+        This replaces the earlier physical-slot [0..window-2] mask, which was correct
+        only for a ROLLING cache. With the linear cache it would read the wrong slots
+        once pos passed the window; more importantly the linear cache is what makes
+        long prompts (> window) work at all (Task 031 / PR #106): CTE fills the cache
+        linearly, and this mask reads it linearly, so the recent tail of a long prompt
+        is visible to decode.
+
+        For short contexts (pos < window_size) the lower bound is negative, so the
+        window condition is always true and the mask degrades to pure causal `j < pos`.
+        Slots beyond the causal window (including any beyond the filled region) are
+        masked False automatically, so no explicit padding step is needed even when
+        max_length > sliding_window.
         """
-        batch_size, _ = attention_mask.shape
         cache_len = self._uniform_cache_len
-
-        if cache_len == window_size:
-            # No padding needed: fall back to base class behavior
-            return super()._create_windowed_attn_mask_tkg(
-                attention_mask, window_size, position_ids
-            )
-
-        # Build a cache_len-sized mask. The SWA KV cache is written with a
-        # rolling index (pos % cache_len). During TKG the base class reads the
-        # full cache of size cache_len, but only the last (window_size - 1)
-        # positions are valid for this query.
-        #
-        # For simplicity we replicate the base-class windowed logic over the
-        # first window_size slots and mask out the rest (slots window_size ..
-        # cache_len - 1 are always False).
-        pos = position_ids[:, 0]
-        idx = torch.arange(window_size, device=attention_mask.device).unsqueeze(0)
-        base_mask = (idx < pos.unsqueeze(1)) & (idx < window_size - 1)
-
-        full_mask = torch.ones(
-            (batch_size, window_size), dtype=torch.bool, device=attention_mask.device
-        )
-        full_mask[:, -1] = False
-
-        seq_less_than_window = pos < window_size - 1
-        window_mask = torch.where(
-            seq_less_than_window.unsqueeze(1), base_mask, full_mask
-        )
-
-        # Pad to cache_len with False (masked out)
-        pad_len = cache_len - window_size
-        padded_mask = F.pad(window_mask, (0, pad_len), value=False)
-
-        return padded_mask[:, None, None, :]
+        pos = position_ids[:, 0].unsqueeze(1)  # [B, 1] absolute query position
+        j = torch.arange(cache_len, device=attention_mask.device).unsqueeze(0)  # [1, cache_len]
+        window_mask = (j < pos) & (j >= (pos - window_size + 1))  # [B, cache_len]
+        return window_mask[:, None, None, :]
 
     def _create_simple_attn_mask(self, attention_mask):
         """Override: global (non-SWA) mask must match uniform KV cache size.
@@ -1128,12 +1109,23 @@ class NeuronGemma4TextModel(NeuronBaseModel):
         # We'll use the layer_to_cache_size_mapping mechanism, but we also need
         # different head/dim per layer. We do this by creating a uniform cache
         # with the maximum dimensions and handling the mismatch per layer.
+        #
+        # IMPORTANT: pass sliding_window=None so the KV manager uses a LINEAR cache
+        # layout (token-gen scatter writes at absolute position_ids). If we passed
+        # sliding_window here, the manager would write token-gen K/V at a ROLLING
+        # index `position_ids % (sliding_window - 1)`, while context encoding (CTE)
+        # fills the cache LINEARLY via fill_prefix. That CTE-linear vs TKG-rolling
+        # mismatch made the recent tail of any prompt longer than the window
+        # invisible to decode -> gibberish continuation for prompts > 1024 tokens.
+        # With a uniform linear cache (sized to _uniform_cache_len for all layers),
+        # the SWA window is enforced entirely by the position-aware TKG mask in
+        # _create_windowed_attn_mask_tkg and by the causal-window CTE mask.
         self.kv_mgr = Gemma4KVCacheManager(
             config,
             layer_kv_configs=layer_kv_configs,
             global_rank=self.rank_util,
             attention_chunk_size=self.attention_chunk_size,
-            sliding_window=self.sliding_window,
+            sliding_window=None,
             windowed_context_encoding_size=self.windowed_context_encoding_size,
             layer_to_cache_size_mapping=self.layer_to_cache_size_mapping,
         )
