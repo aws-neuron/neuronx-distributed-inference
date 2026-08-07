@@ -31,7 +31,23 @@ Internal SBUF layout after DMA transpose of Q/K:
 
 import os
 
-os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+# Set the compile/NKI platform target from the ACTUAL host rather than hardcoding trn2.
+# Hardcoding trn2 poisons compilation on non-trn2 platforms: on inf2 (Inferentia2, arch v2)
+# it produces a NEFF the runtime rejects with "NEFF arch: v3, instance arch: v2". We detect
+# the instance family from DMI and map inf2 -> "trn1" (both are arch v2/gen2; the NKI/MLA
+# compiler recognizes trn1 but not the literal string "inf2"). trn2 behavior is unchanged.
+if "NEURON_PLATFORM_TARGET_OVERRIDE" not in os.environ:
+    try:
+        with open("/sys/devices/virtual/dmi/id/product_name") as _f:
+            _inst = _f.readline().split(".")[0]
+    except IOError:
+        _inst = ""
+    if "inf2" in _inst:
+        os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn1"  # inf2 == arch v2 == trn1 target
+    elif "trn1" in _inst:
+        os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn1"
+    else:
+        os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
 
 import math
 import nki.isa as nisa

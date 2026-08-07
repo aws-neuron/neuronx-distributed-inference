@@ -69,11 +69,25 @@ from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
 )
 from neuronx_distributed_inference.modules.kvcache.utils import get_kv_shapes
 
-# NKI flash attention kernel for head_dim=256 SWA layers
+# NKI flash attention kernel for head_dim=256 SWA layers.
+# The d256 SWA kernel uses a DMA-transpose instruction that is only valid on trn2
+# (arch v3). On inf2 / trn1 (arch v2) the compiler rejects it with
+# NCC_INLA001 checkDMATranspose. We therefore only enable the kernel on trn2 and fall
+# back to the (compiler-optimized) decomposed attention path on other platforms.
+def _platform_supports_nki_swa_kernel() -> bool:
+    try:
+        with open("/sys/devices/virtual/dmi/id/product_name") as _f:
+            _inst = _f.readline().split(".")[0]
+    except IOError:
+        _inst = ""
+    # Only trn2/trn3 (arch v3+) support the kernel's DMA-transpose. inf2/trn1 do not.
+    return ("trn2" in _inst) or ("trn3" in _inst)
+
+
 try:
     from nki_flash_attn_d256_swa import flash_attn_d256_swa as _nki_flash_attn_d256_swa
 
-    _HAS_NKI_SWA_KERNEL = True
+    _HAS_NKI_SWA_KERNEL = _platform_supports_nki_swa_kernel()
 except ImportError:
     _HAS_NKI_SWA_KERNEL = False
 
