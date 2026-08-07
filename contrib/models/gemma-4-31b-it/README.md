@@ -2,6 +2,13 @@
 
 NeuronX Distributed Inference implementation of Google's Gemma 4 31B Instruct, supporting both text-only and vision-language (VLM) inference.
 
+## Recent fixes (PR #106 review, 2026-08)
+
+- **Proportional RoPE on global layers** — fixed the frequency denominator and rotated dims to match the HF reference (`ProportionalRotaryEmbedding`); on-device verified to bf16 precision through 32K positions.
+- **Long context (prompts > sliding_window / 1024)** — fixed an SWA KV-cache layout mismatch (context encoding filled the cache linearly while token generation read it with a rolling index, hiding the tail of long prompts from decode). The SWA cache is now linear end-to-end with a position-aware absolute sliding-window mask; long-context generation matches a native HF reference.
+- **inf2 support** — added platform detection so the compile target and NKI-kernel enablement adapt to trn2 vs inf2. See the Compatibility Matrix.
+- **Decode collapse at position ≥ 512 (psum_fmax)** — reported on SDK 2.29; does not reproduce on SDK 2.31 (compiler fix). Use SDK 2.31 on trn2 for long-generation workloads. No model-code change required.
+
 ## Model Information
 
 - **HuggingFace ID:** [`google/gemma-4-31b-it`](https://huggingface.co/google/gemma-4-31b-it)
@@ -374,17 +381,40 @@ with torch.no_grad():
 
 ## Compatibility Matrix
 
-| Instance Type | SDK 2.29 | SDK 2.28 |
-|---------------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | **VALIDATED** (text + VLM, seq_len up to 8192) | VALIDATED (text + VLM, seq_len up to 2048) |
-| trn2.48xlarge | Not tested (may support seq_len=16384+) | Not tested |
-| trn1 | Not tested (SDK 2.28 likely needed) | Not tested |
+| Instance Type | SDK 2.31 | SDK 2.29 | SDK 2.28 |
+|---------------|----------|----------|----------|
+| trn2.3xlarge (TP=4, LNC=2) | **VALIDATED** (text, seq_len up to 8192) | VALIDATED (text + VLM, seq_len up to 8192) | VALIDATED (text + VLM) |
+| inf2.48xlarge (TP=16, LNC=1) | Not supported (NxDI 0.10 drops Inf2) | Not supported | **VALIDATED** (text; see inf2 notes) |
+| trn2.48xlarge | Not tested (may support seq_len=16384+) | Not tested | Not tested |
+| trn1 | Not supported (NxDI 0.10 drops Trn1) | Not tested | Likely (untested) |
 
 **Notes:**
-- Requires TP=4 on trn2.3xlarge with LNC=2 (default). Global layers have 4 KV heads, requiring TP <= 4.
+- **trn2**: TP=4 with LNC=2 (default). Global layers have 4 KV heads; TP=4 divides both the 16 SWA and 4 global KV heads cleanly.
+- **inf2**: TP=16 with LNC=1 (`NEURON_LOGICAL_NC_CONFIG=1`). TP=16 shards the 16 SWA KV heads (1/rank) and replicates the 4 global heads to 16. inf2 requires SDK 2.28 (NxDI 0.8) — NxDI 0.9+ (SDK 2.29+) drops Inf2/Trn1 support. The d256 SWA NKI kernel is automatically disabled on inf2 (its DMA-transpose is trn2-only); inf2 uses the decomposed attention path. See "inf2 usage" below.
 - `fused_qkv=False` required (heterogeneous Q/K/V shapes per layer type).
 - `attn_kernel_enabled=False` in NeuronConfig (the standard NxDI kernel doesn't support head_dim > 128). The custom NKI kernel in `nki_flash_attn_large_d.py` is applied separately via `ndxi_patch.py`.
 - SDK 2.29 NxDI 0.9 moved `create_sampler` to `modules.generation.sampling`; the code handles both paths automatically.
+- On SDK 2.31 (transformers 4.57), the tokenizer's `extra_special_tokens` is a list; convert it to a dict (`{"video_token": "<|video|>"}`) in `tokenizer_config.json`, and download `chat_template.jinja` (not pulled by default patterns) if you need the chat template.
+
+### inf2 usage
+
+To run on inf2.48xlarge, compile and run with `NEURON_LOGICAL_NC_CONFIG=1` and `tp_degree=16`:
+
+```bash
+# inf2 requires LNC=1 (LNC=2 is a Trainium2-only feature)
+export NEURON_LOGICAL_NC_CONFIG=1
+```
+```python
+neuron_config = Gemma4NeuronConfig(
+    tp_degree=16,          # inf2: shards 16 SWA KV heads, replicates 4 global heads
+    batch_size=1, max_batch_size=1,
+    seq_len=8192,
+    torch_dtype=torch.bfloat16,
+    fused_qkv=False,
+    attn_kernel_enabled=False,   # NKI SWA kernel auto-disabled on inf2 anyway
+)
+```
+The platform (trn2 vs inf2) is auto-detected: the compile target and NKI-kernel enablement are set from the instance family, so the same code runs on both without edits.
 
 ## Testing
 
@@ -410,6 +440,7 @@ python test/integration/test_model.py
 
 ## Known Limitations
 
+- **Deep long-context recall**: Gemma-4's sliding-window attention (window=1024) means only the global layers (every 6th) see beyond 1024 tokens. A fact placed deep inside a long context, outside the SWA window, may not be retrieved. This is inherent to the sliding-window architecture — the native HF model behaves identically on the same input — not a Neuron limitation. (Long-context generation itself is coherent and matches HF after the PR #106 long-context fix.)
 - **No bidirectional vision attention**: HF Gemma4 uses bidirectional attention for vision tokens in SWA layers (`or_mask`). This implementation uses standard causal masking for all tokens. Vision quality may be slightly degraded but generation is coherent.
 - **Fixed image resolution**: Currently supports 384x384 images (64 vision tokens). Dynamic resolution requires different bucket configurations.
 - **Prompt format required**: VLM inference requires the specific HF Gemma4 chat template format (see Usage: VLM above). Incorrect prompt formatting produces garbage output.
