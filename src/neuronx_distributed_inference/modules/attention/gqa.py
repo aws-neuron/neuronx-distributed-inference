@@ -102,7 +102,15 @@ def get_shardable_head_counts(
 
 def is_per_channel(scale: torch.Tensor) -> bool:
     """See if the scale is per channel"""
-    if scale.shape == (1,):
+    # PATCH 2026-08-28 worker-llama70b-measurement: handle scalar () shape + numel-1 per-tensor scales
+    if scale is None:
+        return False
+    try:
+        if getattr(scale, "numel", None) is not None and scale.numel() == 1:
+            return False
+    except Exception:
+        pass
+    if scale.shape == (1,) or scale.shape == () or scale.shape == tuple():
         return False
     return True
 

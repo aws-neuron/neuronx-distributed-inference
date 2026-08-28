@@ -299,9 +299,36 @@ class NeuronConfig:
         # KV Quantization
         self.kv_quant_config = kwargs.pop("kv_quant_config", None)
         if type(self.kv_quant_config) is dict:
-            self.kv_quant_config = KVQuantizationConfig(
-                **self.kv_quant_config
-            )
+            # PATCH 2026-08-28 worker-llama70b-measurement:
+            # Coerce dict-form enum values (from JSON round-trip) to real enum
+            # members before instantiating KVQuantizationConfig, so the assert
+            # in __init__ (direct_cast=True requires PER_TENSOR_SYMMETRIC) sees
+            # a live QuantizationType instead of a plain dict.
+            _kv = dict(self.kv_quant_config)
+            try:
+                from neuronx_distributed.quantization.quantization_config import QuantizationType as _QT
+                for _k in ("k_quant_method", "v_quant_method"):
+                    _v = _kv.get(_k)
+                    if isinstance(_v, dict):
+                        _name = _v.get("_name_") or _v.get("name")
+                        _val  = _v.get("_value_") or _v.get("value")
+                        if _name is not None:
+                            _kv[_k] = _QT[_name]
+                        elif _val is not None:
+                            _kv[_k] = _QT(_val)
+                    elif isinstance(_v, str):
+                        try:
+                            _kv[_k] = _QT(_v)
+                        except Exception:
+                            _kv[_k] = _QT[_v]
+                import torch as _torch
+                _dt = _kv.get("quant_dtype")
+                if isinstance(_dt, str):
+                    _dt2 = _dt.split(".", 1)[1] if _dt.startswith("torch.") else _dt
+                    _kv["quant_dtype"] = getattr(_torch, _dt2, _dt)
+            except Exception as _e:
+                print(f"[nxdi-patch] kv_quant enum coerce warning: {_e}")
+            self.kv_quant_config = KVQuantizationConfig(**_kv)
 
         self.is_chunked_prefill = self.chunked_prefill_config is not None
         if self.is_chunked_prefill:

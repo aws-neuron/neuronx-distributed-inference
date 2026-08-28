@@ -411,6 +411,31 @@ class NeuronApplicationBase(torch.nn.Module):
                 cte_model.lora_weight_manager.lora_checkpoint.update_weights_for_lora_cpu(cte_model)
                 lora_cpu_weights = cte_model.lora_weight_manager.lora_checkpoint.shard_cpu_checkpoints(start_rank_id, local_ranks_size, self.neuron_config.tp_degree, cte_model)
 
+        # PATCH 2026-08-28 worker-llama70b-measurement:
+        # For FP8-KV compiled NEFFs, the compiled graph expects kv_mgr.k_scales.N
+        # and kv_mgr.v_scales.N tensors in the sharded checkpoint (created as
+        # nn.Parameter by KVCacheManager._init_scale_buffers), but these are
+        # RUNTIME buffers not present in the model checkpoint. Inject them as
+        # torch.ones(1) (per-tensor unity) so initialize() finds them.
+        try:
+            kv_cfg = getattr(self.neuron_config, "kv_quant_config", None)
+            if kv_cfg is not None:
+                num_hidden_layers = getattr(self.config, "num_hidden_layers", None)
+                if num_hidden_layers is not None and len(weights) > 0:
+                    injected = 0
+                    for rank_sd in weights:
+                        if not isinstance(rank_sd, dict):
+                            continue
+                        for L in range(num_hidden_layers):
+                            for base in ("kv_mgr.k_scales", "kv_mgr.v_scales"):
+                                key = f"{base}.{L}"
+                                if key not in rank_sd:
+                                    rank_sd[key] = torch.ones(1, dtype=torch.bfloat16)
+                                    injected += 1
+                    logger.info(f"[patch-injected] kv_mgr.*_scales unity tensors injected: {injected} across {len(weights)} ranks (num_layer={num_hidden_layers})")
+        except Exception as _e:
+            logger.warning(f"[patch-injected] kv_mgr scale injection warning: {_e}")
+
         start_rank_tensor = torch.tensor([start_rank_id], dtype=torch.int32, device="cpu")
         self.traced_model.nxd_model.initialize(weights, start_rank_tensor)
 
