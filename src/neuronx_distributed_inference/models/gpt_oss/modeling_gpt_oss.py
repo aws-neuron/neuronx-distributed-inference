@@ -56,6 +56,9 @@ from neuronx_distributed_inference.modules.generation.sampling import create_sam
 from neuronx_distributed_inference.modules.kvcache.gpt_oss_kv_cache_manager import GptOssKVCacheManager
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
+from neuronx_distributed_inference.utils.normalized_fp8 import (
+    validate_gpt_oss_120b_normalized_fp8_checkpoint,
+)
 
 from transformers import GptOssForCausalLM
 
@@ -982,6 +985,11 @@ class NeuronGptOssModel(NeuronBaseModel):
 class NeuronGptOssForCausalLM(NeuronBaseForCausalLM):
 
     _model_cls = NeuronGptOssModel
+
+    @staticmethod
+    def _validate_normalized_fp8_checkpoint(model_path, config):
+        """Validate the post-conversion GPT-OSS static-FP8 checkpoint layout."""
+        validate_gpt_oss_120b_normalized_fp8_checkpoint(str(model_path), config)
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):

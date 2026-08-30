@@ -717,6 +717,21 @@ class NeuronApplicationBase(torch.nn.Module):
     @classmethod
     def get_state_dict(cls, model_name_or_path: str, config: InferenceConfig) -> dict:
         """Gets the state dict for this model."""
+        checkpoint_format = os.environ.get("CHECKPOINT_FORMAT", "hf").lower()
+        normalized_fp8 = checkpoint_format == "normalized_fp8"
+        if normalized_fp8:
+            validator = getattr(cls, "_validate_normalized_fp8_checkpoint", None)
+            if validator is None:
+                raise ValueError(
+                    "CHECKPOINT_FORMAT=normalized_fp8 is not supported by this model"
+                )
+            if not os.path.isdir(model_name_or_path):
+                raise ValueError(
+                    "CHECKPOINT_FORMAT=normalized_fp8 requires an indexed "
+                    "SafeTensors directory"
+                )
+            validator(model_name_or_path, config)
+
         if os.path.isdir(model_name_or_path):
             model_sd = load_state_dict(model_name_or_path)
         elif os.path.isfile(model_name_or_path):
@@ -752,7 +767,8 @@ class NeuronApplicationBase(torch.nn.Module):
                     "Recompile the model with save_sharded_checkpoint=True."
                 )
 
-        model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
+        if not normalized_fp8:
+            model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
         if getattr(config, "tie_word_embeddings", False):
             cls.update_state_dict_for_tied_weights(model_sd)
 

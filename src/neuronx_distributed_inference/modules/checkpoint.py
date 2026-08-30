@@ -5,6 +5,7 @@ from shutil import copytree, ignore_patterns
 
 import torch
 from huggingface_hub import save_torch_state_dict
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 _SAFETENSORS_MODEL_INDEX_FILENAME_JSON = "model.safetensors.index.json"
@@ -108,6 +109,91 @@ def _load_from_files(
 
         state_dict.update(part_state_dict)
     return state_dict
+
+
+def inspect_safetensors_sharded(state_dict_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Inspect an indexed SafeTensors checkpoint without materializing tensors.
+
+    The indexed file is the authority for tensor ownership.  This helper is
+    intentionally stricter than the legacy loader: every SafeTensors file in
+    the directory must be indexed, every indexed tensor must exist in its
+    declared file, and a tensor name may have only one physical owner.  The
+    returned metadata is sufficient for model-specific dtype and shape gates.
+    """
+    if not os.path.isdir(state_dict_dir):
+        raise ValueError(f"SafeTensors checkpoint directory missing: {state_dict_dir}")
+
+    index_path = os.path.join(state_dict_dir, _SAFETENSORS_MODEL_INDEX_FILENAME_JSON)
+    if not os.path.isfile(index_path):
+        raise ValueError(f"Indexed SafeTensors checkpoint required: {index_path}")
+
+    with open(index_path, encoding="utf-8") as f:
+        index = json.load(f)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"SafeTensors index has no non-empty weight_map: {index_path}")
+    if not all(
+        isinstance(name, str) and isinstance(filename, str)
+        for name, filename in weight_map.items()
+    ):
+        raise ValueError(f"SafeTensors index contains non-string entries: {index_path}")
+
+    filenames = set(weight_map.values())
+    unsafe = sorted(
+        filename
+        for filename in filenames
+        if filename != os.path.basename(filename)
+        or "\\" in filename
+        or not filename.endswith(".safetensors")
+        or os.path.isabs(filename)
+    )
+    if unsafe:
+        raise ValueError(f"SafeTensors index references unsafe files: {unsafe}")
+
+    actual_files = {
+        filename
+        for filename in os.listdir(state_dict_dir)
+        if filename.endswith(".safetensors")
+    }
+    if actual_files != filenames:
+        raise ValueError(
+            "SafeTensors file inventory disagrees with index: "
+            f"unindexed={sorted(actual_files - filenames)}, "
+            f"missing={sorted(filenames - actual_files)}"
+        )
+
+    metadata: Dict[str, Dict[str, Any]] = {}
+    owners: Dict[str, str] = {}
+    for filename in sorted(filenames):
+        path = os.path.join(state_dict_dir, filename)
+        with safe_open(path, framework="pt", device="cpu") as source:
+            for name in source.keys():
+                if name in owners:
+                    raise ValueError(
+                        f"duplicate SafeTensors tensor name {name!r}: "
+                        f"{owners[name]} and {filename}"
+                    )
+                if weight_map.get(name) != filename:
+                    raise ValueError(
+                        f"SafeTensors tensor {name!r} is not owned by its indexed file"
+                    )
+                tensor = source.get_slice(name)
+                owners[name] = filename
+                metadata[name] = {
+                    "filename": filename,
+                    "dtype": tensor.get_dtype(),
+                    "shape": tuple(tensor.get_shape()),
+                }
+
+    indexed_names = set(weight_map)
+    actual_names = set(metadata)
+    if actual_names != indexed_names:
+        raise ValueError(
+            "SafeTensors tensor inventory disagrees with index: "
+            f"unindexed={sorted(actual_names - indexed_names)}, "
+            f"missing={sorted(indexed_names - actual_names)}"
+        )
+    return metadata
 
 
 def load_safetensors_sharded(state_dict_dir: str) -> Dict[str, torch.Tensor]:
