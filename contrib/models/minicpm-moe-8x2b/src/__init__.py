@@ -1,0 +1,1 @@
+from .modeling_minicpm_moe_neuronx import NeuronMiniCPMMoEForCausalLM, MiniCPMMoEInferenceConfig
