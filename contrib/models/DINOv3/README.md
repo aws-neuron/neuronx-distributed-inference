@@ -300,11 +300,69 @@ recovers ~6 points on ViT-S and nothing on ViT-B/L, so **the remaining loss is t
 boundary itself**: it forces the attention output through HBM and stops the compiler fusing
 LN2 into the following fc1 GEMM. All six arms converged (last two repeats within 3%).
 
-**This is why the rest of the fused-block path was not ported.** The attention+LN and MLP+LN
-kernels each introduce the same boundary, and are far larger ports (the attention kernels
-depend on `nkilib` and use `nl.program_id` LNC sharding that has no inf2 equivalent). On the
-traced path, the compiler's own fusion across block boundaries is already better than
-anything a hand kernel can recover by fusing within one.
+#### Fused attention + LayerNorm and fused MLP + LayerNorm kernels -- ported, also rejected
+
+The two larger whole-block kernels were then ported as well, because their effect was hard to
+predict from the small one:
+
+- **attention + residual + LN2** (QKV projection with norm1 folded into the weights, in-kernel
+  RoPE, softmax attention, out-projection with LayerScale folded in, residual add, LN2), and
+- **MLP + residual + next LN1** (fc1, GELU, fc2 with LayerScale, residual add, next block's LN).
+
+Porting them to Inferentia2 (NeuronCore-v2) under `trace()` took four changes, each forced by
+the compiler. `tensor_copy` on the Scalar engine becomes `activation(op=copy)`. The SBUF->SBUF
+`dma_transpose` of the softmax probabilities becomes a Tensor-engine `nc_transpose` through PSUM,
+because gen2 only supports HBM->SBUF DMA transposes. The LayerNorm mean moves from an
+`activation(copy, bias=tensor)` reduce to `tensor_reduce`, because gen2 accepts only an immediate
+bias there. The LNC `program_id` sharding is removed. Wheel-style `@nki.jit` kernels can be
+called directly inside `trace()`.
+
+Both ported kernels **compile and are exact**: cos_sim >= 0.99999 against PyTorch inside a
+block, and full-model cos_sim matching the compiler arm (0.99998 FP32, 0.9999 BF16). The fused
+MLP does not fit gen2 SBUF at ViT-L width (106%) without weight streaming, so it was tested on
+ViT-S/B only.
+
+**Inside one block (1 core, ViT-S/B/L):** fused attention measured 1.074x / 0.970x / 1.042x.
+
+**Whole model, every block fused, 1 core, inf2.xlarge:**
+
+| Model | Dtype | BS | attn | mlp | attn+mlp |
+|-------|-------|---:|-----:|----:|---------:|
+| ViT-S/16 | FP32 | 1 | 0.789x | 0.831x | 0.748x |
+| ViT-S/16 | FP32 | 4 | 0.895x | 1.021x | 0.886x |
+| ViT-S/16 | BF16 | 1 | 0.690x | 0.812x | 0.655x |
+| ViT-S/16 | BF16 | 4 | 0.670x | 0.924x | 0.658x |
+| ViT-B/16 | FP32 | 1 | 0.828x | 0.847x | 0.799x |
+| ViT-B/16 | BF16 | 1 | 0.733x | 0.857x | 0.708x |
+
+On ViT-S and ViT-B the wins in the 2-block slices do not survive at full depth. The extra
+kernel boundaries (two per block) cost more than the fusion inside them saves.
+
+ViT-B at BS >= 2 cannot be read as a ratio. The same compiled graph on a single core ran
+either at ~560 img/s or at ~230 img/s, sometimes switching between the two inside one run of
+repeats, and the compiler arm hit the slow state more often. This is the reason the best-config
+benchmark uses converged repeats on two independent worker processes. The decisive comparison
+for ViT-B is therefore the best value ever observed: the compiler graph reaches 570 img/s per
+core (BF16 BS2, which matches the 1,119.6 img/s 2-core best config). The best any fused arm
+ever reached is 514.6 img/s (MLP), 426.0 (attention) and 397.0 (both).
+
+**ViT-L, fused attention, standard 2-worker measurement** (img/s aggregate, last-2 mean):
+
+| Dtype | BS | Compiler | Fused attention | Ratio |
+|-------|---:|---------:|----------------:|------:|
+| BF16 | 1 | 298.3 | 273.4 | 0.92x |
+| BF16 | 2 | 317.4 | 298.1 | 0.94x |
+| BF16 | 4 | 287.2 | 313.8 | 1.09x |
+| FP32 + matmult | 4 | 257.2 | 314.7 | 1.22x |
+
+Fused attention does help ViT-L at BS=4, where the compiled graph sits past its batch cliff.
+It does not reach the ViT-L best config (381.8 img/s, BF16 BS2, in the best-config table),
+so no shipped configuration improves.
+
+**Verdict: none of the fused kernels are wired in.** On the traced path the compiler's
+cross-block fusion beats hand fusion within a block for every DINOv3 width that fits. The only
+win is a partial recovery of the BS=4 cliff, and the best configuration already avoids that
+cliff.
 
 > **Scope.** These results are specific to `torch_neuronx.trace()` on Inferentia2. They do not
 > show that NKI cannot help DINOv3 in general -- the whole-block kernels win on Trainium2 on a
@@ -390,7 +448,7 @@ With the fix, `DataParallel` (806.2 img/s) comes within **14%** of independent w
 4. **`torch_neuronx.trace()` miscompiles the HuggingFace `transformers` DINOv3 port** (cos_sim 0.50 with real weights, even at `--auto-cast=none`). Root cause: `apply_rotary_pos_emb` uses `torch.split(..., dim=-2)` on a 4D tensor, which `neuronx-cc` miscompiles on Inferentia2; a no-model micro-repro of just that op gives cos 0.17. **Replacing that one function with index slicing restores cos 1.000000.** Use the `dinov3` reference-repo architecture (which already uses index slicing) and remap the published checkpoints into it -- see "With real pretrained weights".
 5. **Inferentia2 runs the entire DINOv3 family**, including the 6.7B ViT-7B at TP=2 -- and all of it fits on a single **inf2.xlarge** (see "Maximum model size on Inferentia2").
 6. **ViT-7B: batch size is the lever.** At TP=2, BS=8 gives 22.1 img/s vs 15.4 at BS=1 (1.46x). RoPE precompute (+2%) and `-O2` (+4% at BS=1 only) are marginal.
-7. **Hand-written NKI kernels do not help on this path.** A single-op GELU kernel regressed 13 of 14 configs (-5 to -15%). A port of the fused residual+LayerNorm kernel from the whole-block fused path also regressed (-4 to -13% inside a real block) even after removing all wrapper overhead (no padding, LN affine folded in), because the kernel boundary itself blocks the compiler's fusion of LN2 into the following GEMM. See "Tested and rejected: NKI kernels on the traced path".
+7. **Hand-written NKI kernels do not help on this path.** A single-op GELU kernel regressed 13 of 14 configs (-5 to -15%). A port of the fused residual+LayerNorm kernel from the whole-block fused path also regressed (-4 to -13% inside a real block) even after removing all wrapper overhead (no padding, LN affine folded in), because the kernel boundary itself blocks the compiler's fusion of LN2 into the following GEMM. The larger fused attention+LN and MLP+LN kernels were ported too. They are exact on Inferentia2 but slower at full depth on ViT-S/B (0.65-0.92x). On ViT-L they help only at BS=4 (up to 1.22x) and still fall short of the ViT-L best config. See "Tested and rejected: NKI kernels on the traced path".
 8. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **1.82-1.87x** on 4 trn2 cores and **5.18x** on 12 inf2 cores (the penalty scales with core count, since the default caps concurrency at 2). This is an API fix for anyone using `DataParallel` -- it does not affect the tables in this README, which all use independent worker processes.
 9. **Inline weights into the NEFF.** `inline_weights=False` costs **6.8x** on inf2 (ViT-L 56.9 -> 8.4 img/s).
 10. **Per-core throughput is independent of inf2 instance size.** One worker per NeuronCore scales linearly: the 12-core inf2.24xlarge reproduced 6x the 2-core inf2.xlarge figure to within 0.1-0.8% (ViT-S, ViT-B). Buy cores for throughput, not efficiency.
