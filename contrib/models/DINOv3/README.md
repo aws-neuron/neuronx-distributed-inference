@@ -84,30 +84,40 @@ reference's true nearest neighbour is always within the compiled model's **top 3
 > The checkpoints ship in `transformers` format, but tracing `AutoModel` directly gives
 > **cos_sim 0.50** with the real ViT-S weights -- even with `--auto-cast=none`.
 >
-> **Root cause: `torch.split()` on dim -2 of a 4D tensor.** HF's `apply_rotary_pos_emb` splits
-> the prefix (CLS + register) tokens from the patch tokens with
-> `q.split((num_prefix_tokens, num_patches), dim=-2)` on a `[B, heads, tokens, head_dim]`
-> tensor, and `neuronx-cc` miscompiles that on Inferentia2:
+> **Root cause: `split()` with an explicit list of sizes, lowered with functionalization off.**
+> HF's `apply_rotary_pos_emb` separates the prefix (CLS + register) tokens from the patch tokens
+> with `q.split((num_prefix_tokens, num_patches), dim=-2)`. `torch_neuronx` sets
+> `XLA_DISABLE_FUNCTIONALIZATION=1` by default, and with that setting torch_xla 2.9 lowers
+> `split_with_sizes` to a reshape -> 1-D slice -> reshape with the wrong slice offsets. The
+> wrong graph is handed to `neuronx-cc`, so the compiler is not the cause. The same thing
+> happens on the XLA CPU backend with no Neuron device at all.
 >
-> | Test (SDK 2.31, `--auto-cast=none`) | cos_sim vs CPU |
+> | Test (`--auto-cast=none`, trn2 and inf2, neuronx-cc 2.26 and 2.27) | cos_sim vs CPU |
 > |---|---:|
-> | split + rotate + cat alone, **no model**, `torch.split(dim=-2)` | **0.167** |
+> | split + rotate + cat alone, **no model**, `split((5, 196), dim=-2)` | **0.167** |
 > | same op, index slicing `q[:, :, :n, :]` | **1.000001** |
 > | full HF model, real weights, stock | **0.502** |
 > | full HF model, real weights, `apply_rotary_pos_emb` patched to index slicing | **1.000000** |
+> | full HF model, real weights, stock, **`XLA_DISABLE_FUNCTIONALIZATION=0`** | **1.000000** |
 >
-> Every other submodule (embeddings, both LayerNorms, both LayerScales, the MLP) compiles
-> correctly in isolation; only `attention` diverges. The `dinov3` reference repo already uses
-> index slicing in `Attention.apply_rope`, which is why the architecture this contrib traces is
-> unaffected. **Any HF model that applies RoPE to a token subset via `split(dim=-2)` is likely
-> affected.**
+> It is not specific to dim -2: `split((16, 48), dim=-1)` gives cos 0.009. Integer `split(n)`,
+> `chunk`, `narrow`, `torch.tensor_split` and index slicing are all correct. The `dinov3`
+> reference repo already uses index slicing in `Attention.apply_rope`, which is why the
+> architecture this contrib traces is unaffected. **Any traced model that calls `split()` with
+> an explicit size list on an inner dimension is likely affected**, silently.
 >
-> **Two workarounds:** (1) use the reference-repo architecture and remap the published
-> checkpoints into it -- `benchmark/hf_to_repo_weights.py` does this and self-verifies on CPU
-> (`remap_cos` must be ~1.0 before any accuracy number is meaningful); or (2) keep the HF model
-> and monkey-patch `transformers.models.dinov3_vit.modeling_dinov3_vit.apply_rotary_pos_emb` with
-> an index-slicing version before tracing. Reproducer: `benchmark/repro_hf_rootcause.py`.
-> Measured on SDK 2.31 (neuronx-cc 2.26.6360).
+> **Workarounds:**
+>
+> 1. Use the reference-repo architecture and remap the published checkpoints into it.
+>    `benchmark/hf_to_repo_weights.py` does this and self-verifies on CPU (`remap_cos` must be
+>    ~1.0 before any accuracy number is meaningful).
+> 2. Keep the HF model and monkey-patch
+>    `transformers.models.dinov3_vit.modeling_dinov3_vit.apply_rotary_pos_emb` with an
+>    index-slicing version before tracing. Reproducer: `benchmark/repro_hf_rootcause.py`.
+> 3. Set `XLA_DISABLE_FUNCTIONALIZATION=0` in the environment **before** `import torch_neuronx`
+>    (torch_neuronx keeps a value you set). On the HF ViT-S model this gives exact output and
+>    was also 5.2x faster at BS=1 on one core (355.5 vs 67.9 img/s). Only this model was
+>    tested with that setting, so check your own model's output before relying on it.
 
 #### Architecture check with random weights
 
@@ -445,7 +455,7 @@ With the fix, `DataParallel` (806.2 img/s) comes within **14%** of independent w
 1. **Precompute RoPE out of the traced graph -- the single largest lever, ~2.0x per core.** The reference-repo ViT computes 2D-axial RoPE (`torch.arange` / `torch.meshgrid` / `torch.cos` / `torch.sin` over `[H*W, D]`) *inside* `forward()` on every call, and Neuron traces these poorly. Baking the tables as constants (`trace_dinov3(..., precompute_rope_tables=True)`, default on) is accuracy-neutral (cos_sim 1.000000) and, measured single-core FP32 with converged baselines on both arms, worth **2.14x (ViT-S), 1.64x (ViT-B), 2.04x (ViT-L)**. It also removes what had looked like an FP32 SwiGLU problem on ViT-H+. It is worth only +2% on ViT-7B, where the 40 layers dominate. ⚠️ **It pins the compiled NEFF to one image size** -- compile one NEFF per resolution, or pass `precompute_rope_tables=False` for variable-resolution inference. ConvNeXt has no RoPE and is unaffected. *(An earlier figure of 2.76x was measured against an unconverged in-graph baseline: ViT-L in-graph climbs 48.6 -> 78.8 img/s over ~7 repeats, and the 2.76x used 58.9.)*
 2. **BF16 weights add 1.16-1.34x on ViT -- but only at small batch.** BF16 has a sharp device-side cliff at BS=8 (ViT-L 381.8 at BS=2 -> 72.1 at BS=8); FP32 degrades gently. Serve BF16 ViT at **BS=1-4** and never BS=8+. FP32 + `--auto-cast=matmult` remains the default because it is safe at any batch size. See "Picking batch size -- the BF16 cliff".
 3. **`--model-type=transformer` is a small net win on ViT: +1-6% at each model's best config.** It is not uniformly positive -- across 36 matched (dtype, BS) pairs it ranged 0.87x to 1.18x and lost in 5 -- but every model's best configuration uses it. Keep it (the default). Not applicable to ConvNeXt.
-4. **`torch_neuronx.trace()` miscompiles the HuggingFace `transformers` DINOv3 port** (cos_sim 0.50 with real weights, even at `--auto-cast=none`). Root cause: `apply_rotary_pos_emb` uses `torch.split(..., dim=-2)` on a 4D tensor, which `neuronx-cc` miscompiles on Inferentia2; a no-model micro-repro of just that op gives cos 0.17. **Replacing that one function with index slicing restores cos 1.000000.** Use the `dinov3` reference-repo architecture (which already uses index slicing) and remap the published checkpoints into it -- see "With real pretrained weights".
+4. **`torch_neuronx.trace()` miscompiles the HuggingFace `transformers` DINOv3 port** (cos_sim 0.50 with real weights, even at `--auto-cast=none`). Root cause: `apply_rotary_pos_emb` uses `split()` with an explicit size list, which torch_xla mis-lowers when `XLA_DISABLE_FUNCTIONALIZATION=1` (the torch_neuronx default). This is not a compiler issue, and it reproduces on trn2 and inf2; a no-model micro-repro of just that op gives cos 0.17. **Replacing that one function with index slicing, or setting `XLA_DISABLE_FUNCTIONALIZATION=0` before importing torch_neuronx, restores cos 1.000000.** Use the `dinov3` reference-repo architecture (which already uses index slicing) and remap the published checkpoints into it -- see "With real pretrained weights".
 5. **Inferentia2 runs the entire DINOv3 family**, including the 6.7B ViT-7B at TP=2 -- and all of it fits on a single **inf2.xlarge** (see "Maximum model size on Inferentia2").
 6. **ViT-7B: batch size is the lever.** At TP=2, BS=8 gives 22.1 img/s vs 15.4 at BS=1 (1.46x). RoPE precompute (+2%) and `-O2` (+4% at BS=1 only) are marginal.
 7. **Hand-written NKI kernels do not help on this path.** A single-op GELU kernel regressed 13 of 14 configs (-5 to -15%). A port of the fused residual+LayerNorm kernel from the whole-block fused path also regressed (-4 to -13% inside a real block) even after removing all wrapper overhead (no padding, LN affine folded in), because the kernel boundary itself blocks the compiler's fusion of LN2 into the following GEMM. The larger fused attention+LN and MLP+LN kernels were ported too. They are exact on Inferentia2 but slower at full depth on ViT-S/B (0.65-0.92x). On ViT-L they help only at BS=4 (up to 1.22x) and still fall short of the ViT-L best config. See "Tested and rejected: NKI kernels on the traced path".
