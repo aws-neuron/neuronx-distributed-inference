@@ -89,6 +89,6 @@ Profiled on trn1.32xlarge (single NeuronCore utilization):
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Annapurna Labs
 
 **Last Updated:** 2026-03-18
