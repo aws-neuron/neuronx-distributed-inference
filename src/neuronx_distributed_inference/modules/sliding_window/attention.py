@@ -35,7 +35,7 @@ class FlashConfig:
     windowed_context_encoding: bool = False  # if True, uses offset-ed mask for WCTE window = sliding window
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def transpose_p_local(p_local_transposed, p_local, LARGE_TILE_SZ, use_dma_transpose=False):
     for i in nl.affine_range(LARGE_TILE_SZ // B_F_SIZE):
         # Temporarily disable use_dma_tranpose by default until we stablized it
@@ -58,7 +58,7 @@ def transpose_p_local(p_local_transposed, p_local, LARGE_TILE_SZ, use_dma_transp
         )
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def _flash_attention_core(
     q_local_tile,
     k,
@@ -207,7 +207,7 @@ def _flash_attention_core(
     l_buffer[:, 0] = nl.add(m_current, nisa.activation(nl.log, exp, bias=ps))
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def load_v_tile(v_hbm_tile, cur_v_tile, j, v_i, config):
     LARGE_TILE_SZ = config.seq_tile_size
     B_P_SIZE = 128

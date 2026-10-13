@@ -331,6 +331,68 @@ def get_sampler(topk, num_beams, on_device=True):
     return Sampler(neuron_config, **sampler_kwargs)
 
 
+def test_greedy_full_vocab_argmax_uses_torch_argmax():
+    neuron_config = NeuronConfig(
+        on_device_sampling_config=OnDeviceSamplingConfig(do_sample=False)
+    )
+    neuron_config.on_cpu = False
+    neuron_config.vocab_parallel = False
+
+    with patch(
+        "neuronx_distributed_inference.modules.generation.sampling.parallel_state.get_tensor_model_parallel_group",
+        return_value=None,
+    ):
+        sampler = Sampler(neuron_config)
+
+    logits = torch.tensor(
+        [[0.0, 4.0, 1.0], [3.0, -1.0, 2.0]],
+        dtype=torch.float32,
+    )
+    with patch(
+        "neuronx_distributed_inference.modules.generation.sampling.nxd_argmax",
+        side_effect=AssertionError("distributed argmax should not be used"),
+    ):
+        tokens = sampler._argmax_sample(logits, return_values=False, dim=1)
+
+    assert tokens.dtype == torch.int32
+    assert tokens.tolist() == [1, 0]
+
+
+def test_vocab_parallel_argmax_accepts_context_encoding_kernel_override():
+    neuron_config = NeuronConfig(
+        on_device_sampling_config=OnDeviceSamplingConfig(do_sample=False),
+        disable_argmax_kernel=False,
+    )
+    neuron_config.on_cpu = False
+    neuron_config.vocab_parallel = True
+
+    with patch(
+        "neuronx_distributed_inference.modules.generation.sampling.parallel_state.get_tensor_model_parallel_group",
+        return_value="tp_group",
+    ):
+        sampler = Sampler(neuron_config)
+
+    logits = torch.tensor(
+        [[0.0, 4.0, 1.0], [3.0, -1.0, 2.0]],
+        dtype=torch.float32,
+    )
+    with patch(
+        "neuronx_distributed_inference.modules.generation.sampling.nxd_argmax",
+        return_value=torch.tensor([1, 0], dtype=torch.int32),
+    ) as mock_argmax:
+        tokens = sampler.forward(
+            logits,
+            torch.ones((2, 3), dtype=torch.float32),
+            disable_argmax_kernel_override=True,
+        )
+
+    assert tokens.dtype == torch.int32
+    assert tokens.tolist() == [1, 0]
+    mock_argmax.assert_called_once()
+    assert mock_argmax.call_args.kwargs["process_group"] == "tp_group"
+    assert mock_argmax.call_args.kwargs["disable_argmax_kernel"] is True
+
+
 def run_sampler_accuracy_test(batch_size, topk, num_beams=1):
     torch.manual_seed(0)
     torch.distributed.init_process_group("xla", init_method="pjrt://")

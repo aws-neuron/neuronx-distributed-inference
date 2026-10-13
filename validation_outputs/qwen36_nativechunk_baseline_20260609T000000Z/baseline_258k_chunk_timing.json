@@ -1,0 +1,7 @@
+{
+  "chunk_count": 0,
+  "run_count": 0,
+  "runs": [],
+  "runtime_log": "validation_outputs/qwen36_nativechunk_baseline_20260609T000000Z/qwen36_256k_nativechunk_crossguard_258k_runtime_20260609T000000Z.log",
+  "total_elapsed_s": 0
+}

@@ -1,0 +1,66 @@
+{
+  "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_256k_fp8_loadfix_lmheadbf16_gatesbf16_kvbf16_qkvnki_segmented_cte512_gdnseg512_cte2048_pfx256k_pa1025_slots64_20260608T195113Z_256k_loadfix_segcte2048_chatfix_hostsampling_kkt_hier_scan7",
+  "baseline_chunk_timing": null,
+  "baseline_prefill_tok_s": 622.9956983504886,
+  "boundary": {
+    "case_count": 1,
+    "case_failures": [],
+    "lengths": [
+      16374
+    ],
+    "ok": true,
+    "path": "validation_outputs/qwen36_nativechunk_baseline_20260609T000000Z/qwen36_256k_nativechunk_crossguard_clean16k_probe_20260609T000000Z.jsonl",
+    "summary_ok": true,
+    "summary_present": false
+  },
+  "chunk_timing": {
+    "chunk_count": 0,
+    "path": "validation_outputs/qwen36_nativechunk_baseline_20260609T000000Z/baseline_258k_chunk_timing.json",
+    "run_count": 0,
+    "runs": [],
+    "runtime_log": "validation_outputs/qwen36_nativechunk_baseline_20260609T000000Z/qwen36_256k_nativechunk_crossguard_258k_runtime_20260609T000000Z.log",
+    "total_elapsed_s": 0
+  },
+  "chunk_timing_comparison": null,
+  "coherent": true,
+  "log_scan": {
+    "empty": true,
+    "line_count": 0,
+    "path": "validation_outputs/qwen36_nativechunk_baseline_20260609T000000Z/log_scan_empty.txt",
+    "sample": []
+  },
+  "long_context": [
+    {
+      "case_count": 1,
+      "case_failures": [],
+      "lengths": [
+        242864
+      ],
+      "ok": true,
+      "path": "validation_outputs/qwen36_nativechunk_baseline_20260609T000000Z/qwen36_256k_nativechunk_crossguard_258k_probe_20260609T000000Z.jsonl",
+      "summary_ok": true,
+      "summary_present": false
+    }
+  ],
+  "material_speedup_threshold": 1.2,
+  "materially_faster": true,
+  "near_max": null,
+  "raw_16k": {
+    "completion_tokens": 16,
+    "elapsed_seconds": 6.83794949100411,
+    "path": "validation_outputs/qwen36_nativechunk_baseline_20260609T000000Z/qwen36_256k_nativechunk_crossguard_clean16k_probe_20260609T000000Z.jsonl",
+    "prefill_tok_s": 2394.577500395602,
+    "prompt_tokens": 16374,
+    "text": "Here's a thinking process:\n\n1.  **Analyze User Input:**",
+    "time_basis": "ttft_seconds"
+  },
+  "recommended_next_action": {
+    "action": "promote_after_repeat_validation",
+    "reason": "Candidate recovered the target prefill speed while staying coherent."
+  },
+  "run_id": "baseline_nativechunk_20260609T000000Z",
+  "speed_class": "target_recovered",
+  "speedup_vs_baseline": 3.843650135523803,
+  "target_recovered": true,
+  "target_tok_s": 1200.0
+}

@@ -1,0 +1,32 @@
+{
+  "stage": "live_decode_throughput_sweep",
+  "date": "2026-06-11",
+  "host": "trn2.3xlarge (runtime 16.51.138.12, i-0880e77419b189402), TP=4, LNC=2",
+  "server": "serve_qwen36.py :8001, 256K native-chunk hybrid-APC prod artifact",
+  "server_config_relevant": {
+    "max_model_len": 262144,
+    "enable_bucketing": false,
+    "token_generation_buckets": [262144],
+    "context_encoding_buckets": [2048],
+    "max_num_seqs": 1,
+    "torch_dtype": "bfloat16",
+    "gdn_recurrent_cache_dtype": "float32",
+    "gdn_conv_cache_dtype": "bfloat16"
+  },
+  "method": "OpenAI streaming chat, ignore_eos, temperature=0, decode_tok_s = (completion_tokens-1)/(t_last-t_first) = 1/TPOT, batch=1",
+  "decode_tokens_per_case": 96,
+  "cases": [
+    {"target_prefix": 16,    "prompt_tokens": 11,    "ttft_s": 0.765,  "decode_tok_s": 7.63, "tpot_ms": 131.14, "total_s": 13.223},
+    {"target_prefix": 2048,  "prompt_tokens": 2018,  "ttft_s": 0.782,  "decode_tok_s": 7.65, "tpot_ms": 130.77, "total_s": 13.205},
+    {"target_prefix": 8192,  "prompt_tokens": 8162,  "ttft_s": 3.154,  "decode_tok_s": 7.62, "tpot_ms": 131.27, "total_s": 15.625},
+    {"target_prefix": 16384, "prompt_tokens": 16354, "ttft_s": 6.627,  "decode_tok_s": 7.59, "tpot_ms": 131.73, "total_s": 19.142},
+    {"target_prefix": 32768, "prompt_tokens": 32738, "ttft_s": 14.573, "decode_tok_s": 7.53, "tpot_ms": 132.85, "total_s": 27.194},
+    {"target_prefix": 65536, "prompt_tokens": 65506, "ttft_s": 34.383, "decode_tok_s": 7.39, "tpot_ms": 135.24, "total_s": 47.231}
+  ],
+  "interpretation": [
+    "Decode throughput is ~7.4-7.65 tok/s, essentially FLAT from 11 to 65,506 tokens of context (TPOT 131ms -> 135ms, ~3% over 64K).",
+    "Flatness is the expected hybrid signature: 48/64 layers are Gated DeltaNet with O(1) recurrent state (context-independent decode); only the 16 GQA layers carry a growing KV cache, so context length barely moves decode latency.",
+    "The absolute rate (~7.5 tok/s) is bottlenecked by the fixed decode graph: enable_bucketing=false with a single token_generation bucket at 262144, so EVERY decode step runs the 262K-sized TKG graph even for an 11-token prompt. This is why short context is not faster than long context.",
+    "Optimization lever: enabling token-generation bucketing (e.g. [8192, 32768, 131072, 262144]) would let short/mid context decode use a right-sized graph and run faster, at the cost of more compiled artifacts. The older 2026-05-26 multi-bucket artifact showed ~12 tok/s at 32-64K and ~5.8 tok/s at 128K for exactly this reason."
+  ]
+}

@@ -118,6 +118,28 @@ def test_generate_buckets_for_cte():
     assert result == [128, 256, 512, 1024]
 
 
+def test_generate_buckets_for_cte_uses_sparse_prefix_pairs():
+    n_config = NeuronConfig(
+        enable_bucketing=True,
+        is_prefix_caching=True,
+        max_context_length=65536,
+        max_length=65536,
+        context_encoding_buckets=[512, 1536],
+        prefix_buckets=[256, 65536],
+        context_encoding_bucket_pairs=[
+            [512, 0],
+            [512, 256],
+            [1536, 0],
+            [1536, 65536],
+        ],
+    )
+    config = InferenceConfig(neuron_config=n_config)
+
+    result = autobucketing.generate_buckets_for_cte(config)
+
+    assert result == [[512, 0], [512, 256], [1536, 0], [1536, 65536]]
+
+
 def test_generate_buckets_for_tkg():
     # Test with bucketing disabled and no prefix caching
     n_config = NeuronConfig(

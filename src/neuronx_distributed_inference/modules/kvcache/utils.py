@@ -549,3 +549,71 @@ def get_kv_shapes(max_len: int, bsz: int, num_kv_heads_per_rank: int, head_dim: 
             max_len,
         )
     return k_shape, v_shape
+
+
+def floor_to_block_boundary(length: int, block_size: int) -> int:
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    return max(0, int(length)) // int(block_size) * int(block_size)
+
+
+def get_cumulative_prefix_hash_at_boundary(
+    cumulative_hashes_by_prefix_len,
+    prefix_len: int,
+    block_size: int,
+):
+    boundary = floor_to_block_boundary(prefix_len, block_size)
+    if boundary not in cumulative_hashes_by_prefix_len:
+        raise KeyError(f"missing cumulative prefix hash for boundary {boundary}")
+    return cumulative_hashes_by_prefix_len[boundary]
+
+
+def validate_active_block_table_for_prefix(
+    active_block_table: Tensor,
+    prefix_len: int,
+    block_size: int,
+) -> bool:
+    boundary = floor_to_block_boundary(prefix_len, block_size)
+    expected_blocks = boundary // int(block_size)
+    if active_block_table.numel() < expected_blocks:
+        raise ValueError(
+            f"active_block_table has {active_block_table.numel()} blocks, "
+            f"expected at least {expected_blocks} for prefix {boundary}"
+        )
+    return True
+
+
+def make_hybrid_restore_inputs(
+    checkpoint_slot_ids: Tensor,
+    restore_prefix_lens: Tensor,
+    *,
+    block_size: int,
+):
+    if checkpoint_slot_ids.shape != restore_prefix_lens.shape:
+        raise ValueError("checkpoint_slot_ids and restore_prefix_lens must match")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    restore_mask = restore_prefix_lens > 0
+    if torch.any(restore_prefix_lens[restore_mask] % int(block_size) != 0):
+        raise ValueError("restore_prefix_lens must be block aligned")
+    return (
+        checkpoint_slot_ids.to(torch.int32),
+        restore_mask.to(torch.int32),
+        restore_prefix_lens.to(torch.int32),
+    )
+
+
+def make_hybrid_commit_inputs(
+    checkpoint_slot_ids: Tensor,
+    commit_prefix_lens: Tensor,
+    *,
+    block_size: int,
+):
+    if checkpoint_slot_ids.shape != commit_prefix_lens.shape:
+        raise ValueError("checkpoint_slot_ids and commit_prefix_lens must match")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    commit_mask = commit_prefix_lens > 0
+    if torch.any(commit_prefix_lens[commit_mask] % int(block_size) != 0):
+        raise ValueError("commit_prefix_lens must be block aligned")
+    return checkpoint_slot_ids.to(torch.int32), commit_mask.to(torch.int32)

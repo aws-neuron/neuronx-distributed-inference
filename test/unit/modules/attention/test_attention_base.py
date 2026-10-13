@@ -772,6 +772,75 @@ def test_perform_prefix_prefill_sharded_flash_attn(mock_flash_fwd_call, attn_mod
 
     _check_prefix_prefill_flash_attn_kernel_call(mock_flash_fwd_kernel, attn_module, batch_size, seq_len, seq_len_prior)
 
+
+@pytest.mark.parametrize(
+    "attn_module",
+    [
+        ({"num_key_value_heads": 4, "prefix_cte_attention_chunk_size": 2}),
+        ({"num_key_value_heads": 2, "prefix_cte_attention_chunk_size": 2}),
+    ],
+    indirect=["attn_module"],
+)
+@patch("neuronx_distributed_inference.modules.attention.attention_base._flash_fwd_call_nki")
+def test_perform_prefix_prefill_chunked_prior_matches_native(
+    mock_flash_fwd_call,
+    attn_module,
+):
+    q_len = 3
+    seq_len_prior = 5
+    batch_size = 1
+    q = torch.rand((batch_size, attn_module.num_heads, q_len, attn_module.head_dim))
+    k = torch.rand(
+        (batch_size, attn_module.num_key_value_heads, q_len, attn_module.head_dim)
+    )
+    v = torch.rand(
+        (batch_size, attn_module.num_key_value_heads, q_len, attn_module.head_dim)
+    )
+    k_prior = torch.rand(
+        (batch_size, attn_module.num_key_value_heads, seq_len_prior, attn_module.head_dim)
+    )
+    v_prior = torch.rand(
+        (batch_size, attn_module.num_key_value_heads, seq_len_prior, attn_module.head_dim)
+    )
+    prior_mask = torch.ones((batch_size, seq_len_prior))
+    active_mask = _create_attn_mask(batch_size, q_len)
+
+    attn_module.get_flash_attention_strategy = MagicMock(
+        return_value=FlashAttentionStrategy.SHARDED_KERNEL
+    )
+    actual_output, actual_strategy = attn_module.perform_prefix_prefill(
+        q,
+        k,
+        v,
+        q_len,
+        batch_size,
+        prior_mask,
+        [k_prior, v_prior],
+        active_mask,
+    )
+
+    assert actual_strategy == FlashAttentionStrategy.NONE
+    mock_flash_fwd_call.assert_not_called()
+
+    attn_module.neuron_config.prefix_cte_attention_chunk_size = None
+    attn_module.get_flash_attention_strategy = MagicMock(
+        return_value=FlashAttentionStrategy.NONE
+    )
+    expected_output, expected_strategy = attn_module.perform_prefix_prefill(
+        q,
+        k,
+        v,
+        q_len,
+        batch_size,
+        prior_mask,
+        [k_prior, v_prior],
+        active_mask,
+    )
+
+    assert expected_strategy == FlashAttentionStrategy.NONE
+    torch.testing.assert_close(actual_output, expected_output, atol=1e-6, rtol=1e-5)
+
+
 @pytest.mark.parametrize(
     "attn_module, batch_size, flash_attention_strategy",
     # fmt: off

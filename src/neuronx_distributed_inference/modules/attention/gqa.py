@@ -1,5 +1,6 @@
 import enum
 import logging
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -16,13 +17,23 @@ from torch import nn
 from torch.distributed import ProcessGroup
 from torch.nn import functional as F
 
-from neuronx_distributed_inference.modules.attention.utils import transpose_parallel_linear_layer
+from neuronx_distributed_inference.modules.attention.utils import (
+    preprocess_quantized_linear_layer,
+    transpose_parallel_linear_layer,
+)
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 
 import nki
 from nkilib.core.output_projection.output_projection_cte import output_projection_cte
 from nkilib.core.qkv.qkv import qkv
-from nkilib.core.utils.common_types import NormType, QKVOutputLayout
+from nkilib.core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
+
+try:
+    from neuronx_distributed_inference.modules.attention.nki_kernels.qwen_gated_output_projection import (
+        qwen_gated_output_projection_cte,
+    )
+except Exception:
+    qwen_gated_output_projection_cte = None
 
 logger = logging.getLogger("Neuron")
 # To satisfy test_gqa
@@ -243,6 +254,58 @@ def _replicate_kv(tensor, source_heads: int, repeats: int, head_dim=0):
     return tensor.view(shape)
 
 
+def _rank_block_qwen_q_gate_for_tp(
+    q_tensor: torch.Tensor,
+    gate_tensor: torch.Tensor,
+    *,
+    num_attention_heads: int,
+    head_dim: int,
+    tp_degree: int,
+    dim: int = 0,
+) -> torch.Tensor:
+    """Pack Qwen Q/gate heads so each TP shard receives local Q then local gate."""
+
+    if q_tensor is None or gate_tensor is None:
+        raise ValueError("Qwen packed QKV+gate requires both Q and gate tensors")
+    if q_tensor.shape != gate_tensor.shape:
+        raise ValueError(
+            "Qwen packed QKV+gate requires Q and gate tensors with identical "
+            f"shapes, got {tuple(q_tensor.shape)} and {tuple(gate_tensor.shape)}"
+        )
+    if num_attention_heads % tp_degree != 0:
+        raise ValueError(
+            "Qwen packed QKV+gate requires attention heads divisible by TP degree, "
+            f"got heads={num_attention_heads}, tp_degree={tp_degree}"
+        )
+    expected_width = num_attention_heads * head_dim
+    if q_tensor.shape[dim] != expected_width:
+        raise ValueError(
+            "Qwen packed QKV+gate tensor width does not match attention shape, "
+            f"got width={q_tensor.shape[dim]}, expected={expected_width}"
+        )
+
+    shape = (
+        q_tensor.shape[:dim]
+        + (num_attention_heads, head_dim)
+        + q_tensor.shape[dim + 1 :]
+    )
+    q_heads = q_tensor.reshape(shape)
+    gate_heads = gate_tensor.reshape(shape)
+    heads_per_rank = num_attention_heads // tp_degree
+    rank_blocks = []
+    for rank in range(tp_degree):
+        start = rank * heads_per_rank
+        rank_blocks.append(q_heads.narrow(dim, start, heads_per_rank))
+        rank_blocks.append(gate_heads.narrow(dim, start, heads_per_rank))
+    packed = torch.cat(rank_blocks, dim=dim)
+    packed_shape = (
+        q_tensor.shape[:dim]
+        + (2 * expected_width,)
+        + q_tensor.shape[dim + 1 :]
+    )
+    return packed.reshape(packed_shape).contiguous()
+
+
 class BaseGroupQueryAttention(nn.Module):
     def __init__(
         self,
@@ -370,6 +433,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         seq_len_threshold_for_cc_tiling: int = 16834,
         logical_nc_config: int = 1,
         qkv_kernel_nbsd_layout: bool = False,
+        quantized: bool = False,
         on_cpu: bool = False,
         rank_ordering: dict = None,
     ):
@@ -404,6 +468,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         self.seq_len_threshold_for_cc_tiling = seq_len_threshold_for_cc_tiling
         self.logical_nc_config = logical_nc_config
         self.qkv_kernel_nbsd_layout = qkv_kernel_nbsd_layout
+        self.quantized = quantized
         self.rank_ordering = rank_ordering
 
         if self.tensor_model_parallel_group is not None:
@@ -418,7 +483,16 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     tensor_model_parallel_group=self.tensor_model_parallel_group,
                     rank_ordering=rank_ordering,
                 )
-                if self.qkv_kernel_enabled or self.qkv_nki_kernel_enabled:
+                if (
+                    (self.qkv_kernel_enabled or self.qkv_nki_kernel_enabled)
+                    and self.quantized
+                ):
+                    setattr(
+                        self.Wqkv,
+                        "post_create_quantized_module_hook",
+                        preprocess_quantized_linear_layer,
+                    )
+                elif self.qkv_kernel_enabled or self.qkv_nki_kernel_enabled:
                     # we need to transpose the weights on the CPU side to avoid
                     # needing to transpose on the device when using QKV kernel
                     self.Wqkv.weight = transpose_parallel_linear_layer(self.Wqkv.weight)
@@ -580,6 +654,15 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 qkv_norm_type = NormType.RMS_NORM_SKIP_GAMMA
 
         fuse_rope = cos_cache is not None and sin_cache is not None
+        qkv_w_scale = None
+        qkv_in_scale = None
+        quantization_type = QuantizationType.NONE
+        qkv_scale = getattr(self.Wqkv, "scale", None)
+        if qkv_scale is not None:
+            qkv_w_scale = qkv_scale.data
+            qkv_input_scale = getattr(self.Wqkv, "input_scale", None)
+            qkv_in_scale = qkv_input_scale.data if qkv_input_scale is not None else None
+            quantization_type = QuantizationType.ROW
 
         fused_residual_add = False
         mlp_prev = None
@@ -595,24 +678,54 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             )
             mlp_prev = residual
 
-        QKV = qkv_kernel[self.logical_nc_config](
-            input=hidden_states,
-            fused_qkv_weights=self.Wqkv.weight.data,
-            output_layout=qkv_output_layout,
-            bias=self.Wqkv.bias.data.unsqueeze(0) if self.bias else None,
-            fused_residual_add=fused_residual_add,
-            mlp_prev=mlp_prev,
-            attention_prev=attention_prev,
-            fused_norm_type=qkv_norm_type,
-            gamma_norm_weights=rmsnorm.weight.data.unsqueeze(0) if fused_rmsnorm else None,
-            norm_eps=self.rms_norm_eps,
-            fused_rope=fuse_rope,
-            cos_cache=cos_cache,
-            sin_cache=sin_cache,
-            d_head=self.head_dim,
-            num_q_heads=self.num_attention_heads // self.tp_degree,
-            num_kv_heads=self.num_key_value_heads // self.tp_degree,
-        )
+        # --- Qwen3.6 FP8 qkv_cte workaround (sequence tiling) ---
+        # The nkilib `qkv` kernel routes S > SEQLEN_THRESHOLD_FOR_QKV_CTE (=96) or
+        # B*S > pmax (=128) to the `qkv_cte` sub-kernel, whose FP8 path corrupts the
+        # projection for prefills beyond ~96 tokens (validated: coherent <=96, garbage
+        # >96). The `qkv_tkg` sub-kernel (B*S <= 128, S <= 96, no fused_rope) is correct.
+        # The QKV projection is per-token (per-token RMSNorm + per-token residual add,
+        # NO cross-token mixing here), so slicing the sequence into <=96-token tiles and
+        # concatenating reproduces the full-S result exactly while routing every sub-call
+        # to the correct qkv_tkg path. Only valid when fused_rope is off (qkv_tkg has no
+        # RoPE); for the Qwen3.6 attention path RoPE is applied after this projection.
+        def _qkv_kernel_call(_input, _mlp_prev, _attention_prev):
+            return qkv_kernel[self.logical_nc_config](
+                input=_input,
+                fused_qkv_weights=self.Wqkv.weight.data,
+                output_layout=qkv_output_layout,
+                bias=self.Wqkv.bias.data.unsqueeze(0) if self.bias else None,
+                fused_residual_add=fused_residual_add,
+                mlp_prev=_mlp_prev,
+                attention_prev=_attention_prev,
+                fused_norm_type=qkv_norm_type,
+                gamma_norm_weights=rmsnorm.weight.data.unsqueeze(0) if fused_rmsnorm else None,
+                norm_eps=self.rms_norm_eps,
+                fused_rope=fuse_rope,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                quantization_type=quantization_type,
+                qkv_w_scale=qkv_w_scale,
+                qkv_in_scale=qkv_in_scale,
+                d_head=self.head_dim,
+                num_q_heads=self.num_attention_heads // self.tp_degree,
+                num_kv_heads=self.num_key_value_heads // self.tp_degree,
+            )
+
+        _qkv_tile = min(96, max(1, 128 // bs))
+        if (not fuse_rope) and (seqlen > _qkv_tile or bs * seqlen > 128):
+            _qkv_parts = []
+            for _ts in range(0, seqlen, _qkv_tile):
+                _te = min(_ts + _qkv_tile, seqlen)
+                _inp = hidden_states[:, _ts:_te, :].contiguous()
+                if fused_residual_add:
+                    _mp = mlp_prev[:, _ts:_te, :].contiguous()
+                    _ap = attention_prev[:, _ts:_te, :].contiguous()
+                else:
+                    _mp, _ap = mlp_prev, attention_prev
+                _qkv_parts.append(_qkv_kernel_call(_inp, _mp, _ap))
+            QKV = torch.cat(_qkv_parts, dim=(2 if self.qkv_kernel_nbsd_layout else 1))
+        else:
+            QKV = _qkv_kernel_call(hidden_states, mlp_prev, attention_prev)
         if fused_residual_add:
             residual = hidden_states
 
@@ -680,6 +793,10 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         prefix_parts = prefix.split(".")
         prefix = ".".join(prefix_parts[:-1])
         hf_prefix = ".".join(prefix_parts[:-2])
+        qwen_qkv_gate_packed = bool(getattr(self, "qwen_qkv_gate_packed", False))
+        gate_proj_weight = None
+        gate_proj_scale = None
+        gate_proj_bias = None
         if self.fused_qkv:
             self.replace_prefixes(
                 old_prefix=f"{hf_prefix}.Wqkv",
@@ -690,24 +807,27 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             qkv_weight, qkv_scale, _ = self.get_weight(
                 prefix=prefix, layer=self.Wqkv, layer_name="Wqkv", model_state_dict=model_state_dict
             )
-            q_proj_weight, k_proj_weight, v_proj_weight = qkv_weight.split(
+            q_split_sizes = [self._src_num_attention_heads * self.head_dim]
+            if qwen_qkv_gate_packed:
+                q_split_sizes.append(self._src_num_attention_heads * self.head_dim)
+            q_split_sizes.extend(
                 [
-                    self._src_num_attention_heads * self.head_dim,
                     self._src_num_key_value_heads * self.head_dim,
                     self._src_num_key_value_heads * self.head_dim,
-                ],
-                dim=0,
+                ]
             )
+            qkv_parts = qkv_weight.split(q_split_sizes, dim=0)
+            if qwen_qkv_gate_packed:
+                q_proj_weight, gate_proj_weight, k_proj_weight, v_proj_weight = qkv_parts
+            else:
+                q_proj_weight, k_proj_weight, v_proj_weight = qkv_parts
 
             if qkv_scale is not None:
-                q_proj_scale, k_proj_scale, v_proj_scale = qkv_scale.split(
-                    [
-                        self._src_num_attention_heads * self.head_dim,
-                        self._src_num_key_value_heads * self.head_dim,
-                        self._src_num_key_value_heads * self.head_dim,
-                    ],
-                    dim=0,
-                )
+                qkv_scale_parts = qkv_scale.split(q_split_sizes, dim=0)
+                if qwen_qkv_gate_packed:
+                    q_proj_scale, gate_proj_scale, k_proj_scale, v_proj_scale = qkv_scale_parts
+                else:
+                    q_proj_scale, k_proj_scale, v_proj_scale = qkv_scale_parts
             else:
                 q_proj_scale, k_proj_scale, v_proj_scale = None, None, None
 
@@ -715,14 +835,11 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 prefix=prefix, layer=self.Wqkv, layer_name="Wqkv", model_state_dict=model_state_dict
             )
             if qkv_bias is not None:
-                q_proj_bias, k_proj_bias, v_proj_bias = qkv_bias.split(
-                    [
-                        self._src_num_attention_heads * self.head_dim,
-                        self._src_num_key_value_heads * self.head_dim,
-                        self._src_num_key_value_heads * self.head_dim,
-                    ],
-                    dim=0,
-                )
+                qkv_bias_parts = qkv_bias.split(q_split_sizes, dim=0)
+                if qwen_qkv_gate_packed:
+                    q_proj_bias, gate_proj_bias, k_proj_bias, v_proj_bias = qkv_bias_parts
+                else:
+                    q_proj_bias, k_proj_bias, v_proj_bias = qkv_bias_parts
             else:
                 q_proj_bias, k_proj_bias, v_proj_bias = None, None, None
         else:
@@ -822,6 +939,22 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 target_heads=self.num_attention_heads,
                 source_group_size=self._src_num_attention_heads // self._src_num_key_value_heads,
             )
+            if qwen_qkv_gate_packed:
+                gate_proj_weight, gate_proj_scale = maybe_pad_interleaved(
+                    gate_proj_weight,
+                    pad_dim=0,
+                    source_heads=self._src_num_attention_heads,
+                    target_heads=self.num_attention_heads,
+                    source_group_size=self._src_num_attention_heads // self._src_num_key_value_heads,
+                    tensor_scale=gate_proj_scale,
+                )
+                gate_proj_bias, _ = maybe_pad_interleaved(
+                    gate_proj_bias,
+                    pad_dim=0,
+                    source_heads=self._src_num_attention_heads,
+                    target_heads=self.num_attention_heads,
+                    source_group_size=self._src_num_attention_heads // self._src_num_key_value_heads,
+                )
 
         if self.sharding_strategy == GQA.CONVERT_TO_MHA:
             q_proj_weight, q_proj_scale = maybe_pad_tail(
@@ -837,6 +970,20 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 target_heads=self.num_attention_heads,
                 pad_dim=0,
             )
+            if qwen_qkv_gate_packed:
+                gate_proj_weight, gate_proj_scale = maybe_pad_tail(
+                    gate_proj_weight,
+                    source_heads=self._src_num_attention_heads,
+                    target_heads=self.num_attention_heads,
+                    pad_dim=0,
+                    tensor_scale=gate_proj_scale,
+                )
+                gate_proj_bias, _ = maybe_pad_tail(
+                    gate_proj_bias,
+                    source_heads=self._src_num_attention_heads,
+                    target_heads=self.num_attention_heads,
+                    pad_dim=0,
+                )
             k_proj_weight, k_proj_scale = maybe_pad_tail(
                 k_proj_weight,
                 source_heads=self._src_num_key_value_heads,
@@ -865,18 +1012,47 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             )
 
         if self.fused_qkv:
-            qkv_weight = torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)
+            if qwen_qkv_gate_packed:
+                q_gate_weight = _rank_block_qwen_q_gate_for_tp(
+                    q_proj_weight,
+                    gate_proj_weight,
+                    num_attention_heads=self.num_attention_heads,
+                    head_dim=self.head_dim,
+                    tp_degree=self.tp_degree,
+                )
+                qkv_weight_parts = [q_gate_weight]
+            else:
+                qkv_weight_parts = [q_proj_weight]
+            qkv_weight_parts.extend([k_proj_weight, v_proj_weight])
+            qkv_weight = torch.cat(qkv_weight_parts, dim=0)
             qkv_scale = None
-            if all(scale is not None for scale in (q_proj_scale, k_proj_scale, v_proj_scale)):
-                qkv_scale = torch.cat([q_proj_scale, k_proj_scale, v_proj_scale], dim=0)
+            if qwen_qkv_gate_packed:
+                q_gate_scale = None
+                if q_proj_scale is not None and gate_proj_scale is not None:
+                    q_gate_scale = _rank_block_qwen_q_gate_for_tp(
+                        q_proj_scale,
+                        gate_proj_scale,
+                        num_attention_heads=self.num_attention_heads,
+                        head_dim=self.head_dim,
+                        tp_degree=self.tp_degree,
+                    )
+                qkv_scale_parts = [q_gate_scale]
+            else:
+                qkv_scale_parts = [q_proj_scale]
+            qkv_scale_parts.extend([k_proj_scale, v_proj_scale])
+            if all(scale is not None for scale in qkv_scale_parts):
+                qkv_scale = torch.cat(qkv_scale_parts, dim=0)
 
             # Set heads info as weight parameter attributes to be used in weights sharding
             fused_qkv_params = (
                 [self.Wqkv.weight, self.Wqkv.scale] if qkv_scale is not None else [self.Wqkv.weight]
             )
+            packed_num_attention_heads = (
+                self.num_attention_heads * 2 if qwen_qkv_gate_packed else self.num_attention_heads
+            )
             for param in fused_qkv_params:
                 setattr(param, "fused_qkv", True)
-                setattr(param, "num_attention_heads", self.num_attention_heads)
+                setattr(param, "num_attention_heads", packed_num_attention_heads)
                 setattr(param, "num_key_value_heads", self.num_key_value_heads)
                 setattr(param, "head_dim", self.head_dim)
 
@@ -889,7 +1065,19 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 scale=qkv_scale,
             )
             if self.bias:
-                qkv_bias = torch.cat([q_proj_bias, k_proj_bias, v_proj_bias], dim=0)
+                if qwen_qkv_gate_packed:
+                    q_gate_bias = _rank_block_qwen_q_gate_for_tp(
+                        q_proj_bias,
+                        gate_proj_bias,
+                        num_attention_heads=self.num_attention_heads,
+                        head_dim=self.head_dim,
+                        tp_degree=self.tp_degree,
+                    )
+                    qkv_bias_parts = [q_gate_bias]
+                else:
+                    qkv_bias_parts = [q_proj_bias]
+                qkv_bias_parts.extend([k_proj_bias, v_proj_bias])
+                qkv_bias = torch.cat(qkv_bias_parts, dim=0)
                 self.set_bias(
                     tensor=qkv_bias,
                     prefix=prefix,
@@ -973,6 +1161,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         logical_nc_config: int = 1,
         rank_ordering: dict = None,
         tiling_factor: int = 1,
+        quantized: bool = False,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -993,6 +1182,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         self.rpl_reduce_dtype = rpl_reduce_dtype
         self.sequence_parallel_enabled = sequence_parallel_enabled
         self.rank_ordering = rank_ordering
+        self.quantized = quantized
 
         if self.tensor_model_parallel_group is not None:
             self.o_proj = RowParallelLinear(
@@ -1008,7 +1198,13 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
                 rank_ordering=rank_ordering,
                 tile_cc=self.tiling_factor > 1,
             )
-            if self.out_proj_kernel_enabled:
+            if self.out_proj_kernel_enabled and self.quantized:
+                setattr(
+                    self.o_proj,
+                    "post_create_quantized_module_hook",
+                    preprocess_quantized_linear_layer,
+                )
+            elif self.out_proj_kernel_enabled:
                 # we need to transpose the weights on the CPU side to avoid
                 # needing to transpose on the device when using out proj kernel
                 self.o_proj.weight = transpose_parallel_linear_layer(self.o_proj.weight)
@@ -1033,11 +1229,47 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         heads_per_core = self.num_attention_heads // self.tp_degree
         assert (
             nd == heads_per_core * self.head_dim
-        ), f"attention_output.shape = {attention_output.shape}, heads_per_core = {heads_per_core}, head_dim = {self.head_dim}"
+        ), (
+            f"attention_output.shape = {attention_output.shape}, "
+            f"heads_per_core = {heads_per_core}, head_dim = {self.head_dim}"
+        )
 
-        # Kernel wants BndS layout for input.
         attention_output = attention_output.reshape(B, S, heads_per_core, self.head_dim)
-        kernel_attn_in = attention_output.permute(0, 2, 3, 1)
+        o_proj_scale = getattr(self.o_proj, "scale", None)
+        if o_proj_scale is not None:
+            # ROW path dynamically quantizes BF16 attention rows on-device and
+            # consumes FP8 weights plus per-row dequant scales shaped [128, H].
+            max_row_quant_head_dim = 128
+            if self.head_dim > max_row_quant_head_dim:
+                fold_factor = math.ceil(self.head_dim / max_row_quant_head_dim)
+                while self.head_dim % fold_factor != 0:
+                    fold_factor += 1
+                folded_head_dim = self.head_dim // fold_factor
+                folded_heads = heads_per_core * fold_factor
+                if folded_head_dim > max_row_quant_head_dim:
+                    raise RuntimeError(
+                        "Output projection NKI ROW FP8 path cannot fold "
+                        f"head_dim={self.head_dim} to <= {max_row_quant_head_dim}"
+                    )
+                if folded_heads > 17:
+                    raise RuntimeError(
+                        "Output projection NKI ROW FP8 path exceeds validated "
+                        f"head count after folding: heads={folded_heads}"
+                    )
+                kernel_attn_in = attention_output.reshape(
+                    B, S, folded_heads, folded_head_dim
+                )
+            else:
+                kernel_attn_in = attention_output
+            quantization_type = QuantizationType.ROW
+            weight_scales = o_proj_scale.data
+        elif self.quantized:
+            raise RuntimeError("Output projection NKI FP8 path requires o_proj.scale")
+        else:
+            # Non-quantized kernel wants BndS layout for input.
+            kernel_attn_in = attention_output.permute(0, 2, 3, 1)
+            quantization_type = QuantizationType.NONE
+            weight_scales = None
 
         out = torch.zeros(B, S, H, dtype=attention_output.dtype, device=attention_output.device)
 
@@ -1045,6 +1277,8 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
             attention=kernel_attn_in,
             weight=self.o_proj.weight.data,
             bias=self.o_proj.bias.data.unsqueeze(0) / self.tp_degree if self.bias else None,
+            quantization_type=quantization_type,
+            weight_scales=weight_scales,
         )
 
         # All-reduce or reduce-scatter, depending on whether SP is enabled
@@ -1063,6 +1297,111 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         out = out.to(original_dtype)
 
         return out
+
+    def _kernel_gated_o_proj(self, attention_output, gate):
+        if qwen_gated_output_projection_cte is None:
+            return self._kernel_o_proj(attention_output * torch.sigmoid(gate))
+
+        logger.debug(
+            f"Qwen gated output projection kernel: logical_nc_config={self.logical_nc_config}"
+        )
+        nd, H = self.o_proj.weight.shape
+        B, S, attn_nd = attention_output.shape
+        if attn_nd != nd:
+            raise RuntimeError(
+                f"attention_output.shape = {attention_output.shape}, "
+                f"o_proj.weight.shape = {self.o_proj.weight.shape}"
+            )
+        if gate.shape != attention_output.shape:
+            raise RuntimeError(
+                "Qwen gated output projection requires gate shape to match "
+                f"attention_output shape, got gate={gate.shape}, "
+                f"attention_output={attention_output.shape}"
+            )
+
+        heads_per_core = self.num_attention_heads // self.tp_degree
+        assert (
+            nd == heads_per_core * self.head_dim
+        ), (
+            f"attention_output.shape = {attention_output.shape}, "
+            f"heads_per_core = {heads_per_core}, head_dim = {self.head_dim}"
+        )
+
+        attention_output = attention_output.reshape(B, S, heads_per_core, self.head_dim)
+        gate = gate.reshape(B, S, heads_per_core, self.head_dim)
+
+        o_proj_scale = getattr(self.o_proj, "scale", None)
+        if o_proj_scale is None:
+            gated = attention_output.reshape(B, S, nd) * torch.sigmoid(
+                gate.reshape(B, S, nd)
+            )
+            return self._kernel_o_proj(gated)
+
+        max_row_quant_head_dim = 128
+        if self.head_dim > max_row_quant_head_dim:
+            fold_factor = math.ceil(self.head_dim / max_row_quant_head_dim)
+            while self.head_dim % fold_factor != 0:
+                fold_factor += 1
+            folded_head_dim = self.head_dim // fold_factor
+            folded_heads = heads_per_core * fold_factor
+            if folded_head_dim > max_row_quant_head_dim:
+                raise RuntimeError(
+                    "Qwen gated output projection ROW FP8 path cannot fold "
+                    f"head_dim={self.head_dim} to <= {max_row_quant_head_dim}"
+                )
+            if folded_heads > 17:
+                raise RuntimeError(
+                    "Qwen gated output projection ROW FP8 path exceeds validated "
+                    f"head count after folding: heads={folded_heads}"
+                )
+            kernel_attn_in = attention_output.reshape(
+                B, S, folded_heads, folded_head_dim
+            )
+            kernel_gate_in = gate.reshape(B, S, folded_heads, folded_head_dim)
+        else:
+            kernel_attn_in = attention_output
+            kernel_gate_in = gate
+
+        out = qwen_gated_output_projection_cte[self.logical_nc_config](
+            attention=kernel_attn_in,
+            gate=kernel_gate_in,
+            weight=self.o_proj.weight.data,
+            bias=(
+                self.o_proj.bias.data.unsqueeze(0) / self.tp_degree
+                if self.bias
+                else None
+            ),
+            weight_scales=o_proj_scale.data,
+        )
+
+        original_dtype = out.dtype
+        out = out.to(self.rpl_reduce_dtype)
+
+        if self.sequence_parallel_enabled:
+            out = reduce_scatter_to_sequence_parallel_region(
+                out, 1, process_group=self.tensor_model_parallel_group
+            )
+        else:
+            out = reduce_from_tensor_model_parallel_region(
+                out, process_group=self.tensor_model_parallel_group
+            )
+
+        out = out.to(original_dtype)
+
+        return out
+
+    def forward_gated(
+        self, attention_output: torch.Tensor, gate: torch.Tensor, adapter_ids=None
+    ):
+        if (
+            self.out_proj_kernel_enabled
+            and self.quantized
+            and getattr(self.o_proj, "scale", None) is not None
+        ):
+            return self._kernel_gated_o_proj(attention_output, gate)
+
+        gated = attention_output * torch.sigmoid(gate)
+        return self.forward(gated, adapter_ids=adapter_ids)
 
     def forward(self, attention_output: torch.Tensor, adapter_ids=None):
         if self.out_proj_kernel_enabled:
