@@ -1,0 +1,5 @@
+output/
+output_edited.png
+log-neuron-cc.txt
+scratch/
+global_metric_store.json

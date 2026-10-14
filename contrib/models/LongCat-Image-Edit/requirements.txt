@@ -1,0 +1,12 @@
+# LongCat-Image-Edit Neuron Adaptation
+# Install in /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference
+
+# Diffusers from source (LongCat classes are in latest diffusers)
+git+https://github.com/huggingface/diffusers
+
+# Required packages
+accelerate
+sentencepiece
+qwen-vl-utils
+Pillow
+safetensors
