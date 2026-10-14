@@ -1,0 +1,159 @@
+diff --git a/vllm_neuron/platform.py b/vllm_neuron/platform.py
+index 7d64b83..9966ce8 100644
+--- a/vllm_neuron/platform.py
++++ b/vllm_neuron/platform.py
+@@ -286,6 +286,43 @@ class NeuronPlatform(Platform):
+     ) -> None:
+         # Apply config overrides here - this is called before VllmConfig is created
+         cls._apply_config_overrides()
++        # Register NxDI contrib model architectures into vLLM's ModelRegistry.
++        # This hook runs before ModelConfig's architecture validation and after
++        # vLLM is fully importable, so (unlike the platform-plugin register())
++        # it avoids the vllm.config circular import. Lazy string registration
++        # ("<module>:<class>") imports nothing here.
++        cls._register_contrib_archs()
++
++    @classmethod
++    def _register_contrib_archs(cls) -> None:
++        """Alias contrib architectures (in checkpoint config.json but not in
++        vLLM's built-in registry) so ModelConfig validation accepts them.
++
++        Best-effort and idempotent. The aliased stub is only used to satisfy
++        validation; the Neuron path resolves the real class via NxDI
++        MODEL_TYPES inside the engine worker (see neuronx_distributed_model_loader
++        ._register_contrib_models / _get_neuron_model_cls).
++        """
++        import warnings as _w
++        try:
++            from vllm.model_executor.models.registry import ModelRegistry
++            supported = set(ModelRegistry.get_supported_archs())
++            _aliases = {
++                # MiMo-V2.5-Pro config.json declares MiMoV2ForCausalLM, which
++                # vLLM does not know; alias to its built-in MiMoV2Flash stub.
++                "MiMoV2ForCausalLM":
++                    "vllm.model_executor.models.mimo_v2_flash:MiMoV2FlashForCausalLM",
++                "MiMoV2ProForCausalLM":
++                    "vllm.model_executor.models.mimo_v2_flash:MiMoV2FlashForCausalLM",
++            }
++            for _arch, _target in _aliases.items():
++                if _arch not in supported:
++                    ModelRegistry.register_model(_arch, _target)
++        except Exception as _e:  # pragma: no cover - best-effort
++            _w.warn(
++                f"Contrib architecture registration failed: {_e}",
++                category=UserWarning,
++            )
+ 
+     @classmethod
+     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+diff --git a/vllm_neuron/worker/neuronx_distributed_model_loader.py b/vllm_neuron/worker/neuronx_distributed_model_loader.py
+index d2099eb..a8dfc7f 100644
+--- a/vllm_neuron/worker/neuronx_distributed_model_loader.py
++++ b/vllm_neuron/worker/neuronx_distributed_model_loader.py
+@@ -922,6 +922,98 @@ def _camel_to_kebab(name: str) -> str:
+     return re.sub("([a-z0-9])([A-Z])", r"\1-\2", s1).lower()
+ 
+ 
++
++def _patch_autoconfig_trust_remote_code():
++    """Monkey-patch ``AutoConfig.from_pretrained`` to default ``trust_remote_code=True``.
++
++    NxDI's ``hf_adapter.load_config`` calls ``AutoConfig.from_pretrained(path)``
++    without ``trust_remote_code``. Contrib models like MiMo-V2.5-Pro that
++    ship a ``configuration_*.py`` with the checkpoint require custom code
++    execution, so the default behaviour crashes with ``ValueError: The
++    repository ... contains custom code which must be executed``.
++
++    vLLM's top-level ``--trust-remote-code`` flag only affects vLLM's own
++    config load, not NxDI's. Patching here is cheap and idempotent.
++    """
++    try:
++        from transformers import AutoConfig
++    except ImportError:
++        return
++    if getattr(AutoConfig, "_nxdi_contrib_patched", False):
++        return
++    _orig = AutoConfig.from_pretrained
++
++    def _patched(*args, **kwargs):
++        kwargs.setdefault("trust_remote_code", True)
++        return _orig(*args, **kwargs)
++
++    AutoConfig.from_pretrained = _patched
++    AutoConfig._nxdi_contrib_patched = True
++
++
++def _register_contrib_models():
++    """Lazy-register NxDI contrib models on each process that calls the loader.
++
++    Driven by env vars:
++      NXDI_CONTRIB_MIMO_V2_FLASH_SRC -> path to contrib MiMo-V2.5-Pro src/
++      NXDI_CONTRIB_MINIMAX_M2_SRC    -> path to contrib MiniMax-M2 src/
++
++    Registers the contrib model class into NxDI's MODEL_TYPES and, where
++    vLLM does not already know the architecture, registers it into vLLM's
++    ModelRegistry. Runs every time _get_neuron_model_cls is called so that
++    vLLM's spawn'd EngineCore workers (which don't inherit the parent's
++    module-level state) pick up the registration too. Registration is
++    idempotent.
++    """
++    import os as _os
++    import sys as _sys
++    import warnings as _w
++
++    _patch_autoconfig_trust_remote_code()
++
++    mimo_src = _os.environ.get("NXDI_CONTRIB_MIMO_V2_FLASH_SRC")
++    if mimo_src and _os.path.isdir(mimo_src) and "mimov2" not in MODEL_TYPES:
++        if mimo_src not in _sys.path:
++            _sys.path.insert(0, mimo_src)
++        try:
++            from modeling_mimo_v2 import NeuronMiMoV2ForCausalLM
++            # Register under both Flash and Pro model_type keys so the same
++            # NxDI wrapper serves MiMo-V2-Flash, MiMo-V2.5-Pro, and any sibling
++            # that inherits the same config.
++            for _mt in ("mimov2", "mimov2flash", "mimov2pro"):
++                MODEL_TYPES.setdefault(_mt, {"causal-lm": NeuronMiMoV2ForCausalLM})
++            try:
++                from vllm.model_executor.models.registry import ModelRegistry
++                # Override vLLM's GPU-only MiMoV2* stubs with our Neuron
++                # wrapper so ModelConfig validation accepts the architecture
++                # regardless of whether the checkpoint calls itself Flash or
++                # Pro.
++                for _arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM"):
++                    ModelRegistry.register_model(_arch, NeuronMiMoV2ForCausalLM)
++            except ImportError:
++                pass
++        except Exception as e:
++            _w.warn(
++                f"Failed to register MiMo-V2 contrib model: {e}",
++                category=UserWarning,
++            )
++
++    minimax_src = _os.environ.get("NXDI_CONTRIB_MINIMAX_M2_SRC")
++    if minimax_src and _os.path.isdir(minimax_src) and "minimaxm2" not in MODEL_TYPES:
++        if minimax_src not in _sys.path:
++            _sys.path.insert(0, minimax_src)
++        try:
++            from modeling_minimax_m2 import NeuronMiniMaxM2ForCausalLM
++            MODEL_TYPES.setdefault(
++                "minimaxm2", {"causal-lm": NeuronMiniMaxM2ForCausalLM}
++            )
++        except Exception as e:
++            _w.warn(
++                f"Failed to register MiniMax-M2 contrib model: {e}",
++                category=UserWarning,
++            )
++
++
+ def _get_neuron_model_cls(architecture: str):
+     """
+     Get Neuron model class from architecture string.
+@@ -941,6 +1033,7 @@ def _get_neuron_model_cls(architecture: str):
+         _get_neuron_model_cls("NeuronLlamaForCausalLM")
+         <class 'NeuronLlamaForCausalLM'>
+     """
++    _register_contrib_models()
+     # Handle Neuron class name (starts with "Neuron") - strip prefix
+     if architecture.startswith("Neuron") and "For" in architecture:
+         original_architecture = architecture

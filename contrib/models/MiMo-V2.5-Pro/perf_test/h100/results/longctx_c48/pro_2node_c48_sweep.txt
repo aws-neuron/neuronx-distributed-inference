@@ -1,0 +1,94 @@
+===== c=48 ISL=2048 OSL=128 np=96 =====
+Maximum request concurrency: 48
+Successful requests:                     96        
+Failed requests:                         0         
+Maximum request concurrency:             48        
+Benchmark duration (s):                  22.34     
+Total input tokens:                      196738    
+Output token throughput (tok/s):         551.45    
+Total token throughput (tok/s):          9358.90   
+Median TTFT (ms):                        1827.48   
+P99 TTFT (ms):                           5583.13   
+Median TPOT (ms):                        66.82     
+--- ISL=2048 done ---
+===== c=48 ISL=4096 OSL=128 np=96 =====
+Maximum request concurrency: 48
+Successful requests:                     96        
+Failed requests:                         0         
+Maximum request concurrency:             48        
+Benchmark duration (s):                  41.67     
+Total input tokens:                      393481    
+Output token throughput (tok/s):         295.59    
+Total token throughput (tok/s):          9737.72   
+Median TTFT (ms):                        5607.88   
+P99 TTFT (ms):                           16342.96  
+Median TPOT (ms):                        77.86     
+--- ISL=4096 done ---
+ALL_DONE
+===== c=48 ISL=8192 OSL=128 np=96 =====
+Maximum request concurrency: 48
+Successful requests:                     96        
+Failed requests:                         0         
+Maximum request concurrency:             48        
+Benchmark duration (s):                  60.83     
+Total input tokens:                      786950    
+Output token throughput (tok/s):         202.51    
+Total token throughput (tok/s):          13139.79  
+Median TTFT (ms):                        11726.26  
+P99 TTFT (ms):                           25506.28  
+Median TPOT (ms):                        112.78    
+--- ISL=8192 done ---
+===== c=48 ISL=12288 OSL=128 np=96 =====
+Maximum request concurrency: 48
+Successful requests:                     96        
+Failed requests:                         0         
+Maximum request concurrency:             48        
+Benchmark duration (s):                  86.78     
+Total input tokens:                      1180429   
+Output token throughput (tok/s):         141.95    
+Total token throughput (tok/s):          13744.53  
+Median TTFT (ms):                        24141.47  
+P99 TTFT (ms):                           34176.05  
+Median TPOT (ms):                        131.58    
+--- ISL=12288 done ---
+===== c=48 ISL=16384 OSL=128 np=96 =====
+Maximum request concurrency: 48
+Successful requests:                     96        
+Failed requests:                         0         
+Maximum request concurrency:             48        
+Benchmark duration (s):                  114.34    
+Total input tokens:                      1573907   
+Output token throughput (tok/s):         107.73    
+Total token throughput (tok/s):          13872.41  
+Median TTFT (ms):                        37061.26  
+P99 TTFT (ms):                           49876.34  
+Median TPOT (ms):                        140.41    
+--- ISL=16384 done ---
+ALL_DONE
+===== c=48 ISL=24576 OSL=128 np=96 =====
+Maximum request concurrency: 48
+Successful requests:                     96        
+Failed requests:                         0         
+Maximum request concurrency:             48        
+Benchmark duration (s):                  163.83    
+Total input tokens:                      2360860   
+Output token throughput (tok/s):         75.19     
+Total token throughput (tok/s):          14485.45  
+Median TTFT (ms):                        62240.21  
+P99 TTFT (ms):                           72843.07  
+Median TPOT (ms):                        125.32    
+--- ISL=24576 done ---
+===== c=48 ISL=32768 OSL=128 np=96 =====
+Maximum request concurrency: 48
+Successful requests:                     96        
+Failed requests:                         0         
+Maximum request concurrency:             48        
+Benchmark duration (s):                  213.65    
+Total input tokens:                      3147810   
+Output token throughput (tok/s):         57.65     
+Total token throughput (tok/s):          14791.10  
+Median TTFT (ms):                        91318.11  
+P99 TTFT (ms):                           99738.05  
+Median TPOT (ms):                        112.16    
+--- ISL=32768 done ---
+ALL_DONE
