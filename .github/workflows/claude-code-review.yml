@@ -1,0 +1,57 @@
+# Automated Claude Code review for pull requests.
+# Runs on every PR open/update and posts inline + summary review comments.
+#
+# Authentication uses Amazon Bedrock via GitHub OIDC (no long-lived API key).
+# One-time setup is required by a repo admin -- see docs/claude-code-review.md.
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+# Fork PRs do not receive secrets/OIDC credentials, so the review job is a no-op
+# for them. Auto-review runs for pull requests from branches within this repo.
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write # required for AWS OIDC
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CLAUDE_CODE_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ vars.CLAUDE_CODE_AWS_REGION || 'us-west-2' }}
+
+      - name: Review PR
+        uses: anthropics/claude-code-action@v1
+        with:
+          use_bedrock: "true"
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request with a focus on:
+            - Correctness bugs and potential runtime errors
+            - Numerical / accuracy regressions in model or kernel code
+            - Neuron/Trainium-specific concerns (tensor/expert parallelism,
+              dtype handling, compilation constraints, sharding)
+            - Security implications
+            - Performance considerations
+            - Code quality and adherence to existing conventions
+
+            Note: The PR branch is already checked out in the current working directory.
+
+            Use `gh pr comment` for a concise top-level summary.
+            Use `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`)
+            to flag specific lines. Keep feedback actionable and avoid nitpicking.
+            Only post GitHub comments -- don't submit review text as chat messages.
+          claude_args: |
+            --model ${{ vars.CLAUDE_CODE_BEDROCK_MODEL || 'us.anthropic.claude-sonnet-4-5-20250929-v1:0' }}
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
