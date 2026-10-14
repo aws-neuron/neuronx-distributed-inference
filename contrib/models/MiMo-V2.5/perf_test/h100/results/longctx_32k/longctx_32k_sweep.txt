@@ -1,0 +1,72 @@
+===== 32K in / 128 out  c=1  np=2 =====
+Maximum request concurrency: 1
+Successful requests:                     2         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  5.73      
+Total input tokens:                      66176     
+Output token throughput (tok/s):         44.34     
+Total token throughput (tok/s):          11597.34  
+Median TTFT (ms):                        1621.26   
+P99 TTFT (ms):                           2092.67   
+Median TPOT (ms):                        9.86      
+===== 32K in / 128 out  c=8  np=16 =====
+Maximum request concurrency: 8
+Successful requests:                     16        
+Failed requests:                         0         
+Maximum request concurrency:             8         
+Benchmark duration (s):                  13.48     
+Total input tokens:                      524380    
+Output token throughput (tok/s):         152.24    
+Total token throughput (tok/s):          39038.47  
+Median TTFT (ms):                        3635.72   
+P99 TTFT (ms):                           5271.67   
+Median TPOT (ms):                        24.01     
+===== 32K in / 128 out  c=16  np=32 =====
+Maximum request concurrency: 16
+Successful requests:                     32        
+Failed requests:                         0         
+Maximum request concurrency:             16        
+Benchmark duration (s):                  24.26     
+Total input tokens:                      1049711   
+Output token throughput (tok/s):         168.65    
+Total token throughput (tok/s):          43433.19  
+Median TTFT (ms):                        5894.95   
+P99 TTFT (ms):                           10309.44  
+Median TPOT (ms):                        48.07     
+===== 32K in / 128 out  c=32  np=64 =====
+Maximum request concurrency: 32
+Successful requests:                     64        
+Failed requests:                         0         
+Maximum request concurrency:             32        
+Benchmark duration (s):                  45.37     
+Total input tokens:                      2097979   
+Output token throughput (tok/s):         180.72    
+Total token throughput (tok/s):          46422.67  
+Median TTFT (ms):                        10967.79  
+P99 TTFT (ms):                           20627.90  
+Median TPOT (ms):                        91.52     
+===== 32K in / 128 out  c=64  np=128 =====
+Maximum request concurrency: 64
+Successful requests:                     128       
+Failed requests:                         0         
+Maximum request concurrency:             64        
+Benchmark duration (s):                  91.13     
+Total input tokens:                      4196114   
+Output token throughput (tok/s):         180.09    
+Total token throughput (tok/s):          46227.46  
+Median TTFT (ms):                        20360.99  
+P99 TTFT (ms):                           42893.79  
+Median TPOT (ms):                        173.11    
+===== 32K in / 128 out  c=128  np=256 =====
+Maximum request concurrency: 128
+Successful requests:                     256       
+Failed requests:                         0         
+Maximum request concurrency:             128       
+Benchmark duration (s):                  182.23    
+Total input tokens:                      8395750   
+Output token throughput (tok/s):         180.00    
+Total token throughput (tok/s):          46253.30  
+Median TTFT (ms):                        64895.67  
+P99 TTFT (ms):                           87692.25  
+Median TPOT (ms):                        196.05    

@@ -1,0 +1,43 @@
+===== vllm c=1 ISL=15000 OSL=1000 np=2 =====
+WARNING 07-22 23:19:57 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Maximum request concurrency: 1
+Successful requests:                     2         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  24.02     
+Total input tokens:                      30439     
+Output token throughput (tok/s):         82.72     
+Total token throughput (tok/s):          1349.97   
+Median TTFT (ms):                        6587.39   
+P99 TTFT (ms):                           7486.82   
+Median TPOT (ms):                        5.46      
+--- c=1 done ---
+===== vllm c=16 ISL=15000 OSL=1000 np=32 =====
+WARNING 07-22 23:20:43 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Maximum request concurrency: 16
+Successful requests:                     32        
+Failed requests:                         0         
+Maximum request concurrency:             16        
+Benchmark duration (s):                  44.89     
+Total input tokens:                      480778    
+Output token throughput (tok/s):         712.51    
+Total token throughput (tok/s):          11422.87  
+Median TTFT (ms):                        1131.82   
+P99 TTFT (ms):                           10021.23  
+Median TPOT (ms):                        16.33     
+--- c=16 done ---
+===== vllm c=32 ISL=15000 OSL=1000 np=64 =====
+WARNING 07-22 23:21:52 [cpu.py:441] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Maximum request concurrency: 32
+Successful requests:                     64        
+Failed requests:                         0         
+Maximum request concurrency:             32        
+Benchmark duration (s):                  54.20     
+Total input tokens:                      960566    
+Output token throughput (tok/s):         1181.65   
+Total token throughput (tok/s):          18904.03  
+Median TTFT (ms):                        2053.64   
+P99 TTFT (ms):                           9957.17   
+Median TPOT (ms):                        24.12     
+--- c=32 done ---
+ALL_DONE
