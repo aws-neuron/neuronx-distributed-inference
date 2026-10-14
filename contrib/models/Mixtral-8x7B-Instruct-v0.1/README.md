@@ -1,121 +1,133 @@
 # Contrib Model: Mixtral 8x7B Instruct v0.1
 
-NeuronX Distributed Inference implementation of Mixtral 8x7B Instruct v0.1.
+NeuronX Distributed Inference implementation of Mixtral 8x7B Instruct v0.1 on trn2.48xlarge.
 
 ## Model Information
 
-- **HuggingFace ID:** `Mixtral-8x7B-Instruct-v0.1`
-- **Model Type:** Decoder-only transformer
-- **License:** Check HuggingFace model card
+- **HuggingFace ID:** `mistralai/Mixtral-8x7B-Instruct-v0.1`
+- **Model Type:** Mixture-of-Experts (8 experts, top-2 routing)
+- **Parameters:** 46.7B total, ~12.9B active per token
+- **License:** Apache 2.0
 
 ## Architecture Details
 
+- 32 transformer layers
+- hidden_size: 4096, intermediate_size: 14336
+- 32 attention heads, 8 KV heads (GQA)
+- 8 experts per layer, top-2 routing (softmax)
+- head_dim: 128, vocab_size: 32000
 
-## Validation Results
+## Performance (SDK 2.29, vLLM 0.16.0, trn2.48xlarge)
 
-**Validated:** 2026-01-29  
-**Configuration:** TP=5, batch_size=None, seq_len=None, None
+| Workload | tok/s (conc=1) | TPOT | TTFT | GPU tok/s | GPU/Neuron |
+|----------|:--------------:|:----:|:----:|:---------:|:----------:|
+| short-short (128/128) | **40.4** | 24.9ms | 130ms | 123.8 | 3.1x |
+| short-long (128/512) | **39.6** | 25.3ms | 130ms | 123.3 | 3.1x |
+| long-short (2048/128) | **39.6** | 25.3ms | 370ms | 123.1 | 3.1x |
+| long-long (2048/512) | **39.2** | 25.5ms | 370ms | 122.7 | 3.1x |
 
-### Test Results
+**GPU baseline**: 2x H100 (TP=2), vLLM 0.8.5
+
+### SDK 2.29 vs 2.28
+
+| Metric | SDK 2.28 | SDK 2.29 | Improvement |
+|--------|:--------:|:--------:|:-----------:|
+| tok/s (short-short) | 38.5 | **40.4** | +5% |
+| TPOT | 26.0ms | 24.9ms | -4% |
+
+The improvement comes from `torch_block_wise` MoE implementation replacing the broken NKI blockwise kernel.
+
+## SDK 2.29 Required Workaround
+
+**CRITICAL**: NKI 0.3.0 GA (SDK 2.29) removed `neuronxcc.nki._private.blockwise_mm`. Without the workaround, MoE models crash with `NotImplementedError: _call_shard_hidden_kernel is not available`.
+
+**Two-part fix:**
+
+1. **Patch moe.py** to forward `use_torch_block_wise` to ExpertMLPs:
+```bash
+python src/patch_moe.py
+```
+
+2. **Pass torch_block_wise config to vLLM**:
+```bash
+--additional-config '{"override_neuron_config": {"blockwise_matmul_config": {"use_torch_block_wise": true}}}'
+```
+
+Both steps are required. The patch only needs to be applied once per environment.
+
+## TKG Optimization: Not Applicable
+
+TKG was tested on this model (kv_heads/TP = 8/8 = 1, stock TKG eligible) but provides **no benefit**:
+- Baseline: 40.4 tok/s, 24.9ms TPOT
+- TKG: 40.3 tok/s, 25.0ms TPOT (+0%)
+
+**Root cause**: MoE expert dispatch dominates TPOT (~60% of decode time). The attention kernel is not the bottleneck for MoE models.
+
+## Quick Start
+
+```bash
+# Activate venv
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
+
+# Apply moe.py patch (SDK 2.29 only)
+python src/patch_moe.py
+
+# Download model
+huggingface-cli download mistralai/Mixtral-8x7B-Instruct-v0.1 \
+    --local-dir /mnt/models/Mixtral-8x7B-Instruct-v0.1
+
+# Start vLLM server
+python -m vllm.entrypoints.openai.api_server \
+    --model /mnt/models/Mixtral-8x7B-Instruct-v0.1 \
+    --tensor-parallel-size 8 \
+    --max-model-len 8192 \
+    --max-num-seqs 4 \
+    --no-enable-prefix-caching \
+    --additional-config '{"override_neuron_config": {"blockwise_matmul_config": {"use_torch_block_wise": true}}}' \
+    --disable-log-requests \
+    --port 8000
+```
+
+## Instance Requirements
+
+| Resource | Minimum |
+|----------|---------|
+| Instance type | trn2.48xlarge |
+| TP degree | 8 |
+| LNC | 2 (default) |
+| HBM | ~93 GB (model) + KV cache |
+| EBS | 300 GB |
+| Compile time | ~25 minutes |
+
+**Note**: This model does NOT fit on trn2.3xlarge (93 GB > 96 GB total HBM at TP=4).
+
+## Compatibility
+
+| Instance/SDK | SDK 2.29 | SDK 2.28 |
+|--------------|----------|----------|
+| trn2.48xlarge | ✅ Working (with patch) | ✅ Working (no patch needed) |
+| trn2.3xlarge | ❌ OOM | ❌ OOM |
+| trn1.32xlarge | ✅ Working (TP=5-8) | ✅ Working |
+
+## Validation Results (Legacy, Trn1)
+
+**Validated:** 2026-01-29 on trn1.32xlarge
+**Configuration:** TP=5, batch_size=None, seq_len=None
 
 | Test | Status | Result |
 |------|--------|--------|
 | Smoke Test | ✅ PASS | Model loads successfully |
 | Token Matching | ✅ PASS | **100.0% match** |
-| Throughput | ⚠️ SLOW | 5.28 tok/s (threshold: 10 tok/s) |
+| Throughput | 5.28 tok/s (trn1, TP=5) |
 
-### Performance Metrics
+## Key Flags
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 5.28 tokens/s |
-
-
-**Status:** ✅ EXCELLENT
-
-### Device Profiling Metrics
-
-**Configuration:** TP=8, batch_size=1, seq_len=128, bfloat16
-**Instance:** trn1.32xlarge | **Profiled:** 2026-03-20
-
-| Metric | Context Encoding | Token Generation |
-|--------|-----------------|------------------|
-| MFU (%) | 0.21 | 0.00 |
-| MBU (%) | 0.38 | 0.99 |
-| HFU (%) | 0.21 | 0.00 |
-| Execution Time (us) | 0.08 | 0.01 |
-| HBM Read | 11.94 GB | 6.01 GB |
-| HBM Write | 260.47 MB | 2.21 MB |
-
-**Throughput:** 12.64 tok/s | **Compile Time:** 1208.41s
-
-> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
-> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
-
-## Usage
-
-```python
-from transformers import AutoTokenizer, GenerationConfig
-from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
-
-# Import model classes from src
-from src.modeling_mixtral_8x7b_instruct_v0_1 import NeuronMixtral8x7BInstructv01ForCausalLM, Mixtral8x7BInstructv01InferenceConfig
-
-model_path = "/path/to/Mixtral-8x7B-Instruct-v0.1/"
-compiled_model_path = "/path/to/compiled/"
-
-# Configure
-neuron_config = NeuronConfig(
-    tp_degree=5,
-    batch_size=None,
-    seq_len=512,
-    torch_dtype=torch.None,
-)
-
-config = Mixtral8x7BInstructv01InferenceConfig(
-    neuron_config,
-    load_config=load_pretrained_config(model_path),
-)
-
-# Compile and load
-model = NeuronMixtral8x7BInstructv01ForCausalLM(model_path, config)
-model.compile(compiled_model_path)
-model.load(compiled_model_path)
-
-# Generate
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-# ... (see integration test for full example)
-```
-
-## Compatibility Matrix
-
-| Instance/Version | 2.20+ | 2.19 and earlier |
-|------------------|-------|------------------|
-| Trn1             | ✅ Working | Not tested |
-| Inf2             | Not tested | Not tested |
-
-## Testing
-
-Run integration tests:
-
-```bash
-pytest nxdi_contrib_models/models/Mixtral-8x7B-Instruct-v0.1/test/integration/test_model.py --capture=tee-sys
-```
-
-Or run manually:
-
-```bash
-cd nxdi_contrib_models/models/Mixtral-8x7B-Instruct-v0.1
-python3 test/integration/test_model.py
-```
-
-## Example Checkpoints
-
-* Mixtral-8x7B-Instruct-v0.1
+- `--no-enable-prefix-caching`: Required to avoid OOB crash in block KV cache path
+- `--additional-config '{"override_neuron_config": ...}'`: Required on SDK 2.29
+- `--max-num-seqs 4`: Recommended for stable performance
 
 ## Maintainer
 
-Annapurna Labs
+Annapurna Labs / Agent Andretti (Mistral Family Benchmark Project)
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-04-20
