@@ -1,6 +1,6 @@
 # Contrib Model: OpenFold3
 
-Biomolecular structure prediction (AlphaFold3 reproduction, ~330M params) on AWS Trainium 2 using vanilla `torch_neuronx.trace()` compilation with weight replacement for multi-layer stacks. Supports sequence lengths up to N=2048 via progressive decomposition of PairFormer sub-operations, with N-range-aware strategy selection that merges segments at smaller N for reduced overhead. Enables protein structure prediction at scales where GPU (A100-40GB) runs out of memory.
+Biomolecular structure prediction (AlphaFold3 reproduction, ~330M params) on AWS Trainium 2 using vanilla `torch_neuronx.trace()` compilation with weight replacement for multi-layer stacks. Supports sequence lengths up to N=2048 via progressive decomposition of PairFormer sub-operations, with N-range-aware strategy selection that merges segments at smaller N for reduced overhead. The decomposed path runs N=2048, where the TriMul intermediate alone is ~128 GB.
 
 ## Model Information
 
@@ -38,19 +38,6 @@ Two compilation strategies are provided based on sequence length:
 
 *Decomposition overhead dominates at N=256 -- use monolithic strategy at small N.
 
-### GPU Comparison (Single A100-SXM4-40GB, p4d.24xlarge)
-
-GPU runs PairFormerBlock monolithically (no decomposition needed). Comparison is per-layer latency:
-
-| N | GPU (A100) | Neuron | GPU/Neuron Ratio | Notes |
-|---|-----------|--------|-----------------|-------|
-| 256 | 15.4ms | 66.1ms (mono) | 0.23x | GPU faster |
-| 512 | 83.4ms | 988ms (decomp) | 0.08x | GPU faster |
-| 1024 | 531.5ms | 4,155ms (decomp) | 0.13x | GPU uses 39.8/40 GB HBM |
-| 2048 | **OOM** | 19,120ms (decomp) | N/A | GPU cannot run (needs ~128GB) |
-
-At N=2048, the TriMul intermediate tensor `[128, N, N]` requires ~128 GB -- exceeding A100-40GB, A100-80GB, and H100-80GB memory. Only B200 (192GB) or Neuron decomposition can handle this scale.
-
 ### Per-Sub-Op Breakdown (Decomposed, avg ms)
 
 | N | TriMulOut | TriMulIn | TriAttnStart | TriAttnEnd | PairTrans | AttnPairBias | SingleTrans | Total |
@@ -60,16 +47,16 @@ At N=2048, the TriMul intermediate tensor `[128, N, N]` requires ~128 GB -- exce
 | 1024 | 1146 | 1128 | 600 | 602 | 229 | 81 | 2 | 4170 |
 | 2048 | 4539 | 4516 | 3624 | 3624 | 919 | 331 | 2 | 19156 |
 
-### Compilation Times (N=128, monolithic blocks; N=384, decomposed sub-ops)
+### Compiled Blocks (N=128, monolithic blocks; N=384, decomposed sub-ops)
 
-| Block | Compile Time | Layers | Weight Swaps |
-|-------|-------------|--------|--------------|
-| PairFormerBlock (monolithic, N=128) | 63.2s | 48 | 47 x replace_weights |
-| MSA type A | 45.0s | 3 | 2 x replace_weights |
-| MSA type B | 44.5s | 1 | Separate NEFF |
-| TemplatePairBlock | 8.7s | 2 | 1 x replace_weights |
-| DiffCond._forward() | 4.0s | 1 | Shared weights |
-| Decomposed sub-ops (N=384) | ~60-70s | 48 | 47 x replace_weights per segment |
+| Block | Layers | Weight Swaps |
+|-------|--------|--------------|
+| PairFormerBlock (monolithic, N=128) | 48 | 47 x replace_weights |
+| MSA type A | 3 | 2 x replace_weights |
+| MSA type B | 1 | Separate NEFF |
+| TemplatePairBlock | 2 | 1 x replace_weights |
+| DiffCond._forward() | 1 | Shared weights |
+| Decomposed sub-ops (N=384) | 48 | 47 x replace_weights per segment |
 
 ### End-to-End Benchmark (Monolithic, N=256)
 
@@ -148,7 +135,7 @@ pipeline = OpenFold3NeuronPipeline(
 # Step 2: Load model and apply source patches
 pipeline.load_model()
 
-# Step 3: Compile all blocks (~5-10 min total)
+# Step 3: Compile all blocks
 compile_times = pipeline.compile_all()
 
 # Step 4: Monkey-patch model
@@ -384,8 +371,6 @@ All patches are applied automatically by `patch_openfold3_source()` or the `Open
 7. **OpenFold3 model access requires download.** Weights are publicly available via `aws s3 cp s3://openfold/staging/of3-p2-155k.pt . --no-sign-request`.
 
 8. **Only trn2.3xlarge validated.** Compilation and benchmarks were performed exclusively on trn2.3xlarge with LNC=2 (4 logical cores). Other instance types have not been tested.
-
-9. **GPU comparison uses A100-SXM4-40GB.** A100-80GB or H100-80GB may handle larger N before OOM, but the ~128GB TriMul intermediate at N=2048 exceeds all current single-GPU HBM sizes.
 
 ## Source Files
 
