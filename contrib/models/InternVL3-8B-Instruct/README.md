@@ -41,13 +41,6 @@ InternVL3-8B-Instruct is a vision-language model (VLM) running on AWS Trainium2 
 
 Vision encoder latency: 34.5 ms per 448x448 tile (batch=1).
 
-#### GPU Comparison (1x NVIDIA L40S, BF16, SDPA)
-
-| Metric | GPU (L40S) | Neuron (trn2.3xlarge TP=4) | Speedup |
-|--------|------------|---------------------------|---------|
-| TTFT (2048 input tokens) | 153.5 ms | 138 ms | 1.11x |
-| Output tok/s (BS=1) | 40.5 | 75.1 | **1.85x** |
-
 ### Accuracy Validation
 
 | Test | Status | Metrics |
