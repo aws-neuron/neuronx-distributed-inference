@@ -66,9 +66,11 @@ configuration unless stated otherwise.
 
 ## Performance
 
-Benchmark: 18 audio clips (0-30 s, mono 16 kHz) transcribed serially,
-prompt `"Transcribe this audio."`, `max_new_tokens=256`, greedy. All numbers
-measured end-to-end on `trn2.3xlarge`.
+Benchmark: a 5-clip mix (5, 10, 15, 20, 25 s) trimmed from the public
+`reach-vb/random-audios/ted_60.wav` sample (see the walkthrough notebook),
+transcribed serially, prompt `"Transcribe this audio."`, `max_new_tokens=256`,
+greedy. All numbers measured end-to-end on `trn2.3xlarge`. Results on
+additional public benchmarks to be added.
 
 ### trn2.3xlarge, TP=4, LNC=2, bfloat16, SDK 2.30
 
@@ -88,10 +90,6 @@ encoder, on-device sampling (greedy), TP=4 on trn2.3xlarge at LNC=2.
 | Metric | Value |
 |--------|-------:|
 | Mean latency per file (5-clip mix, 5-25 s) | **0.477 s** |
-| Median decode throughput (18-clip TED benchmark, 3 clips per 5 s bin) | **155 tok/s** |
-| Encoder wall (median) | 78 ms |
-| CPU projector | 7 ms |
-| Decoder wall (median) | 389 ms |
 
 **vLLM path** (`seq_len=768`, `n_positions=768`):
 
@@ -110,14 +108,11 @@ Per-duration bin (5-clip harness, means in ms) -- both paths:
 
 ### trn2.3xlarge, TP=1, LNC=2, bfloat16, SDK 2.30
 
-Standalone path only. Mean latency per file: **0.967 s**, decode
-throughput median **66 tok/s**. Functional at TP=1; 16/18 transcripts
-byte-identical to TP=4 (2 differ in punctuation or paraphrasing).
+Standalone path only. Functional at TP=1; results on public benchmarks to be added.
 
 ## Optimizations shipped in this contrib
 
-Four changes over the initial port (stock SDK 2.31 was 0.656 s/file at
-TP=4) that together bring the harness mean to ~0.47-0.50 s/file:
+Four changes over the initial port that together reduce per-file latency:
 
 1. **`torch_neuronx.move_trace_to_device(encoder, 0)`** at load time
    (default; the constructor argument `move_trace_to_device=True` gates

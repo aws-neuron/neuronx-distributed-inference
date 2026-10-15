@@ -40,8 +40,8 @@ For quick end-to-end validation you can use:
 - Any 16 kHz mono WAV file you have on hand
 - The [LibriSpeech](https://www.openslr.org/12/) dev-clean split
 
-To reproduce the ~0.468 s/file mean documented in the parent README, use
-18 clips spread across the six 5-second duration bins (0-5, 5-10, 10-15,
-15-20, 20-25, 25-30 seconds), three clips per bin.  Numbers will vary by
+For a duration-balanced benchmark, spread clips across the six 5-second
+duration bins (0-5, 5-10, 10-15, 15-20, 20-25, 25-30 seconds), e.g. three
+clips per bin.  Numbers will vary by
 content complexity — dense speech generates more tokens and therefore takes
 longer.
