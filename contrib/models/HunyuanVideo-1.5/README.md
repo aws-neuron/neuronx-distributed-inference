@@ -76,13 +76,13 @@ export NEURON_FUSE_SOFTMAX=1
 ### 3. Compile Models (First Run Only)
 
 ```bash
-# Compile DiT transformer (TP=4, ~2 minutes)
+# Compile DiT transformer (TP=4)
 python src/recompile_dit_masked.py
 
-# Compile VAE decoder (~12 minutes)
+# Compile VAE decoder
 python src/compile_vae_neuron.py
 
-# Trace byT5 encoder (~30 seconds)
+# Trace byT5 encoder
 python src/trace_byt5.py
 
 # Pre-cache negative embeddings for CFG (~15 seconds)
@@ -303,12 +303,12 @@ When `sta_config` is `None` (default), dense attention is used.
 
 **Compiler Memory Requirements:**
 
-| Configuration | Compiler Memory | Compile Time |
-|--------------|----------------|--------------|
-| 2 blocks × 3.5K tokens | ~2 GB | ~51s |
-| 54 blocks × 3.5K tokens | ~4 GB | ~65s |
-| 2 blocks × 52K tokens | ~42 GB | ~715s |
-| 54 blocks × 52K tokens | >124 GB | Requires trn2.48xlarge |
+| Configuration | Compiler Memory |
+|--------------|----------------|
+| 2 blocks × 3.5K tokens | ~2 GB |
+| 54 blocks × 3.5K tokens | ~4 GB |
+| 2 blocks × 52K tokens | ~42 GB |
+| 54 blocks × 52K tokens | >124 GB (requires trn2.48xlarge) |
 
 **Benchmark Results (trn2.3xlarge, TP=4):**
 
@@ -327,7 +327,7 @@ STA is slower than dense at short sequences due to tiling/gather overhead, but i
 
 3. **B=2 batched CFG is slower**: Compiling DiT at B=2 to batch uncond+cond in a single call results in 4.2x slower execution due to HBM bandwidth saturation. Sequential B=1 is optimal.
 
-4. **First-run compilation**: DiT ~2 min, VAE ~12 min, byT5 ~30s. NEFF cache makes subsequent runs instant.
+4. **First-run compilation**: DiT, VAE and byT5 compile on first run. The NEFF cache makes subsequent runs instant.
 
 ## Maintainer
 
