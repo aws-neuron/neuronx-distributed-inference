@@ -51,13 +51,13 @@ All results: BF16, TP=4, trn2.3xlarge, LNC=2, NKI fused TKG enabled.
 
 #### Sequence Length Scaling (batch_size=1)
 
-| seq_len | TTFT (ms) | TPOT (ms) | Throughput (tok/s) | Compile Time |
-|---------|-----------|-----------|-------------------|-------------|
-| 256 | 152.8 | 7.52 | 102.2 | 71.6s |
-| 1024 | 192.4 | 7.68 | 94.6 | 82.6s |
-| 4096 | 341.4 | 7.71 | 77.4 | 128.7s |
-| 8192 | 559.0 | 8.00 | 60.2 | 227.5s |
-| 16384 | 1127.7 | 8.43 | 38.6 | 555.8s |
+| seq_len | TTFT (ms) | TPOT (ms) | Throughput (tok/s) |
+|---------|-----------|-----------|-------------------|
+| 256 | 152.8 | 7.52 | 102.2 |
+| 1024 | 192.4 | 7.68 | 94.6 |
+| 4096 | 341.4 | 7.71 | 77.4 |
+| 8192 | 559.0 | 8.00 | 60.2 |
+| 16384 | 1127.7 | 8.43 | 38.6 |
 
 Maximum compilable sequence length: 16384. At 32768, CTE compilation fails.
 
@@ -72,21 +72,13 @@ Maximum compilable sequence length: 16384. At 32768, CTE compilation fails.
 
 #### NKI Fused TKG Optimization
 
-| Config | Throughput | TPOT | Compile Time |
-|--------|-----------|------|-------------|
-| Baseline (no NKI) | 82.3 tok/s | 12.15ms | 103s |
-| **NKI fused TKG** | **100.0 tok/s** | **~10ms** | **70.1s** |
-| Improvement | **+21.5%** | **-18%** | **-32%** |
+| Config | Throughput | TPOT |
+|--------|-----------|------|
+| Baseline (no NKI) | 82.3 tok/s | 12.15ms |
+| **NKI fused TKG** | **100.0 tok/s** | **~10ms** |
+| Improvement | **+21.5%** | **-18%** |
 
 NKI fused TKG requires extracting shared experts as a standalone module on the decoder layer (the SDK 2.29 `moe_block_tkg` kernel does not support shared experts internally).
-
-#### GPU Comparison (1x NVIDIA H100 80GB, vLLM 0.19.1, BF16)
-
-| Metric | GPU (H100) | Neuron (trn2.3xlarge) |
-|--------|-----------|----------------------|
-| Decode tok/s (BS=1, short input) | 277.6 | 102.2 |
-| TPOT (BS=1) | 3.60ms | 7.52ms |
-| Aggregate tok/s (BS=4) | 835.2 | 134.9 |
 
 ### Accuracy Validation
 
@@ -238,4 +230,3 @@ Layer 0 uses a standard dense MLP (intermediate_size=8192) instead of MoE. The `
 
 - **32K sequence length fails**: CTE compilation crashes at seq_len=32768 (neuronx-cc limitation, not HBM). Maximum compilable sequence length is 16384.
 - **BF16 logit divergence**: MoE routing with 128 experts × top-6 in BF16 accumulates numerical drift faster than dense models. Logit validation requires wider tolerances (rtol=1.2) but token-level accuracy is 100%.
-- **Compilation time scales with batch size**: BS=8 at seq_len=4096 takes ~10 minutes to compile vs ~2 minutes for BS=1.
