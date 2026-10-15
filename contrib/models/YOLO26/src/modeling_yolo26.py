@@ -35,10 +35,10 @@ mathematically identical.
 
 Key Results (trn2.3xlarge, LNC=1, DP=8)
 ----------------------------------------
-- YOLO26s: 1,523 img/s (1.43x vs A10G compiled)
-- YOLO26m: 1,267 img/s (2.67x vs A10G compiled)
-- YOLO26l: 1,093 img/s (2.95x vs A10G compiled)
-- YOLO26x:   876 img/s (4.49x vs A10G compiled)
+- YOLO26s: 1,523 img/s
+- YOLO26m: 1,267 img/s
+- YOLO26l: 1,093 img/s
+- YOLO26x:   876 img/s
 
 inf2.xlarge Results (DP=2, 384×640, 16ch pad)
 ----------------------------------------------

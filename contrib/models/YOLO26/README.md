@@ -31,13 +31,13 @@ Key Neuron porting challenges:
 
 ### Peak Throughput (LNC=1, DP=8)
 
-| Variant | Params | Dtype | NEFF (MB) | BS/core | img/s | A10G Compiled | Speedup |
-|---------|--------|-------|-----------|---------|-------|---------------|---------|
-| YOLO26n | 2.4M | FP32 | 19.5 | 1 | 272 | 2,166 | 0.13x |
-| YOLO26s | 10.0M | FP32 | 69.6 | 32 | 1,523 | 1,065 | **1.43x** |
-| YOLO26m | 21.9M | BF16 | 66.4 | 32 | 1,267 | 474 | **2.67x** |
-| YOLO26l | 26.3M | BF16 | 80.8 | 32 | 1,093 | 371 | **2.95x** |
-| YOLO26x | 58.9M | BF16 | 177.7 | 16 | 876 | 195 | **4.49x** |
+| Variant | Params | Dtype | NEFF (MB) | BS/core | img/s |
+|---------|--------|-------|-----------|---------|-------|
+| YOLO26n | 2.4M | FP32 | 19.5 | 1 | 272 |
+| YOLO26s | 10.0M | FP32 | 69.6 | 32 | 1,523 |
+| YOLO26m | 21.9M | BF16 | 66.4 | 32 | 1,267 |
+| YOLO26l | 26.3M | BF16 | 80.8 | 32 | 1,093 |
+| YOLO26x | 58.9M | BF16 | 177.7 | 16 | 876 |
 
 ### Accuracy Validation
 
