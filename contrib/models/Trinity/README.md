@@ -89,7 +89,6 @@ Single forward pass comparison -- HuggingFace `AutoModelForCausalLM` (bf16) vs N
 
 | Metric | Result |
 |--------|--------|
-| Compilation Time | 5.1 min |
 | Load Time | 2.2 min |
 | Forward Pass Latency | ~0.50s |
 
@@ -109,7 +108,6 @@ Single forward pass comparison -- HuggingFace `AutoModelForCausalLM` (bf16) vs N
 
 | Metric | Result |
 |--------|--------|
-| Compilation Time | 4.9 min |
 | Load Time | 4.1 min (from pre-compiled) |
 | Forward Pass Latency | ~0.37s |
 
@@ -129,7 +127,6 @@ Single forward pass comparison -- HuggingFace `AutoModelForCausalLM` (bf16) vs N
 
 | Metric | Result |
 |--------|--------|
-| Compilation Time | Reused from trn2.3xlarge |
 | Load Time | 47.7s |
 | Forward Pass Latency | ~0.73s |
 
@@ -139,7 +136,6 @@ Single forward pass comparison -- HuggingFace `AutoModelForCausalLM` (bf16) vs N
 
 | Metric | Result |
 |--------|--------|
-| Compilation Time | 8.6 min |
 | Load Time | 15.6 min |
 | Forward Pass Latency | ~1.15s |
 
@@ -162,21 +158,21 @@ Single forward pass comparison -- HuggingFace `AutoModelForCausalLM` (bf16) vs N
 
 ### Trinity-Nano (~6B total, ~1B active)
 
-| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile |
-|----------|-----|------|-----------|-------------|-------------------|-----------------|---------|
-| inf2.xlarge* | 1 | 1 | 706 | 9.0 | 112 | 112 | N/A (pre-sharded) |
-| inf2.8xlarge | 1 | 1 | 706 | 9.2 | 109 | 109 | 7.9 min |
-| inf2.8xlarge | 1 | 2 | 901 | 13.3 | 150 | 75 | 8.8 min |
-| inf2.8xlarge | 1 | 4 | 1347 | 20.8 | 192 | 48 | 11.7 min |
-| inf2.8xlarge | 2 | 1 | 516 | 7.6 | 131 | 131 | 4.8 min |
-| inf2.8xlarge | 2 | 2 | 674 | 9.4 | 212 | 106 | 6.6 min |
-| inf2.8xlarge | 2 | 4 | 993 | 13.6 | 294 | 74 | 8.5 min |
-| trn2.3xlarge | 2 | 1 | 516 | 10.8 | 93 | 93 | 4.9 min |
-| trn2.3xlarge | 2 | 2 | 680 | 13.9 | 144 | 72 | 7.4 min |
-| trn2.3xlarge | 2 | 4 | 930 | 16.3 | 245 | 61 | 9.4 min |
-| trn2.3xlarge | 4 | 1 | 476 | 9.2 | 109 | 109 | 5.0 min |
-| trn2.3xlarge | 4 | 2 | 600 | 12.4 | 161 | 81 | 6.5 min |
-| trn2.3xlarge | 4 | 4 | 817 | 14.9 | 269 | 67 | 8.5 min |
+| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) |
+|----------|-----|------|-----------|-------------|-------------------|-----------------|
+| inf2.xlarge* | 1 | 1 | 706 | 9.0 | 112 | 112 |
+| inf2.8xlarge | 1 | 1 | 706 | 9.2 | 109 | 109 |
+| inf2.8xlarge | 1 | 2 | 901 | 13.3 | 150 | 75 |
+| inf2.8xlarge | 1 | 4 | 1347 | 20.8 | 192 | 48 |
+| inf2.8xlarge | 2 | 1 | 516 | 7.6 | 131 | 131 |
+| inf2.8xlarge | 2 | 2 | 674 | 9.4 | 212 | 106 |
+| inf2.8xlarge | 2 | 4 | 993 | 13.6 | 294 | 74 |
+| trn2.3xlarge | 2 | 1 | 516 | 10.8 | 93 | 93 |
+| trn2.3xlarge | 2 | 2 | 680 | 13.9 | 144 | 72 |
+| trn2.3xlarge | 2 | 4 | 930 | 16.3 | 245 | 61 |
+| trn2.3xlarge | 4 | 1 | 476 | 9.2 | 109 | 109 |
+| trn2.3xlarge | 4 | 2 | 600 | 12.4 | 161 | 81 |
+| trn2.3xlarge | 4 | 4 | 817 | 14.9 | 269 | 67 |
 
 **Whole-instance throughput** (TP x DP = all available cores):
 
@@ -193,12 +189,12 @@ Single forward pass comparison -- HuggingFace `AutoModelForCausalLM` (bf16) vs N
 
 ### Trinity-Mini (~26B total, ~4.5B active)
 
-| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile | Notes |
-|----------|-----|------|-----------|-------------|-------------------|-----------------|---------|-------|
-| trn2.3xlarge | 4 | 1 | 371 | 11.8 | 85 | 85 | 3.9 min | |
-| trn2.3xlarge | 4 | 2 | 598 | 11.5 | 174 | 87 | 6.8 min | |
-| trn2.3xlarge | 4 | 4 | 805 | 13.6 | 295 | 74 | 9.1 min | |
-| trn2.3xlarge | 4 | 1 | 371 | **9.1** | **110** | **110** | 3.8 min | **Fused TKG** |
+| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Notes |
+|----------|-----|------|-----------|-------------|-------------------|-----------------|-------|
+| trn2.3xlarge | 4 | 1 | 371 | 11.8 | 85 | 85 | |
+| trn2.3xlarge | 4 | 2 | 598 | 11.5 | 174 | 87 | |
+| trn2.3xlarge | 4 | 4 | 805 | 13.6 | 295 | 74 | |
+| trn2.3xlarge | 4 | 1 | 371 | **9.1** | **110** | **110** | **Fused TKG** |
 
 Mini requires TP=4 (all cores on trn2.3xlarge), so DP is not applicable. With the fused MoE TKG kernel (requires patched libraries), BS=1 throughput improves from 85 to **110 tok/s** (+29%).
 
@@ -206,45 +202,13 @@ Mini requires TP=4 (all cores on trn2.3xlarge), so DP is not applicable. With th
 
 ### Trinity-Large (~250B total, ~15B active)
 
-| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Compile | Load |
-|----------|-----|------|-----------|-------------|-------------------|-----------------|---------|------|
-| trn2.48xlarge | 64 | 1 | 1161 | 14.7 | 68 | 68 | 9.2 min | 851s |
-| trn2.48xlarge | 64 | 2 | 1657 | 19.1 | 102 | 51 | 11.1 min | 867s |
-| trn2.48xlarge | 64 | 4 | 1980 | 29.0 | 137 | 34 | 14.0 min | 873s |
+| Instance | TP | BS | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) | Per-seq (tok/s) | Load |
+|----------|-----|------|-----------|-------------|-------------------|-----------------|------|
+| trn2.48xlarge | 64 | 1 | 1161 | 14.7 | 68 | 68 | 851s |
+| trn2.48xlarge | 64 | 2 | 1657 | 19.1 | 102 | 51 | 867s |
+| trn2.48xlarge | 64 | 4 | 1980 | 29.0 | 137 | 34 | 873s |
 
 **Recommended config**: trn2.48xlarge TP=64 BS=1 for lowest latency (1.16s TTFT, 14.7ms TKG), or BS=4 for max aggregate throughput (137 tok/s). NVMe instance store required for model storage (~743GB on disk).
-
-### GPU Comparison (g5.12xlarge, 4x NVIDIA A10G)
-
-Benchmarked via vLLM 0.16.0, bf16. Shows single-request latency and aggregate throughput at various concurrency levels. GPU uses continuous batching with CUDA graphs (PagedAttention v2).
-
-**Trinity-Nano** on 1x A10G (TP=1):
-
-| Concurrency | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) |
-|-------------|-----------|-------------|-------------------|
-| 1 | 20 | 6.9 | 137 |
-| 4 | 30 | -- | 400 |
-| 16 | 56 | -- | 1140 |
-| 64 | 65 | -- | 2782 |
-
-**Trinity-Mini** on 4x A10G (TP=4, max_num_seqs=32):
-
-| Concurrency | TTFT (ms) | TKG (ms/tok) | Throughput (tok/s) |
-|-------------|-----------|-------------|-------------------|
-| 1 | 24 | 6.7 | 138 |
-| 4 | 42 | -- | 337 |
-| 16 | 79 | -- | 857 |
-
-**GPU vs Neuron** (single-request, BS=1):
-
-| Model | Metric | GPU (A10G) | Neuron (best) | Notes |
-|-------|--------|-----------|---------------|-------|
-| Nano | TTFT | 20 ms | 476 ms | GPU 24x faster (CUDA graphs vs CTE forward) |
-| Nano | TKG | 6.9 ms | 7.6 ms | GPU 1.1x faster (inf2 TP=2) |
-| Mini | TTFT | 24 ms | 371 ms | GPU 15x faster |
-| Mini | TKG | 6.7 ms | 11.5 ms | GPU 1.7x faster |
-
-GPU TTFT advantage comes from vLLM's CUDA graph capture eliminating kernel launch overhead. Neuron TTFT is dominated by the CTE forward pass through compiled HLO graphs. A vLLM-Neuron serving stack would narrow this gap.
 
 ### Key Observations
 
@@ -254,12 +218,8 @@ GPU TTFT advantage comes from vLLM's CUDA graph capture eliminating kernel launc
 - **TP=2 on inf2 outperforms TP=1**: 21-53% higher throughput across batch sizes (TKG drops from 9.2ms to 7.6ms at BS=1)
 - **DP gives higher throughput than TP for small models**: trn2 TP=2 DP=2 at BS=1 yields 186 tok/s vs TP=4 DP=1 BS=1 at 109 tok/s, but at higher per-token latency
 - **TP=4 vs TP=2 on trn2**: TP=4 has 15-17% lower TKG latency (better per-sequence), but TP=2 enables DP=2 for higher aggregate throughput
-- **Compile time grows with batch size**: BS=4 takes 8.5-9.4 min vs 3.9-5.0 min (BS=1)
 - **Large TKG is comparable to smaller models**: 14.7ms despite 250B total params -- MoE activates only 15B
-- **Load time dominates Large**: 14.2 min to shard 516GB across 64 cores; compile is only 9.2 min
-- **GPU has massive TTFT advantage**: 20-24ms vs 371-706ms (15-35x) due to CUDA graphs vs compiled HLO forward pass
-- **GPU aggregate throughput scales with concurrency**: 2782 tok/s (Nano, 64 concurrent) vs 294 tok/s (Neuron inf2 TP=2 BS=4) -- continuous batching vs static batching
-- **GPU TKG is 1.1-1.7x faster**: 6.7-6.9ms vs 7.6-11.8ms on Neuron
+- **Load time dominates Large**: 14.2 min to shard 516GB across 64 cores
 - **inf2.xlarge cannot run Nano**: 16GB system RAM is insufficient for 12GB bf16 model weight loading (OOM during sharding), even with pre-compiled artifacts. **Pre-sharded weights solve this** (1.39 GB RSS, 112 tok/s).
 
 ## Usage
@@ -489,14 +449,12 @@ model.load(compiled_artifact_path)  # Reads directly from sharded files — only
 
 Validated with token generation (5 tokens per prompt) at each max seq_len:
 
-| Model | Instance | TP | Max seq_len | Compile | Load | Gen Latency |
-|-------|----------|-----|------------|---------|------|-------------|
-| Nano | trn2.3xlarge | 2 | **40,960** | 1.5 min | 3.2 min | 2.4s/tok |
-| Nano | trn2.3xlarge | 4 | **49,152** | 1.4 min | 1.4 min | 2.4s/tok |
-| Mini | trn2.3xlarge | 4 | **32,768** | 0.9 min | 7.7 min | 2.4s/tok |
-| Large | trn2.48xlarge | 64 | **30,720** | 1.6 min | 16.5 min | 2.9s/tok |
-
-Compile times above are for cache-hit runs. First compilation at each seq_len takes 5-25 min.
+| Model | Instance | TP | Max seq_len | Load | Gen Latency |
+|-------|----------|-----|------------|------|-------------|
+| Nano | trn2.3xlarge | 2 | **40,960** | 3.2 min | 2.4s/tok |
+| Nano | trn2.3xlarge | 4 | **49,152** | 1.4 min | 2.4s/tok |
+| Mini | trn2.3xlarge | 4 | **32,768** | 7.7 min | 2.4s/tok |
+| Large | trn2.48xlarge | 64 | **30,720** | 16.5 min | 2.9s/tok |
 
 Higher TP gives more headroom for KV cache (Nano TP=4 fits 49K vs 41K at TP=2). The failure mode at the limit is compilation timeout, not OOM.
 
@@ -542,7 +500,7 @@ If `context_encoding_buckets` / `token_generation_buckets` are omitted, NxDI aut
 | (20-token prompt) | 20 | "Provide" | 0.50s | PASS |
 | (124-token prompt) | 124 | `<\|im_end\|>` | 0.50s | PASS |
 
-- Compile: 7.0 min (4 NEFFs: 2 CTE + 2 TKG)
+- 4 NEFFs: 2 CTE + 2 TKG
 - Load: 37.6s
 - Token generation: ~0.5s/tok (5 tokens generated per prompt)
 - Backward compatible with non-bucketing flow
@@ -556,7 +514,7 @@ If `context_encoding_buckets` / `token_generation_buckets` are omitted, NxDI aut
 | (20-token prompt) | 20 | "Also" | 0.37s | PASS |
 | (124-token prompt) | 124 | "Conclude" | 0.37s | PASS |
 
-- Compile: 5.5 min (4 NEFFs: 2 CTE + 2 TKG)
+- 4 NEFFs: 2 CTE + 2 TKG
 - Load: 78.3s (1.3 min)
 - Token generation: ~0.4s/tok (5 tokens generated per prompt)
 
@@ -569,7 +527,7 @@ If `context_encoding_buckets` / `token_generation_buckets` are omitted, NxDI aut
 | (20-token prompt) | 20 | "\n" | 1.15s | PASS |
 | (124-token prompt) | 124 | `<\|end_of_text\|>` | 1.15s | PASS |
 
-- Compile: 12.5 min (4 NEFFs: 2 CTE + 2 TKG)
+- 4 NEFFs: 2 CTE + 2 TKG
 - Load: 15.7 min
 - Token generation: ~1.2s/tok (5 tokens generated per prompt)
 
@@ -734,7 +692,6 @@ The config class automatically enables/disables fused TKG based on this alignmen
 
 | Metric | Non-fused | Fused | Notes |
 |--------|-----------|-------|-------|
-| Compile | 357s (5.9 min) | 258s (4.3 min) | Fused compiles faster |
 | CTE latency | ~0.52s | ~0.49s | Similar |
 | TKG latency | ~0.011s | ~0.014s | Fused is slower on Nano |
 
@@ -761,7 +718,6 @@ Tested with patched `nki-library`, `neuronx-distributed`, and `neuronx-distribut
 | CTE (ms) | 371.1 | 371.0 | -0.0% |
 | TKG (ms/tok) | 11.8 | 9.1 | **-22.5%** |
 | Throughput (tok/s) | 84.9 | 109.5 | **+29.0%** |
-| Compile time | 3.9 min | 3.8 min | -2.6% |
 
 **TKG multi-token divergence:** The second TKG token diverges between fused and non-fused paths due to numerical reordering in the fused kernel (different operation order produces bf16-equivalent but non-identical intermediate values). This is the same class of divergence observed in all bf16 MoE comparisons (see Token Match Rate section). Both paths produce coherent text; the divergence compounds autoregressively as expected.
 

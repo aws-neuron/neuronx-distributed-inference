@@ -21,12 +21,12 @@ The video VAE decoder is also compiled for Neuron using tensor-parallel tiled de
 
 Tested on trn2.3xlarge (1 NeuronDevice, 4 logical NeuronCores with LNC=2) with Neuron SDK 2.28:
 
-| Metric | Neuron (trn2) | GPU (g5.12xlarge) |
-|--------|--------------|-------------------|
-| Generation time (warm, CFG, 8 steps) | ~22s | ~48s |
-| First generation (includes warmup) | ~64s | ~48s |
+| Metric | Neuron (trn2) |
+|--------|--------------|
+| Generation time (warm, CFG, 8 steps) | ~22s |
+| First generation (includes warmup) | ~64s |
 
-The Neuron pipeline produces nearly identical output to the GPU reference.
+The Neuron pipeline produces nearly identical output to the GPU reference (SSIM > 0.7, same seed and settings).
 
 ## Compatibility Matrix
 
@@ -73,20 +73,20 @@ pip install imageio imageio-ffmpeg
 ```bash
 cd /home/ubuntu/ltx2-neuron/src
 
-# Compile the DiT transformer backbone (~2 minutes)
+# Compile the DiT transformer backbone
 NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
   python compile_gemma3.py
 
-# Pre-shard Gemma3 weights for fast loading (~2 minutes)
+# Pre-shard Gemma3 weights for fast loading
 python shard_gemma3_weights.py
 
 # Compile VAE decoder for Neuron
-# For 25-frame videos (default E2E config): use 8x8 tiles (~6 min)
+# For 25-frame videos (default E2E config): use 8x8 tiles
 NEURON_RT_VISIBLE_CORES=0-3 python compile_vae.py \
   --tp-degree 4 --height 256 --width 256 --num-frames 25 \
   --output-dir /home/ubuntu/ltx2_vae_tp4_256x256_f25
 
-# For 121-frame videos: use 4x16 tiles (~15 min, requires trn2.48xlarge)
+# For 121-frame videos: use 4x16 tiles (requires trn2.48xlarge)
 # NEURON_RT_VISIBLE_CORES=0-3 python compile_vae.py \
 #   --tp-degree 4 --height 128 --width 512 --num-frames 121 \
 #   --output-dir /home/ubuntu/ltx2_vae_tp4_128x512_f121
@@ -277,8 +277,8 @@ pipe._swap_vae_to_neuron("/path/to/compiled_vae", tile_latent_h=8, tile_latent_w
 | 25 | 4 | **8×8** (256×256 px) | 4×16 fails at latent_t=4 (SRAM issue) |
 | 121 | 16 | **4×16** (128×512 px) | 12.5% faster per-tile, fewer tiles at high res |
 
-- **Short videos (25 frames)**: Use 8×8 tiles. The 4×16 tile fails to compile at latent_t=4 due to `NCC_IBIR229` state buffer allocation failure. 8×8 compiles in ~6 minutes.
-- **Long videos (121 frames)**: Use 4×16 tiles for best performance. Compiles in ~15 minutes but requires trn2.48xlarge (2TB RAM) — the compiler OOMs on trn2.3xlarge (124GB) for rectangular tiles.
+- **Short videos (25 frames)**: Use 8×8 tiles. The 4×16 tile fails to compile at latent_t=4 due to `NCC_IBIR229` state buffer allocation failure.
+- **Long videos (121 frames)**: Use 4×16 tiles for best performance. Requires trn2.48xlarge (2TB RAM) — the compiler OOMs on trn2.3xlarge (124GB) for rectangular tiles.
 
 Compile examples:
 ```bash
