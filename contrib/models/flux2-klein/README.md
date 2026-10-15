@@ -39,7 +39,6 @@ FLUX.2-klein differs from FLUX.1 in several important ways:
 | Pipeline steps/sec | 0.96 |
 | Per-step latency | 1036ms |
 | Backbone forward/sec | 1.93 (2 CFG passes/step) |
-| Compilation time | ~135s (2.3 min) |
 | Model load time | ~20s |
 
 ### Accuracy Validation
@@ -61,11 +60,9 @@ FLUX.2-klein differs from FLUX.1 in several important ways:
 | TP Degree | 4 |
 | E2E generation time | 191.44s/img (10/10 seeds pass) |
 | HBM usage | ~40 GB |
-| Compilation time | ~795s (cacheable) |
 | Weight load time | ~136s |
-| $/image | $0.1189 (7% cheaper than H100 BF16: $0.1286) |
 
-**Tested by:** xniwang (external SA), on trn2.3xlarge, SDK 2.29.
+Tested on trn2.3xlarge, SDK 2.29.
 
 The backbone compiles natively at 2048x2048 (16,384 tokens) with TP=4 — no context
 parallelism or tiling needed. The model produces coherent high-quality images at 2K.
@@ -73,14 +70,14 @@ parallelism or tiling needed. The model produces coherent high-quality images at
 ### 4096x4096: NOT SUPPORTED (Model Limitation)
 
 > **IMPORTANT:** FLUX.2-klein does NOT support 4096x4096 generation. This is a fundamental
-> model limitation, NOT a hardware constraint. The model produces noise/gray images at 4K
-> on ALL devices, including NVIDIA H100.
+> model limitation (max_area = 4 MP), independent of hardware. The model produces
+> noise/gray images at 4K.
 
 **Root cause:** The FLUX.2-klein model specification defines `max_area=4194304` (4 megapixels),
 which caps the maximum supported resolution at 2048x2048. Generating beyond this limit
 produces degenerate output regardless of hardware.
 
-This was confirmed on both Neuron (trn2) and GPU (H100) — 4K produces noise/gray on both.
+This is a model limitation (max_area = 4 MP), independent of hardware.
 The limitation is architectural (likely in the RoPE positional encoding and training
 distribution), not a compilation or memory issue.
 
@@ -113,7 +110,7 @@ app = NeuronFlux2KleinApplication(
     backbone_config=backbone_config,
 )
 
-# Compile (first time only, ~2-3 min)
+# Compile (first time only)
 app.compile(COMPILE_DIR)
 
 # Load compiled model
@@ -181,7 +178,7 @@ FLUX.2-klein uses SwiGLU activation (`SiLU(gate) * value`) in its feed-forward n
 
 - **Gated model**: Requires HuggingFace access approval before use
 - **CPU text encoding**: Qwen3-8B runs on CPU (~5s per prompt)
-- **First compilation**: Takes ~2-3 minutes on trn2.3xlarge
+- **First compilation**: Compiles on first run; later runs reuse the compiled artifacts
 - **Memory**: The 9B transformer requires all 4 cores with TP=4 on trn2.3xlarge
 
 ## Maintainer
