@@ -10,7 +10,7 @@ correctly and the HF port does not.
 
 Test: monkey-patch ONLY apply_rotary_pos_emb to use index slicing (numerically identical),
 change nothing else, re-trace with real weights. If cos goes 0.50 -> ~1.0, root cause
-confirmed. Also a pure-op micro-repro with no model at all, for the ticket.
+confirmed. Also a pure-op micro-repro with no model at all, for an upstream report.
 """
 
 import json
