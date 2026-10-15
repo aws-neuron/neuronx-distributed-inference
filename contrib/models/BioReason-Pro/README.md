@@ -58,31 +58,6 @@ Throughput scales steadily with batch size. Compiled separately per batch size u
 | 8          | 128.8             | 124.3s                   | |
 | 16         | 134.7             | 78.8s                    | 10 proteins padded to 16 (62.5% utilization) |
 
-#### GPU Comparison
-
-**A10G (g5.2xlarge, vLLM 0.10.1.1, gpu_memory_utilization=0.5):**
-
-| Batch Size | GPU tok/s | Neuron tok/s | Neuron/GPU |
-|------------|-----------|--------------|------------|
-| 4          | 142.3     | 98.6         | 0.69x      |
-| 8          | 132.7     | 128.8        | 0.97x      |
-| 16         | 137.8     | 134.7        | 0.98x      |
-
-A10G peaks at BS=4 then declines due to KV cache preemption at 0.5 `gpu_memory_utilization` (required because ESM3 shares GPU VRAM).
-
-**H100 (p5.48xlarge, single GPU, vLLM 0.19, FlashAttention 3, gpu_memory_utilization=0.85, ESM3 on CPU):**
-
-| BS | H100 tok/s | Neuron DP=4 tok/s | Neuron/H100 |
-|----|-----------|-------------------|-------------|
-| 4  | 348.2     | 270.9             | 0.78x       |
-| 8  | 411.3     | 494.9             | **1.20x**   |
-| 16 | 507.0     | 537.3             | **1.06x**   |
-| 32 | 522.6     | --                | --          |
-
-**Best vs best: Neuron 537.3 tok/s (DP=4, BS=16) vs H100 522.6 tok/s (BS=32) = 1.03x Neuron.**
-
-At BS=8+, Neuron DP=4 surpasses the H100 due to 4 NeuronCores processing batches in parallel. The H100 has the advantage at low batch sizes (vLLM continuous batching, FlashAttention 3), but Neuron's data parallelism gives it the edge at higher batch sizes where static batching overhead is amortized.
-
 #### LNC Configuration Comparison (trn2.3xlarge)
 
 LNC=1 splits the chip into 8 logical cores (12 GB HBM each) vs LNC=2's 4 cores (24 GB each). Per-core throughput:
@@ -298,7 +273,7 @@ Expected output:
 
 2. **Prompt truncation**: The NxDI model is compiled with `max_context_length=1024` (default). Proteins with long InterPro annotations may have their prompt truncated, affecting prediction quality. Longer context lengths (up to 4096 tested) work but reduce throughput by ~10%.
 
-3. **First compilation**: Initial model compilation takes 5-8 minutes per batch size. Subsequent loads use the cached compiled model (~26s). Use `compiled_model_path` to cache separate compilations for different batch sizes.
+3. **First compilation**: Each batch size is compiled separately on first use. Subsequent loads use the cached compiled model. Use `compiled_model_path` to cache separate compilations for different batch sizes.
 
 4. **ESM3 gated access**: The ESM3-small model requires accepting a license on HuggingFace and setting `HF_TOKEN`.
 
