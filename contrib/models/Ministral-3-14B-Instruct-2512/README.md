@@ -108,7 +108,7 @@ python -m vllm.entrypoints.openai.api_server \
   --additional-config '{"override_neuron_config": {"fused_qkv": true, "qkv_nki_kernel_enabled": true, "qkv_kernel_enabled": true}}'
 ```
 
-First launch compiles the model (~5 minutes). Subsequent launches use the NCC cache.
+First launch compiles the model. Subsequent launches use the NCC cache.
 
 For higher batch sizes (BS=8), change `--max-num-seqs 8`.
 
@@ -164,9 +164,8 @@ Measured on trn2.3xlarge (TP=4, LNC=2, SDK 2.29) via vLLM 0.16:
 | **2.29** | QKV NKI kernel (baseline) | **~252** (4/TPOT) | 63.3 |
 | **2.29** | TKG kernel (LNC=2) | **~255** (4/TPOT) | 63.5 |
 | 2.28 | Fused QKV+TKG | 213.7 | 71.0 |
-| GPU | H100 FP8 | 140.3 | — |
 
-At BS=4, both baseline and TKG configs **exceed H100 by 1.8x**. The TKG kernel with LNC=2
+At BS=4, the TKG kernel with LNC=2
 matches baseline throughput while fusing the KV cache update into the attention kernel.
 
 ## TKG Kernel Results
