@@ -31,7 +31,7 @@ cd /mnt/models
 python yue_e2e_neuron.py --genre_txt genre.txt --lyrics_txt lyrics.txt --seed 123
 ```
 
-First run compiles models to Neuron IR (~7 min). Subsequent runs use `--skip-compile`.
+First run compiles models to Neuron IR. Subsequent runs use `--skip-compile`.
 
 ### With NKI Kernel Optimization (Recommended)
 
@@ -41,7 +41,7 @@ Enable fused NKI MLP kernels for a **20% speedup** on token generation:
 python yue_e2e_neuron.py --genre_txt genre.txt --lyrics_txt lyrics.txt --seed 123 --nki-kernels
 ```
 
-First run with `--nki-kernels` requires a separate compilation (~7 min). Subsequent runs use `--skip-compile`.
+First run with `--nki-kernels` requires a separate compilation. Subsequent runs use `--skip-compile`.
 
 ### With S2 Batching
 
@@ -171,16 +171,14 @@ The GPSIMD collapse (51.9% -> 1.6%) confirms elimination of unfused RMSNorm/SiLU
 
 Benchmarked on trn2.3xlarge with SDK 2.28 (seed=123, 2 segments, CFG enabled):
 
-### GPU Comparison (CFG enabled, ~29s audio)
+### End-to-End (CFG enabled, ~29s audio)
 
-| Metric | L4 GPU (24GB) | trn2 Baseline | trn2 + NKI + bs=2 | Neuron vs GPU |
-|--------|--------------|---------------|-------------------|---------------|
-| S1 gen | 300.3s (9.7 tok/s) | 85s (34.5 tok/s) | 85s (34.5 tok/s) | **3.5x faster** |
-| S2 gen | 1004.1s (105s/chunk) | 317s (40s/chunk) | 235s (bs=2) | **4.3x faster** |
-| Pipeline total | 1461.5s | 514s | ~440s | **3.3x faster** |
-| RTF | 50.3x | 17.6x | ~15x | -- |
-
-Benchmarked on g6.xlarge (NVIDIA L4, 24GB, PyTorch 2.9.1, BF16, SDPA).
+| Metric | trn2 Baseline | trn2 + NKI + bs=2 |
+|--------|---------------|-------------------|
+| S1 gen | 85s (34.5 tok/s) | 85s (34.5 tok/s) |
+| S2 gen | 317s (40s/chunk) | 235s (bs=2) |
+| Pipeline total | 514s | ~440s |
+| RTF | 17.6x | ~15x |
 
 ### Default Configuration (LNC=2, TP=2/1)
 
